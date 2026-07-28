@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zen-ai",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.97"
+license = "MIT"
+authors = ["Zen Contributors"]
+
+# ──────────────────────────────────────────────────────────────────
+#  shared workspace dependency versions
+#  all crate-level Cargo.toml should reference these via
+#  `dep_name.workspace = true` unless a crate needs a specific override.
+# ──────────────────────────────────────────────────────────────────
+[workspace.dependencies]
+# ── async runtime ────────────────────────────────────────────────
+tokio = { version = "1", features = [
+    "macros",
+    "sync",
+    "rt-multi-thread",
+    "fs",
+    "process",
+    "io-util",
+    "signal",
+] }
+tokio-util = "0.7"
+
+# ── serialization (core types → JSONL, API request/response) ────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── UUIDv7 (session / tool-call identifiers) ─────────────────────
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# ── HTTP client (OpenAI-compatible API calls) ────────────────────
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+
+# ── SSE streaming (LLM streaming response parsing) ───────────────
+eventsource-stream = "0.2"
+
+# ── error handling ───────────────────────────────────────────────
+thiserror = "2"
+anyhow = "1"
+
+# ── CLI argument parsing ─────────────────────────────────────────
+clap = { version = "4", features = ["derive"] }
+
+# ── TUI ──────────────────────────────────────────────────────────
+# ratatui + crossterm: alternative to Pi's own TUI framework.
+# crossterm is the backend; ratatui each release pins a crossterm
+# range – keep both in sync.
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+
+# ── Markdown rendering (terminal output in TUI & print mode) ────
+pulldown-cmark = "0.13"
+
+# ── Syntax highlighting (replaces highlight.js) ──────────────────
+# default-fancy = pure-Rust regex engine, avoids C lib oniguruma.
+syntect = { version = "5", default-features = false, features = [
+    "default-fancy",
+] }
+
+# ── JSON Schema (tool parameter validation, REQ-AI-03) ───────────
+schemars = "1"
+jsonschema = "0.18"
+
+# ── Observability (tracing spans → diagnostics) ─────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "json",
+] }
+tracing-appender = "0.2"
+
+# ── miscellaneous ────────────────────────────────────────────────
+chrono = { version = "0.4", features = ["serde"] }
+
+# ── (not yet needed) ─────────────────────────────────────────────
+# rusqlite – only if SQLite persistence is explicitly required;
+#              default persistence is JSONL.

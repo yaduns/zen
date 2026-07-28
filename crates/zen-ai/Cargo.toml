@@ -1,0 +1,10 @@
+[package]
+name = "zen-ai"
+version.workspace = true
+edition.workspace = true
+description = "AI infrastructure for Zen"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
