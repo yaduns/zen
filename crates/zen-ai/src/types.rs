@@ -60,7 +60,7 @@ pub struct TextContent {
     /// Text content
     pub text: String,
     /// Text signature ID (message metadata from the OpenAI responses API; field retained by zen)
-    text_signature: Option<String>,
+    pub text_signature: Option<String>,
 }
 
 /// LLM reasoning/thinking content block containing the thinking text and its signature, used to pass thinking context across multi-turn conversations.
@@ -68,11 +68,11 @@ pub struct TextContent {
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingContent {
     /// Thinking process text
-    thinking: String,
+    pub thinking: String,
     /// Thinking signature (passed back to the API in multi-turn conversations)
-    thinking_signature: Option<String>,
+    pub thinking_signature: Option<String>,
     /// Whether the content was masked by a safety filter (when true, the thinking field is placeholder text and the actual content is in signature)
-    redacted: Option<bool>,
+    pub redacted: Option<bool>,
 }
 
 /// Image content block, supporting multimodal input.
@@ -80,9 +80,9 @@ pub struct ThinkingContent {
 #[serde(rename_all = "camelCase")]
 pub struct ImageContent {
     /// Base64-encoded image data
-    data: String,
+    pub data: String,
     /// MIME type, e.g. "image/jpeg", "image/png"
-    mime_type: String,
+    pub mime_type: String,
 }
 
 /// Union type of the message content array, comprising text, thinking, image, and tool-call content blocks.
@@ -104,13 +104,13 @@ pub enum ContentBlock {
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     /// Tool call ID, used to match the tool result
-    id: String,
+    pub id: String,
     /// Tool name
-    name: String,
+    pub name: String,
     /// Tool arguments, a JSON object; parsed from the stringified JSON returned by the LLM
-    arguments: serde_json::Value,
+    pub arguments: serde_json::Value,
     /// Google-specific thinking signature, preserved field in zen
-    thought_signature: Option<String>,
+    pub thought_signature: Option<String>,
 }
 
 /// User message containing text or image content.
