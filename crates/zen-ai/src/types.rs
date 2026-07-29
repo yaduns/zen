@@ -20,15 +20,15 @@ pub enum StopReason {
 #[serde(rename_all = "camelCase")]
 pub struct Cost {
     /// Input token cost ($/million tokens)
-    input: f64,
+    pub input: f64,
     /// Output token cost
-    output: f64,
+    pub output: f64,
     /// Cache hit read cost
-    cache_read: f64,
+    pub cache_read: f64,
     /// Cache write cost
-    cache_write: f64,
+    pub cache_write: f64,
     /// Total = input + output + cache_read + cache_write
-    total: f64,
+    pub total: f64,
 }
 
 /// Token usage stats for a single LLM request, including token counts per dimension and cost
@@ -36,21 +36,21 @@ pub struct Cost {
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     /// Number of input tokens
-    input: u64,
+    pub input: u64,
     /// Number of output tokens
-    output: u64,
+    pub output: u64,
     /// Number of tokens read from cache hits
-    cache_read: u64,
+    pub cache_read: u64,
     /// Number of tokens written to cache
-    cache_write: u64,
+    pub cache_write: u64,
     /// cache_write subset with 1h retention (only Anthropic reports this split; zen keeps the field but it may be None)
-    cache_write_1h: Option<u64>,
+    pub cache_write_1h: Option<u64>,
     /// Number of reasoning/thinking tokens; a subset of output (output already includes this value)
-    reasoning: Option<u64>,
+    pub reasoning: Option<u64>,
     /// Total token count = input + outpu
-    total_tokens: u64,
+    pub total_tokens: u64,
     /// Cost breakdown
-    cost: Cost,
+    pub cost: Cost,
 }
 
 /// Plain text content block, used for text fragments in the message content array
@@ -117,9 +117,9 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     /// User content, either a plain text string or an array of content blocks
-    content: ContentBlockList,
+    pub content: ContentBlockList,
     /// Unix timestamp (milliseconds)
-    timestamp: i64,
+    pub timestamp: i64,
 }
 
 /// The content field of a user message can be a simple string or an array of content blocks.
@@ -145,25 +145,25 @@ pub enum ContentBlockList {
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
     /// Response content blocks (text, thinking, tool call)
-    content: Vec<ContentBlock>,
+    pub content: Vec<ContentBlock>,
     /// API type used (simplified under single provider, e.g. "openai-completions")
-    api: String,
+    pub api: String,
     /// Provider ID (e.g. "deepseek")
-    provider: String,
+    pub provider: String,
     /// Model name used for the request
-    model: String,
+    pub model: String,
     /// Actual response model (when different from the requested model, e.g. OpenRouter auto-routing)
-    response_model: Option<String>,
+    pub response_model: Option<String>,
     /// Response/message identifier returned by the provider
-    response_id: Option<String>,
+    pub response_id: Option<String>,
     /// Token usage statistics
-    usage: Usage,
+    pub usage: Usage,
     /// Termination reason
-    stop_reason: StopReason,
+    pub stop_reason: StopReason,
     /// Description when an error occurs
-    error_message: Option<String>,
+    pub error_message: Option<String>,
     /// Unix timestamp (milliseconds)
-    timestamp: i64,
+    pub timestamp: i64,
 }
 
 /// Tool execution result message returned to the LLM, containing the tool call's output.
@@ -171,19 +171,21 @@ pub struct AssistantMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
     /// Corresponding tool call ID
-    tool_call_id: String,
+    pub tool_call_id: String,
     /// Tool name
-    tool_name: String,
+    pub tool_name: String,
     /// Tool execution result content (text and images)
-    content: Vec<ContentBlock>,
+    pub content: Vec<ContentBlock>,
     /// Tool execution metadata; concrete structure determined by the implementation (e.g. bash exit code + duration, read byte count, edit diff summary)
-    details: Option<serde_json::Value>,
+    pub details: Option<serde_json::Value>,
     /// Resource consumption of the tool itself, independent of the LLM call's Usage
-    usage: Usage,
+    pub usage: Usage,
     /// Whether the tool execution failed
-    is_error: bool,
+    pub is_error: bool,
+    /// List of new tool names introduced by this tool result (for the tools parameter of subsequent requests)
+    pub added_tool_names: Option<Vec<String>>,
     /// Unix timestamp (milliseconds)
-    timestamp: i64,
+    pub timestamp: i64,
 }
 
 /// Union type of session messages, comprising user message, assistant message, and tool result message.
@@ -298,11 +300,11 @@ pub enum ErrorStopReason {
 #[serde(rename_all = "camelCase")]
 pub struct Context {
     /// System prompt
-    system_prompt: Option<String>,
+    pub system_prompt: Option<String>,
     /// Message history
-    messages: Vec<Message>,
+    pub messages: Vec<Message>,
     /// List of tool definitions
-    tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<Tool>>,
 }
 
 /// Tool definition describing the tool's name, description, and parameter JSON Schema.
@@ -310,9 +312,9 @@ pub struct Context {
 #[serde(rename_all = "camelCase")]
 pub struct Tool {
     /// Tool name
-    name: String,
+    pub name: String,
     /// Tool description
-    description: String,
+    pub description: String,
     /// Tool parameter JSON Schema (concrete type designed at implementation time; can be schemars::schema::Schema or serde_json::Value)
-    parameters: serde_json::Value,
+    pub parameters: serde_json::Value,
 }
