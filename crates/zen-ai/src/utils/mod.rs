@@ -3,4 +3,5 @@ pub mod hash;
 pub mod headers;
 pub mod json_parse;
 pub mod overflow;
+pub mod provider_env;
 pub mod text;
