@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Reason the LLM response terminated, used to decide the agent loop's next action
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -317,4 +318,40 @@ pub struct Tool {
     pub description: String,
     /// Tool parameter JSON Schema (concrete type designed at implementation time; can be schemars::schema::Schema or serde_json::Value)
     pub parameters: serde_json::Value,
+}
+
+/// Describes an AI model's capabilities and configuration; the source of configuration for all LLM calls in zen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Model {
+    /// Model identifier, sent to the API as the model field (e.g. "deepseek-v4-flash")
+    pub id: String,
+    /// Human-readable name (e.g. "DeepSeek V4 Flash")
+    pub name: Option<String>,
+    /// API endpoint base URL (e.g. "https://api.deepseek.com"), without the /chat/completions path
+    pub base_url: String,
+    /// Maximum context window (token count), used for overflow detection
+    pub context_window: u64,
+    /// Maximum output token count
+    pub max_tokens: u64,
+    /// Whether thinking/reasoning (thinking mode) is supported
+    pub reasoning: bool,
+    /// Extra HTTP request headers, merged into the API request
+    pub headers: Option<HashMap<String, String>>,
+    /// Token rates, used for cost calculation. When None, no cost is calculated
+    pub cost_rates: Option<CostRates>,
+}
+
+/// Describes per-million-token rates for a model, used to compute actual cost from token usage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostRates {
+    /// Input token rate ($/million tokens)
+    pub input: f64,
+    /// Output token rate
+    pub output: f64,
+    /// Cache-hit read rate
+    pub cache_read: f64,
+    /// Cache-write rate
+    pub cache_write: f64,
 }
