@@ -1,4 +1,4 @@
 target/
-.pi/
 reference/
 .DS_Store
+*.bak
