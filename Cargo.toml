@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/zen-ai",
+    "crates/zen-app",
 ]
 
 [workspace.package]
