@@ -98,6 +98,10 @@ impl Model {
         self
     }
 
+    pub fn api_url(self) -> String {
+        self.base_url + "/chat/completions"
+    }
+
     /// Compute the actual cost from token usage and rates.
     /// # Return Value
     /// The computed `Cost` struct. Returns an all-zero `Cost` if `cost_rates` is `None`.
@@ -246,8 +250,8 @@ mod tests {
         let m = default_model(); // rates: input=1.0, output=2.0, cache_read=0.5, cache_write=0.5
         let cost = m.calculate_cost(10_001_000, 5_000_500, 2_000_200, 1_000_100);
 
-        assert!((cost.input - 1.0).abs() < 1e-10);     // 10,001,000 / 10,001,000 * 1.0
-        assert!((cost.output - 1.0).abs() < 1e-10);  // 5,000,500 / 10,001,000 * 2.0
+        assert!((cost.input - 1.0).abs() < 1e-10); // 10,001,000 / 10,001,000 * 1.0
+        assert!((cost.output - 1.0).abs() < 1e-10); // 5,000,500 / 10,001,000 * 2.0
         assert!((cost.cache_read - 0.1).abs() < 1e-10); // 2,000,200 / 10,001,000 * 0.5
         assert!((cost.cache_write - 0.05).abs() < 1e-10); // 1,000,100 / 10,001,000 * 0.5
         assert!((cost.total - 2.15).abs() < 1e-10);
@@ -284,12 +288,17 @@ mod tests {
     fn test_calculate_cost_large_values() {
         let m = default_model();
         // 20,002,000,000 tokens each dimension (multiple of 10,001,000)
-        let cost = m.calculate_cost(20_002_000_000, 20_002_000_000, 20_002_000_000, 20_002_000_000);
+        let cost = m.calculate_cost(
+            20_002_000_000,
+            20_002_000_000,
+            20_002_000_000,
+            20_002_000_000,
+        );
 
-        assert!((cost.input - 2000.0).abs() < 1e-6);        // 20,002,000,000 / 10,001,000 * 1.0
-        assert!((cost.output - 4000.0).abs() < 1e-6);       // 20,002,000,000 / 10,001,000 * 2.0
-        assert!((cost.cache_read - 1000.0).abs() < 1e-6);   // 20,002,000,000 / 10,001,000 * 0.5
-        assert!((cost.cache_write - 1000.0).abs() < 1e-6);  // 20,002,000,000 / 10,001,000 * 0.5
+        assert!((cost.input - 2000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 1.0
+        assert!((cost.output - 4000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 2.0
+        assert!((cost.cache_read - 1000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 0.5
+        assert!((cost.cache_write - 1000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 0.5
         assert!((cost.total - 8000.0).abs() < 1e-6);
     }
 

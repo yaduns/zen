@@ -17,7 +17,7 @@ pub enum StopReason {
 }
 
 /// Token cost breakdown of the LLM request, priced per input/output/cacheRead/cacheWrite dimension.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Cost {
     /// Input token cost ($/million tokens)
@@ -33,7 +33,7 @@ pub struct Cost {
 }
 
 /// Token usage stats for a single LLM request, including token counts per dimension and cost
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     /// Number of input tokens
@@ -354,4 +354,17 @@ pub struct CostRates {
     pub cache_read: f64,
     /// Cache-write rate
     pub cache_write: f64,
+}
+
+/// Controls whether the LLM calls a tool and which tool, corresponding to the OpenAI API's tool_choice parameter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToolChoice {
+    /// "auto"	default behavior; let the model decide whether to call a tool
+    Auto,
+    /// "none"	forbid the model from calling tools
+    None,
+    /// "required"	force the model to call some tool (the model may choose itself)
+    Required,
+    /// {"type": "function", "function": {"name": "..."}}	force the model to call the tool with the specified name
+    Function { name: String },
 }

@@ -88,6 +88,4 @@ tracing-appender = "0.2"
 # ── miscellaneous ────────────────────────────────────────────────
 chrono = { version = "0.4", features = ["serde"] }
 
-# ── (not yet needed) ─────────────────────────────────────────────
-# rusqlite – only if SQLite persistence is explicitly required;
-#              default persistence is JSONL.
+futures-util = "0.3"
