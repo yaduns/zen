@@ -1,7 +1,7 @@
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
-    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ThinkingContent,
-    Tool, ToolCall, ToolChoice, Usage,
+    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent,
+    ThinkingContent, ThinkingLevel, Tool, ToolCall, ToolChoice, Usage,
 };
 use crate::utils::error_body::extract_error_body;
 use crate::utils::provider_env::get_provider_env_value;
@@ -17,26 +17,9 @@ pub struct StreamConfig {
     api_key: Option<String>,
     headers: Option<HashMap<String, String>>,
     tool_choice: Option<ToolChoice>,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<ThinkingLevel>,
     timeout_ms: Option<u64>,
     session_id: Option<String>,
-}
-
-/// Intensity level for DeepSeek thinking mode, corresponding to the set of allowed values for the reasoning_effort parameter in the API.
-#[derive(Debug, Clone, Serialize)]
-pub enum ReasoningEffort {
-    /// "minimal"	Minimal thinking time, suitable for simple tasks
-    Minimal,
-    /// Lower thinking intensity
-    Low,
-    /// Default medium thinking effort
-    Medium,
-    /// Higher thinking effort
-    High,
-    /// Even higher thinking effort
-    XHigh,
-    /// Maximum thinking effort
-    Max,
 }
 
 /// Error types that the stream() function may return, covering scenarios such as missing API key, HTTP request failure, API error response, SSE parsing error, incomplete stream, and user cancellation.
@@ -91,9 +74,9 @@ struct Request {
     /// Stop word list; generation terminates when the model outputs any stop word.
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
-    /// DeepSeek thinking mode intensity
+    /// DeepSeek thinking mode strength (API string value, converted from ThinkingLevel)
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning_effort")]
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -354,7 +337,7 @@ pub async fn stream(
         .ok_or(StreamError::NoApiKey)?;
 
     // 2. Build request body
-    let body = build_request_body(model, context, cfg.tool_choice.as_ref());
+    let body = build_request_body(model, context, cfg.tool_choice.as_ref(), cfg.reasoning_effort);
 
     // 3. Build HTTP request
     let client = reqwest::Client::new();
@@ -450,10 +433,25 @@ pub async fn stream_collect(
 /// - SystemPrompt (from `Context.system_prompt`) → `role: "system"`
 /// - `ContentBlock::Image` → OpenAI image_url format
 /// - `ContentBlock::Thinking` → skipped (OpenAI does not send thinking to the LLM)
+/// Map `ThinkingLevel` to the OpenAI API `reasoning_effort` string value.
+/// `ThinkingLevel::Off` returns `None` (the field is not sent).
+fn thinking_level_to_api_value(level: ThinkingLevel) -> Option<String> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some("minimal".to_string()),
+        ThinkingLevel::Low => Some("low".to_string()),
+        ThinkingLevel::Medium => Some("medium".to_string()),
+        ThinkingLevel::High => Some("high".to_string()),
+        ThinkingLevel::XHigh => Some("xhigh".to_string()),
+        ThinkingLevel::Max => Some("max".to_string()),
+    }
+}
+
 fn build_request_body(
     model: &Model,
     context: &Context,
     tool_choice: Option<&crate::types::ToolChoice>,
+    reasoning_effort: Option<ThinkingLevel>,
 ) -> Request {
     let mut messages = Vec::new();
 
@@ -491,7 +489,7 @@ fn build_request_body(
         temperature: None,
         top_p: None,
         stop: None,
-        reasoning_effort: None,
+        reasoning_effort: reasoning_effort.and_then(thinking_level_to_api_value),
     }
 }
 
@@ -1418,7 +1416,7 @@ mod tests {
     fn test_build_request_body_basic() {
         let model = sample_model();
         let ctx = sample_context();
-        let req = build_request_body(&model, &ctx, None);
+        let req = build_request_body(&model, &ctx, None, None);
         assert_eq!(req.model, "deepseek-v4-flash");
         assert_eq!(req.messages.len(), 2); // system + user
         assert!(req.stream);
@@ -1446,7 +1444,7 @@ mod tests {
                 }),
             }]),
         };
-        let req = build_request_body(&model, &ctx, Some(&ToolChoice::Auto));
+        let req = build_request_body(&model, &ctx, Some(&ToolChoice::Auto), None);
         assert_eq!(req.messages.len(), 1);
         assert!(req.tools.is_some());
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
@@ -1461,7 +1459,7 @@ mod tests {
             messages: vec![],
             tools: None,
         };
-        let req = build_request_body(&model, &ctx, None);
+        let req = build_request_body(&model, &ctx, None, None);
         assert_eq!(req.messages.len(), 0);
     }
 

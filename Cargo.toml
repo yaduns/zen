@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/zen-ai",
     "crates/zen-app",
+    "crates/zen-core",
 ]
 
 [workspace.package]
@@ -18,6 +19,10 @@ authors = ["Zen Contributors"]
 #  `dep_name.workspace = true` unless a crate needs a specific override.
 # ──────────────────────────────────────────────────────────────────
 [workspace.dependencies]
+
+# Workspace crates
+zen-ai = { path = "crates/zen-ai" }
+
 # ── async runtime ────────────────────────────────────────────────
 tokio = { version = "1", features = [
     "macros",
@@ -89,3 +94,6 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
 futures-util = "0.3"
+
+# ── async trait (dyn-compatible async methods in AgentTool) ─────
+async-trait = "0.1"

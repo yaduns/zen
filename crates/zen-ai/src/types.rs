@@ -356,6 +356,28 @@ pub struct CostRates {
     pub cache_write: f64,
 }
 
+/// LLM inference/thinking intensity level, mapping to the OpenAI API's `reasoning_effort` parameter.
+/// `Off` means the `reasoning_effort` field is not sent (the model uses its default behavior).
+/// The remaining variants map directly to the API's string values.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    /// No thinking enabled (reasoning_effort field not sent)
+    Off,
+    /// Minimal thinking time, suitable for simple tasks
+    Minimal,
+    /// Lower thinking intensity
+    Low,
+    /// Default medium thinking effort
+    Medium,
+    /// Higher thinking effort
+    High,
+    /// Even higher thinking effort
+    XHigh,
+    /// Maximum thinking effort
+    Max,
+}
+
 /// Controls whether the LLM calls a tool and which tool, corresponding to the OpenAI API's tool_choice parameter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolChoice {
