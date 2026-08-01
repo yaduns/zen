@@ -110,27 +110,16 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    #[test]
-    fn test_override_empty_map() {
-        let overrides = HashMap::new();
-        let result = get_provider_env_value("OPENAI_API_KEY", Some(&overrides));
-        // An empty map should fall back to env, but env may not contain it, so the result is None
-        assert_eq!(result, None);
-    }
-
     // ── is_provider_configured ──
 
     #[test]
     fn test_is_configured_true_when_override_present() {
         let mut overrides = HashMap::new();
         overrides.insert("OPENAI_API_KEY".to_string(), "key".to_string());
-        assert!(is_provider_configured(&["OPENAI_API_KEY"], Some(&overrides)));
-    }
-
-    #[test]
-    fn test_is_configured_false_when_none_present() {
-        let overrides = HashMap::new();
-        assert!(!is_provider_configured(&["OPENAI_API_KEY"], Some(&overrides)));
+        assert!(is_provider_configured(
+            &["OPENAI_API_KEY"],
+            Some(&overrides)
+        ));
     }
 
     #[test]

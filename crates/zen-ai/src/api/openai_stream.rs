@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Optional configuration parameters for the stream() function, controlling non-functional behavior of the API call (authentication, timeouts, tool-selection policy, thinking mode, etc.).
 #[derive(Default)]
-struct StreamConfig {
+pub struct StreamConfig {
     api_key: Option<String>,
     headers: Option<HashMap<String, String>>,
     tool_choice: Option<ToolChoice>,
@@ -24,7 +24,7 @@ struct StreamConfig {
 
 /// Intensity level for DeepSeek thinking mode, corresponding to the set of allowed values for the reasoning_effort parameter in the API.
 #[derive(Debug, Clone, Serialize)]
-enum ReasoningEffort {
+pub enum ReasoningEffort {
     /// "minimal"	Minimal thinking time, suitable for simple tasks
     Minimal,
     /// Lower thinking intensity
@@ -41,7 +41,7 @@ enum ReasoningEffort {
 
 /// Error types that the stream() function may return, covering scenarios such as missing API key, HTTP request failure, API error response, SSE parsing error, incomplete stream, and user cancellation.
 #[derive(thiserror::Error, Debug)]
-enum StreamError {
+pub enum StreamError {
     #[error("API key not configured")]
     NoApiKey,
 
@@ -1046,7 +1046,7 @@ mod tests {
     use super::*;
     use crate::types::{
         AssistantMessage, ContentBlock, ContentBlockList, ImageContent, Message, TextContent,
-        ThinkingContent, ToolCall, ToolResultMessage, UserMessage, Usage,
+        ThinkingContent, ToolCall, ToolResultMessage, Usage, UserMessage,
     };
 
     // ═════════════════════════════════════════════════════════════
