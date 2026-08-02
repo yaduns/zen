@@ -17,7 +17,8 @@ use zen_ai::types::{
 ///   `AssistantMessage` (stop_reason = "error" / "aborted").
 /// - The caller (agent loop) controls cancellation via the `cancel` parameter; on cancellation the stream should close as soon as possible.
 ///
-/// `Arc<dyn Fn>` is used because `setDefaultStreamFn` needs to store the function as a module-level variable.
+/// StreamFn is passed explicitly via the `run_agent_loop` parameter; no global static is kept.
+/// Can be migrated to a `Provider` trait when multiple providers are supported.
 pub type StreamFn = Arc<
     dyn Fn(
             &Model,
@@ -34,7 +35,7 @@ pub type StreamFn = Arc<
 >;
 
 /// Controls the execution order of multiple tool calls within a single assistant message.
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolExecutionMode {
     Sequential,
@@ -89,15 +90,15 @@ pub struct CustomAgentMessage {
 #[derive(Serialize)]
 pub struct AgentToolResult {
     /// Content returned to the LLM (only Text and Image blocks; Thinking and ToolCall must not appear; callers must ensure this constraint)
-    content: Vec<ContentBlock>,
+    pub content: Vec<ContentBlock>,
     /// Structured metadata for logging or UI rendering
-    details: serde_json::Value,
+    pub details: serde_json::Value,
     /// Resource usage of the tool execution itself, independent of the LLM call's Usage
-    usage: Usage,
+    pub usage: Usage,
     /// List of new tool names introduced by this result
-    added_tool_names: Option<Vec<String>>,
+    pub added_tool_names: Option<Vec<String>>,
     /// Indicates whether the agent should terminate early after the current tool batch
-    terminate: bool,
+    pub terminate: bool,
 }
 
 /// Callback type used to stream partial results during tool execution.
@@ -363,4 +364,27 @@ pub struct CompactionSummaryMessage {
     pub tokens_before: u64,
     /// Unix timestamp (milliseconds)
     pub timestamp: i64,
+}
+
+/// Pure data configuration for the agent loop.
+///
+/// Contains only static configuration parameters (model, API key, execution mode, etc.); all dynamic behavior is expressed via
+/// the `AgentLoopHooks` trait. Constructed purely at runtime, not serializable.
+#[derive(Debug, Clone)]
+pub struct AgentLoopConfig {
+    /// LLM model to use
+    pub model: Model,
+
+    /// Static API key. If this field is set, `AgentLoopHooks::get_api_key` will not be called.
+    /// Override hooks only when dynamic API key retrieval is needed (e.g. short-lived OAuth tokens).
+    pub api_key: Option<String>,
+
+    /// Tool execution mode: parallel (default) or sequential
+    pub tool_execution: ToolExecutionMode,
+
+    /// max_tokens parameter passed to the LLM
+    pub max_tokens: Option<u32>,
+
+    /// temperature parameter passed to the LLM
+    pub temperature: Option<f32>,
 }
