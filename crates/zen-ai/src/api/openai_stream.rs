@@ -603,12 +603,32 @@ fn convert_content_block(block: &crate::types::ContentBlock) -> Option<ContentPa
 /// - First tool call chunk (`delta.tool_calls[0].id` non-empty) → `ContentBlockStart { block_type: "tool_use" }` + `InputJsonDelta`
 /// - Tool call incremental chunk (`delta.tool_calls[0].function.arguments` non-empty) → `InputJsonDelta`
 /// - Final chunk (`choices[0].finish_reason` non-empty) → `ContentBlockStop` + `MessageDelta`
-/// - usage chunk (`usage` non-empty) → `MessageDelta`
+/// - usage chunk (`usage` non-empty, may exist independently of choices) → `MessageDelta`
+///
+/// Note: `usage` is processed before `choices` because some APIs return usage as a separate chunk with `choices: []`.
 ///
 /// Combined with Pi's internal functions such as `ensureTextBlock` / `ensureThinkingBlock` / `finishBlock`
 /// chunk parsing logic.
 fn parse_chunk(chunk: &serde_json::Value) -> Vec<StreamEvent> {
     let mut events = Vec::new();
+
+    // usage → message metadata (final chunk only, may exist independently of choices)
+    // Must be handled before the early return, because some APIs only return usage in the final chunk
+    // with choices as an empty array, which would cause the early return to skip usage parsing.
+    if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+        let (input, output, cache_read, total, reasoning) = parse_usage(u);
+        events.push(StreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: Some(Usage {
+                input,
+                output,
+                cache_read,
+                total_tokens: total,
+                reasoning,
+                ..Usage::default()
+            }),
+        });
+    }
 
     let choice = match chunk.get("choices").and_then(|c| c.as_array()?.first()) {
         Some(c) => c,
@@ -677,22 +697,6 @@ fn parse_chunk(chunk: &serde_json::Value) -> Vec<StreamEvent> {
         events.push(StreamEvent::MessageDelta {
             stop_reason: Some(map_finish_reason(r)),
             usage: None,
-        });
-    }
-
-    // usage → message metadata (final chunk only)
-    if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
-        let (input, output, cache_read, total, reasoning) = parse_usage(u);
-        events.push(StreamEvent::MessageDelta {
-            stop_reason: None,
-            usage: Some(Usage {
-                input,
-                output,
-                cache_read,
-                total_tokens: total,
-                reasoning,
-                ..Usage::default()
-            }),
         });
     }
 
@@ -1002,7 +1006,7 @@ async fn sse_event_loop(
     };
 
     // 4b. Assemble the final message
-    let msg = AssistantMessage {
+    let mut msg = AssistantMessage {
         content,
         api: "openai-completions".to_string(),
         provider: model.id.clone(),
@@ -1014,6 +1018,15 @@ async fn sse_event_loop(
         error_message: error_msg,
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
+
+    // 4c. If the API did not return usage (e.g. Volcano Engine DeepSeek streaming mode), estimate output from content
+    if msg.usage.input == 0 && msg.usage.output == 0 && !msg.content.is_empty() {
+        let estimated = crate::utils::estimate::estimate_content_blocks_tokens(&msg.content) as u64;
+        msg.usage.output = estimated;
+        msg.usage.total_tokens = estimated;
+    }
+
+    eprintln!("[DEBUG] final message usage: {}in/{}out (estimated={})", msg.usage.input, msg.usage.output, msg.usage.total_tokens);
 
     // ── Phase 5: Push Done / Error events ──────────────────────────
     // Error if there is an error and no finish_reason was received
@@ -1597,15 +1610,53 @@ mod tests {
             }
         });
         let events = parse_chunk(&chunk);
-        // ContentBlockStop + MessageDelta(stop_reason) + MessageDelta(usage)
+        // MessageDelta(usage) + ContentBlockStop + MessageDelta(stop_reason)
+        // usage is now processed before choices, so the index is 0
         assert_eq!(events.len(), 3);
         assert!(matches!(
-            events[2],
+            events[0],
             StreamEvent::MessageDelta {
                 stop_reason: None,
                 usage: Some(ref u),
             } if u.input == 10 && u.output == 20
         ));
+    }
+
+    #[test]
+    fn test_parse_chunk_usage_only() {
+        // Some APIs only return usage in the final chunk, with choices as an empty array.
+        // See https://platform.openai.com/docs/api-reference/streaming#chat-streaming-usage
+        let chunk = serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 15,
+                "completion_tokens": 25,
+                "total_tokens": 40
+            }
+        });
+        let events = parse_chunk(&chunk);
+        assert_eq!(events.len(), 1, "should only emit usage MessageDelta");
+        assert!(matches!(
+            events[0],
+            StreamEvent::MessageDelta {
+                stop_reason: None,
+                usage: Some(ref u),
+            } if u.input == 15 && u.output == 25
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunk_no_usage() {
+        // Regular chunk, no usage field
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "hello"}
+            }]
+        });
+        let events = parse_chunk(&chunk);
+        // Only TextDelta, no MessageDelta
+        assert!(events.iter().all(|e| !matches!(e, StreamEvent::MessageDelta { .. })));
     }
 
     // ═════════════════════════════════════════════════════════════
