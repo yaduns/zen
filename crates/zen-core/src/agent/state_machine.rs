@@ -1,6 +1,6 @@
 use crate::agent::types::AgentEvent;
-use crate::agent::types::AgentMessage;
 use std::collections::HashSet;
+use zen_ai::types::Message;
 
 /// State machine of the agent runtime, precisely representing the agent's current processing stage.
 /// Idle means a new prompt can be accepted; Running means streaming LLM output with no pending tool calls; ToolCalling means executing tool calls (at least one pending).
@@ -9,11 +9,11 @@ enum AgentRuntimeState {
     Idle,
     /// After start_run
     Running {
-        streaming_message: Option<AgentMessage>,
+        streaming_message: Option<Message>,
     },
     /// After a tool_execution_start event
     ToolCalling {
-        streaming_message: Option<AgentMessage>,
+        streaming_message: Option<Message>,
         pending_tool_calls: HashSet<String>,
     },
 }
@@ -200,7 +200,7 @@ impl AgentRuntimeState {
     }
 
     /// Returns a reference to the message currently being built by streaming (if any).
-    pub fn streaming_message(&self) -> Option<&AgentMessage> {
+    pub fn streaming_message(&self) -> Option<&Message> {
         match self {
             AgentRuntimeState::Running { streaming_message }
             | AgentRuntimeState::ToolCalling {
@@ -222,22 +222,26 @@ impl AgentRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::types::{AgentEvent, AgentMessage, CustomAgentMessage};
+    use crate::agent::types::AgentEvent;
     use serde_json::json;
     use zen_ai::types::{
-        AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Cost, TextContent,
-        Usage,
+        AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Cost, Message,
+        TextContent, Usage, UserMessage,
     };
 
     // ---- helpers ----
 
-    fn test_message() -> AgentMessage {
-        AgentMessage::Custom(CustomAgentMessage {
-            custom_type: "test".into(),
+    fn test_user_message() -> Message {
+        Message::User(UserMessage {
             content: ContentBlockList::Text("hello".into()),
-            details: None,
-            display: true,
             timestamp: 1000,
+        })
+    }
+
+    fn test_updated_user_message() -> Message {
+        Message::User(UserMessage {
+            content: ContentBlockList::Text("updated".into()),
+            timestamp: 2000,
         })
     }
 
@@ -291,12 +295,15 @@ mod tests {
         }
     }
 
-    /// Assert that streaming_message is Some and is a Custom message with the specified custom_type
-    fn assert_streaming_msg_custom_type(state: &AgentRuntimeState, expected_type: &str) {
+    /// Assert that streaming_message is Some and its text content equals the expected string
+    fn assert_streaming_msg_text(state: &AgentRuntimeState, expected_text: &str) {
         let msg = state.streaming_message().expect("expected streaming message");
         match msg {
-            AgentMessage::Custom(c) => assert_eq!(c.custom_type, expected_type),
-            _ => panic!("expected Custom message"),
+            Message::User(u) => match &u.content {
+                ContentBlockList::Text(t) => assert_eq!(t, expected_text),
+                _ => panic!("expected Text content"),
+            },
+            _ => panic!("expected User message"),
         }
     }
 
@@ -407,9 +414,9 @@ mod tests {
     #[test]
     fn test_streaming_message_running_some() {
         let state = AgentRuntimeState::Running {
-            streaming_message: Some(test_message()),
+            streaming_message: Some(test_user_message()),
         };
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
     }
 
     #[test]
@@ -421,10 +428,10 @@ mod tests {
     #[test]
     fn test_streaming_message_toolcalling_some() {
         let state = AgentRuntimeState::ToolCalling {
-            streaming_message: Some(test_message()),
+            streaming_message: Some(test_user_message()),
             pending_tool_calls: HashSet::from(["x".into()]),
         };
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
     }
 
     // ---- reset ----
@@ -456,27 +463,27 @@ mod tests {
     fn test_apply_message_start_from_running() {
         let mut state = running_state();
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.is_streaming());
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
     }
 
     #[test]
     fn test_apply_message_start_from_toolcalling() {
         let mut state = toolcalling_state(&["call-1"]);
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.has_pending_tool_calls());
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
     }
 
     #[test]
     fn test_apply_message_start_from_idle_is_ignored() {
         let mut state = AgentRuntimeState::Idle;
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.is_idle());
     }
@@ -487,34 +494,28 @@ mod tests {
     fn test_apply_message_update_overwrites_streaming_message() {
         let mut state = running_state();
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
         state.apply_event(&AgentEvent::MessageUpdate {
-            message: AgentMessage::Custom(CustomAgentMessage {
-                custom_type: "updated".into(),
-                content: ContentBlockList::Text("world".into()),
-                details: None,
-                display: true,
-                timestamp: 2000,
-            }),
+            message: test_updated_user_message(),
             assistant_message_event: AssistantMessageEvent::Start {
                 partial: test_assistant_message(),
             },
         });
-        assert_streaming_msg_custom_type(&state, "updated");
+        assert_streaming_msg_text(&state, "updated");
     }
 
     #[test]
     fn test_apply_message_update_from_toolcalling_preserves_pending() {
         let mut state = toolcalling_state(&["call-1"]);
         state.apply_event(&AgentEvent::MessageUpdate {
-            message: test_message(),
+            message: test_user_message(),
             assistant_message_event: AssistantMessageEvent::Start {
                 partial: test_assistant_message(),
             },
         });
         assert!(state.has_pending_tool_calls());
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
     }
 
     // ---- apply_event: MessageEnd ----
@@ -523,12 +524,12 @@ mod tests {
     fn test_apply_message_end_clears_streaming_message() {
         let mut state = running_state();
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.streaming_message().is_some());
 
         state.apply_event(&AgentEvent::MessageEnd {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.streaming_message().is_none());
         assert!(state.is_streaming());
@@ -538,7 +539,7 @@ mod tests {
     fn test_apply_message_end_from_toolcalling_preserves_pending() {
         let mut state = toolcalling_state(&["call-1", "call-2"]);
         state.apply_event(&AgentEvent::MessageEnd {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.has_pending_tool_calls());
         assert!(state.streaming_message().is_none());
@@ -612,22 +613,22 @@ mod tests {
         state.apply_event(&AgentEvent::TurnStart);
         assert!(state.is_streaming());
         state.apply_event(&AgentEvent::TurnEnd {
-            message: test_message(),
+            message: test_user_message(),
             tool_results: vec![],
         });
         assert!(state.is_streaming());
         state.apply_event(&AgentEvent::AgentStart);
         assert!(state.is_streaming());
         state.apply_event(&AgentEvent::AgentEnd {
-            messages: vec![test_message()],
+            messages: vec![test_user_message()],
         });
         assert!(state.is_streaming());
     }
 
     // ---- apply_event: ToolExecutionEnd ----
-    // Note: AgentToolResult fields are private and cannot be constructed from this module.
+    // Note: ToolExecutionResult's fields are private and cannot be constructed from this module.
     // Therefore the full transition test for ToolExecutionEnd (remove ID / switch back to Running when empty)
-    // Revisit after AgentToolResult gains a pub constructor or pub(crate) fields.
+    // Add this after ToolExecutionResult provides a pub constructor or pub(crate) fields.
 
     // ---- Multi-tool call sequence ----
 
@@ -663,11 +664,11 @@ mod tests {
         state.start_run().unwrap();
         assert!(state.is_streaming());
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.streaming_message().is_some());
         state.apply_event(&AgentEvent::MessageEnd {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.streaming_message().is_none());
         state.finish_run();
@@ -681,9 +682,9 @@ mod tests {
         let mut state = AgentRuntimeState::Idle;
         state.start_run().unwrap();
         state.apply_event(&AgentEvent::MessageStart {
-            message: test_message(),
+            message: test_user_message(),
         });
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
 
         state.apply_event(&AgentEvent::ToolExecutionStart {
             tool_call_id: "call-1".into(),
@@ -691,10 +692,10 @@ mod tests {
             args: json!({}),
         });
         assert!(state.has_pending_tool_calls());
-        assert_streaming_msg_custom_type(&state, "test");
+        assert_streaming_msg_text(&state, "hello");
 
         state.apply_event(&AgentEvent::MessageEnd {
-            message: test_message(),
+            message: test_user_message(),
         });
         assert!(state.has_pending_tool_calls());
         assert!(state.streaming_message().is_none());

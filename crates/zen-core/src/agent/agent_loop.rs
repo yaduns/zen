@@ -1,14 +1,15 @@
-use crate::agent::messages;
 use crate::agent::types::{
-    AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentLoopConfig,
-    AgentLoopTurnUpdate, AgentMessage, AgentTool, AgentToolResult, BeforeToolCallContext,
-    BeforeToolCallResult, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamFn,
+    AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentLoopConfig,
+    AgentLoopTurnUpdate, BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
+    ShouldStopAfterTurnContext, StreamFn, ToolExecutionMode,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use zen_ai::tool::{Tool, ToolExecutionResult};
 use zen_ai::types::{
-    AssistantMessage, ContentBlock, Message, TextContent, ToolCall, ToolResultMessage, Usage,
+    AssistantMessage, ContentBlock, Context, Message, TextContent, ToolCall, ToolResultMessage,
+    Usage,
 };
 
 /// Fixed behavioral policies for the agent loop.
@@ -26,22 +27,23 @@ use zen_ai::types::{
 /// stuffing `Arc<dyn Fn>` into the config struct.
 #[async_trait]
 pub trait AgentLoopHooks: Send + Sync {
-    /// Converts agent transcript messages into an LLM-compatible format.
+    /// Filter out messages that should not be sent to the LLM context.
     ///
-    /// The default implementation calls `messages::convert_to_llm`.
-    async fn convert_to_llm(&self, messages: &[AgentMessage]) -> Vec<Message> {
-        messages::convert_to_llm(messages)
+    /// Default implementation: keep everything.
+    /// The application layer may override this to skip verbose tool output, etc.
+    async fn filter_messages(&self, messages: Vec<Message>) -> Vec<Message> {
+        messages
     }
 
-    /// Transforms the message list before `convert_to_llm`.
+    /// Transform messages after `filter_messages` and before sending to the LLM.
     ///
     /// Used for context window management (truncating old messages) or injecting external context.
     /// The default implementation returns the original messages unchanged.
     async fn transform_context(
         &self,
-        messages: Vec<AgentMessage>,
+        messages: Vec<Message>,
         cancel: &CancellationToken,
-    ) -> Vec<AgentMessage> {
+    ) -> Vec<Message> {
         drop(cancel); // Default implementation ignores cancellation signals
         messages
     }
@@ -77,7 +79,7 @@ pub trait AgentLoopHooks: Send + Sync {
     ///
     /// Called after each tool batch completes; if a non-empty message list is returned, it is injected before the next LLM call.
     /// Returns an empty vec by default.
-    async fn get_steering_messages(&self) -> Vec<AgentMessage> {
+    async fn get_steering_messages(&self) -> Vec<Message> {
         vec![]
     }
 
@@ -86,7 +88,7 @@ pub trait AgentLoopHooks: Send + Sync {
     /// Called when the agent has no more tool calls and no steering messages.
     /// If a non-empty message list is returned, the agent continues running.
     /// Returns an empty vec by default.
-    async fn get_follow_up_messages(&self) -> Vec<AgentMessage> {
+    async fn get_follow_up_messages(&self) -> Vec<Message> {
         vec![]
     }
 
@@ -142,7 +144,7 @@ pub(crate) struct PreparedToolCall {
     /// Raw tool call
     pub tool_call: ToolCall,
     /// Found tool definition
-    pub tool: Arc<dyn AgentTool>,
+    pub tool: Arc<dyn Tool>,
     /// Validated arguments
     pub args: serde_json::Value,
 }
@@ -150,7 +152,7 @@ pub(crate) struct PreparedToolCall {
 /// Executed tool call result (not processed by the `after_tool_call` hook).
 pub(crate) struct ExecutedToolCallOutcome {
     /// Tool execution result
-    pub result: AgentToolResult,
+    pub result: ToolExecutionResult,
     /// Whether it is an error
     pub is_error: bool,
 }
@@ -160,7 +162,7 @@ pub(crate) struct FinalizedToolCallOutcome {
     /// Raw tool call
     pub tool_call: ToolCall,
     /// Final tool execution result
-    pub result: AgentToolResult,
+    pub result: ToolExecutionResult,
     /// Whether it is an error
     pub is_error: bool,
 }
@@ -188,13 +190,13 @@ pub(crate) struct FinalizedToolCallOutcome {
 /// - If hook methods (`before_tool_call`, `after_tool_call`, etc.) return `Err`, the error is captured and encoded as a tool error result rather than propagated.
 /// - Errors occurring inside `hooks.on_event()` are handled by the hooks implementer and are not propagated into the loop.
 pub async fn run_agent_loop(
-    prompts: Vec<AgentMessage>,
-    context: &mut AgentContext,
+    prompts: Vec<Message>,
+    context: &mut Context,
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
     stream_fn: StreamFn,
-) -> Vec<AgentMessage> {
+) -> Vec<Message> {
     todo!()
 }
 
@@ -220,12 +222,12 @@ pub async fn run_agent_loop(
 /// # Edge Cases
 /// Same as `run_agent_loop`, but without adding a new prompt.
 pub async fn run_agent_loop_continue(
-    context: &mut AgentContext,
+    context: &mut Context,
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
     stream_fn: StreamFn,
-) -> Result<Vec<AgentMessage>, AgentLoopError> {
+) -> Result<Vec<Message>, AgentLoopError> {
     todo!()
 }
 
@@ -234,12 +236,12 @@ pub async fn run_agent_loop_continue(
 /// Calls `stream_fn` to obtain an `AssistantMessageEventStream`, processes all events (start/delta/end),
 /// and assembles the final `AssistantMessage`. Events are forwarded via `hooks.on_event()`.
 ///
-/// In this function, `AgentMessage`s are converted to `Message` (LLM-compatible format) and sent to the LLM.
+/// In this function, `Message` is converted to `Message` (LLM-compatible format) and sent to the LLM.
 ///
 /// # Parameters
 /// - `context`: current agent context (it is mutated: partial messages are appended, eventually replaced by the finalized message)
 /// - `config`: pure data configuration
-/// - `hooks`: used for `transform_context`, `convert_to_llm`, and `on_event`
+/// - `hooks`: used for `transform_context`, `filter_messages`, and `on_event`
 /// - `cancel`: cancellation token
 /// - `stream_fn`: LLM streaming call function
 ///
@@ -248,10 +250,10 @@ pub async fn run_agent_loop_continue(
 ///
 /// # Edge Cases
 /// - If `stream_fn` returns an error, stop_reason is "error" or "aborted".
-/// - Calls `hooks.transform_context()` and `hooks.convert_to_llm()` to convert messages.
-/// - If `convert_to_llm` returns an empty list, behavior is up to the LLM provider (usually an error).
+/// - Calls `hooks.transform_context()` and `hooks.filter_messages()` for message transformation.
+/// - If `filter_messages` returns an empty list, behavior is up to the LLM provider (usually an error).
 pub(crate) async fn stream_assistant_response(
-    context: &mut AgentContext,
+    context: &mut Context,
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
@@ -272,7 +274,7 @@ pub(crate) async fn stream_assistant_response(
 /// # Return Value
 /// The tool result message list and a flag indicating whether the loop should terminate.
 pub(crate) async fn execute_tool_calls(
-    context: &mut AgentContext,
+    context: &mut Context,
     assistant_message: &AssistantMessage,
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
@@ -283,7 +285,7 @@ pub(crate) async fn execute_tool_calls(
 
 /// Execute tool calls sequentially.
 pub(crate) async fn execute_tool_calls_sequential(
-    context: &mut AgentContext,
+    context: &mut Context,
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
     config: &AgentLoopConfig,
@@ -298,7 +300,7 @@ pub(crate) async fn execute_tool_calls_sequential(
 /// Tool calls are preprocessed in order (`prepare_tool_call`), then the permitted tool calls are executed concurrently;
 /// Tool results are ordered by the tool call order in the original assistant message.
 pub(crate) async fn execute_tool_calls_parallel(
-    context: &mut AgentContext,
+    context: &mut Context,
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
     config: &AgentLoopConfig,
@@ -312,14 +314,14 @@ pub(crate) async fn execute_tool_calls_parallel(
 ///
 /// # Return Value
 /// `Ok(PreparedToolCall)` means the tool can execute and contains the found tool definition and validated arguments.
-/// `Err(AgentToolResult)` means tool execution was blocked or the tool was not found; the error result is returned directly.
+/// `Err(ToolExecutionResult)` means tool execution was blocked or the tool was not found; the error result is returned directly.
 pub(crate) async fn prepare_tool_call(
-    context: &AgentContext,
+    context: &Context,
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
-) -> Result<PreparedToolCall, AgentToolResult> {
+) -> Result<PreparedToolCall, ToolExecutionResult> {
     todo!()
 }
 
@@ -346,7 +348,7 @@ pub(crate) async fn execute_prepared_tool_call(
 ///
 /// Overwrite fields of the tool result with the return value. If the hook returns `Err`, it is caught and encoded as an error result.
 pub(crate) async fn finalize_executed_tool_call(
-    context: &AgentContext,
+    context: &Context,
     assistant_message: &AssistantMessage,
     prepared: &PreparedToolCall,
     executed: &ExecutedToolCallOutcome,
@@ -367,11 +369,6 @@ pub(crate) async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[ToolCall],
     hooks: &dyn AgentLoopHooks,
 ) -> (Vec<ToolResultMessage>, bool) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
     let mut messages = Vec::with_capacity(tool_calls.len());
 
     for tool_call in tool_calls {
@@ -392,18 +389,23 @@ pub(crate) async fn fail_tool_calls_from_truncated_message(
             tool_call.name
         );
 
-        // - content: a single text whose content is the error message above
-        // - details: no structured metadata
+        // - message: a single text whose content is the error message above; details carries no structured metadata
         // - usage: the tool never executed, zero cost
         // - terminate: false — don't end the loop; let the LLM retry
-        let result = AgentToolResult {
-            content: vec![ContentBlock::Text(TextContent {
-                text: error_text,
-                text_signature: None,
-            })],
-            details: serde_json::Value::Null,
-            usage: Usage::default(),
-            added_tool_names: None,
+        let result = ToolExecutionResult {
+            message: ToolResultMessage {
+                tool_call_id: "".into(),
+                tool_name: "".into(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: error_text,
+                    text_signature: None,
+                })],
+                details: Some(serde_json::Value::Null),
+                usage: Usage::default(),
+                is_error: true,
+                added_tool_names: None,
+                timestamp: 0,
+            },
             terminate: false,
         };
 
@@ -411,12 +413,12 @@ pub(crate) async fn fail_tool_calls_from_truncated_message(
         let tool_result_msg = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            content: result.content.clone(),
-            details: None,
-            usage: Usage::default(),
-            is_error: true,
-            added_tool_names: None,
-            timestamp: now,
+            content: result.message.content.clone(),
+            details: result.message.details.clone(),
+            usage: result.message.usage.clone(),
+            is_error: result.message.is_error,
+            added_tool_names: result.message.added_tool_names.clone(),
+            timestamp: result.message.timestamp,
         };
 
         // Send tool_execution_end event

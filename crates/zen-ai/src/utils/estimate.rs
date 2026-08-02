@@ -1,5 +1,5 @@
 use crate::types::{
-    ContentBlock, ContentBlockList, Context, Message, StopReason, Tool, Usage,
+    ContentBlock, ContentBlockList, Context, Message, StopReason, ToolDefinition, Usage,
 };
 
 /// Estimated char-to-token ratio: every 4 characters ≈ 1 token.
@@ -113,7 +113,7 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
         let added_tool_tokens = if added_names.is_empty() {
             0
         } else {
-            let new_tools: Vec<&Tool> = context
+            let new_tools: Vec<&ToolDefinition> = context
                 .tools
                 .as_ref()
                 .map(|tools| {
@@ -657,7 +657,7 @@ mod tests {
                 }),
             ],
             tools: Some(vec![
-                Tool {
+                ToolDefinition {
                     name: "read".to_string(),
                     description: "Read a file".to_string(),
                     parameters: json!({"type": "object", "properties": {}}),

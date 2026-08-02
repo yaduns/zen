@@ -305,13 +305,14 @@ pub struct Context {
     /// Message history
     pub messages: Vec<Message>,
     /// List of tool definitions
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<ToolDefinition>>,
 }
 
 /// Tool definition describing the tool's name, description, and parameter JSON Schema.
+/// Serialized data sent to the LLM. Runtime behavior is provided by the `crate::tool::Tool` trait.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Tool {
+pub struct ToolDefinition {
     /// Tool name
     pub name: String,
     /// Tool description

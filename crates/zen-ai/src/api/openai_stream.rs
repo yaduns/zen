@@ -1,7 +1,7 @@
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent,
-    ThinkingContent, ThinkingLevel, Tool, ToolCall, ToolChoice, Usage,
+    ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, Usage,
 };
 use crate::utils::error_body::extract_error_body;
 use crate::utils::provider_env::get_provider_env_value;
@@ -53,7 +53,7 @@ struct Request {
     messages: Vec<RequestMessage>,
     /// Tool definition list, set only when `context.tools` is non-empty and the message history contains tool calls/results.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<Tool>>,
+    tools: Option<Vec<ToolDefinition>>,
     /// Tool selection strategy
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
@@ -1433,7 +1433,7 @@ mod tests {
                 content: ContentBlockList::Text("list files".into()),
                 timestamp: 0,
             })],
-            tools: Some(vec![Tool {
+            tools: Some(vec![ToolDefinition {
                 name: "bash".into(),
                 description: "run a shell command".into(),
                 parameters: serde_json::json!({
