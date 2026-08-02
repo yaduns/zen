@@ -21,7 +21,7 @@ pub type ToolUpdateCallback = Box<dyn Fn(ToolExecutionResult) + Send + Sync>;
 /// `message` is pure data; it is stored in the session transcript and fed into the LLM context.
 /// `terminate` is a runtime control signal telling the agent loop whether to terminate early after the current tool batch.
 /// The two are separated because `terminate` does not belong to the message data.
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolExecutionResult {
     /// Message injected into the LLM context
     pub message: ToolResultMessage,
@@ -53,7 +53,7 @@ pub enum ToolError {
 /// - Continuing to call the `on_update` callback after `execute()` returns has no effect.
 /// - `prepare_arguments()` is optional; the default implementation returns the input directly.
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub trait Tool: std::fmt::Debug + Send + Sync {
     /// Tool name, used for LLM tool selection and log identification.
     fn name(&self) -> &str;
 
@@ -69,10 +69,7 @@ pub trait Tool: Send + Sync {
     /// Optional argument preprocessing hook that type-coerces raw arguments before schema validation.
     /// Returns the transformed argument object (must match the Schema defined by `parameters`).
     /// Default implementation returns the input as-is.
-    fn prepare_arguments(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
+    fn prepare_arguments(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         Ok(args.clone())
     }
 

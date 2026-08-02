@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::future::Future;
@@ -7,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::openai_stream::{StreamConfig, StreamError};
-use zen_ai::tool::{Tool, ToolExecutionResult, ToolError};
+use zen_ai::tool::{Tool, ToolExecutionResult};
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, Context, Message, Model, ThinkingLevel, ToolCall,
     ToolResultMessage, Usage,
@@ -67,7 +66,7 @@ pub struct AgentState {
 
 /// Events emitted by the agent while running, for UI updates and logging.
 /// Events covering four phases: agent lifecycle, turn lifecycle, message lifecycle, and tool execution lifecycle.
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// Agent starts processing prompt
@@ -115,12 +114,14 @@ pub enum AgentEvent {
 // --------------Hook data model-----------
 
 /// Return value of the beforeToolCall hook; block = true prevents tool execution, and the loop will inject an error tool result.
+#[derive(Debug, Clone)]
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
 }
 
 /// Return value of the afterToolCall hook, used to override certain fields of the executed tool result. Field-level merge semantics (not a deep merge)
+#[derive(Debug, Clone)]
 pub struct AfterToolCallResult {
     /// Replace the entire content array
     pub content: Option<Vec<zen_ai::types::ContentBlock>>,
