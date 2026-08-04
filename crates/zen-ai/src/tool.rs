@@ -42,12 +42,22 @@ pub struct ToolExecutionResult {
 pub struct ToolContext {
     /// Current working directory, used for resolving relative paths and executing commands
     pub working_dir: PathBuf,
+    pub session_id: Option<String>,
+    pub allowed_directories: Option<Vec<PathBuf>>,
 }
 
 impl ToolContext {
     /// Creates a new tool context.
-    pub fn new(working_dir: PathBuf) -> Self {
-        Self { working_dir }
+    pub fn new(
+        working_dir: PathBuf,
+        session_id: Option<String>,
+        allowed_directories: Option<Vec<PathBuf>>,
+    ) -> Self {
+        Self {
+            working_dir: working_dir,
+            session_id: session_id,
+            allowed_directories: allowed_directories,
+        }
     }
 }
 

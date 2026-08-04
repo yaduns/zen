@@ -14,3 +14,4 @@ tokio-util = { workspace = true }
 thiserror = { workspace = true }
 zen-ai = { workspace = true }
 async-trait = { workspace = true }
+unicode-normalization = { workspace = true }

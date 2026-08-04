@@ -97,3 +97,5 @@ futures-util = "0.3"
 
 # ── async trait (dyn-compatible async methods in AgentTool) ─────
 async-trait = "0.1"
+
+unicode-normalization = "0.1"

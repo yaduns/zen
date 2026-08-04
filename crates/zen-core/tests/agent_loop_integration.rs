@@ -311,7 +311,7 @@ async fn mock_test_empty_prompts() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -335,7 +335,7 @@ async fn mock_test_stream_error() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -369,7 +369,7 @@ async fn mock_test_cancellation() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -406,7 +406,7 @@ async fn mock_test_create_context_and_loop() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -435,7 +435,7 @@ async fn mock_test_text_response_no_tool_calls() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -503,7 +503,7 @@ async fn mock_test_tool_call_execution() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -599,7 +599,7 @@ async fn real_test_agent_loop_simple_chat() {
         &cancel,
         stream_fn,
         &tools,
-        &ToolContext::new(PathBuf::from(".")),
+        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 

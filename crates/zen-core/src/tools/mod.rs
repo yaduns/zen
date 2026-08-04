@@ -1,3 +1,5 @@
+pub mod path_utils;
+
 use std::sync::Arc;
 use zen_ai::tool::ToolRegistry;
 
