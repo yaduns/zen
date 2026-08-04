@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use zen_ai::tool::Tool;
+use zen_ai::tool::{Tool, ToolContext};
 use zen_ai::types::{Context, Message, ToolDefinition};
 
 /// Assemble the agent context (Context).
@@ -100,6 +100,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             _params: &serde_json::Value,
+            _ctx: &ToolContext,
             _cancel: &tokio_util::sync::CancellationToken,
             _on_update: ToolUpdateCallback,
         ) -> Result<ToolExecutionResult, ToolError> {

@@ -9,9 +9,10 @@
 //!
 //! REQ-AGENT-01 (pi-204, pi-202): context assembly + multi-turn tool loop integration behavior.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolError, ToolExecutionResult, ToolUpdateCallback};
+use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ToolCall,
@@ -230,6 +231,7 @@ impl Tool for BashMockTool {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
+        _ctx: &ToolContext,
         _cancel: &CancellationToken,
         _on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
@@ -309,6 +311,7 @@ async fn mock_test_empty_prompts() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 
@@ -332,6 +335,7 @@ async fn mock_test_stream_error() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 
@@ -365,6 +369,7 @@ async fn mock_test_cancellation() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 
@@ -401,6 +406,7 @@ async fn mock_test_create_context_and_loop() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 
@@ -429,6 +435,7 @@ async fn mock_test_text_response_no_tool_calls() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 
@@ -496,6 +503,7 @@ async fn mock_test_tool_call_execution() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 
@@ -591,6 +599,7 @@ async fn real_test_agent_loop_simple_chat() {
         &cancel,
         stream_fn,
         &tools,
+        &ToolContext::new(PathBuf::from(".")),
     )
     .await;
 

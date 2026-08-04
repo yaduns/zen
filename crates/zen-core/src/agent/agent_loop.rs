@@ -9,7 +9,7 @@ use crate::agent::types::{
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::Tool;
+use zen_ai::tool::{Tool, ToolContext};
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, StopReason, ToolCall,
     ToolResultMessage, Usage,
@@ -46,6 +46,7 @@ pub async fn run_agent_loop(
     cancel: &CancellationToken,
     stream_fn: StreamFn,
     tools: &[Arc<dyn Tool>],
+    tool_ctx: &ToolContext,
 ) -> Vec<Message> {
     // 1. Empty prompts → no-op
     if prompts.is_empty() {
@@ -73,7 +74,7 @@ pub async fn run_agent_loop(
     }
 
     // 3. Multi-turn inner loop
-    agent_loop_inner(context, config, hooks, cancel, stream_fn, tools, &mut new_messages).await;
+    agent_loop_inner(context, config, hooks, cancel, stream_fn, tools, tool_ctx, &mut new_messages).await;
 
     hooks
         .on_event(&AgentEvent::AgentEnd {
@@ -134,6 +135,7 @@ pub async fn run_agent_loop_continue(
     cancel: &CancellationToken,
     stream_fn: StreamFn,
     tools: &[Arc<dyn Tool>],
+    tool_ctx: &ToolContext,
 ) -> Result<Vec<Message>, AgentLoopError> {
     // 1. Validate: context must not be empty and last message must not be assistant
     if context.messages.is_empty() {
@@ -149,7 +151,7 @@ pub async fn run_agent_loop_continue(
     hooks.on_event(&AgentEvent::AgentStart).await;
 
     // 3. Multi-turn inner loop
-    agent_loop_inner(context, config, hooks, cancel, stream_fn, tools, &mut new_messages).await;
+    agent_loop_inner(context, config, hooks, cancel, stream_fn, tools, tool_ctx, &mut new_messages).await;
 
     hooks
         .on_event(&AgentEvent::AgentEnd {
@@ -339,6 +341,7 @@ async fn agent_loop_inner(
     cancel: &CancellationToken,
     stream_fn: StreamFn,
     tools: &[Arc<dyn Tool>],
+    tool_ctx: &ToolContext,
     new_messages: &mut Vec<Message>,
 ) {
     loop {
@@ -382,7 +385,7 @@ async fn agent_loop_inner(
         let (tool_results, terminate) = if assistant_msg.stop_reason == StopReason::Length {
             fail_tool_calls_from_truncated_message(&tool_calls, hooks).await
         } else {
-            execute_tool_calls(context, &assistant_msg, tools, config, hooks, cancel).await
+            execute_tool_calls(context, &assistant_msg, tools, config, hooks, cancel, tool_ctx).await
         };
 
         // Inject tool results into context
@@ -494,6 +497,7 @@ pub(crate) async fn execute_tool_calls(
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
+    tool_ctx: &ToolContext,
 ) -> (Vec<ToolResultMessage>, bool) {
     let tool_calls: Vec<ToolCall> = assistant_message
         .content
@@ -521,6 +525,7 @@ pub(crate) async fn execute_tool_calls(
                 config,
                 hooks,
                 cancel,
+                tool_ctx,
             )
             .await
         }
@@ -533,6 +538,7 @@ pub(crate) async fn execute_tool_calls(
                 config,
                 hooks,
                 cancel,
+                tool_ctx,
             )
             .await
         }
@@ -548,6 +554,7 @@ pub(crate) async fn execute_tool_calls_sequential(
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
+    tool_ctx: &ToolContext,
 ) -> (Vec<ToolResultMessage>, bool) {
     let mut finalized_calls: Vec<FinalizedToolCallOutcome> = Vec::new();
     let mut messages: Vec<ToolResultMessage> = Vec::new();
@@ -578,7 +585,7 @@ pub(crate) async fn execute_tool_calls_sequential(
                 is_error: true,
             },
             Ok(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, cancel, hooks).await;
+                let executed = execute_prepared_tool_call(&prepared, tool_ctx, cancel, hooks).await;
                 finalize_executed_tool_call(
                     context,
                     assistant_message,
@@ -620,6 +627,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
+    tool_ctx: &ToolContext,
 ) -> (Vec<ToolResultMessage>, bool) {
     let mut finalized_calls: Vec<FinalizedToolCallOutcome> = Vec::new();
     let mut messages: Vec<ToolResultMessage> = Vec::new();
@@ -645,7 +653,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                 is_error: true,
             },
             Ok(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, cancel, hooks).await;
+                let executed = execute_prepared_tool_call(&prepared, tool_ctx, cancel, hooks).await;
                 finalize_executed_tool_call(
                     context,
                     assistant_message,

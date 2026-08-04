@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolExecutionResult, ToolUpdateCallback};
+use zen_ai::tool::{Tool, ToolContext, ToolExecutionResult, ToolUpdateCallback};
 use zen_ai::types::{
     AssistantMessage, ContentBlock, Context, Message, TextContent, ToolCall, ToolResultMessage,
     Usage,
@@ -276,6 +276,7 @@ fn error_tool_result(tool_call: &ToolCall, text: String) -> ToolExecutionResult 
 /// Tool execution result (success or failure).
 pub(crate) async fn execute_prepared_tool_call(
     prepared: &PreparedToolCall,
+    tool_ctx: &ToolContext,
     cancel: &CancellationToken,
     hooks: &dyn AgentLoopHooks,
 ) -> ExecutedToolCallOutcome {
@@ -303,7 +304,7 @@ pub(crate) async fn execute_prepared_tool_call(
     // Execute the tool
     let result = match prepared
         .tool
-        .execute(&tool_call_id, &prepared.args, cancel, on_update)
+        .execute(&tool_call_id, &prepared.args, tool_ctx, cancel, on_update)
         .await
     {
         Ok(r) => {
@@ -581,6 +582,7 @@ mod tests {
             &self,
             tool_call_id: &str,
             _params: &serde_json::Value,
+            _ctx: &ToolContext,
             _cancel: &CancellationToken,
             _on_update: ToolUpdateCallback,
         ) -> Result<ToolExecutionResult, ToolError> {

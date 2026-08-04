@@ -10,6 +10,7 @@
 use crate::types::{ToolDefinition, ToolResultMessage};
 use async_trait::async_trait;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,26 @@ pub struct ToolExecutionResult {
     pub message: ToolResultMessage,
     /// Whether to terminate the agent loop early (triggered when all tool results have terminate=true)
     pub terminate: bool,
+}
+
+/// Runtime context during tool execution.
+///
+/// Contains the shared state required for tool execution (e.g. working directory, session ID, permissions).
+/// Tools are stateless; all external dependencies are passed in at execution time via `ToolContext`.
+/// Each tool picks the fields it needs; unused fields are simply ignored.
+///
+/// Phase 1 contains only `working_dir`; later extended by T-AG-02-2 (session_id, permissions, etc.).
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    /// Current working directory, used for resolving relative paths and executing commands
+    pub working_dir: PathBuf,
+}
+
+impl ToolContext {
+    /// Creates a new tool context.
+    pub fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
 }
 
 /// Tool execution error type.
@@ -172,6 +193,7 @@ pub trait Tool: std::fmt::Debug + Send + Sync {
     /// # Parameters
     /// - `tool_call_id`: tool call ID, used to match the tool result message.
     /// - `params`: Arguments after processing by `prepare_arguments`.
+    /// - `ctx`: Runtime context (working directory, etc.). Tools pick fields as needed; unused fields are ignored.
     /// - `cancel`: cancellation token; the tool should stop as soon as possible when a cancellation signal is received.
     /// - `on_update`: Optional callback for streaming partial execution results.
     ///
@@ -181,6 +203,7 @@ pub trait Tool: std::fmt::Debug + Send + Sync {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
+        ctx: &ToolContext,
         cancel: &CancellationToken,
         on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError>;
