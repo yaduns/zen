@@ -10,6 +10,7 @@
 use crate::types::{ToolDefinition, ToolResultMessage};
 use async_trait::async_trait;
 use serde::Serialize;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Runtime tool execution callback, used to stream partial results.
@@ -41,6 +42,99 @@ pub enum ToolError {
     /// User cancelled
     #[error("Tool execution cancelled")]
     Cancelled,
+}
+
+/// Lightweight wrapper around a tool set.
+///
+/// Provides lookup by name, conversion to an API definition list, iteration, emptiness checks, etc.
+/// Not persisted, not serialized — constructed purely at runtime.
+///
+/// # Design decisions
+/// - Uses `Vec<Arc<dyn Tool>>` instead of `HashMap<String, Arc<dyn Tool>>`,
+///   because the tool count is small (< 10), so a linear scan is fine and registration order is preserved.
+/// - Provides flexible construction via `FromIterator` and `From<Vec<Arc<dyn Tool>>>`.
+///
+/// # Edge Cases
+/// - Empty registry: `is_empty()` returns true, `get_by_name()` always returns None.
+/// - Duplicate tool names: when two tools with the same name are registered, `get_by_name()` returns the first match.
+/// - Thread-safe: `Send + Sync` (guaranteed via `Arc<dyn Tool>`).
+pub struct ToolRegistry {
+    /// Tool list, ordered by registration. `Arc` provides shared ownership, `dyn Tool` provides runtime polymorphism.
+    pub tools: Vec<Arc<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    /// Create an empty tool registry.
+    pub fn new() -> Self {
+        Self { tools: vec![] }
+    }
+
+    /// Register a tool.
+    ///
+    /// # Parameters
+    /// - `tool`: the tool instance to register.
+    ///
+    /// # Edge Cases
+    /// - Registering a tool with a duplicate name is allowed (the later one does not overwrite, but `get_by_name` returns the first match).
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
+    /// Find a tool by name.
+    ///
+    /// # Parameters
+    /// - `name`: the tool name (compared against `Tool::name()`'s return value).
+    ///
+    /// # Return Value
+    /// The first matching tool found, or `None`.
+    ///
+    /// # Edge Cases
+    /// - The comparison is case-sensitive (consistent with `Tool::name()`'s return value).
+    pub fn get_by_name(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.iter().find(|tool| tool.name() == name)
+    }
+
+    /// Get the list of all tool names.
+    pub fn names(&self) -> Vec<&str> {
+        self.tools.iter().map(|tool| tool.name()).collect()
+    }
+
+    /// Convert to a list of API definitions (sent to the LLM).
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|tool| tool.to_api_definition())
+            .collect()
+    }
+
+    /// Number of tools.
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Whether it is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
+    /// Iterate over all tools (in registration order).
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.tools.iter()
+    }
+}
+
+impl FromIterator<Arc<dyn Tool>> for ToolRegistry {
+    fn from_iter<I: IntoIterator<Item = Arc<dyn Tool>>>(iter: I) -> Self {
+        Self {
+            tools: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl From<Vec<Arc<dyn Tool>>> for ToolRegistry {
+    fn from(tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self { tools }
+    }
 }
 
 /// Runtime tool definition, containing the tool's metadata, parameter schema, and execution logic.
