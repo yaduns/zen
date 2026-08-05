@@ -100,3 +100,4 @@ async-trait = "0.1"
 
 unicode-normalization = "0.1"
 tempfile = "3"
+similar = "2"
