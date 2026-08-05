@@ -1,4 +1,6 @@
+pub mod bash;
 pub mod path_utils;
+pub mod read;
 
 use std::sync::Arc;
 use zen_ai::tool::ToolRegistry;
