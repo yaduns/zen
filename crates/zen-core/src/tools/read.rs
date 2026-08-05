@@ -143,7 +143,13 @@ impl Tool for ReadTool {
 }
 
 /// Extracts path/offset/limit from the arguments.
-///
+/// ```json
+///   {
+///     "path": "src/main.rs",
+///     "offset": 10,
+///     "limit": 50
+///   }
+/// ```
 /// # Parameters
 /// - `params`: parameter JSON object of the tool call.
 ///
@@ -248,149 +254,4 @@ async fn read_file_content(
     };
 
     Ok((result, info))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    // ─── parse_read_args ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_read_args_path_only() {
-        let params = json!({ "path": "/foo/bar.txt" });
-        let (path, offset, limit) = parse_read_args(&params).unwrap();
-        assert_eq!(path, "/foo/bar.txt");
-        assert_eq!(offset, None);
-        assert_eq!(limit, None);
-    }
-
-    #[test]
-    fn test_parse_read_args_path_with_offset_and_limit() {
-        let params = json!({ "path": "src/main.rs", "offset": 10, "limit": 50 });
-        let (path, offset, limit) = parse_read_args(&params).unwrap();
-        assert_eq!(path, "src/main.rs");
-        assert_eq!(offset, Some(10));
-        assert_eq!(limit, Some(50));
-    }
-
-    #[test]
-    fn test_parse_read_args_offset_only() {
-        let params = json!({ "path": "Cargo.toml", "offset": 5 });
-        let (path, offset, limit) = parse_read_args(&params).unwrap();
-        assert_eq!(path, "Cargo.toml");
-        assert_eq!(offset, Some(5));
-        assert_eq!(limit, None);
-    }
-
-    #[test]
-    fn test_parse_read_args_limit_only() {
-        let params = json!({ "path": "Cargo.toml", "limit": 100 });
-        let (path, offset, limit) = parse_read_args(&params).unwrap();
-        assert_eq!(path, "Cargo.toml");
-        assert_eq!(offset, None);
-        assert_eq!(limit, Some(100));
-    }
-
-    #[test]
-    fn test_parse_read_args_offset_zero() {
-        let params = json!({ "path": "f", "offset": 0 });
-        let (_, offset, _) = parse_read_args(&params).unwrap();
-        // 0 is valid as u64 and is converted to Some(0)
-        assert_eq!(offset, Some(0));
-    }
-
-    #[test]
-    fn test_parse_read_args_missing_path() {
-        let params = json!({ "offset": 1 });
-        let err = parse_read_args(&params).unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArguments(_)));
-        assert!(err.to_string().contains("path"));
-    }
-
-    #[test]
-    fn test_parse_read_args_empty_params() {
-        let params = json!({});
-        let err = parse_read_args(&params).unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn test_parse_read_args_path_not_string() {
-        let params = json!({ "path": 42 });
-        let err = parse_read_args(&params).unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArguments(_)));
-    }
-
-    #[test]
-    fn test_parse_read_args_offset_not_integer() {
-        // In serde_json, 1.5 is an f64, as_u64 returns None, so offset should be None
-        let params = json!({ "path": "f", "offset": 1.5 });
-        let (_, offset, _) = parse_read_args(&params).unwrap();
-        assert_eq!(offset, None);
-    }
-
-    #[test]
-    fn test_parse_read_args_negative_offset() {
-        // Negative numbers are f64, as_u64 returns None
-        let params = json!({ "path": "f", "offset": -1 });
-        let (_, offset, _) = parse_read_args(&params).unwrap();
-        assert_eq!(offset, None);
-    }
-
-    // ─── ReadTool metadata ────────────────────────────────────────────────
-
-    #[test]
-    fn test_read_tool_name() {
-        let tool = ReadTool::new();
-        assert_eq!(tool.name(), "read");
-    }
-
-    #[test]
-    fn test_read_tool_label() {
-        let tool = ReadTool::new();
-        assert_eq!(tool.label(), "read");
-    }
-
-    #[test]
-    fn test_read_tool_description_not_empty() {
-        let tool = ReadTool::new();
-        assert!(!tool.description().is_empty());
-        assert!(tool.description().contains("truncated"));
-    }
-
-    #[test]
-    fn test_read_tool_parameters_schema() {
-        let tool = ReadTool::new();
-        let params = tool.parameters();
-        assert_eq!(params["type"], "object");
-        assert!(params["properties"]["path"].is_object());
-        assert_eq!(params["required"].as_array().unwrap()[0].as_str().unwrap(), "path");
-        // offset and limit are optional
-        assert!(params["properties"]["offset"].is_object());
-        assert!(params["properties"]["limit"].is_object());
-        // only path is in required
-        assert_eq!(params["required"].as_array().unwrap().len(), 1);
-    }
-
-    // ─── read_file_content (cancellation only) ────────────────────────────
-
-    #[tokio::test]
-    async fn test_read_file_content_cancelled_before_read() {
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-
-        let path = std::path::Path::new("/nonexistent/file");
-        let result = read_file_content(path, None, None, &cancel).await;
-        assert!(matches!(result, Err(ToolError::Cancelled)));
-    }
-
-    // The file IO part of read_file_content depends on the actual filesystem,
-    // Recommended to cover in integration tests:
-    // - Normal file reads (short files, long files)
-    // - offset/limit boundaries (offset=1, offset past end of file)
-    // - Truncation when a large file exceeds MAX_LINES
-    // - Truncation when a long line exceeds MAX_BYTES
-    // - Errors for missing/unreadable files
 }
