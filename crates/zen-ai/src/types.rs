@@ -308,16 +308,41 @@ pub struct Context {
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
-/// Tool definition describing the tool's name, description, and parameter JSON Schema.
-/// Serialized data sent to the LLM. Runtime behavior is provided by the `crate::tool::Tool` trait.
+/// Tool definition, conforming to the tool object format of the OpenAI Chat Completions API.
+///
+/// Serialized form:
+/// ```json
+/// {
+///   "type": "function",
+///   "function": {
+///     "name": "get_weather",
+///     "description": "...",
+///     "parameters": { ... }
+///   }
+/// }
+/// ```
+///
+/// Runtime behavior is provided by the `crate::tool::Tool` trait.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// Tool type, currently only `"function"` is supported
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Tool function definition (name, description, parameter schema)
+    pub function: ToolFunction,
+}
+
+/// Tool function definition, describing the tool's name, description, and parameter JSON Schema.
+///
+/// Mirrors the `tool.function` object in the OpenAI Chat Completions API.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolDefinition {
+pub struct ToolFunction {
     /// Tool name
     pub name: String,
     /// Tool description
     pub description: String,
-    /// Tool parameter JSON Schema (concrete type designed at implementation time; can be schemars::schema::Schema or serde_json::Value)
+    /// JSON Schema for tool parameters.
     pub parameters: serde_json::Value,
 }
 

@@ -136,9 +136,9 @@ mod tests {
         let result = tools_to_definitions(&tools);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].name, "bash");
-        assert_eq!(result[0].description, "A test tool");
-        assert_eq!(result[0].parameters, params);
+        assert_eq!(result[0].function.name, "bash");
+        assert_eq!(result[0].function.description, "A test tool");
+        assert_eq!(result[0].function.parameters, params);
     }
 
     #[test]
@@ -151,9 +151,9 @@ mod tests {
         let result = tools_to_definitions(&tools);
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].name, "bash");
-        assert_eq!(result[1].name, "read");
-        assert_eq!(result[2].name, "write");
+        assert_eq!(result[0].function.name, "bash");
+        assert_eq!(result[1].function.name, "read");
+        assert_eq!(result[2].function.name, "write");
     }
 
     #[test]
@@ -167,10 +167,10 @@ mod tests {
         ];
         let result = tools_to_definitions(&tools);
 
-        assert_eq!(result[0].name, "read");
-        assert_eq!(result[0].parameters, params_a);
-        assert_eq!(result[1].name, "edit");
-        assert_eq!(result[1].parameters, params_b);
+        assert_eq!(result[0].function.name, "read");
+        assert_eq!(result[0].function.parameters, params_a);
+        assert_eq!(result[1].function.name, "edit");
+        assert_eq!(result[1].function.parameters, params_b);
     }
 
     // ─── create_context ────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(ctx.messages, msgs);
         assert!(ctx.tools.is_some());
         assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
-        assert_eq!(ctx.tools.as_ref().unwrap()[0].name, "bash");
+        assert_eq!(ctx.tools.as_ref().unwrap()[0].function.name, "bash");
     }
 
     #[test]
@@ -253,9 +253,9 @@ mod tests {
 
         let defs = ctx.tools.unwrap();
         assert_eq!(defs.len(), 3);
-        assert_eq!(defs[0].name, "bash");
-        assert_eq!(defs[1].name, "read");
-        assert_eq!(defs[2].name, "edit");
+        assert_eq!(defs[0].function.name, "bash");
+        assert_eq!(defs[1].function.name, "read");
+        assert_eq!(defs[2].function.name, "edit");
     }
 
     #[test]
@@ -270,6 +270,6 @@ mod tests {
         // tool list is not consumed
         assert_eq!(tools.len(), 1);
         assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
-        assert_eq!(ctx.tools.as_ref().unwrap()[0].name, "bash");
+        assert_eq!(ctx.tools.as_ref().unwrap()[0].function.name, "bash");
     }
 }

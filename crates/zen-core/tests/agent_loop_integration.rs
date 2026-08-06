@@ -1,11 +1,9 @@
-//! Agent loop tests.
+//! Agent loop tests (mock tests).
 //!
-//! ## Mock tests (mock_ prefix; only mock stream_fn is used, with no real requests sent)
+//! Uses only a mock stream_fn; no real requests are made.
 //! Verify flow integrity, error handling, and cancellation behavior of `create_context` + `run_agent_loop`.
 //!
-//! ## Real integration tests (real_ prefix; depends on the OPENAI_API_KEY environment variable)
-//! Inject `zen_ai::api::openai_stream::stream()` as the real StreamFn into the agent loop,
-//! verifying the end-to-end chain: LLM call → tool loop → result return.
+//! See `agent_loop_real_tools.rs` for real integration tests.
 //!
 //! REQ-AGENT-01 (pi-204, pi-202): context assembly + multi-turn tool loop integration behavior.
 
@@ -260,6 +258,19 @@ impl Tool for BashMockTool {
 
 // ─── Test helpers ────────────────────────────────────────────────
 
+/// Construct a StreamFn wrapping the real `stream()` function.
+fn real_stream_fn() -> StreamFn {
+    Arc::new(
+        |model: &Model, ctx: &Context, cfg: Option<_>, cancel: Option<_>| {
+            let model = model.clone();
+            let ctx = ctx.clone();
+            Box::pin(
+                async move { zen_ai::api::openai_stream::stream(&model, &ctx, cfg, cancel).await },
+            )
+        },
+    )
+}
+
 fn default_model() -> Model {
     Model {
         id: "test-model".into(),
@@ -394,7 +405,7 @@ async fn mock_test_create_context_and_loop() {
     );
     assert!(ctx.tools.is_some());
     assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
-    assert_eq!(ctx.tools.as_ref().unwrap()[0].name, "bash");
+    assert_eq!(ctx.tools.as_ref().unwrap()[0].function.name, "bash");
 
     let stream_fn = mock_text_stream_fn("I understand.", StopReason::Stop);
 
@@ -535,20 +546,6 @@ async fn mock_test_tool_call_execution() {
 
 // ═══════════════════════════════════════════════════════════════════
 // Real integration tests (real_ prefix, require OPENAI_API_KEY env var)
-// ═══════════════════════════════════════════════════════════════════
-
-/// Construct a StreamFn wrapping the real `stream()` function.
-fn real_stream_fn() -> StreamFn {
-    Arc::new(
-        |model: &Model, ctx: &Context, cfg: Option<_>, cancel: Option<_>| {
-            let model = model.clone();
-            let ctx = ctx.clone();
-            Box::pin(
-                async move { zen_ai::api::openai_stream::stream(&model, &ctx, cfg, cancel).await },
-            )
-        },
-    )
-}
 
 /// Real LLM integration test: the agent loop receives a user message and returns the LLM response.
 ///
@@ -557,8 +554,11 @@ fn real_stream_fn() -> StreamFn {
 /// 1. `create_context` assembles the Context correctly
 /// 2. `run_agent_loop` uses the real `stream()` function to make the LLM call
 /// 3. The returned message contains non-empty content and a valid stop_reason
-// cargo test --test agent_loop_integration -- --show-output
-// cargo test -p zen-core --test agent_loop_integration -- real --nocapture
+///
+/// Run:
+/// ```bash
+/// cargo test -p zen-core --test agent_loop_integration -- real_test_agent_loop_simple_chat --nocapture
+/// ```
 #[tokio::test]
 async fn real_test_agent_loop_simple_chat() {
     let api_key = std::env::var("OPENAI_API_KEY");
@@ -571,10 +571,8 @@ async fn real_test_agent_loop_simple_chat() {
     let cancel = CancellationToken::new();
     let tools: Vec<Arc<dyn Tool>> = vec![];
 
-    // Create the Model from an environment variable
     let model = Model::from_env().with_env_overrides();
 
-    // Build the initial context with create_context
     let mut ctx = create_context(
         "You are a helpful assistant. Answer concisely.".into(),
         vec![],
@@ -583,7 +581,7 @@ async fn real_test_agent_loop_simple_chat() {
 
     let config = AgentLoopConfig {
         model: model.clone(),
-        api_key: None, // stream() reads from environment variables internally
+        api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
         max_tokens: Some(256),
         temperature: Some(0.0),
@@ -603,7 +601,6 @@ async fn real_test_agent_loop_simple_chat() {
     )
     .await;
 
-    // Print the result
     println!("=== real_test_agent_loop_simple_chat ===");
     for (i, msg) in result.iter().enumerate() {
         match msg {
@@ -638,7 +635,6 @@ async fn real_test_agent_loop_simple_chat() {
         }
     }
 
-    // Verify that an assistant message was returned
     let last = result.last().expect("expected at least one new message");
     match last {
         Message::Assistant(a) => {
@@ -659,7 +655,6 @@ async fn real_test_agent_loop_simple_chat() {
         _ => panic!("expected Assistant message, got {:?}", last),
     }
 
-    // Verify the event sequence
     let events = hooks.collected_events();
     assert!(
         events.iter().any(|e| matches!(e, AgentEvent::AgentStart)),

@@ -474,8 +474,11 @@ async fn agent_loop_inner(
             continue;
         }
 
-        // No steering, no follow-up, no tool calls → loop ends
-        break;
+        // Tool results are already injected into context.messages; the next loop iteration sends them to the LLM automatically.
+        // After seeing the tool results, the LLM decides the next step: call more tools or return text to finish.
+        // When the LLM returns plain text (no tool calls), the `tool_calls.is_empty()` check at the top breaks the loop.
+        // Cancellation signals and terminate are also handled by the earlier checks.
+        continue;
     }
 }
 

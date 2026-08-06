@@ -7,7 +7,7 @@
 //! REQ-AGENT-02 (pi-210): Tool trait, merged from zen_ai::types::ToolDefinition (data
 //! struct) and zen_core::agent::types::AgentTool (trait, eliminated).
 
-use crate::types::{ToolDefinition, ToolResultMessage};
+use crate::types::{ToolDefinition, ToolFunction, ToolResultMessage};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -219,11 +219,17 @@ pub trait Tool: std::fmt::Debug + Send + Sync {
     ) -> Result<ToolExecutionResult, ToolError>;
 
     /// Serialize into an API-usable tool definition (sent to the LLM).
+    ///
+    /// Builds a `ToolDefinition` in OpenAI Chat Completions API format:
+    /// includes the `type: "function"` and `function: { name, description, parameters }` wrapper.
     fn to_api_definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: self.name().to_string(),
-            description: self.description().to_string(),
-            parameters: self.parameters().clone(),
+            type_: "function".to_string(),
+            function: ToolFunction {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: self.parameters().clone(),
+            },
         }
     }
 }

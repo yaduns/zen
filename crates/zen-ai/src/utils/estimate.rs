@@ -1,5 +1,6 @@
 use crate::types::{
-    ContentBlock, ContentBlockList, Context, Message, StopReason, ToolDefinition, Usage,
+    ContentBlock, ContentBlockList, Context, Message, StopReason, ToolDefinition, ToolFunction,
+    Usage,
 };
 
 /// Estimated char-to-token ratio: every 4 characters ≈ 1 token.
@@ -119,7 +120,7 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
                 .map(|tools| {
                     tools
                         .iter()
-                        .filter(|t| added_names.contains(&t.name))
+                        .filter(|t| added_names.contains(&t.function.name))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -658,9 +659,12 @@ mod tests {
             ],
             tools: Some(vec![
                 ToolDefinition {
-                    name: "read".to_string(),
-                    description: "Read a file".to_string(),
-                    parameters: json!({"type": "object", "properties": {}}),
+                    type_: "function".to_string(),
+                    function: ToolFunction {
+                        name: "read".to_string(),
+                        description: "Read a file".to_string(),
+                        parameters: json!({"type": "object", "properties": {}}),
+                    },
                 },
             ]),
         };

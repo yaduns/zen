@@ -1,7 +1,7 @@
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent,
-    ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, Usage,
+    ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
 };
 use crate::utils::error_body::extract_error_body;
 use crate::utils::provider_env::get_provider_env_value;
@@ -132,7 +132,7 @@ struct RequestToolCall {
 #[derive(Debug, Clone, Serialize)]
 struct RequestToolCallFunction {
     name: String,
-    argumens: String,
+    arguments: String,
 }
 
 /// Message content; can be a plain text string or an array of content blocks.
@@ -476,7 +476,7 @@ fn build_request_body(
         }
     });
 
-    Request {
+    let req = Request {
         model: model.id.clone(),
         messages,
         tools,
@@ -490,7 +490,9 @@ fn build_request_body(
         top_p: None,
         stop: None,
         reasoning_effort: reasoning_effort.and_then(thinking_level_to_api_value),
-    }
+    };
+
+    req
 }
 
 /// Converts a `Message` into an OpenAI API message object.
@@ -526,7 +528,7 @@ fn convert_message(message: &Message) -> RequestMessage {
                             r#type: String::from("function"),
                             function: RequestToolCallFunction {
                                 name: tool_call.name.clone(),
-                                argumens: tool_call.arguments.to_string(),
+                                arguments: tool_call.arguments.to_string(),
                             },
                         };
                         _tool_calls.push(request_tool_call);
@@ -638,17 +640,7 @@ fn parse_chunk(chunk: &serde_json::Value) -> Vec<StreamEvent> {
     let delta = &choice["delta"];
     let idx = 0; // n=1, only choice index 0
 
-    // First chunk: role == "assistant" → create a new text block
-    if delta["role"].as_str() == Some("assistant") {
-        events.push(StreamEvent::ContentBlockStart {
-            index: idx,
-            block_type: "text".into(),
-            id: None,
-            name: None,
-        });
-    }
-
-    // Text delta
+    // Text delta (Pi mode: text chunks are created lazily by TextDelta, not triggered by role)
     if let Some(t) = delta["content"].as_str().filter(|s| !s.is_empty()) {
         events.push(StreamEvent::TextDelta {
             index: idx,
@@ -800,15 +792,27 @@ impl StreamAccumulator {
                 name,
             } => {
                 self.block_types.insert(index, block_type);
+                // Only update id/name if non-empty. Some providers (e.g. DeepSeek)
+                // send subsequent chunks with id="" and name="" which would
+                // overwrite the correct values from the first chunk.
                 if let Some(id) = id {
-                    self.tool_use_ids.insert(index, id);
+                    if !id.is_empty() {
+                        self.tool_use_ids.insert(index, id);
+                    }
                 }
                 if let Some(name) = name {
-                    self.tool_use_names.insert(index, name);
+                    if !name.is_empty() {
+                        self.tool_use_names.insert(index, name);
+                    }
                 }
             }
 
             StreamEvent::TextDelta { index, text } => {
+                // Lazily create a text block if not already started at this index.
+                // This matches Pi's ensureTextBlock() pattern: text blocks are created
+                // when text content actually arrives, not when role: "assistant" is seen.
+                // This avoids creating empty text blocks for tool-call-only responses.
+                self.block_types.entry(index).or_insert_with(|| "text".to_string());
                 self.partial_text.entry(index).or_default().push_str(&text);
             }
 
@@ -875,6 +879,7 @@ impl StreamAccumulator {
             }
         }
     }
+
 }
 
 // ── Event stream background task ────────────────────────────────
@@ -960,7 +965,7 @@ async fn sse_event_loop(
                             response_id = json["id"].as_str().map(String::from);
                         }
 
-                        // 3f. Parse chunk into StreamEvent, accumulate each one
+                                        // 3f. Parse chunk into StreamEvent, accumulate each one
                         let events = parse_chunk(&json);
                         for ev in events {
                             // stop_reason and usage from MessageDelta are written directly into the accumulator
@@ -991,6 +996,7 @@ async fn sse_event_loop(
     // Take all finalized content blocks from the accumulator.
     let mut content = Vec::new();
     std::mem::swap(&mut content, &mut accumulator.content_blocks);
+
 
     // 4a. Reconcile the relationship between stop_reason and error_message:
     //     - has finish_reason but also an error → keep finish_reason, write the error into error_message
@@ -1026,7 +1032,7 @@ async fn sse_event_loop(
         msg.usage.total_tokens = estimated;
     }
 
-    eprintln!("[DEBUG] final message usage: {}in/{}out (estimated={})", msg.usage.input, msg.usage.output, msg.usage.total_tokens);
+
 
     // ── Phase 5: Push Done / Error events ──────────────────────────
     // Error if there is an error and no finish_reason was received
@@ -1447,14 +1453,17 @@ mod tests {
                 timestamp: 0,
             })],
             tools: Some(vec![ToolDefinition {
-                name: "bash".into(),
-                description: "run a shell command".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": { "type": "string" }
-                    }
-                }),
+                type_: "function".into(),
+                function: ToolFunction {
+                    name: "bash".into(),
+                    description: "run a shell command".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string" }
+                        }
+                    }),
+                },
             }]),
         };
         let req = build_request_body(&model, &ctx, Some(&ToolChoice::Auto), None);
@@ -1488,6 +1497,7 @@ mod tests {
 
     #[test]
     fn test_parse_chunk_first_chunk() {
+        // role only, no content, no tool_calls → no events (text block is lazy)
         let chunk = serde_json::json!({
             "id": "chatcmpl-1",
             "choices": [{
@@ -1497,14 +1507,7 @@ mod tests {
             }]
         });
         let events = parse_chunk(&chunk);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            StreamEvent::ContentBlockStart {
-                block_type: ref t,
-                ..
-            } if t == "text"
-        ));
+        assert_eq!(events.len(), 0, "role alone should not emit events");
     }
 
     #[test]
