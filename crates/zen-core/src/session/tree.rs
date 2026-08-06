@@ -133,7 +133,7 @@ pub enum SessionTreeEntry {
 
 /// Holds a set of SessionTreeEntry and tracks the current leaf node ID; provides pure tree navigation functions (no storage IO)
 #[derive(Debug, Serialize, Deserialize)]
-struct SessionTree {
+pub struct SessionTree {
     /// All entries, in append order
     entries: Vec<SessionTreeEntry>,
     /// Current leaf node ID; None means an empty tree
@@ -213,6 +213,11 @@ impl SessionTreeEntry {
 /// Involves no storage IO — all operations run on the in-memory entries slice.
 /// The caller (zen-app's SessionManager) is responsible for persisting after modifications.
 impl SessionTree {
+    /// Create a new session tree containing the given entries and leaf node IDs.
+    pub(crate) fn new(entries: Vec<SessionTreeEntry>, leaf_id: Option<String>) -> Self {
+        SessionTree { entries, leaf_id }
+    }
+
     /// Walk from the given leaf (or the current leaf_id) up the parentId chain to the root.
     /// Returns an ordered slice of entries from root to leaf (root first, leaf last).
     ///
@@ -336,5 +341,455 @@ impl SessionTree {
             total_tokens,
             cost_total,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zen_ai::types::{
+        AssistantMessage, Cost, StopReason, UserMessage,
+    };
+
+    // ─── Helper constructors ────────────────────────────────────────────────────
+
+    fn msg_entry(id: &str, parent: Option<&str>, role: &str) -> SessionTreeEntry {
+        let msg = match role {
+            "user" => Message::User(UserMessage {
+                content: ContentBlockList::Text("hello".into()),
+                timestamp: 0,
+            }),
+            "assistant" => Message::Assistant(AssistantMessage {
+                content: vec![],
+                api: "test".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                response_model: None,
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }),
+            _ => unreachable!(),
+        };
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: parent.map(|p| p.into()),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            message: msg,
+        }
+    }
+
+    fn compaction_entry(
+        id: &str,
+        parent: Option<&str>,
+        retained_tail: bool,
+        first_kept: Option<&str>,
+    ) -> SessionTreeEntry {
+        SessionTreeEntry::Compaction {
+            id: id.into(),
+            parent_id: parent.map(|p| p.into()),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            summary: "compacted".into(),
+            first_kept_entry_id: first_kept.map(|s| s.into()),
+            tokens_before: 100,
+            retained_tail: if retained_tail { Some(vec![]) } else { None },
+            details: None,
+            usage: None,
+            from_hook: None,
+        }
+    }
+
+    fn make_tree(entries: Vec<SessionTreeEntry>, leaf_id: Option<&str>) -> SessionTree {
+        SessionTree {
+            entries,
+            leaf_id: leaf_id.map(|s| s.into()),
+        }
+    }
+
+    // ─── SessionTreeEntry::id / parent_id ────────────────────────────
+
+    #[test]
+    fn test_entry_id_message() {
+        let e = msg_entry("e1", None, "user");
+        assert_eq!(e.id(), "e1");
+    }
+
+    #[test]
+    fn test_entry_id_compaction() {
+        let e = compaction_entry("c1", None, false, None);
+        assert_eq!(e.id(), "c1");
+    }
+
+    #[test]
+    fn test_entry_parent_id_root() {
+        let e = msg_entry("e1", None, "user");
+        assert_eq!(e.parent_id(), None);
+    }
+
+    #[test]
+    fn test_entry_parent_id_child() {
+        let e = msg_entry("e2", Some("e1"), "user");
+        assert_eq!(e.parent_id(), Some("e1"));
+    }
+
+    // ─── SessionTree::get_entry ──────────────────────────────────────
+
+    #[test]
+    fn test_get_entry_found() {
+        let tree = make_tree(vec![msg_entry("e1", None, "user")], None);
+        let e = tree.get_entry("e1");
+        assert!(e.is_some());
+        assert_eq!(e.unwrap().id(), "e1");
+    }
+
+    #[test]
+    fn test_get_entry_not_found() {
+        let tree = make_tree(vec![msg_entry("e1", None, "user")], None);
+        assert!(tree.get_entry("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_entry_empty_tree() {
+        let tree = make_tree(vec![], None);
+        assert!(tree.get_entry("anything").is_none());
+    }
+
+    // ─── SessionTree::get_path_to_root ───────────────────────────────
+
+    #[test]
+    fn test_path_to_root_single_entry() {
+        let tree = make_tree(vec![msg_entry("e1", None, "user")], Some("e1"));
+        let path = tree.get_path_to_root(None);
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].id(), "e1");
+    }
+
+    #[test]
+    fn test_path_to_root_chain() {
+        let entries = vec![
+            msg_entry("root", None, "user"),
+            msg_entry("mid", Some("root"), "user"),
+            msg_entry("leaf", Some("mid"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root(None);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].id(), "root");
+        assert_eq!(path[1].id(), "mid");
+        assert_eq!(path[2].id(), "leaf");
+    }
+
+    #[test]
+    fn test_path_to_root_broken_chain() {
+        let entries = vec![
+            msg_entry("root", None, "user"),
+            msg_entry("leaf", Some("nonexistent"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root(None);
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].id(), "leaf");
+    }
+
+    #[test]
+    fn test_path_to_root_leaf_id_not_found() {
+        let tree = make_tree(vec![msg_entry("e1", None, "user")], Some("missing"));
+        let path = tree.get_path_to_root(None);
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn test_path_to_root_explicit_leaf_id() {
+        let entries = vec![
+            msg_entry("root", None, "user"),
+            msg_entry("mid", Some("root"), "user"),
+            msg_entry("leaf", Some("mid"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root(Some("mid"));
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].id(), "root");
+        assert_eq!(path[1].id(), "mid");
+    }
+
+    #[test]
+    fn test_path_to_root_empty_tree() {
+        let tree = make_tree(vec![], None);
+        let path = tree.get_path_to_root(None);
+        assert!(path.is_empty());
+    }
+
+    // ─── SessionTree::get_path_to_root_or_compaction ─────────────────
+
+    #[test]
+    fn test_path_to_root_or_compaction_no_compaction() {
+        let entries = vec![
+            msg_entry("root", None, "user"),
+            msg_entry("leaf", Some("root"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root_or_compaction(None);
+        assert_eq!(path.len(), 2);
+    }
+
+    #[test]
+    fn test_path_to_root_or_compaction_with_retained_tail() {
+        let entries = vec![
+            msg_entry("old", None, "user"),
+            compaction_entry("c1", Some("old"), true, None),
+            msg_entry("new", Some("c1"), "user"),
+            msg_entry("leaf", Some("new"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root_or_compaction(None);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].id(), "c1");
+        assert_eq!(path[1].id(), "new");
+        assert_eq!(path[2].id(), "leaf");
+    }
+
+    #[test]
+    fn test_path_to_root_or_compaction_with_first_kept() {
+        let entries = vec![
+            msg_entry("a", None, "user"),
+            msg_entry("b", Some("a"), "user"),
+            compaction_entry("c1", Some("b"), false, Some("b")),
+            msg_entry("d", Some("c1"), "user"),
+            msg_entry("leaf", Some("d"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root_or_compaction(None);
+        assert_eq!(path.len(), 4);
+        assert_eq!(path[0].id(), "b");
+        assert_eq!(path[1].id(), "c1");
+        assert_eq!(path[2].id(), "d");
+        assert_eq!(path[3].id(), "leaf");
+    }
+
+    #[test]
+    fn test_path_to_root_or_compaction_no_tail_no_kept() {
+        let entries = vec![
+            msg_entry("old", None, "user"),
+            compaction_entry("c1", Some("old"), false, None),
+            msg_entry("new", Some("c1"), "user"),
+            msg_entry("leaf", Some("new"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root_or_compaction(None);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].id(), "c1");
+        assert_eq!(path[1].id(), "new");
+        assert_eq!(path[2].id(), "leaf");
+    }
+
+    #[test]
+    fn test_path_to_root_or_compaction_multiple_compactions() {
+        let entries = vec![
+            msg_entry("a", None, "user"),
+            compaction_entry("c1", Some("a"), false, Some("a")),
+            msg_entry("b", Some("c1"), "user"),
+            compaction_entry("c2", Some("b"), false, None),
+            msg_entry("leaf", Some("c2"), "user"),
+        ];
+        let tree = make_tree(entries, Some("leaf"));
+        let path = tree.get_path_to_root_or_compaction(None);
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].id(), "c2");
+        assert_eq!(path[1].id(), "leaf");
+    }
+
+    // ─── SessionTree::get_stats ──────────────────────────────────────
+
+    fn make_usage(input: u64, output: u64, cache_read: u64, cache_write: u64, cost_total: f64) -> Usage {
+        Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_1h: None,
+            reasoning: None,
+            total_tokens: input + output + cache_read + cache_write,
+            cost: Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: cost_total,
+            },
+        }
+    }
+
+    fn assistant_entry(id: &str, usage: Usage) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: None,
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            message: Message::Assistant(AssistantMessage {
+                content: vec![],
+                api: "test".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                response_model: None,
+                response_id: None,
+                usage,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_get_stats_empty_tree() {
+        let tree = make_tree(vec![], None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.cached_tokens, 0);
+        assert_eq!(stats.uncached_tokens, 0);
+        assert_eq!(stats.total_tokens, 0);
+        assert_eq!(stats.cost_total, 0.0);
+    }
+
+    #[test]
+    fn test_get_stats_count_messages() {
+        let entries = vec![
+            msg_entry("e1", None, "user"),
+            msg_entry("e2", Some("e1"), "assistant"),
+            msg_entry("e3", Some("e2"), "user"),
+        ];
+        let tree = make_tree(entries, None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 3);
+        assert_eq!(stats.cached_tokens, 0);
+    }
+
+    #[test]
+    fn test_get_stats_with_assistant_usage() {
+        let usage = make_usage(100, 50, 10, 5, 0.002);
+        let tree = make_tree(vec![assistant_entry("a1", usage)], None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 1);
+        assert_eq!(stats.cached_tokens, 10);
+        assert_eq!(stats.uncached_tokens, 105);
+        assert_eq!(stats.total_tokens, 165);
+        assert!((stats.cost_total - 0.002).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_get_stats_skips_zero_usage() {
+        let tree = make_tree(vec![assistant_entry("a1", Usage::default())], None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 1);
+        assert_eq!(stats.cached_tokens, 0);
+        assert_eq!(stats.cost_total, 0.0);
+    }
+
+    #[test]
+    fn test_get_stats_compaction_usage() {
+        let usage = make_usage(200, 100, 20, 10, 0.005);
+        let entry = SessionTreeEntry::Compaction {
+            id: "c1".into(),
+            parent_id: None,
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            summary: "sum".into(),
+            first_kept_entry_id: None,
+            tokens_before: 100,
+            retained_tail: None,
+            details: None,
+            usage: Some(usage),
+            from_hook: None,
+        };
+        let tree = make_tree(vec![entry], None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.cached_tokens, 20);
+        assert_eq!(stats.uncached_tokens, 210);
+        assert_eq!(stats.total_tokens, 330);
+        assert!((stats.cost_total - 0.005).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_get_stats_branch_summary_usage() {
+        let usage = make_usage(50, 25, 5, 2, 0.001);
+        let entry = SessionTreeEntry::BranchSummary {
+            id: "b1".into(),
+            parent_id: None,
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            from_id: "old".into(),
+            summary: "branch summary".into(),
+            details: None,
+            usage: Some(usage),
+            from_hook: None,
+        };
+        let tree = make_tree(vec![entry], None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.cached_tokens, 5);
+        assert_eq!(stats.uncached_tokens, 52);
+        assert_eq!(stats.total_tokens, 82);
+        assert!((stats.cost_total - 0.001).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_get_stats_mixed_entries() {
+        let ass_usage = make_usage(100, 50, 10, 5, 0.002);
+        let comp_usage = make_usage(50, 20, 5, 2, 0.001);
+        let entries = vec![
+            msg_entry("u1", None, "user"),
+            assistant_entry("a1", ass_usage),
+            SessionTreeEntry::Compaction {
+                id: "c1".into(),
+                parent_id: Some("a1".into()),
+                timestamp: "2024-01-01T00:00:00Z".into(),
+                summary: "sum".into(),
+                first_kept_entry_id: None,
+                tokens_before: 100,
+                retained_tail: None,
+                details: None,
+                usage: Some(comp_usage),
+                from_hook: None,
+            },
+            msg_entry("u2", Some("c1"), "user"),
+        ];
+        let tree = make_tree(entries, None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 3);
+        assert_eq!(stats.cached_tokens, 15);
+        assert_eq!(stats.uncached_tokens, 157);
+        assert_eq!(stats.total_tokens, 242);
+        assert!((stats.cost_total - 0.003).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_get_stats_user_message_no_usage() {
+        let tree = make_tree(vec![msg_entry("u1", None, "user")], None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 1);
+        assert_eq!(stats.cached_tokens, 0);
+        assert_eq!(stats.cost_total, 0.0);
+    }
+
+    #[test]
+    fn test_get_stats_non_message_entries_ignored() {
+        let entries = vec![
+            SessionTreeEntry::Label {
+                id: "l1".into(), parent_id: None, timestamp: "".into(),
+                target_id: "x".into(), label: None,
+            },
+            SessionTreeEntry::SessionInfo {
+                id: "s1".into(), parent_id: None, timestamp: "".into(),
+                name: Some("sess".into()),
+            },
+            SessionTreeEntry::Leaf {
+                id: "f1".into(), parent_id: None, timestamp: "".into(),
+                target_id: None,
+            },
+        ];
+        let tree = make_tree(entries, None);
+        let stats = tree.get_stats();
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.cached_tokens, 0);
     }
 }
