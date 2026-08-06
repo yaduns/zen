@@ -16,6 +16,7 @@ zen-ai = { workspace = true }
 async-trait = { workspace = true }
 unicode-normalization = { workspace = true }
 similar = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
