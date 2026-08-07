@@ -18,7 +18,7 @@ use zen_ai::types::{
 };
 use zen_core::agent::agent_hooks::AgentLoopHooks;
 use zen_core::agent::agent_loop::run_agent_loop;
-use zen_core::agent::context::create_context;
+use zen_core::harness::context::create_context;
 use zen_core::agent::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
 
 // ═══════════════════════════════════════════════════════════════════
