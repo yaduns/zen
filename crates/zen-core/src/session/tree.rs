@@ -176,7 +176,7 @@ struct SessionStats {
 
 // Enumerate all variants, extracting id and parent_id
 impl SessionTreeEntry {
-    pub(crate) fn id(&self) -> &str {
+    pub fn id(&self) -> &str {
         match self {
             SessionTreeEntry::Message { id, .. }
             | SessionTreeEntry::ThinkingLevelChange { id, .. }
@@ -191,7 +191,7 @@ impl SessionTreeEntry {
             | SessionTreeEntry::Leaf { id, .. } => id.as_str(),
         }
     }
-    pub(crate) fn parent_id(&self) -> Option<&str> {
+    pub fn parent_id(&self) -> Option<&str> {
         match self {
             SessionTreeEntry::Message { parent_id, .. }
             | SessionTreeEntry::ThinkingLevelChange { parent_id, .. }
@@ -347,9 +347,7 @@ impl SessionTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_ai::types::{
-        AssistantMessage, Cost, StopReason, UserMessage,
-    };
+    use zen_ai::types::{AssistantMessage, Cost, StopReason, UserMessage};
 
     // ─── Helper constructors ────────────────────────────────────────────────────
 
@@ -602,7 +600,13 @@ mod tests {
 
     // ─── SessionTree::get_stats ──────────────────────────────────────
 
-    fn make_usage(input: u64, output: u64, cache_read: u64, cache_write: u64, cost_total: f64) -> Usage {
+    fn make_usage(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost_total: f64,
+    ) -> Usage {
         Usage {
             input,
             output,
@@ -775,15 +779,22 @@ mod tests {
     fn test_get_stats_non_message_entries_ignored() {
         let entries = vec![
             SessionTreeEntry::Label {
-                id: "l1".into(), parent_id: None, timestamp: "".into(),
-                target_id: "x".into(), label: None,
+                id: "l1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                target_id: "x".into(),
+                label: None,
             },
             SessionTreeEntry::SessionInfo {
-                id: "s1".into(), parent_id: None, timestamp: "".into(),
+                id: "s1".into(),
+                parent_id: None,
+                timestamp: "".into(),
                 name: Some("sess".into()),
             },
             SessionTreeEntry::Leaf {
-                id: "f1".into(), parent_id: None, timestamp: "".into(),
+                id: "f1".into(),
+                parent_id: None,
+                timestamp: "".into(),
                 target_id: None,
             },
         ];
