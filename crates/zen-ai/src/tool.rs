@@ -191,6 +191,21 @@ pub trait Tool: std::fmt::Debug + Send + Sync {
     /// Human-readable tool label for UI display.
     fn label(&self) -> &str;
 
+    /// One-line summary of the tool, used in the "Available tools" section of the system prompt.
+    ///
+    /// `None` means the tool does not appear in the system prompt's prose list (but remains visible and callable to the model via the API `tools` schema),
+    /// aligning with pi's `ToolDefinition.promptSnippet`.
+    fn prompt_snippet(&self) -> Option<&str> {
+        None
+    }
+
+    /// Usage guidelines for the tool (0..N entries), appended to the "Guidelines" section of the system prompt (deduplicated against the default guidelines).
+    ///
+    /// Only used for the system prompt prose; does not enter the API `tools` schema. Aligns with pi's `ToolDefinition.promptGuidelines`.
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Optional argument preprocessing hook that type-coerces raw arguments before schema validation.
     /// Returns the transformed argument object (must match the Schema defined by `parameters`).
     /// Default implementation returns the input as-is.

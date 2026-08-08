@@ -100,6 +100,15 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Read file contents")
+    }
+
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        // Reference: reference/pi-original/packages/coding-agent/src/core/tools/read.ts
+        &["Use read to examine files instead of cat or sed."]
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,

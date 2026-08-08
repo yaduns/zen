@@ -76,6 +76,11 @@ impl Tool for BashTool {
         "bash"
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        // Reference: reference/pi-original/packages/coding-agent/src/core/tools/bash.ts
+        Some("Execute bash commands (ls, grep, find, etc.)")
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,

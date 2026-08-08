@@ -77,6 +77,16 @@ impl Tool for WriteTool {
         "write"
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        // Reference: reference/pi-original/packages/coding-agent/src/core/tools/write.ts
+        Some("Create or overwrite files")
+    }
+
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        // Reference: reference/pi-original/packages/coding-agent/src/core/tools/write.ts
+        &["Use write only for new files or complete rewrites."]
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,
