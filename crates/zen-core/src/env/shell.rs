@@ -1,6 +1,6 @@
 use crate::env::ExecutionError;
-use crate::env::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
 /// Pure-data output of resolve_shell, describing which shell to use and with what arguments and transport to execute commands.
 pub struct ShellConfig {
@@ -194,13 +194,16 @@ mod tests {
         for p in [
             r"C:\Windows\System32\WSL\bash.exe", // there is a suffix after \system32
             r"C:\Program Files\Git\bin\bash.exe",
-            "/bin/bash", // does not end with \bash.exe
-            r"C:\Windows\System32\bash", // no .exe
+            "/bin/bash",                      // does not end with \bash.exe
+            r"C:\Windows\System32\bash",      // no .exe
             r"CC:\Windows\System32\bash.exe", // drive letter is longer than one character
-            r"\Windows\System32\bash.exe", // no drive letter
+            r"\Windows\System32\bash.exe",    // no drive letter
             "",
         ] {
-            assert!(!is_legacy_wsl_bash_path(Path::new(p)), "expected false: {p}");
+            assert!(
+                !is_legacy_wsl_bash_path(Path::new(p)),
+                "expected false: {p}"
+            );
         }
     }
 

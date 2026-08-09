@@ -33,7 +33,7 @@ pub fn create_coding_tools() -> ToolRegistry {
 pub fn create_readonly_tools() -> ToolRegistry {
     // TODO: Add after T-AP-04-4 (grep), T-AP-04-5 (find), T-AP-04-6 (ls) are implemented
     ToolRegistry::from(vec![
-        Arc::new(read::ReadTool::new()) as Arc<dyn zen_ai::tool::Tool>,
+        Arc::new(read::ReadTool::new()) as Arc<dyn zen_ai::tool::Tool>
     ])
 }
 

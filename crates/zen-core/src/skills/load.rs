@@ -324,8 +324,10 @@ mod tests {
     // ─── parse_frontmatter_fields ─────────────────────────────────
     #[test]
     fn test_parse_frontmatter_fields_all_keys() {
-        let fm = parse_frontmatter_fields("name: foo\ndescription: does foo\ndisable-model-invocation: true")
-            .unwrap();
+        let fm = parse_frontmatter_fields(
+            "name: foo\ndescription: does foo\ndisable-model-invocation: true",
+        )
+        .unwrap();
         assert_eq!(fm.name.as_deref(), Some("foo"));
         assert_eq!(fm.description.as_deref(), Some("does foo"));
         assert!(fm.disable_model_invocation);
@@ -456,7 +458,10 @@ mod tests {
     #[test]
     fn test_build_skill_name_derivation_failure_errors() {
         // No frontmatter and no derivable name from the path (no parent-directory filename) → InvalidMetadata
-        let diag = expect_skill_err(build_skill("no frontmatter".to_string(), Path::new("SKILL.md")));
+        let diag = expect_skill_err(build_skill(
+            "no frontmatter".to_string(),
+            Path::new("SKILL.md"),
+        ));
         assert!(matches!(diag.code, SkillDiagnosticCode::InvalidMetadata));
         assert!(diag.message.contains("cannot derive skill name"));
     }
@@ -474,4 +479,3 @@ mod tests {
         );
     }
 }
-

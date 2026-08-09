@@ -347,7 +347,12 @@ mod tests {
         }
     }
 
-    fn branch_summary_entry(id: &str, parent: Option<&str>, summary: &str, from_id: &str) -> SessionTreeEntry {
+    fn branch_summary_entry(
+        id: &str,
+        parent: Option<&str>,
+        summary: &str,
+        from_id: &str,
+    ) -> SessionTreeEntry {
         SessionTreeEntry::BranchSummary {
             id: id.into(),
             parent_id: parent.map(|p| p.into()),
@@ -406,7 +411,8 @@ mod tests {
 
     #[test]
     fn test_create_compaction_summary_message_format() {
-        let msg = create_compaction_summary_message("summarized content", 500, "2024-01-01T00:00:00Z");
+        let msg =
+            create_compaction_summary_message("summarized content", 500, "2024-01-01T00:00:00Z");
         let text = match &msg {
             Message::User(u) => match &u.content {
                 ContentBlockList::Text(t) => t.clone(),
@@ -431,7 +437,8 @@ mod tests {
 
     #[test]
     fn test_create_branch_summary_message_format() {
-        let msg = create_branch_summary_message("branch summary", "entry-abc", "2024-01-01T00:00:00Z");
+        let msg =
+            create_branch_summary_message("branch summary", "entry-abc", "2024-01-01T00:00:00Z");
         let text = match &msg {
             Message::User(u) => match &u.content {
                 ContentBlockList::Text(t) => t.clone(),
@@ -478,12 +485,10 @@ mod tests {
 
     #[test]
     fn test_session_entry_to_messages_compaction_with_retained_tail() {
-        let retained = vec![
-            Message::User(UserMessage {
-                content: ContentBlockList::Text("tail msg".into()),
-                timestamp: 0,
-            }),
-        ];
+        let retained = vec![Message::User(UserMessage {
+            content: ContentBlockList::Text("tail msg".into()),
+            timestamp: 0,
+        })];
         let entry = SessionTreeEntry::Compaction {
             id: "c1".into(),
             parent_id: None,
@@ -540,22 +545,42 @@ mod tests {
     fn test_session_entry_to_messages_non_message_returns_empty() {
         let variants: Vec<SessionTreeEntry> = vec![
             SessionTreeEntry::ThinkingLevelChange {
-                id: "t1".into(), parent_id: None, timestamp: "".into(), thinking_level: "off".into(),
+                id: "t1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                thinking_level: "off".into(),
             },
             SessionTreeEntry::ModelChange {
-                id: "m1".into(), parent_id: None, timestamp: "".into(), provider: "dp".into(), model_id: "m".into(),
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                provider: "dp".into(),
+                model_id: "m".into(),
             },
             SessionTreeEntry::ActiveToolsChange {
-                id: "a1".into(), parent_id: None, timestamp: "".into(), active_tool_names: vec![],
+                id: "a1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                active_tool_names: vec![],
             },
             SessionTreeEntry::Label {
-                id: "l1".into(), parent_id: None, timestamp: "".into(), target_id: "x".into(), label: None,
+                id: "l1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                target_id: "x".into(),
+                label: None,
             },
             SessionTreeEntry::SessionInfo {
-                id: "s1".into(), parent_id: None, timestamp: "".into(), name: None,
+                id: "s1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                name: None,
             },
             SessionTreeEntry::Leaf {
-                id: "f1".into(), parent_id: None, timestamp: "".into(), target_id: None,
+                id: "f1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+                target_id: None,
             },
         ];
         for entry in &variants {
@@ -636,23 +661,25 @@ mod tests {
 
     #[test]
     fn test_build_session_context_derives_thinking_level() {
-        let entries = vec![
-            SessionTreeEntry::ThinkingLevelChange {
-                id: "t1".into(), parent_id: None, timestamp: "".into(), thinking_level: "high".into(),
-            },
-        ];
+        let entries = vec![SessionTreeEntry::ThinkingLevelChange {
+            id: "t1".into(),
+            parent_id: None,
+            timestamp: "".into(),
+            thinking_level: "high".into(),
+        }];
         let ctx = build_session_context(&entries);
         assert_eq!(ctx.thinking_level, "high");
     }
 
     #[test]
     fn test_build_session_context_derives_model() {
-        let entries = vec![
-            SessionTreeEntry::ModelChange {
-                id: "m1".into(), parent_id: None, timestamp: "".into(),
-                provider: "deepseek".into(), model_id: "v4-flash".into(),
-            },
-        ];
+        let entries = vec![SessionTreeEntry::ModelChange {
+            id: "m1".into(),
+            parent_id: None,
+            timestamp: "".into(),
+            provider: "deepseek".into(),
+            model_id: "v4-flash".into(),
+        }];
         let ctx = build_session_context(&entries);
         assert!(ctx.model.is_some());
         assert_eq!(ctx.model.as_ref().unwrap().provider, "deepseek");
@@ -667,9 +694,16 @@ mod tests {
             parent_id: None,
             timestamp: "".into(),
             message: Message::Assistant(AssistantMessage {
-                content: vec![], api: "test".into(), provider: "openai".into(),
-                model: "gpt-4".into(), response_model: None, response_id: None,
-                usage, stop_reason: StopReason::Stop, error_message: None, timestamp: 0,
+                content: vec![],
+                api: "test".into(),
+                provider: "openai".into(),
+                model: "gpt-4".into(),
+                response_model: None,
+                response_id: None,
+                usage,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
             }),
         };
         let ctx = build_session_context(&[assistant_entry]);
@@ -680,12 +714,12 @@ mod tests {
 
     #[test]
     fn test_build_session_context_derives_active_tools() {
-        let entries = vec![
-            SessionTreeEntry::ActiveToolsChange {
-                id: "at1".into(), parent_id: None, timestamp: "".into(),
-                active_tool_names: vec!["bash".into(), "read".into()],
-            },
-        ];
+        let entries = vec![SessionTreeEntry::ActiveToolsChange {
+            id: "at1".into(),
+            parent_id: None,
+            timestamp: "".into(),
+            active_tool_names: vec!["bash".into(), "read".into()],
+        }];
         let ctx = build_session_context(&entries);
         assert!(ctx.active_tool_names.is_some());
         assert_eq!(ctx.active_tool_names.as_ref().unwrap().len(), 2);

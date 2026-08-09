@@ -8,9 +8,7 @@ enum AgentRuntimeState {
     /// Initial state, or after finish_run
     Idle,
     /// After start_run
-    Running {
-        streaming_message: Option<Message>,
-    },
+    Running { streaming_message: Option<Message> },
     /// After a tool_execution_start event
     ToolCalling {
         streaming_message: Option<Message>,
@@ -297,7 +295,9 @@ mod tests {
 
     /// Assert that streaming_message is Some and its text content equals the expected string
     fn assert_streaming_msg_text(state: &AgentRuntimeState, expected_text: &str) {
-        let msg = state.streaming_message().expect("expected streaming message");
+        let msg = state
+            .streaming_message()
+            .expect("expected streaming message");
         match msg {
             Message::User(u) => match &u.content {
                 ContentBlockList::Text(t) => assert_eq!(t, expected_text),

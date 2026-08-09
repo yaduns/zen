@@ -182,7 +182,10 @@ mod tests {
 
         let ctx = create_context("You are a helpful assistant.".into(), msgs.clone(), &tools);
 
-        assert_eq!(ctx.system_prompt, Some("You are a helpful assistant.".to_string()));
+        assert_eq!(
+            ctx.system_prompt,
+            Some("You are a helpful assistant.".to_string())
+        );
         assert_eq!(ctx.messages, msgs);
         assert!(ctx.tools.is_some());
         assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
@@ -227,17 +230,11 @@ mod tests {
 
         assert_eq!(ctx.messages.len(), 2);
         match &ctx.messages[0] {
-            Message::User(u) => assert_eq!(
-                u.content,
-                ContentBlockList::Text("hello".into())
-            ),
+            Message::User(u) => assert_eq!(u.content, ContentBlockList::Text("hello".into())),
             _ => panic!("expected User message"),
         }
         match &ctx.messages[1] {
-            Message::User(u) => assert_eq!(
-                u.content,
-                ContentBlockList::Text("world".into())
-            ),
+            Message::User(u) => assert_eq!(u.content, ContentBlockList::Text("world".into())),
             _ => panic!("expected User message"),
         }
     }

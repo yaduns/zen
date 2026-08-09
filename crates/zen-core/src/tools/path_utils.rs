@@ -235,7 +235,10 @@ mod tests {
 
     #[test]
     fn test_expand_path_file_url() {
-        assert_eq!(expand_path("file:///home/user/config.toml"), "/home/user/config.toml");
+        assert_eq!(
+            expand_path("file:///home/user/config.toml"),
+            "/home/user/config.toml"
+        );
     }
 
     #[test]
@@ -248,16 +251,28 @@ mod tests {
     #[test]
     fn test_expand_path_unicode_whitespace() {
         // \u{00A0} = no-break space, \u{202F} = narrow no-break space
-        assert_eq!(expand_path("/dir/file\u{00A0}name.txt"), "/dir/file name.txt");
-        assert_eq!(expand_path("/dir/file\u{202F}name.txt"), "/dir/file name.txt");
+        assert_eq!(
+            expand_path("/dir/file\u{00A0}name.txt"),
+            "/dir/file name.txt"
+        );
+        assert_eq!(
+            expand_path("/dir/file\u{202F}name.txt"),
+            "/dir/file name.txt"
+        );
     }
 
     // -- normalize_unicode_whitespace --
 
     #[test]
     fn test_normalize_unicode_whitespace_all_variants() {
-        assert_eq!(normalize_unicode_whitespace("hello\u{00A0}world"), "hello world");
-        assert_eq!(normalize_unicode_whitespace("hello\u{202F}world"), "hello world");
+        assert_eq!(
+            normalize_unicode_whitespace("hello\u{00A0}world"),
+            "hello world"
+        );
+        assert_eq!(
+            normalize_unicode_whitespace("hello\u{202F}world"),
+            "hello world"
+        );
         assert_eq!(normalize_unicode_whitespace("a\u{2000}b"), "a b");
         assert_eq!(normalize_unicode_whitespace("a\u{200A}b"), "a b");
         assert_eq!(normalize_unicode_whitespace("a\u{3000}b"), "a b");
@@ -282,7 +297,10 @@ mod tests {
     #[test]
     fn test_resolve_to_cwd_absolute() {
         let cwd = std::path::Path::new("/home/user/project");
-        assert_eq!(resolve_to_cwd("/etc/config", cwd), std::path::Path::new("/etc/config"));
+        assert_eq!(
+            resolve_to_cwd("/etc/config", cwd),
+            std::path::Path::new("/etc/config")
+        );
     }
 
     #[test]

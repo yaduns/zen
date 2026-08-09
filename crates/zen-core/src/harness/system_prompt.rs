@@ -352,7 +352,8 @@ mod tests {
     fn test_build_system_prompt_visible_tools_only_with_snippet() {
         let mut opts = default_options("/p");
         opts.selected_tools = Some(vec!["read".into(), "bash".into()]);
-        opts.tool_snippets.insert("read".into(), "Read file contents".into());
+        opts.tool_snippets
+            .insert("read".into(), "Read file contents".into());
         // bash has no snippet → absent; read has one → present
         let out = build_system_prompt(&opts);
         assert!(out.contains("- read: Read file contents"));
@@ -387,7 +388,7 @@ mod tests {
         let mut opts = default_options("/p");
         opts.prompt_guidelines = vec![
             "  Be concise in your responses  ".to_string(), // duplicates the default, trim + dedupe
-            "   ".to_string(), // blank, skip
+            "   ".to_string(),                              // blank, skip
             "Always run tests".to_string(),
         ];
         let out = build_system_prompt(&opts);
@@ -498,8 +499,14 @@ mod tests {
             MockTool::new("bash").with_snippet("Bash"),
         ]);
         assert_eq!(meta.tool_snippets.len(), 2);
-        assert_eq!(meta.tool_snippets.get("read").map(|s| s.as_str()), Some("Read"));
-        assert_eq!(meta.tool_snippets.get("bash").map(|s| s.as_str()), Some("Bash"));
+        assert_eq!(
+            meta.tool_snippets.get("read").map(|s| s.as_str()),
+            Some("Read")
+        );
+        assert_eq!(
+            meta.tool_snippets.get("bash").map(|s| s.as_str()),
+            Some("Bash")
+        );
         assert_eq!(meta.prompt_guidelines, vec!["g1", "g2"]);
     }
 }

@@ -1,7 +1,7 @@
 use crate::agent::agent_hooks::{
-    fail_tool_calls_from_truncated_message, AgentLoopError, AgentLoopHooks,
-    FinalizedToolCallOutcome, execute_prepared_tool_call, finalize_executed_tool_call,
-    prepare_tool_call,
+    execute_prepared_tool_call, fail_tool_calls_from_truncated_message,
+    finalize_executed_tool_call, prepare_tool_call, AgentLoopError, AgentLoopHooks,
+    FinalizedToolCallOutcome,
 };
 use crate::agent::types::{
     AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamFn,
@@ -74,7 +74,17 @@ pub async fn run_agent_loop(
     }
 
     // 3. Multi-turn inner loop
-    agent_loop_inner(context, config, hooks, cancel, stream_fn, tools, tool_ctx, &mut new_messages).await;
+    agent_loop_inner(
+        context,
+        config,
+        hooks,
+        cancel,
+        stream_fn,
+        tools,
+        tool_ctx,
+        &mut new_messages,
+    )
+    .await;
 
     hooks
         .on_event(&AgentEvent::AgentEnd {
@@ -151,7 +161,17 @@ pub async fn run_agent_loop_continue(
     hooks.on_event(&AgentEvent::AgentStart).await;
 
     // 3. Multi-turn inner loop
-    agent_loop_inner(context, config, hooks, cancel, stream_fn, tools, tool_ctx, &mut new_messages).await;
+    agent_loop_inner(
+        context,
+        config,
+        hooks,
+        cancel,
+        stream_fn,
+        tools,
+        tool_ctx,
+        &mut new_messages,
+    )
+    .await;
 
     hooks
         .on_event(&AgentEvent::AgentEnd {
@@ -385,7 +405,16 @@ async fn agent_loop_inner(
         let (tool_results, terminate) = if assistant_msg.stop_reason == StopReason::Length {
             fail_tool_calls_from_truncated_message(&tool_calls, hooks).await
         } else {
-            execute_tool_calls(context, &assistant_msg, tools, config, hooks, cancel, tool_ctx).await
+            execute_tool_calls(
+                context,
+                &assistant_msg,
+                tools,
+                config,
+                hooks,
+                cancel,
+                tool_ctx,
+            )
+            .await
         };
 
         // Inject tool results into context
@@ -774,4 +803,3 @@ mod tests {
     // - execute_tool_calls_parallel: same as above
     // Suggestion: add tests for these functions after introducing a mock framework (e.g. mockall).
 }
-

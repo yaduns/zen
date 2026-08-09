@@ -118,7 +118,10 @@ mod tests {
 
     #[test]
     fn test_escape_xml_combined() {
-        assert_eq!(escape_xml("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            escape_xml("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
     }
 
     #[test]
@@ -230,4 +233,3 @@ mod tests {
         assert!(out_empty.ends_with("</skill>"));
     }
 }
-

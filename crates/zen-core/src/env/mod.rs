@@ -1,9 +1,9 @@
 pub mod shell;
+pub mod shell_output;
 
 use crate::env::shell::{kill_process_tree, resolve_shell, ShellTransport};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -289,7 +289,10 @@ mod tests {
         );
         assert_eq!(env.base_dir, PathBuf::from("/tmp/zen-env-test"));
         assert_eq!(env.shell_path, Some(PathBuf::from("/bin/bash")));
-        assert_eq!(env.base_env.as_ref().unwrap().get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(
+            env.base_env.as_ref().unwrap().get("FOO"),
+            Some(&"bar".to_string())
+        );
     }
 
     // ── ExecutionError display ─────────────────────────────────────
@@ -310,11 +313,9 @@ mod tests {
             "unknown execution error: boom"
         );
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
-        assert!(
-            ExecutionError::SpawnError(io_err)
-                .to_string()
-                .starts_with("failed to spawn command")
-        );
+        assert!(ExecutionError::SpawnError(io_err)
+            .to_string()
+            .starts_with("failed to spawn command"));
     }
 
     // ── read_stream (pure function, in-memory stream) ──────────────────────────────
@@ -369,7 +370,10 @@ mod tests {
     #[tokio::test]
     async fn test_exec_echo_stdout() {
         let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
-        let out = env.exec("echo hello", &empty_options()).await.expect("exec ok");
+        let out = env
+            .exec("echo hello", &empty_options())
+            .await
+            .expect("exec ok");
         assert_eq!(out.stdout, "hello\n");
         assert_eq!(out.stderr, "");
         assert_eq!(out.exit_code, 0);
@@ -435,14 +439,19 @@ mod tests {
             env: Some(HashMap::from([("FOO".to_string(), "baz".to_string())])),
             ..empty_options()
         };
-        let out = env.exec("printf '%s' \"$FOO\"", &opts).await.expect("exec ok");
+        let out = env
+            .exec("printf '%s' \"$FOO\"", &opts)
+            .await
+            .expect("exec ok");
         assert_eq!(out.stdout, "baz");
     }
 
     #[tokio::test]
     async fn test_exec_default_cwd_is_base_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let base = tokio::fs::canonicalize(dir.path()).await.expect("canonicalize");
+        let base = tokio::fs::canonicalize(dir.path())
+            .await
+            .expect("canonicalize");
         let env = ExecutionEnv::new(base.clone(), None, None);
         let out = env.exec("pwd", &empty_options()).await.expect("exec ok");
         assert_eq!(out.stdout.trim_end(), base.to_str().unwrap());
@@ -452,7 +461,9 @@ mod tests {
     #[tokio::test]
     async fn test_exec_cwd_relative_resolves_against_base_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let base = tokio::fs::canonicalize(dir.path()).await.expect("canonicalize");
+        let base = tokio::fs::canonicalize(dir.path())
+            .await
+            .expect("canonicalize");
         let sub = base.join("sub");
         tokio::fs::create_dir_all(&sub).await.expect("create sub");
         let env = ExecutionEnv::new(base, None, None);
@@ -467,7 +478,9 @@ mod tests {
     #[tokio::test]
     async fn test_exec_absolute_cwd_ignores_base_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let abs = tokio::fs::canonicalize(dir.path()).await.expect("canonicalize");
+        let abs = tokio::fs::canonicalize(dir.path())
+            .await
+            .expect("canonicalize");
         let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
         let opts = ExecOptions {
             cwd: Some(abs.clone()),

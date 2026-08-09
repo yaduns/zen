@@ -437,7 +437,10 @@ mod tests {
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["command"].is_object());
-        assert_eq!(params["required"].as_array().unwrap()[0].as_str().unwrap(), "command");
+        assert_eq!(
+            params["required"].as_array().unwrap()[0].as_str().unwrap(),
+            "command"
+        );
         assert!(params["properties"]["timeout"].is_object());
         assert_eq!(params["required"].as_array().unwrap().len(), 1);
     }
@@ -513,7 +516,10 @@ mod tests {
         // 10 lines, max_lines=5 triggers line-count truncation first, keep the last 5 lines
         // The kept content is about 30 bytes, max_bytes=20 then triggers byte truncation
         // truncated_by prefers Lines (the Lines check comes first in code)
-        let input = (0..10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let input = (0..10)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let info = truncate_tail(&input, Some(5), Some(20));
         assert!(info.truncated);
         assert_eq!(info.truncated_by, Some(TruncationKind::Lines));
@@ -527,7 +533,10 @@ mod tests {
         let input = format!("short\n{}", "x".repeat(10000));
         let info = truncate_tail(&input, Some(100), Some(100));
         assert!(info.truncated);
-        assert!(!info.content.is_empty(), "should never return empty for non-empty input");
+        assert!(
+            !info.content.is_empty(),
+            "should never return empty for non-empty input"
+        );
         assert_eq!(info.total_lines, 2);
         assert_eq!(info.output_lines, 1);
     }

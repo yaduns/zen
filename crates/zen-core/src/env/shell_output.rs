@@ -1,0 +1,731 @@
+// All optional arguments for a single execute_shell_with_capture call
+
+use crate::env::{ExecOptions, ExecutionEnv, ExecutionError};
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+struct ShellCaptureOptions {
+    // Working directory of the command, passed through as ExecOptions.cwd
+    cwd: Option<PathBuf>,
+    // Additional environment variable overrides, passed through as ExecOptions.env
+    env: Option<HashMap<String, String>>,
+    // Timeout, passed through as ExecOptions.timeout (
+    timeout: Option<Duration>,
+    // Cancellation token, passed through as ExecOptions.cancellation
+    cancellation: Option<CancellationToken>,
+    // Streaming callback for each chunk of sanitized text (\r removed); infallible contract (panic unwinds directly, aligning with ExecOptions.on_stdout)
+    on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+// Complete result of a capture call returned to the caller
+struct ShellCaptureResult {
+    // Content after tail truncation (truncateTail semantics: keep last 2000 lines / 50KB)
+    output: String,
+    // Process exit code; None when cancelled, Some(code) on normal exit
+    exit_code: Option<i32>,
+    // Whether it was cancelled (exec returned Err(Aborted), or a race where the token was cancelled after execution)
+    cancelled: bool,
+    // Whether tail truncation occurred
+    truncated: bool,
+    // Full-output temp file path (prefix `bash-`, suffix `.log`); exists only on overflow/truncation
+    full_output_path: Option<PathBuf>,
+}
+
+// Return of the private truncate_tail helper
+struct TailTruncationInfo {
+    // Truncated content
+    content: String,
+    // Whether truncation occurred
+    truncated: bool,
+}
+
+// ---- Constants (move when extracting the shared truncate module in T-AG-06-3) ----
+const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+const DEFAULT_MAX_LINES: usize = 2000;
+
+// ---- Serial write coordination (replaces pi's writeChain promise chain) ----
+enum WriteRequest {
+    /// Create a temp file (`bash-*.log`) and write initial content
+    Create { initial: String },
+    /// Append a chunk of text
+    Append { text: String },
+}
+
+struct SharedCaptureState {
+    total_bytes: usize,
+    create_sent: bool,
+    tail: VecDeque<String>,
+    tail_bytes: usize,
+}
+
+/// Create temp file + write initial content; on success return the persisted path
+async fn create_and_write(initial: &str) -> Result<PathBuf, ExecutionError> {
+    use std::io::Write as _;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("bash-")
+        .suffix(".log")
+        .tempfile()
+        .map_err(|e| ExecutionError::Unknown(format!("create temp file: {e}")))?;
+    tmp.write_all(initial.as_bytes())
+        .map_err(|e| ExecutionError::Unknown(format!("write temp file: {e}")))?;
+    let path = tmp
+        .into_temp_path()
+        .keep()
+        .map_err(|e| ExecutionError::Unknown(format!("persist temp file: {e}")))?;
+    Ok(path)
+}
+
+/// Append a chunk of text to an existing temp file
+async fn append_text(path: &Path, text: &str) -> Result<(), ExecutionError> {
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|e| ExecutionError::Unknown(format!("open temp file: {e}")))?;
+    f.write_all(text.as_bytes())
+        .await
+        .map_err(|e| ExecutionError::Unknown(format!("append temp file: {e}")))?;
+    // tokio::fs::File has an internal write buffer (`max_buf_size` defaults to 8KB), so small writes stay in the buffer,
+    // and drop does not flush to disk (tokio docs explicitly require an explicit flush before drop). Without a flush,
+    // data never reaches the kernel page cache, and other fds (e.g. read_to_string) read stale content —
+    // under concurrency this manifests as lost appends.
+    f.flush()
+        .await
+        .map_err(|e| ExecutionError::Unknown(format!("flush temp file: {e}")))?;
+    Ok(())
+}
+
+/// Sanitize binary output text.
+///
+/// Filter character by character:
+/// - Preserve `\t` (0x09), `\n` (0x0a), `\r` (0x0d);
+/// - Drop remaining C0 control characters (code points ≤ 0x1f);
+/// - Drop U+FFF9..U+FFFB (line-start / line-mid / line-end interlinear annotation chars);
+/// - All other characters are kept as-is.
+///
+/// # Edge Cases
+/// - **Do NOT strip `\r`** (`\r` is stripped by each calling pipeline via `.replace(/\r/g, "")`,
+///   this function keeps the single responsibility of "control character filtering", so it can be reused by call sites such as render-utils).
+/// - Input may be any lossy-decoded text of invalid UTF-8; an empty string returns an empty string.
+pub fn sanitize_binary_output(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let code = *c as u32;
+            // Whitelist: \t \n \r are kept as-is
+            matches!(code, 0x09 | 0x0a | 0x0d)
+                   // Others: remove C0 (≤0x1f) and U+FFF9..U+FFFB
+                   || (code > 0x1f && !(0xfff9..=0xfffb).contains(&code))
+        })
+        .collect()
+}
+
+/// Execute a command on `ExecutionEnv` and capture output in a streaming manner
+///
+/// Behavior:
+/// - Calls `env.exec` under the hood; both `on_stdout` and `on_stderr` are bound to the same internal handler
+///   (preserving the interleaving of stdout/stderr arrival order, consistent with pi).
+/// - Per-chunk processing: `total_bytes += chunk.len()` (UTF-8 bytes); sanitize and strip `\r`
+///   (`sanitize_binary_output(chunk).replace('\r', "")`); push into the bounded tail buffer
+///   `VecDeque<String>` (rolling cap `2 * DEFAULT_MAX_BYTES` = 100KB, popped from the front when exceeded);
+///   each sanitized chunk is then passed back via `options.on_chunk`.
+/// - **Full output overflow**: when `total_bytes` first exceeds `DEFAULT_MAX_BYTES` (50KB),
+///   write "all text so far" to a temp file (`tempfile::Builder`, prefix `bash-`, suffix
+///   `.log`); every subsequent chunk is appended; `full_output_path` records that path.
+/// - **Serial async write coordination**: sync closures can't await, so use a `tokio::sync::mpsc` channel + a dedicated
+///   writer task to serialize the "create temp file / append" operations (replacing pi's `writeChain` promise
+///   chain); the outer scope keeps one `tx` for the final write after exec returns, then drops it + awaits
+///   the `JoinHandle` to surface write errors.
+/// - **Final truncation**: applies `truncate_tail` to the tail buffer (keeps last 2000 lines / 50KB by default,
+///   never returns empty content; if a single line exceeds the limit, returns the tail portion of that line). If truncation occurs and no
+///   `full_output_path` exists yet, writes the full tail buffer to a temporary file.
+///
+/// # Return / error semantics
+/// - Success (or cancellation) returns `Ok(ShellCaptureResult)`:
+///   - exec returns `Err(Aborted)`, or exec succeeds but the token was already cancelled (race) →
+///     `cancelled: true`、`exit_code: None`；
+///   - otherwise `cancelled: false`, `exit_code: Some(exec_output.exit_code)`.
+/// - Other exec errors (`Timeout`/`ShellUnavailable`/`SpawnError`/`Unknown`) propagate unchanged as `Err`.
+/// - Temp file creation/append failure → `Err(ExecutionError::Unknown(cause))`.
+///
+/// # Parameters
+/// - `env`: session-level execution environment (defined in T-AG-06-1; this task does not add an impl for it).
+/// - `command`: the shell command string to execute.
+/// - `options`: options for this capture.
+pub async fn execute_shell_with_capture(
+    env: &ExecutionEnv,
+    command: &str,
+    options: &ShellCaptureOptions,
+) -> Result<ShellCaptureResult, ExecutionError> {
+    const MAX_TAIL_BYTES: usize = 2 * DEFAULT_MAX_BYTES; // 100KB tail buffer rolling cap
+
+    // 1) Shared state: tail buffer / total bytes / file-created flag / full output path
+    let state = Arc::new(Mutex::new(SharedCaptureState {
+        total_bytes: 0,
+        create_sent: false,
+        tail: VecDeque::new(),
+        tail_bytes: 0,
+    }));
+    let full_output_path: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+
+    // 2) mpsc channel + writer task: serializes file creation/appends
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteRequest>(1024);
+    let path_sink = full_output_path.clone();
+    let write_task = tokio::spawn(async move {
+        let mut current_path: Option<PathBuf> = None;
+        // recv() only returns None when the channel is closed and drained
+        while let Some(req) = rx.recv().await {
+            let result = match req {
+                WriteRequest::Create { initial } => match create_and_write(&initial).await {
+                    Ok(p) => {
+                        if let Ok(mut guard) = path_sink.lock() {
+                            *guard = Some(p.clone());
+                        }
+                        current_path = Some(p);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
+                WriteRequest::Append { text } => match &current_path {
+                    Some(p) => append_text(p, &text).await,
+                    None => Ok(()), // Theoretically unreachable: drop it
+                },
+            };
+            if let Err(e) = result {
+                return Err(e); // Terminate on write failure; the outer await on the JoinHandle reaps it
+            }
+        }
+        Ok(())
+    });
+
+    // 3) Per-chunk internal handler (synchronous closure; can only try_send to queue write operations)
+    let on_chunk = options.on_chunk.clone();
+    let state_handler = state.clone();
+    let tx_handler = tx.clone();
+    let handler: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |chunk: &str| {
+        let Ok(mut st) = state_handler.lock() else {
+            return; // Lock poisoning (should not happen): best effort
+        };
+        st.total_bytes += chunk.len();
+        let text = sanitize_binary_output(chunk).replace('\r', "");
+
+        // Full output overflow: create the file on the first overflow (initial content = all text so far), then append each chunk
+        if st.total_bytes > DEFAULT_MAX_BYTES {
+            if !st.create_sent {
+                st.create_sent = true;
+                let initial: String = st.tail.iter().cloned().collect::<Vec<_>>().concat() + &text;
+                let _ = tx_handler.try_send(WriteRequest::Create { initial });
+            } else {
+                let _ = tx_handler.try_send(WriteRequest::Append { text: text.clone() });
+            }
+        }
+
+        // Bounded tail buffer: rolling cap of 100KB, pop from the head when exceeded
+        st.tail.push_back(text.clone());
+        st.tail_bytes += text.len();
+        while st.tail_bytes > MAX_TAIL_BYTES && st.tail.len() > 1 {
+            if let Some(removed) = st.tail.pop_front() {
+                st.tail_bytes -= removed.len();
+            }
+        }
+        drop(st); // Callback after releasing the lock
+        on_chunk(&text); // Direct call on Arc<dyn Fn>
+    });
+
+    // 4) Wrap into two Boxes (stdout/stderr share the same handler, preserving interleaved arrival order)
+    let on_stdout: Box<dyn Fn(&str) + Send + Sync> = {
+        let h = handler.clone();
+        Box::new(move |c: &str| h(c))
+    };
+    let on_stderr: Box<dyn Fn(&str) + Send + Sync> = {
+        let h = handler.clone();
+        Box::new(move |c: &str| h(c))
+    };
+
+    // 5) Assemble ExecOptions and execute
+    let exec_options = ExecOptions {
+        cwd: options.cwd.clone(),
+        env: options.env.clone(),
+        timeout: options.timeout,
+        cancellation: options.cancellation.clone(),
+        on_stdout: Some(on_stdout),
+        on_stderr: Some(on_stderr),
+    };
+    let exec_result = env.exec(command, &exec_options).await;
+
+    // 6) Aggregate tail buffer + final truncation
+    let tail_output: String = match state.lock() {
+        Ok(st) => st.tail.iter().cloned().collect::<Vec<_>>().concat(),
+        Err(_) => String::new(),
+    };
+    let truncation = truncate_tail(&tail_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+
+    // Truncation occurred and no complete output file yet → write the full tail buffer into the temp file
+    let need_final_write = match full_output_path.lock() {
+        Ok(g) => truncation.truncated && g.is_none(),
+        Err(_) => false,
+    };
+    if need_final_write {
+        let _ = tx
+            .send(WriteRequest::Create {
+                initial: tail_output,
+            })
+            .await;
+    }
+
+    // 7) Close all senders, wait for the writer to drain and collect errors.
+    //    Key point: the channel has three senders — the main tx, and tx_handler captured by the handler closure.
+    //    the local handler Arc holds tx_handler, and on_stdout/on_stderr inside exec_options each hold one clone
+    //    handler clone. All three must be dropped, otherwise rx.recv() never returns None and the writer task hangs.
+    drop(exec_options); // Drop the on_stdout/on_stderr Boxes → release the two handler clones
+    drop(handler); // Drop the local handler Arc (holds tx_handler)
+    drop(tx); // Drop the main tx → channel closes → writer recv() returns None
+    let write_result = match write_task.await {
+        Ok(r) => r,
+        Err(_) => Err(ExecutionError::Unknown("writer task panicked".into())),
+    };
+    if let Err(e) = write_result {
+        return Err(e); // Temp file creation/append failed
+    }
+
+    let full_output_path = match full_output_path.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+
+    // 8) Error semantics: Aborted / cancellation race → cancelled; other errors propagate as-is
+    let (cancelled, exit_code) = match exec_result {
+        Err(ExecutionError::Aborted) => (true, None),
+        Err(e) => return Err(e), // Timeout/ShellUnavailable/SpawnError/Unknown propagate as-is
+        Ok(out) => {
+            let cancelled = options
+                .cancellation
+                .as_ref()
+                .is_some_and(|ct| ct.is_cancelled());
+            (
+                cancelled,
+                if cancelled { None } else { Some(out.exit_code) },
+            )
+        }
+    };
+
+    Ok(ShellCaptureResult {
+        output: truncation.content,
+        exit_code,
+        cancelled,
+        truncated: truncation.truncated,
+        full_output_path,
+    })
+}
+
+/// Truncate content from the tail (keep the last `max_lines` lines / `max_bytes` bytes, aligns with pi `truncateTail`).
+///
+/// Two independent limits for line truncation and byte truncation; whichever hits first wins; byte truncation aligns to line start where possible.
+/// Boundary: with non-empty input it **never returns empty content** (if the last line exceeds the byte limit, return the tail of that line
+/// partial content, `truncated: true`).
+///
+/// When T-AG-06-3 extracts the shared truncate module, this private helper together with BashTool's inline
+/// `truncate_tail` will be migrated together; this task ships a private version first to preserve the plan's implementation order (T-AG-06-3 comes later).
+fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TailTruncationInfo {
+    // 1) Split lines on \n; drop the trailing empty line produced by the final newline (aligns with pi's lines.pop())
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if lines.len() > 1 && lines.last() == Some(&"") {
+        lines.pop();
+    }
+
+    // 2) Line count and byte count both within limits → return as-is (content.len() is the UTF-8 byte count)
+    if lines.len() <= max_lines && content.len() <= max_bytes {
+        return TailTruncationInfo {
+            content: content.to_string(),
+            truncated: false,
+        };
+    }
+
+    // 3) Accumulate lines from the tail forward (aligned with pi's reverse traversal)
+    let mut output_lines: Vec<&str> = Vec::new();
+    let mut output_bytes: usize = 0;
+
+    for &line in lines.iter().rev() {
+        if output_lines.len() >= max_lines {
+            break; // Line limit reached
+        }
+        // Byte cost = line bytes + (newline 1 byte when not the first line)
+        let line_cost = line.len() + usize::from(!output_lines.is_empty());
+        if output_bytes + line_cost > max_bytes {
+            // Byte limit hit: no lines accumulated yet → take partial content from the end of that line (guarantees non-empty)
+            if output_lines.is_empty() {
+                let partial = tail_bytes_utf8(line, max_bytes);
+                return TailTruncationInfo {
+                    content: partial,
+                    truncated: true,
+                };
+            }
+            break;
+        }
+        output_lines.push(line);
+        output_bytes += line_cost;
+    }
+
+    output_lines.reverse(); // Convert the reverse-order push result to forward order
+    TailTruncationInfo {
+        content: output_lines.join("\n"),
+        truncated: true,
+    }
+}
+
+/// Take the trailing partial content of `line` (UTF-8 safe, never splits multi-byte characters).
+/// Collect characters from the tail forward up to `max_bytes`; skip tail characters that don't fit and keep searching earlier.
+/// If not even one character fits (e.g. 4-byte char + 3-byte limit), return the last character
+/// (allowing slight overshoot) to honor the boundary promise of "never return empty content when input is non-empty".
+fn tail_bytes_utf8(line: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut bytes = 0usize;
+    for c in line.chars().rev() {
+        if bytes + c.len_utf8() <= max_bytes {
+            out.push(c);
+            bytes += c.len_utf8();
+        } else if !out.is_empty() {
+            break; // Existing content and the next one doesn't fit → stop
+        }
+        // out is empty and c doesn't fit: skip it and keep searching earlier for a character that fits
+    }
+    if out.is_empty() {
+        // Fallback: return the last character to guarantee non-empty
+        return line
+            .chars()
+            .next_back()
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+    }
+    out.iter().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::{ExecutionEnv, ExecutionError};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tokio_util::sync::CancellationToken;
+
+    /// Construct a default ShellCaptureOptions (no cwd/env/timeout/cancellation, on_chunk is a no-op).
+    fn default_options() -> ShellCaptureOptions {
+        ShellCaptureOptions {
+            cwd: None,
+            env: None,
+            timeout: None,
+            cancellation: None,
+            on_chunk: Arc::new(|_s: &str| {}),
+        }
+    }
+
+    // ── sanitize_binary_output ───────────────────────────────────
+
+    #[test]
+    fn test_sanitize_keeps_tab_newline_cr() {
+        assert_eq!(sanitize_binary_output("a\tb\nc\rd"), "a\tb\nc\rd");
+    }
+
+    #[test]
+    fn test_sanitize_strips_c0_control_chars() {
+        // Remove everything in \x00..\x1f except \t\n\r
+        assert_eq!(sanitize_binary_output("\x00\x01\x07\x0b\x0c\x1f"), "");
+        assert_eq!(sanitize_binary_output("a\x00b\x1fc"), "abc");
+    }
+
+    #[test]
+    fn test_sanitize_strips_interlinear_annotation_chars() {
+        // Strip U+FFF9..U+FFFB
+        assert_eq!(
+            sanitize_binary_output("a\u{fff9}b\u{fffa}c\u{fffb}d"),
+            "abcd"
+        );
+        // Keep U+FFF8 / U+FFFC outside the boundary
+        assert_eq!(
+            sanitize_binary_output("x\u{fff8}y\u{fffc}z"),
+            "x\u{fff8}y\u{fffc}z"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_keeps_visible_text() {
+        assert_eq!(
+            sanitize_binary_output("hello, world! 中文 🙂"),
+            "hello, world! 中文 🙂"
+        );
+        // Keep both 0x20 (space) and 0x7f (DEL)
+        assert_eq!(sanitize_binary_output("\x20\x7f"), "\x20\x7f");
+    }
+
+    #[test]
+    fn test_sanitize_empty_input() {
+        assert_eq!(sanitize_binary_output(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_mixed_content() {
+        // Keep \t\n\r, strip other C0 and annotation characters
+        assert_eq!(
+            sanitize_binary_output("a\x01b\t\u{fffa}c\nd\r"),
+            "ab\tc\nd\r"
+        );
+    }
+
+    // ── truncate_tail ────────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_tail_within_limits_unchanged() {
+        let info = truncate_tail("a\nb\nc\n", 10, 100);
+        assert!(!info.truncated);
+        assert_eq!(info.content, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn test_truncate_tail_keeps_last_lines() {
+        let content = (1..=5)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let info = truncate_tail(&content, 3, 10_000);
+        assert!(info.truncated);
+        assert_eq!(info.content, "line3\nline4\nline5");
+    }
+
+    #[test]
+    fn test_truncate_tail_byte_limit_aligns_to_line_start() {
+        // 4 chars per line + newline = 5 bytes; max_bytes=10 → keep full lines from the tail and align to line start
+        // (When the byte limit is hit, no further over-limit lines are appended; only already-accumulated full lines are kept)
+        let info = truncate_tail("aaaa\nbbbb\ncccc\ndddd\n", 100, 10);
+        assert!(info.truncated);
+        assert_eq!(info.content, "cccc\ndddd");
+    }
+
+    #[test]
+    fn test_truncate_tail_single_line_partial_tail() {
+        // Single line exceeds byte limit → return trailing partial content of that line
+        let info = truncate_tail("abcdefghij", 10, 4);
+        assert!(info.truncated);
+        assert_eq!(info.content, "ghij");
+    }
+
+    #[test]
+    fn test_truncate_tail_never_empty_for_nonempty_input() {
+        // With max_bytes=1 a non-empty tail is still returned (fallback guarantee)
+        let info = truncate_tail("abcdefghij", 10, 1);
+        assert!(info.truncated);
+        assert!(!info.content.is_empty());
+        assert_eq!(info.content, "j");
+    }
+
+    #[test]
+    fn test_truncate_tail_empty_input() {
+        let info = truncate_tail("", 10, 100);
+        assert!(!info.truncated);
+        assert_eq!(info.content, "");
+    }
+
+    #[test]
+    fn test_truncate_tail_trailing_newline_within_limits() {
+        // Strip the trailing blank line produced by the final newline before counting; doesn't affect the "not truncated" determination
+        let info = truncate_tail("a\nb\n", 10, 100);
+        assert!(!info.truncated);
+        assert_eq!(info.content, "a\nb\n");
+    }
+
+    // ── tail_bytes_utf8 ──────────────────────────────────────────
+
+    #[test]
+    fn test_tail_bytes_utf8_multibyte_safe() {
+        // é takes 2 bytes; max_bytes=5 exactly fits "éllo", without splitting a multi-byte character
+        assert_eq!(tail_bytes_utf8("héllo", 5), "éllo");
+    }
+
+    #[test]
+    fn test_tail_bytes_utf8_zero_limit() {
+        assert_eq!(tail_bytes_utf8("abc", 0), "");
+    }
+
+    #[test]
+    fn test_tail_bytes_utf8_single_char_exceeds_limit_fallback() {
+        // 🦀 is 4 bytes, max_bytes=2 doesn't fit → fallback returns the last character (allowing slight overshoot)
+        assert_eq!(tail_bytes_utf8("🦀", 2), "🦀");
+    }
+
+    #[test]
+    fn test_tail_bytes_utf8_empty_line() {
+        assert_eq!(tail_bytes_utf8("", 5), "");
+    }
+
+    // ── create_and_write / append_text (tempfile isolates resources, deterministically verifiable) ──
+
+    /// Regression test: multiple OS threads (each with its own tokio runtime, sharing the global blocking pool) in parallel
+    /// doing create_and_write + append_text + read, covering tokio::fs::File write buffering
+    /// concurrency defects where append data was lost without an explicit flush (previously reproducible at ~20% probability).
+    #[test]
+    fn stress_parallel_create_append() {
+        use std::thread;
+        let mut bad = 0usize;
+        let mut collided = 0usize;
+        for round in 0..50 {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    thread::spawn(|| {
+                        let rt = tokio::runtime::Runtime::new().expect("rt");
+                        rt.block_on(async {
+                            let p = create_and_write("hello").await.expect("create");
+                            append_text(&p, " world").await.expect("append");
+                            let c =
+                                std::fs::read_to_string(&p).unwrap_or_else(|_| "<unread>".into());
+                            let _ = std::fs::remove_file(&p);
+                            (format!("{}", p.display()), c)
+                        })
+                    })
+                })
+                .collect();
+            let mut round_paths = std::collections::HashSet::new();
+            for h in handles {
+                let (p, c) = h.join().unwrap();
+                if !round_paths.insert(p.clone()) {
+                    collided += 1;
+                }
+                if c != "hello world" {
+                    bad += 1;
+                    if bad <= 3 {
+                        println!("  MISMATCH round={round} path={p} content={c:?}");
+                    }
+                }
+            }
+        }
+        println!("stress result: bad={bad} collided={collided}");
+        assert_eq!(bad, 0, "append lost under parallelism");
+    }
+
+    #[tokio::test]
+    async fn test_create_and_write_creates_prefixed_log_file() {
+        let path = create_and_write("hello").await.expect("create ok");
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(name.starts_with("bash-"), "prefix: {name}");
+        assert!(name.ends_with(".log"), "suffix: {name}");
+        let content = std::fs::read_to_string(&path).expect("read ok");
+        assert_eq!(content, "hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_append_text_appends_to_existing_file() {
+        let path = create_and_write("hello").await.expect("create ok");
+        append_text(&path, " world").await.expect("append ok");
+        let content = std::fs::read_to_string(&path).expect("read ok");
+        assert_eq!(content, "hello world");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_append_text_missing_file_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such.log");
+        let res = append_text(&missing, "x").await;
+        assert!(matches!(res, Err(ExecutionError::Unknown(_))));
+    }
+
+    // ── execute_shell_with_capture (real shell, same approach as existing env module tests) ──
+
+    #[tokio::test]
+    async fn test_execute_capture_basic_echo() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let res = execute_shell_with_capture(&env, "echo hello", &default_options())
+            .await
+            .expect("capture ok");
+        assert_eq!(res.output, "hello\n");
+        assert_eq!(res.exit_code, Some(0));
+        assert!(!res.cancelled);
+        assert!(!res.truncated);
+        assert!(res.full_output_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_nonzero_exit_code() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let res = execute_shell_with_capture(&env, "exit 3", &default_options())
+            .await
+            .expect("capture ok");
+        assert_eq!(res.exit_code, Some(3));
+        assert!(!res.cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_merges_stdout_and_stderr() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let res =
+            execute_shell_with_capture(&env, "echo to-out; echo to-err >&2", &default_options())
+                .await
+                .expect("capture ok");
+        assert!(res.output.contains("to-out"));
+        assert!(res.output.contains("to-err"));
+        assert_eq!(res.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_strips_carriage_returns() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let res = execute_shell_with_capture(&env, "printf 'a\\r\\nb\\r\\n'", &default_options())
+            .await
+            .expect("capture ok");
+        assert_eq!(res.output, "a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_on_chunk_receives_sanitized_chunks() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let received = Arc::new(Mutex::new(String::new()));
+        let got = received.clone();
+        let opts = ShellCaptureOptions {
+            on_chunk: Arc::new(move |s: &str| got.lock().unwrap().push_str(s)),
+            ..default_options()
+        };
+        let res = execute_shell_with_capture(&env, "echo hello", &opts)
+            .await
+            .expect("capture ok");
+        assert_eq!(*received.lock().unwrap(), "hello\n");
+        assert_eq!(res.output, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_precancelled_returns_cancelled() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let ct = CancellationToken::new();
+        ct.cancel();
+        let opts = ShellCaptureOptions {
+            cancellation: Some(ct),
+            ..default_options()
+        };
+        let res = execute_shell_with_capture(&env, "echo hello", &opts)
+            .await
+            .expect("capture ok (cancelled is not an error)");
+        assert!(res.cancelled);
+        assert_eq!(res.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_large_output_spills_to_file() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let res = execute_shell_with_capture(&env, "yes line | head -n 15000", &default_options())
+            .await
+            .expect("capture ok");
+        assert!(res.truncated);
+        let path = res.full_output_path.as_ref().expect("spilled path");
+        let full = std::fs::read_to_string(path).expect("read full output");
+        assert!(full.lines().count() > 10_000);
+        assert!(res.output.lines().count() <= DEFAULT_MAX_LINES);
+        assert!(res.output.len() < full.len());
+        let _ = std::fs::remove_file(path);
+    }
+}

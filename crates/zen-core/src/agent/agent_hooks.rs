@@ -531,7 +531,9 @@ mod tests {
 
     impl std::fmt::Debug for MockTool {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("MockTool").field("name", &self.name).finish()
+            f.debug_struct("MockTool")
+                .field("name", &self.name)
+                .finish()
         }
     }
 
@@ -571,7 +573,10 @@ mod tests {
         fn label(&self) -> &str {
             "Mock"
         }
-        fn prepare_arguments(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        fn prepare_arguments(
+            &self,
+            args: &serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
             if self.fail_prepare {
                 Err(ToolError::InvalidArguments("bad args".into()))
             } else {
@@ -753,7 +758,10 @@ mod tests {
         assert_eq!(result.message.tool_call_id, "call-1");
         assert_eq!(result.message.tool_name, "bash");
         assert_eq!(result.message.content.len(), 1);
-        assert_eq!(block_text(&result.message.content[0]), "something went wrong");
+        assert_eq!(
+            block_text(&result.message.content[0]),
+            "something went wrong"
+        );
     }
 
     #[test]
@@ -947,7 +955,11 @@ mod tests {
     #[tokio::test]
     async fn test_fail_truncated_multiple_tools() {
         let hooks = MockHooks::new();
-        let calls = [dummy_tool_call("bash"), dummy_tool_call("read"), dummy_tool_call("write")];
+        let calls = [
+            dummy_tool_call("bash"),
+            dummy_tool_call("read"),
+            dummy_tool_call("write"),
+        ];
         let (msgs, terminate) = fail_tool_calls_from_truncated_message(&calls, &hooks).await;
 
         assert_eq!(msgs.len(), 3);

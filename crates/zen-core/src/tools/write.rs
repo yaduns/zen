@@ -205,15 +205,13 @@ async fn write_file(
     // Create parent directories (if they don't exist)
     if let Some(parent) = absolute_path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| {
-                    ToolError::Execution(format!(
-                        "Failed to create parent directory '{}': {}",
-                        parent.display(),
-                        e
-                    ))
-                })?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "Failed to create parent directory '{}': {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
         }
     }
 
@@ -387,8 +385,14 @@ mod tests {
         assert!(params["properties"]["path"].is_object());
         assert!(params["properties"]["content"].is_object());
         assert_eq!(params["required"].as_array().unwrap().len(), 2);
-        assert!(params["required"].as_array().unwrap().contains(&json!("path")));
-        assert!(params["required"].as_array().unwrap().contains(&json!("content")));
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("path")));
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("content")));
     }
 
     #[test]
@@ -423,11 +427,7 @@ mod tests {
         let tool = WriteTool::new();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let ctx = ToolContext::new(
-            std::path::PathBuf::from("/tmp"),
-            None,
-            None,
-        );
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"), None, None);
         let params = json!({
             "path": "test.txt",
             "content": "hello"
@@ -444,11 +444,7 @@ mod tests {
     async fn test_execute_missing_path() {
         let tool = WriteTool::new();
         let cancel = CancellationToken::new();
-        let ctx = ToolContext::new(
-            std::path::PathBuf::from("/tmp"),
-            None,
-            None,
-        );
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"), None, None);
         let params = json!({
             "content": "hello"
         });
@@ -462,11 +458,7 @@ mod tests {
     async fn test_execute_missing_content() {
         let tool = WriteTool::new();
         let cancel = CancellationToken::new();
-        let ctx = ToolContext::new(
-            std::path::PathBuf::from("/tmp"),
-            None,
-            None,
-        );
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"), None, None);
         let params = json!({
             "path": "test.txt"
         });
@@ -533,17 +525,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("output.txt");
         let file_path_str = file_path.to_string_lossy().to_string();
-        let ctx = ToolContext::new(
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let ctx = ToolContext::new(dir.path().to_path_buf(), None, None);
         let params = json!({
             "path": "output.txt",
             "content": "file content"
         });
         let result = tool
-            .execute("call-1", &params, &ctx, &CancellationToken::new(), Box::new(|_| {}))
+            .execute(
+                "call-1",
+                &params,
+                &ctx,
+                &CancellationToken::new(),
+                Box::new(|_| {}),
+            )
             .await
             .unwrap();
         assert!(!result.terminate);
