@@ -18,6 +18,7 @@ unicode-normalization = { workspace = true }
 similar = { workspace = true }
 chrono = { workspace = true }
 ignore = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
