@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::tool::Tool;
 
 /// Reason the LLM response terminated, used to decide the agent loop's next action
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,16 +299,23 @@ pub enum ErrorStopReason {
     Error,
 }
 
-/// Full context for an LLM call, including system prompt, message history, and tool definitions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Full context for an LLM call: system prompt, message history, and executable tools.
+///
+/// `tools` holds the **executable tools** (single source of truth, aligned with Pi's `AgentContext.tools`):
+/// - Execution side (agent loop) looks up and runs tools by name from `context.tools`;
+/// - Tool schemas sent to the LLM (`ToolDefinition`) are derived at the request boundary (`openai_stream`)
+///   via `to_opai_definition()`; not pre-serialized here.
+///
+/// Not `Serialize`/`Deserialize`: Context is an in-memory structure (`Arc<dyn Tool>` is not serializable);
+/// serialization happens at request construction — consistent with Pi's `AgentContext`.
+#[derive(Debug, Clone)]
 pub struct Context {
     /// System prompt
     pub system_prompt: Option<String>,
     /// Message history
     pub messages: Vec<Message>,
-    /// List of tool definitions
-    pub tools: Option<Vec<ToolDefinition>>,
+    /// List of executable tools (single source of truth)
+    pub tools: Option<Vec<Arc<dyn Tool>>>,
 }
 
 /// Tool definition, conforming to the tool object format of the OpenAI Chat Completions API.

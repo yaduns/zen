@@ -185,7 +185,6 @@ async fn real_test_multi_tool_chain() {
         &hooks,
         &cancel,
         stream_fn.clone(),
-        &tools,
         &ToolContext::new(project_root.clone(), None, None),
     )
     .await;
@@ -438,7 +437,6 @@ async fn real_test_tools_list_directory() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(project_root.clone(), None, None),
     )
     .await;

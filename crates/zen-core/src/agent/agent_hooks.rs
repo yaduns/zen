@@ -179,14 +179,15 @@ pub(crate) async fn prepare_tool_call(
     context: &Context,
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
-    tools: &[Arc<dyn Tool>],
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
 ) -> Result<PreparedToolCall, ToolExecutionResult> {
-    // 1. Find the tool by name
-    let tool = tools
-        .iter()
-        .find(|t| t.name() == tool_call.name)
+    // 1. Look up tools by name (single source of truth `context.tools`, aligned with Pi's `currentContext.tools?.find`)
+    let tool = context
+        .tools
+        .as_ref()
+        .and_then(|ts| ts.iter().find(|t| t.name() == tool_call.name))
+        .cloned()
         .ok_or_else(|| {
             error_tool_result(tool_call, format!("Tool {} not found", tool_call.name))
         })?;
@@ -234,7 +235,7 @@ pub(crate) async fn prepare_tool_call(
     // 7. Return the preprocessed tool call
     Ok(PreparedToolCall {
         tool_call: tool_call.clone(),
-        tool: Arc::clone(tool),
+        tool,
         args,
     })
 }
@@ -719,6 +720,15 @@ mod tests {
         }
     }
 
+    /// Build a context with a tool list (used by prepare_tool_call tests).
+    fn dummy_context_with_tools(tools: Vec<Arc<dyn Tool>>) -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: Some(tools),
+        }
+    }
+
     // ─── AgentLoopError tests ────────────────────────────────────────────
 
     #[test]
@@ -781,10 +791,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = prepare_tool_call(
-            &dummy_context(),
+            &dummy_context_with_tools(tools.to_vec()),
             &dummy_assistant_message(),
             &dummy_tool_call("bash"),
-            &tools,
             &hooks,
             &cancel,
         )
@@ -804,10 +813,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = prepare_tool_call(
-            &dummy_context(),
+            &dummy_context_with_tools(tools.to_vec()),
             &dummy_assistant_message(),
             &dummy_tool_call("nonexistent"),
-            &tools,
             &hooks,
             &cancel,
         )
@@ -827,10 +835,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = prepare_tool_call(
-            &dummy_context(),
+            &dummy_context_with_tools(tools.to_vec()),
             &dummy_assistant_message(),
             &dummy_tool_call("bash"),
-            &tools,
             &hooks,
             &cancel,
         )
@@ -849,10 +856,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = prepare_tool_call(
-            &dummy_context(),
+            &dummy_context_with_tools(tools.to_vec()),
             &dummy_assistant_message(),
             &dummy_tool_call("bash"),
-            &tools,
             &hooks,
             &cancel,
         )
@@ -885,10 +891,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = prepare_tool_call(
-            &dummy_context(),
+            &dummy_context_with_tools(tools.to_vec()),
             &dummy_assistant_message(),
             &dummy_tool_call("bash"),
-            &tools,
             &BlockNoReason,
             &cancel,
         )
@@ -908,10 +913,9 @@ mod tests {
         cancel.cancel();
 
         let result = prepare_tool_call(
-            &dummy_context(),
+            &dummy_context_with_tools(tools.to_vec()),
             &dummy_assistant_message(),
             &dummy_tool_call("bash"),
-            &tools,
             &hooks,
             &cancel,
         )

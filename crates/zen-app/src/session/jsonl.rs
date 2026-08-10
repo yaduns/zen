@@ -7,7 +7,7 @@ use zen_core::session::tree::SessionTreeEntry;
 /// First line of the JSONL file, identifying session metadata. Contains session ID, creation timestamp, working directory, parent session path (for fork tracking), and arbitrary metadata
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionHeader {
+pub struct SessionHeader {
     /// Fixed to "session", used for format discrimination
     #[serde(rename = "type")]
     ty: String,
@@ -27,7 +27,7 @@ pub(crate) struct SessionHeader {
 
 /// Metadata summary of the session list, read from SessionHeader.
 /// Used as the return value of SessionManager::list_sessions(); not written directly to the JSONL file (constructed after reading from the header).
-pub(crate) struct JsonlSessionMetadata {
+pub struct JsonlSessionMetadata {
     /// Session ID
     id: String,
     /// ISO 8601 creation timestamp
@@ -44,7 +44,7 @@ pub(crate) struct JsonlSessionMetadata {
 
 /// Error types that can occur during JSONL persistence operations. Derived via thiserror, covering file I/O errors, format errors, entry parsing errors, etc.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum JsonlError {
+pub enum JsonlError {
     #[error("I/O error: {0}")]
     Io(std::io::Error),
     #[error("invalid session metadata: {0}")]
@@ -58,7 +58,9 @@ pub(crate) enum JsonlError {
 }
 
 /// Position where entries are included when forking.
-enum ForkPosition {
+///
+/// Exposed to callers (SessionManager / integration tests) so `get_entries_to_fork` can specify the branch split point.
+pub enum ForkPosition {
     /// Before the target entry (excluding it; requires the target entry to be a UserMessage)
     Before,
     /// Starting from the target entry (inclusive)

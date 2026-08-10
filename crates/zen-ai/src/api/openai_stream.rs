@@ -467,12 +467,12 @@ fn build_request_body(
         messages.push(convert_message(msg));
     }
 
-    // Tool definitions: only set when non-empty
+    // Tool definitions: only set when non-empty (schema derived from executable tools at the request boundary, aligned with Pi's convertTools)
     let tools = context.tools.as_ref().and_then(|ts| {
         if ts.is_empty() {
             None
         } else {
-            Some(ts.clone())
+            Some(ts.iter().map(|t| t.to_api_definition()).collect())
         }
     });
 
@@ -1420,6 +1420,40 @@ mod tests {
         }
     }
 
+    /// Minimal test Tool: `to_api_definition()` uses the default implementation (assembles name/description/parameters).
+    #[derive(Debug)]
+    struct MockTool {
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for MockTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.description
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.parameters
+        }
+        fn label(&self) -> &str {
+            self.name
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _args: &serde_json::Value,
+            _ctx: &crate::tool::ToolContext,
+            _cancel: &tokio_util::sync::CancellationToken,
+            _on_update: crate::tool::ToolUpdateCallback,
+        ) -> Result<crate::tool::ToolExecutionResult, crate::tool::ToolError> {
+            unimplemented!("test mock")
+        }
+    }
+
     fn sample_context() -> Context {
         Context {
             system_prompt: Some("You are a helpful assistant.".into()),
@@ -1452,24 +1486,23 @@ mod tests {
                 content: ContentBlockList::Text("list files".into()),
                 timestamp: 0,
             })],
-            tools: Some(vec![ToolDefinition {
-                type_: "function".into(),
-                function: ToolFunction {
-                    name: "bash".into(),
-                    description: "run a shell command".into(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "command": { "type": "string" }
-                        }
-                    }),
-                },
-            }]),
+            tools: Some(vec![std::sync::Arc::new(MockTool {
+                name: "bash",
+                description: "run a shell command",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    }
+                }),
+            })]),
         };
         let req = build_request_body(&model, &ctx, Some(&ToolChoice::Auto), None);
         assert_eq!(req.messages.len(), 1);
         assert!(req.tools.is_some());
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        // Request-boundary tool definitions are derived from executable tools' to_api_definition()
+        assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "bash");
         assert_eq!(req.tool_choice, Some(ToolChoice::Auto));
     }
 

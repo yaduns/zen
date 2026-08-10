@@ -32,13 +32,16 @@ pub fn create_context(
     Context {
         system_prompt: Some(system_prompt),
         messages,
-        tools: Some(tools_to_definitions(tools)),
+        // Store executable tools (single source, aligned with Pi's `AgentContext.tools`):
+        // The schema serialized for the LLM is derived at the request boundary (openai_stream).
+        tools: Some(tools.to_vec()),
     }
 }
 
 /// Converts a slice of `Tool` trait objects into a list of `ToolDefinition`s.
 ///
-/// Used internally by `create_context`; also exposed separately for other scenarios (e.g. tool list preview).
+/// Used at the request boundary (`openai_stream` builds requests) and for tool-list previews, etc.
+/// Corresponds to Pi's `convertTools`—serialization only happens at request construction.
 ///
 /// # Parameters
 /// - `tools`: runtime tool list
@@ -189,7 +192,7 @@ mod tests {
         assert_eq!(ctx.messages, msgs);
         assert!(ctx.tools.is_some());
         assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
-        assert_eq!(ctx.tools.as_ref().unwrap()[0].function.name, "bash");
+        assert_eq!(ctx.tools.as_ref().unwrap()[0].name(), "bash");
     }
 
     #[test]
@@ -250,9 +253,9 @@ mod tests {
 
         let defs = ctx.tools.unwrap();
         assert_eq!(defs.len(), 3);
-        assert_eq!(defs[0].function.name, "bash");
-        assert_eq!(defs[1].function.name, "read");
-        assert_eq!(defs[2].function.name, "edit");
+        assert_eq!(defs[0].name(), "bash");
+        assert_eq!(defs[1].name(), "read");
+        assert_eq!(defs[2].name(), "edit");
     }
 
     #[test]
@@ -267,6 +270,6 @@ mod tests {
         // tool list is not consumed
         assert_eq!(tools.len(), 1);
         assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
-        assert_eq!(ctx.tools.as_ref().unwrap()[0].function.name, "bash");
+        assert_eq!(ctx.tools.as_ref().unwrap()[0].name(), "bash");
     }
 }

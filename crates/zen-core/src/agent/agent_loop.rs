@@ -7,9 +7,8 @@ use crate::agent::types::{
     AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamFn,
     ToolExecutionMode,
 };
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolContext};
+use zen_ai::tool::ToolContext;
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, StopReason, ToolCall,
     ToolResultMessage, Usage,
@@ -45,7 +44,6 @@ pub async fn run_agent_loop(
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
     stream_fn: StreamFn,
-    tools: &[Arc<dyn Tool>],
     tool_ctx: &ToolContext,
 ) -> Vec<Message> {
     // 1. Empty prompts → no-op
@@ -80,7 +78,6 @@ pub async fn run_agent_loop(
         hooks,
         cancel,
         stream_fn,
-        tools,
         tool_ctx,
         &mut new_messages,
     )
@@ -144,7 +141,6 @@ pub async fn run_agent_loop_continue(
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
     stream_fn: StreamFn,
-    tools: &[Arc<dyn Tool>],
     tool_ctx: &ToolContext,
 ) -> Result<Vec<Message>, AgentLoopError> {
     // 1. Validate: context must not be empty and last message must not be assistant
@@ -167,7 +163,6 @@ pub async fn run_agent_loop_continue(
         hooks,
         cancel,
         stream_fn,
-        tools,
         tool_ctx,
         &mut new_messages,
     )
@@ -360,7 +355,6 @@ async fn agent_loop_inner(
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
     stream_fn: StreamFn,
-    tools: &[Arc<dyn Tool>],
     tool_ctx: &ToolContext,
     new_messages: &mut Vec<Message>,
 ) {
@@ -405,16 +399,7 @@ async fn agent_loop_inner(
         let (tool_results, terminate) = if assistant_msg.stop_reason == StopReason::Length {
             fail_tool_calls_from_truncated_message(&tool_calls, hooks).await
         } else {
-            execute_tool_calls(
-                context,
-                &assistant_msg,
-                tools,
-                config,
-                hooks,
-                cancel,
-                tool_ctx,
-            )
-            .await
+            execute_tool_calls(context, &assistant_msg, config, hooks, cancel, tool_ctx).await
         };
 
         // Inject tool results into context
@@ -525,7 +510,6 @@ async fn agent_loop_inner(
 pub(crate) async fn execute_tool_calls(
     context: &mut Context,
     assistant_message: &AssistantMessage,
-    tools: &[Arc<dyn Tool>],
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
@@ -553,7 +537,6 @@ pub(crate) async fn execute_tool_calls(
                 context,
                 assistant_message,
                 &tool_calls,
-                tools,
                 config,
                 hooks,
                 cancel,
@@ -566,7 +549,6 @@ pub(crate) async fn execute_tool_calls(
                 context,
                 assistant_message,
                 &tool_calls,
-                tools,
                 config,
                 hooks,
                 cancel,
@@ -582,7 +564,6 @@ pub(crate) async fn execute_tool_calls_sequential(
     context: &mut Context,
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
-    tools: &[Arc<dyn Tool>],
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
@@ -608,7 +589,7 @@ pub(crate) async fn execute_tool_calls_sequential(
 
         // Preprocessing
         let preparation =
-            prepare_tool_call(context, assistant_message, tool_call, tools, hooks, cancel).await;
+            prepare_tool_call(context, assistant_message, tool_call, hooks, cancel).await;
 
         let finalized = match preparation {
             Err(err_result) => FinalizedToolCallOutcome {
@@ -655,7 +636,6 @@ pub(crate) async fn execute_tool_calls_parallel(
     context: &mut Context,
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
-    tools: &[Arc<dyn Tool>],
     config: &AgentLoopConfig,
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
@@ -676,7 +656,7 @@ pub(crate) async fn execute_tool_calls_parallel(
 
         // Preprocessing
         let preparation =
-            prepare_tool_call(context, assistant_message, tool_call, tools, hooks, cancel).await;
+            prepare_tool_call(context, assistant_message, tool_call, hooks, cancel).await;
 
         let finalized = match preparation {
             Err(err_result) => FinalizedToolCallOutcome {

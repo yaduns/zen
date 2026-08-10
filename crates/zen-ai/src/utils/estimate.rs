@@ -114,13 +114,14 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
         let added_tool_tokens = if added_names.is_empty() {
             0
         } else {
-            let new_tools: Vec<&ToolDefinition> = context
+            let new_tools: Vec<ToolDefinition> = context
                 .tools
                 .as_ref()
                 .map(|tools| {
                     tools
                         .iter()
-                        .filter(|t| added_names.contains(&t.function.name))
+                        .filter(|t| added_names.contains(t.name()))
+                        .map(|t| t.to_api_definition())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -153,7 +154,11 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
                 if tools.is_empty() {
                     0
                 } else {
-                    let json = serde_json::to_string(tools).unwrap_or_default();
+                    let definitions: Vec<ToolDefinition> = tools
+                        .iter()
+                        .map(|t| t.to_api_definition())
+                        .collect();
+                    let json = serde_json::to_string(&definitions).unwrap_or_default();
                     estimate_text_tokens(&json)
                 }
             })
@@ -229,6 +234,40 @@ mod tests {
         ToolResultMessage, UserMessage,
     };
     use serde_json::json;
+
+    /// Minimal Tool for testing (to_api_definition uses the default implementation).
+    #[derive(Debug)]
+    struct MockTool {
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for MockTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.description
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.parameters
+        }
+        fn label(&self) -> &str {
+            self.name
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _args: &serde_json::Value,
+            _ctx: &crate::tool::ToolContext,
+            _cancel: &tokio_util::sync::CancellationToken,
+            _on_update: crate::tool::ToolUpdateCallback,
+        ) -> Result<crate::tool::ToolExecutionResult, crate::tool::ToolError> {
+            unimplemented!("test mock")
+        }
+    }
 
     // ── calculate_context_tokens ────────────────────────────────
 
@@ -657,16 +696,11 @@ mod tests {
                     timestamp: 1000,
                 }),
             ],
-            tools: Some(vec![
-                ToolDefinition {
-                    type_: "function".to_string(),
-                    function: ToolFunction {
-                        name: "read".to_string(),
-                        description: "Read a file".to_string(),
-                        parameters: json!({"type": "object", "properties": {}}),
-                    },
-                },
-            ]),
+            tools: Some(vec![std::sync::Arc::new(MockTool {
+                name: "read",
+                description: "Read a file",
+                parameters: json!({"type": "object", "properties": {}}),
+            })]),
         };
         let result = estimate_context_tokens(&context);
         // No usage -> prefix = system_prompt + tools + messages

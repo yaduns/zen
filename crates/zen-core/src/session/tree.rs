@@ -214,7 +214,10 @@ impl SessionTreeEntry {
 /// The caller (zen-app's SessionManager) is responsible for persisting after modifications.
 impl SessionTree {
     /// Create a new session tree containing the given entries and leaf node IDs.
-    pub(crate) fn new(entries: Vec<SessionTreeEntry>, leaf_id: Option<String>) -> Self {
+    ///
+    /// Public for zen-app (SessionManager/integration tests):
+    /// Rebuild the tree after reading entries and last_leaf_id back from JSONL.
+    pub fn new(entries: Vec<SessionTreeEntry>, leaf_id: Option<String>) -> Self {
         SessionTree { entries, leaf_id }
     }
 

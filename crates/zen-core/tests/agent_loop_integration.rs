@@ -321,7 +321,6 @@ async fn mock_test_empty_prompts() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
@@ -345,7 +344,6 @@ async fn mock_test_stream_error() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
@@ -379,7 +377,6 @@ async fn mock_test_cancellation() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
@@ -405,7 +402,7 @@ async fn mock_test_create_context_and_loop() {
     );
     assert!(ctx.tools.is_some());
     assert_eq!(ctx.tools.as_ref().unwrap().len(), 1);
-    assert_eq!(ctx.tools.as_ref().unwrap()[0].function.name, "bash");
+    assert_eq!(ctx.tools.as_ref().unwrap()[0].name(), "bash");
 
     let stream_fn = mock_text_stream_fn("I understand.", StopReason::Stop);
 
@@ -416,7 +413,6 @@ async fn mock_test_create_context_and_loop() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
@@ -445,7 +441,6 @@ async fn mock_test_text_response_no_tool_calls() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
@@ -513,7 +508,6 @@ async fn mock_test_tool_call_execution() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
@@ -596,7 +590,6 @@ async fn real_test_agent_loop_simple_chat() {
         &hooks,
         &cancel,
         stream_fn,
-        &tools,
         &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
