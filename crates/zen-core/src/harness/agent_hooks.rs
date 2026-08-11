@@ -2,7 +2,7 @@
 //!
 //! REQ-AGENT-01 (pi-202): hook definitions split out from agent_loop.rs.
 
-use crate::agent::types::{
+use crate::harness::types::{
     AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentLoopTurnUpdate,
     BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
     ShouldStopAfterTurnContext,

@@ -17,12 +17,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext};
 use zen_ai::types::{ContentBlock, ContentBlockList, Context, Message, Model, UserMessage};
-use zen_core::agent::agent_hooks::AgentLoopHooks;
-use zen_core::agent::agent_loop::run_agent_loop;
-use zen_core::agent::types::{
+use zen_core::harness::agent_hooks::AgentLoopHooks;
+use zen_core::harness::agent_loop::run_agent_loop;
+use zen_core::harness::context::create_context;
+use zen_core::harness::types::{
     AgentEvent, AgentLoopConfig, ShouldStopAfterTurnContext, StreamFn, ToolExecutionMode,
 };
-use zen_core::harness::context::create_context;
 use zen_core::skills::format::format_skills_for_system_prompt;
 use zen_core::skills::load::load_skills;
 

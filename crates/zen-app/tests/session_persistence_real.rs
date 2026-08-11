@@ -22,12 +22,12 @@ use zen_app::session::jsonl::{
     append_entry, create_session_file, create_session_id, create_timestamp, get_entries_to_fork,
     read_session_file, CreateSessionOptions, ForkPosition,
 };
-use zen_core::agent::agent_hooks::AgentLoopHooks;
-use zen_core::agent::agent_loop::run_agent_loop;
-use zen_core::agent::types::{
+use zen_core::harness::agent_hooks::AgentLoopHooks;
+use zen_core::harness::agent_loop::run_agent_loop;
+use zen_core::harness::context::create_context;
+use zen_core::harness::types::{
     AgentEvent, AgentLoopConfig, ShouldStopAfterTurnContext, StreamFn, ToolExecutionMode,
 };
-use zen_core::harness::context::create_context;
 use zen_core::session::context::build_context;
 use zen_core::session::tree::{SessionTree, SessionTreeEntry};
 

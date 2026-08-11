@@ -5,7 +5,7 @@
 //! `ToolDefinition` struct lives in `types.rs` alongside `Context`.
 //!
 //! REQ-AGENT-02 (pi-210): Tool trait, merged from zen_ai::types::ToolDefinition (data
-//! struct) and zen_core::agent::types::AgentTool (trait, eliminated).
+//! struct) and zen_core::harness::types::AgentTool (trait, eliminated).
 
 use crate::types::{ToolDefinition, ToolFunction, ToolResultMessage};
 use async_trait::async_trait;
@@ -170,7 +170,7 @@ impl From<Vec<Arc<dyn Tool>>> for ToolRegistry {
 
 /// Runtime tool definition, containing the tool's metadata, parameter schema, and execution logic.
 ///
-/// Merges the former `zen_ai::types::ToolDefinition` (data struct) and `zen_core::agent::types::AgentTool` (trait, now removed).
+/// Merges the former `zen_ai::types::ToolDefinition` (data struct) and `zen_core::harness::types::AgentTool` (trait, now removed).
 /// All tools (bash/read/write/edit etc.) implement this trait.
 ///
 /// Contract (inherits Pi's original constraints):

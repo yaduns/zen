@@ -16,10 +16,10 @@ use zen_ai::types::{
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ToolCall,
     ToolResultMessage, Usage, UserMessage,
 };
-use zen_core::agent::agent_hooks::AgentLoopHooks;
-use zen_core::agent::agent_loop::run_agent_loop;
-use zen_core::agent::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
+use zen_core::harness::agent_hooks::AgentLoopHooks;
+use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
+use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Mock helpers

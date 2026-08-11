@@ -18,11 +18,11 @@ use zen_ai::tool::{Tool, ToolContext};
 use zen_ai::types::{
     ContentBlock, ContentBlockList, Context, Message, Model, StopReason, ToolResultMessage, Usage,
 };
-use zen_core::agent::agent_hooks::AgentLoopHooks;
-use zen_core::agent::agent_loop::run_agent_loop;
-use zen_core::agent::types::ShouldStopAfterTurnContext;
-use zen_core::agent::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
+use zen_core::harness::agent_hooks::AgentLoopHooks;
+use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
+use zen_core::harness::types::ShouldStopAfterTurnContext;
+use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
 use zen_core::tools::create_coding_tools;
 
 // ─── Mock Hooks ──────────────────────────────────────────────────

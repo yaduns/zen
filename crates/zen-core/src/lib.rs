@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod env;
 pub mod harness;
 pub mod session;

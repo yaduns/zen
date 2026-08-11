@@ -1,4 +1,4 @@
-use crate::agent::types::AgentEvent;
+use crate::harness::types::AgentEvent;
 use std::collections::HashSet;
 use zen_ai::types::Message;
 
@@ -220,7 +220,7 @@ impl AgentRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::types::AgentEvent;
+    use crate::harness::types::AgentEvent;
     use serde_json::json;
     use zen_ai::types::{
         AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Cost, Message,

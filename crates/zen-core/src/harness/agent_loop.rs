@@ -1,9 +1,9 @@
-use crate::agent::agent_hooks::{
+use crate::harness::agent_hooks::{
     execute_prepared_tool_call, fail_tool_calls_from_truncated_message,
     finalize_executed_tool_call, prepare_tool_call, AgentLoopError, AgentLoopHooks,
     FinalizedToolCallOutcome,
 };
-use crate::agent::types::{
+use crate::harness::types::{
     AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamFn,
     ToolExecutionMode,
 };
@@ -705,7 +705,7 @@ fn should_terminate_tool_batch(finalized_calls: &[FinalizedToolCallOutcome]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::agent_hooks::FinalizedToolCallOutcome;
+    use crate::harness::agent_hooks::FinalizedToolCallOutcome;
     use zen_ai::tool::ToolExecutionResult;
     use zen_ai::types::{ToolCall, ToolResultMessage, Usage};
 
