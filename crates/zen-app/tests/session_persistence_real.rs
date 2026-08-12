@@ -12,22 +12,19 @@
 //! cargo test -p zen-app --test session_persistence_real -- --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolContext};
-use zen_ai::types::{ContentBlock, ContentBlockList, Context, Message, Model, UserMessage};
+use zen_ai::tool::ToolExecutionMode;
+use zen_ai::types::{ContentBlock, Context, Message, Model, ThinkingLevel};
 use zen_app::session::jsonl::{
     append_entry, create_session_file, create_session_id, create_timestamp, get_entries_to_fork,
     read_session_file, CreateSessionOptions, ForkPosition,
 };
 use zen_core::harness::agent_hooks::AgentLoopHooks;
-use zen_core::harness::agent_loop::run_agent_loop;
-use zen_core::harness::context::create_context;
-use zen_core::harness::types::{
-    AgentEvent, AgentLoopConfig, ShouldStopAfterTurnContext, StreamFn, ToolExecutionMode,
-};
+use zen_core::harness::engine::Agent;
+use zen_core::harness::types::{AgentEvent, AgentState, ShouldStopAfterTurnContext, StreamFn};
 use zen_core::session::context::build_context;
 use zen_core::session::tree::{SessionTree, SessionTreeEntry};
 
@@ -81,11 +78,21 @@ fn real_stream_fn() -> StreamFn {
     )
 }
 
-fn user_message(text: &str) -> Message {
-    Message::User(UserMessage {
-        content: ContentBlockList::Text(text.to_string()),
-        timestamp: 1000,
-    })
+/// Build an AgentState for engine tests (empty tools; fixed system_prompt, messages is the restored history).
+///
+/// The engine's `Agent::prompt` creates a `Context` on the fly from the state (`create_context`) and drives the low-level loop.
+fn agent_state(system_prompt: &str, history: Vec<Message>) -> AgentState {
+    AgentState {
+        system_prompt: system_prompt.to_string(),
+        model: Model::from_env().with_env_overrides(),
+        thinking_level: ThinkingLevel::Off,
+        tools: vec![],
+        messages: history,
+        is_streaming: false,
+        streaming_message: None,
+        pending_tool_calls: HashSet::new(),
+        error_message: None,
+    }
 }
 
 /// Return the plain text of the last assistant message (concatenated Text blocks).
@@ -125,39 +132,25 @@ fn messages_to_entries(messages: &[Message]) -> Vec<SessionTreeEntry> {
     entries
 }
 
-/// Runs one real LLM turn with `history` as existing context, appends `prompt`, and returns the newly added messages from this turn.
+/// Run one real LLM turn with `history` as the existing context, appending `prompt` (string; the Agent constructs the user message internally),
+/// and return the messages added this turn. Create a fresh Agent each turn (state.messages = restored history); no reuse across turns.
 async fn run_turn_with_history(
     base_prompt: &str,
     history: Vec<Message>,
-    prompt: Message,
+    prompt: &str,
 ) -> Vec<Message> {
-    let hooks = MockHooks::new().with_max_turns(3);
-    let cancel = CancellationToken::new();
-    let tools: Vec<Arc<dyn Tool>> = Vec::new();
-    let model = Model::from_env().with_env_overrides();
-    let mut ctx = create_context(base_prompt.to_string(), history, &tools);
-    let config = AgentLoopConfig {
-        model: model.clone(),
-        api_key: None,
-        tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: Some(128),
-        temperature: Some(0.0),
-    };
-    let stream_fn = real_stream_fn();
-    run_agent_loop(
-        vec![prompt],
-        &mut ctx,
-        &config,
-        &hooks,
-        &cancel,
-        stream_fn,
-        &ToolContext::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), None, None),
-    )
-    .await
+    let mut agent = Agent::new(
+        agent_state(base_prompt, history),
+        ToolExecutionMode::Sequential,
+        Arc::new(MockHooks::new().with_max_turns(3)),
+        real_stream_fn(),
+        CancellationToken::new(),
+    );
+    agent.prompt(prompt).await
 }
 
 /// Run one round with a real LLM on empty history.
-async fn run_turn(base_prompt: &str, prompt: Message) -> Vec<Message> {
+async fn run_turn(base_prompt: &str, prompt: &str) -> Vec<Message> {
     run_turn_with_history(base_prompt, Vec::new(), prompt).await
 }
 
@@ -188,7 +181,7 @@ async fn real_test_session_persist_recover_continuity() {
     // ── Round 1: establish session history (remember the passphrase) ──
     let turn1 = run_turn(
         base_prompt,
-        user_message("Remember the codeword ORANGE. Reply with only the word 'remembered'."),
+        "Remember the codeword ORANGE. Reply with only the word 'remembered'.",
     )
     .await;
     let t1_text = last_assistant_text(&turn1);
@@ -242,7 +235,7 @@ async fn real_test_session_persist_recover_continuity() {
     let turn2 = run_turn_with_history(
         base_prompt,
         session_ctx.messages.clone(),
-        user_message("What is the codeword?"),
+        "What is the codeword?",
     )
     .await;
     let t2_text = last_assistant_text(&turn2);
@@ -274,7 +267,7 @@ async fn real_test_session_fork_roundtrip() {
     // Round 1: remember ORANGE
     let turn1 = run_turn(
         base_prompt,
-        user_message("Remember the codeword ORANGE. Reply with only the word 'remembered'."),
+        "Remember the codeword ORANGE. Reply with only the word 'remembered'.",
     )
     .await;
 
@@ -282,9 +275,7 @@ async fn real_test_session_fork_roundtrip() {
     let turn2 = run_turn_with_history(
         base_prompt,
         turn1.clone(),
-        user_message(
-            "Now also remember the codeword PURPLE. Reply with only the word 'remembered'.",
-        ),
+        "Now also remember the codeword PURPLE. Reply with only the word 'remembered'.",
     )
     .await;
 
@@ -336,7 +327,7 @@ async fn real_test_session_fork_roundtrip() {
     let turn3 = run_turn_with_history(
         base_prompt,
         fork_ctx.messages.clone(),
-        user_message("Which codeword do you remember? Name only one."),
+        "Which codeword do you remember? Name only one.",
     )
     .await;
     let t3_text = last_assistant_text(&turn3);

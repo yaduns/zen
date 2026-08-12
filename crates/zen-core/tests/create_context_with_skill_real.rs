@@ -11,18 +11,15 @@
 //! cargo test -p zen-core --test create_context_with_skill_real -- --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolContext};
-use zen_ai::types::{ContentBlock, ContentBlockList, Context, Message, Model, UserMessage};
+use zen_ai::tool::ToolExecutionMode;
+use zen_ai::types::{ContentBlock, Context, Message, Model, ThinkingLevel};
 use zen_core::harness::agent_hooks::AgentLoopHooks;
-use zen_core::harness::agent_loop::run_agent_loop;
-use zen_core::harness::context::create_context;
-use zen_core::harness::types::{
-    AgentEvent, AgentLoopConfig, ShouldStopAfterTurnContext, StreamFn, ToolExecutionMode,
-};
+use zen_core::harness::engine::Agent;
+use zen_core::harness::types::{AgentEvent, AgentState, ShouldStopAfterTurnContext, StreamFn};
 use zen_core::skills::format::format_skills_for_system_prompt;
 use zen_core::skills::load::load_skills;
 
@@ -80,11 +77,21 @@ fn real_stream_fn() -> StreamFn {
     )
 }
 
-fn user_message(text: &str) -> Message {
-    Message::User(UserMessage {
-        content: ContentBlockList::Text(text.to_string()),
-        timestamp: 1000,
-    })
+/// Build an AgentState for engine tests (empty tools, empty history; system_prompt provided by the caller).
+///
+/// The engine's `Agent::prompt` creates a `Context` on the fly from the state (`create_context`) and drives the low-level loop.
+fn agent_state(system_prompt: String) -> AgentState {
+    AgentState {
+        system_prompt,
+        model: Model::from_env().with_env_overrides(),
+        thinking_level: ThinkingLevel::Off,
+        tools: vec![],
+        messages: vec![],
+        is_streaming: false,
+        streaming_message: None,
+        pending_tool_calls: HashSet::new(),
+        error_message: None,
+    }
 }
 
 /// Return the plain text of the last assistant message (concatenated Text blocks).
@@ -163,31 +170,15 @@ async fn real_test_skills_loaded_and_followed_by_llm() {
          Follow the available skills when the task matches their description.\n\n{skills_block}"
     );
 
-    // 4) agent loop (empty tools, pure skill following)
-    let hooks = MockHooks::new().with_max_turns(3);
-    let cancel = CancellationToken::new();
-    let tools: Vec<Arc<dyn Tool>> = Vec::new();
-    let model = Model::from_env().with_env_overrides();
-    let mut ctx = create_context(system_prompt, Vec::new(), &tools);
-    let config = AgentLoopConfig {
-        model: model.clone(),
-        api_key: None,
-        tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: Some(256),
-        temperature: Some(0.0),
-    };
-    let stream_fn = real_stream_fn();
-
-    let all_messages = run_agent_loop(
-        vec![user_message("Hello! What is 2 + 2?")],
-        &mut ctx,
-        &config,
-        &hooks,
-        &cancel,
-        stream_fn,
-        &ToolContext::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), None, None),
-    )
-    .await;
+    // 4) Engine (empty tools, pure skill compliance): the Agent constructs a Context from state internally and drives the low-level loop
+    let mut agent = Agent::new(
+        agent_state(system_prompt),
+        ToolExecutionMode::Sequential,
+        Arc::new(MockHooks::new().with_max_turns(3)),
+        real_stream_fn(),
+        CancellationToken::new(),
+    );
+    let all_messages = agent.prompt("Hello! What is 2 + 2?").await;
 
     // 5) Assert: the skill end token appears in the final answer
     let final_text = last_assistant_text(&all_messages);
@@ -214,34 +205,18 @@ async fn real_test_system_prompt_constraint_honored() {
         return;
     }
 
-    let hooks = MockHooks::new().with_max_turns(3);
-    let cancel = CancellationToken::new();
-    let tools: Vec<Arc<dyn Tool>> = Vec::new();
-    let model = Model::from_env().with_env_overrides();
-    let mut ctx = create_context(
-        "Do not use any tools. Answer with exactly the single word: BANANA".to_string(),
-        Vec::new(),
-        &tools,
+    // Keep an external Arc reference to hooks to inspect events after the run (assert no tool calls)
+    let hooks = Arc::new(MockHooks::new().with_max_turns(3));
+    let mut agent = Agent::new(
+        agent_state(
+            "Do not use any tools. Answer with exactly the single word: BANANA".to_string(),
+        ),
+        ToolExecutionMode::Sequential,
+        hooks.clone(),
+        real_stream_fn(),
+        CancellationToken::new(),
     );
-    let config = AgentLoopConfig {
-        model: model.clone(),
-        api_key: None,
-        tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: Some(64),
-        temperature: Some(0.0),
-    };
-    let stream_fn = real_stream_fn();
-
-    let all_messages = run_agent_loop(
-        vec![user_message("Say hello.")],
-        &mut ctx,
-        &config,
-        &hooks,
-        &cancel,
-        stream_fn,
-        &ToolContext::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), None, None),
-    )
-    .await;
+    let all_messages = agent.prompt("Say hello.").await;
 
     // Assert: the answer contains BANANA (tolerating case/punctuation variants)
     let final_text = last_assistant_text(&all_messages);
