@@ -15,8 +15,8 @@ use zen_ai::tool::{
 };
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
-    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ToolCall,
-    ToolResultMessage, Usage, UserMessage,
+    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ThinkingLevel,
+    ToolCall, ToolResultMessage, Usage, UserMessage,
 };
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::agent_loop::run_agent_loop;
@@ -290,8 +290,7 @@ fn default_config() -> AgentLoopConfig {
         model: default_model(),
         api_key: Some("test-key".into()),
         tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: None,
-        temperature: None,
+        reasoning: None,
     }
 }
 
@@ -572,8 +571,7 @@ async fn real_test_agent_loop_simple_chat() {
         model: model.clone(),
         api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: Some(256),
-        temperature: Some(0.0),
+        reasoning: None,
     };
 
     let stream_fn = real_stream_fn();

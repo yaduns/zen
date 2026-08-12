@@ -14,12 +14,15 @@ use tokio_util::sync::CancellationToken;
 /// Optional configuration parameters for the stream() function, controlling non-functional behavior of the API call (authentication, timeouts, tool-selection policy, thinking mode, etc.).
 #[derive(Default)]
 pub struct StreamConfig {
-    api_key: Option<String>,
-    headers: Option<HashMap<String, String>>,
-    tool_choice: Option<ToolChoice>,
-    reasoning_effort: Option<ThinkingLevel>,
-    timeout_ms: Option<u64>,
-    session_id: Option<String>,
+    pub api_key: Option<String>,
+    // model is a field of AgentLoopConfig (the engine derives it from state.model each turn, see engine.rs);
+    pub headers: Option<HashMap<String, String>>,
+    pub tool_choice: Option<ToolChoice>,
+    pub reasoning_effort: Option<ThinkingLevel>,
+    pub max_tokens: Option<u64>, // Added: request-edge override bit; None = fall back to model.max_tokens
+    pub temperature: Option<f64>, // Added: None = do not send (aligned with the pi default path)
+    pub timeout_ms: Option<u64>,
+    pub session_id: Option<String>,
 }
 
 /// Error types that the stream() function may return, covering scenarios such as missing API key, HTTP request failure, API error response, SSE parsing error, incomplete stream, and user cancellation.
@@ -337,12 +340,7 @@ pub async fn stream(
         .ok_or(StreamError::NoApiKey)?;
 
     // 2. Build request body
-    let body = build_request_body(
-        model,
-        context,
-        cfg.tool_choice.as_ref(),
-        cfg.reasoning_effort,
-    );
+    let body = build_request_body(model, context, &cfg);
 
     // 3. Build HTTP request
     let client = reqwest::Client::new();
@@ -452,12 +450,7 @@ fn thinking_level_to_api_value(level: ThinkingLevel) -> Option<String> {
     }
 }
 
-fn build_request_body(
-    model: &Model,
-    context: &Context,
-    tool_choice: Option<&crate::types::ToolChoice>,
-    reasoning_effort: Option<ThinkingLevel>,
-) -> Request {
+fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> Request {
     let mut messages = Vec::new();
 
     // System prompt as the first message
@@ -485,16 +478,16 @@ fn build_request_body(
         model: model.id.clone(),
         messages,
         tools,
-        tool_choice: tool_choice.cloned(),
-        max_tokens: Some(model.max_tokens),
+        tool_choice: cfg.tool_choice.clone(),
+        max_tokens: cfg.max_tokens.or(Some(model.max_tokens)),
         stream: true,
         stream_options: Some(StreamOptionsParam {
             include_usage: true,
         }),
-        temperature: None,
+        temperature: cfg.temperature,
         top_p: None,
         stop: None,
-        reasoning_effort: reasoning_effort.and_then(thinking_level_to_api_value),
+        reasoning_effort: cfg.reasoning_effort.and_then(thinking_level_to_api_value),
     };
 
     req
@@ -1471,7 +1464,7 @@ mod tests {
     fn test_build_request_body_basic() {
         let model = sample_model();
         let ctx = sample_context();
-        let req = build_request_body(&model, &ctx, None, None);
+        let req = build_request_body(&model, &ctx, &StreamConfig::default());
         assert_eq!(req.model, "deepseek-v4-flash");
         assert_eq!(req.messages.len(), 2); // system + user
         assert!(req.stream);
@@ -1499,7 +1492,11 @@ mod tests {
                 }),
             })]),
         };
-        let req = build_request_body(&model, &ctx, Some(&ToolChoice::Auto), None);
+        let cfg = StreamConfig {
+            tool_choice: Some(ToolChoice::Auto),
+            ..Default::default()
+        };
+        let req = build_request_body(&model, &ctx, &cfg);
         assert_eq!(req.messages.len(), 1);
         assert!(req.tools.is_some());
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
@@ -1516,7 +1513,7 @@ mod tests {
             messages: vec![],
             tools: None,
         };
-        let req = build_request_body(&model, &ctx, None, None);
+        let req = build_request_body(&model, &ctx, &StreamConfig::default());
         assert_eq!(req.messages.len(), 0);
     }
 

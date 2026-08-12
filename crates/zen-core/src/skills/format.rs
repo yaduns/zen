@@ -172,5 +172,4 @@ mod tests {
         let second = out.find("<name>second</name>").unwrap();
         assert!(first < second);
     }
-
 }

@@ -173,8 +173,7 @@ async fn real_test_multi_tool_chain() {
         model: model.clone(),
         api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: Some(1024),
-        temperature: Some(0.0),
+        reasoning: None,
     };
 
     let stream_fn = real_stream_fn();
@@ -425,8 +424,7 @@ async fn real_test_tools_list_directory() {
         model: model.clone(),
         api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
-        max_tokens: Some(512),
-        temperature: Some(0.0),
+        reasoning: None,
     };
 
     let stream_fn = real_stream_fn();

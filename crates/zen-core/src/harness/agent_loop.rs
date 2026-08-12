@@ -7,13 +7,15 @@ use crate::harness::types::{
     AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamFn,
 };
 use tokio_util::sync::CancellationToken;
+use zen_ai::api::openai_stream::StreamConfig;
 use zen_ai::tool::{ToolContext, ToolExecutionMode};
 use zen_ai::types::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, StopReason, ToolCall,
-    ToolResultMessage, Usage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, StopReason,
+    ThinkingLevel, ToolCall, ToolResultMessage, Usage,
 };
 
 /// Start a new agent loop beginning with the prompt messages.
+/// For session-level use, use Agent
 ///
 /// Appends `prompts` to the end of `context`, then repeatedly runs the "LLM call → tool execution → LLM call" loop,
 /// until the LLM no longer requests tool calls or a stop condition is met. All events are sent via `hooks.on_event()`.
@@ -208,7 +210,17 @@ pub(crate) async fn stream_assistant_response(
     }
 
     // 4. Call stream_fn
-    let mut receiver = match stream_fn(&config.model, &stream_ctx, None, Some(cancel.clone())).await
+    let stream_config = StreamConfig {
+        reasoning_effort: config.reasoning, // ← from AgentLoopConfig (new field added by fix item 3)
+        ..Default::default()                // ← remaining 5 fields keep defaults
+    };
+    let mut receiver = match stream_fn(
+        &config.model,
+        &stream_ctx,
+        Some(stream_config),
+        Some(cancel.clone()),
+    )
+    .await
     {
         Ok(rx) => rx,
         Err(err) => {
@@ -336,6 +348,7 @@ async fn agent_loop_inner(
     stream_fn: StreamFn,
     new_messages: &mut Vec<Message>,
 ) {
+    let mut run_config = config.clone(); // signature stays &AgentLoopConfig unchanged; holds a mutable copy internally
     loop {
         // Check cancel signal
         if cancel.is_cancelled() {
@@ -346,7 +359,7 @@ async fn agent_loop_inner(
 
         // Stream the assistant response
         let assistant_msg =
-            stream_assistant_response(context, config, hooks, cancel, stream_fn.clone()).await;
+            stream_assistant_response(context, &run_config, hooks, cancel, stream_fn.clone()).await;
         new_messages.push(Message::Assistant(assistant_msg.clone()));
 
         // Extract tool calls
@@ -377,7 +390,7 @@ async fn agent_loop_inner(
         let (tool_results, terminate) = if assistant_msg.stop_reason == StopReason::Length {
             fail_tool_calls_from_truncated_message(&tool_calls, hooks).await
         } else {
-            execute_tool_calls(context, &assistant_msg, config, hooks, cancel).await
+            execute_tool_calls(context, &assistant_msg, &run_config, hooks, cancel).await
         };
 
         // Inject tool results into context
@@ -421,8 +434,16 @@ async fn agent_loop_inner(
             if let Some(ctx) = update.context {
                 *context = ctx;
             }
-            // model is a field of AgentLoopConfig (the engine derives it from state.model each turn, see engine.rs);
-            // thinking_level is not in AgentLoopConfig (it exists only in AgentState); handled by the application layer via hooks, so not handled here for now
+            // model is a field of AgentLoopConfig (the engine derives it from state.model each turn);
+            // thinking_level is not in AgentLoopConfig (exists only in AgentState)
+            if let Some(model) = update.model {
+                run_config.model = model;
+            }
+            run_config.reasoning = match update.thinking_level {
+                None => run_config.reasoning, // unspecified → keep current (?? config.reasoning)
+                Some(ThinkingLevel::Off) => None, // off → None (reasoning never holds Some(Off), consistent with make_config's normalization)
+                Some(level) => Some(level),       // others → original value
+            };
         }
 
         // Check steering messages
