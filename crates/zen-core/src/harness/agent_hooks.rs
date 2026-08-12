@@ -255,7 +255,7 @@ fn error_tool_result(tool_call: &ToolCall, text: String) -> ToolExecutionResult 
                 text_signature: None,
             })],
             details: None,
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error: true,
             added_tool_names: None,
             timestamp: now,
@@ -277,7 +277,6 @@ fn error_tool_result(tool_call: &ToolCall, text: String) -> ToolExecutionResult 
 /// Tool execution result (success or failure).
 pub(crate) async fn execute_prepared_tool_call(
     prepared: &PreparedToolCall,
-    tool_ctx: &ToolContext,
     cancel: &CancellationToken,
     hooks: &dyn AgentLoopHooks,
 ) -> ExecutedToolCallOutcome {
@@ -305,7 +304,7 @@ pub(crate) async fn execute_prepared_tool_call(
     // Execute the tool
     let result = match prepared
         .tool
-        .execute(&tool_call_id, &prepared.args, tool_ctx, cancel, on_update)
+        .execute(&tool_call_id, &prepared.args, cancel, on_update)
         .await
     {
         Ok(r) => {
@@ -351,7 +350,7 @@ pub(crate) async fn execute_prepared_tool_call(
                             text_signature: None,
                         })],
                         details: None,
-                        usage: Usage::default(),
+                        usage: Some(Usage::default()),
                         is_error: true,
                         added_tool_names: None,
                         timestamp: std::time::SystemTime::now()
@@ -405,7 +404,7 @@ pub(crate) async fn finalize_executed_tool_call(
                 result.message.details = Some(details);
             }
             if let Some(usage) = overrides.usage {
-                result.message.usage = usage;
+                result.message.usage = Some(usage);
             }
             if let Some(terminate) = overrides.terminate {
                 result.terminate = terminate;
@@ -477,7 +476,7 @@ pub(crate) async fn fail_tool_calls_from_truncated_message(
                     text_signature: None,
                 })],
                 details: Some(serde_json::Value::Null),
-                usage: Usage::default(),
+                usage: Some(Usage::default()),
                 is_error: true,
                 added_tool_names: None,
                 timestamp: 0,
@@ -588,7 +587,6 @@ mod tests {
             &self,
             tool_call_id: &str,
             _params: &serde_json::Value,
-            _ctx: &ToolContext,
             _cancel: &CancellationToken,
             _on_update: ToolUpdateCallback,
         ) -> Result<ToolExecutionResult, ToolError> {
@@ -604,7 +602,7 @@ mod tests {
                         text_signature: None,
                     })],
                     details: None,
-                    usage: Usage::default(),
+                    usage: Some(Usage::default()),
                     is_error: false,
                     added_tool_names: None,
                     timestamp: 0,

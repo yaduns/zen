@@ -84,12 +84,14 @@ use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 /// - Does not include TUI rendering components (`EditRenderState`/`EditCallRenderComponent`);
 ///   rendering logic belongs to zen-tui/zen-app.
 #[derive(Debug)]
-pub struct EditTool;
+pub struct EditTool {
+    tool_context: ToolContext, // New: bind the session environment at construction
+}
 
 impl EditTool {
     /// Create a new EditTool instance.
-    pub fn new() -> Self {
-        Self
+    pub fn new(tool_context: ToolContext) -> Self {
+        Self { tool_context }
     }
 }
 
@@ -196,12 +198,11 @@ impl Tool for EditTool {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
-        ctx: &ToolContext,
         cancel: &CancellationToken,
         _on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
         let (file_path, edits) = parse_edit_args(params)?;
-        let abs = resolve_to_cwd(&file_path, &ctx.working_dir);
+        let abs = resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path());
         let details = edit_file(&abs, &edits, cancel)
             .await
             .map_err(|e| map_edit_error(e, &file_path))?;
@@ -224,7 +225,7 @@ impl Tool for EditTool {
                 "diff": details.diff, "patch": details.patch,
                 "firstChangedLine": details.first_changed_line,
             })),
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error: false,
             added_tool_names: None,
             timestamp: now,
@@ -463,6 +464,11 @@ mod tests {
     // Unit test coverage: argument parsing, tool metadata, file edit success/failure.
     // Integration tests (filesystem IO) use tempfile to create temporary directories.
 
+    /// Construct a test ToolContext (metadata tests don't care about the specific working_dir value)
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(std::path::PathBuf::from("/tmp"), None, None)
+    }
+
     #[test]
     fn test_parse_edit_args_normal() {
         let (p, e) =
@@ -486,11 +492,11 @@ mod tests {
     }
     #[test]
     fn test_edit_tool_name() {
-        assert_eq!(EditTool::new().name(), "edit");
+        assert_eq!(EditTool::new(test_ctx()).name(), "edit");
     }
     #[test]
     fn test_edit_tool_label() {
-        assert_eq!(EditTool::new().label(), "edit");
+        assert_eq!(EditTool::new(test_ctx()).label(), "edit");
     }
 
     #[tokio::test]
@@ -519,16 +525,15 @@ mod tests {
     }
     #[tokio::test]
     async fn test_execute_success() {
-        let tool = EditTool::new();
         let dir = tempfile::tempdir().unwrap();
         let fp = dir.path().join("t.txt");
         std::fs::write(&fp, "hello world").unwrap();
         let ctx = ToolContext::new(dir.path().into(), None, None);
+        let tool = EditTool::new(ctx);
         let r = tool
             .execute(
                 "c1",
                 &json!({"path":"t.txt","edits":[{"oldText":"hello","newText":"hi"}]}),
-                &ctx,
                 &CancellationToken::new(),
                 Box::new(|_| {}),
             )

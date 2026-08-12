@@ -10,7 +10,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
+use zen_ai::tool::{
+    Tool, ToolContext, ToolError, ToolExecutionMode, ToolExecutionResult, ToolUpdateCallback,
+};
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ToolCall,
@@ -19,7 +21,7 @@ use zen_ai::types::{
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
-use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
+use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Mock helpers
@@ -229,7 +231,6 @@ impl Tool for BashMockTool {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
-        _ctx: &ToolContext,
         _cancel: &CancellationToken,
         _on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
@@ -246,7 +247,7 @@ impl Tool for BashMockTool {
                     text_signature: None,
                 })],
                 details: None,
-                usage: Usage::default(),
+                usage: Some(Usage::default()),
                 is_error: false,
                 added_tool_names: None,
                 timestamp: 2000,
@@ -321,7 +322,6 @@ async fn mock_test_empty_prompts() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -344,7 +344,6 @@ async fn mock_test_stream_error() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -377,7 +376,6 @@ async fn mock_test_cancellation() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -413,7 +411,6 @@ async fn mock_test_create_context_and_loop() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -441,7 +438,6 @@ async fn mock_test_text_response_no_tool_calls() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -508,7 +504,6 @@ async fn mock_test_tool_call_execution() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 
@@ -590,7 +585,6 @@ async fn real_test_agent_loop_simple_chat() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(PathBuf::from("."), None, None),
     )
     .await;
 

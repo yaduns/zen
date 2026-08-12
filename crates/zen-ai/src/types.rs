@@ -182,8 +182,8 @@ pub struct ToolResultMessage {
     pub content: Vec<ContentBlock>,
     /// Tool execution metadata; concrete structure determined by the implementation (e.g. bash exit code + duration, read byte count, edit diff summary)
     pub details: Option<serde_json::Value>,
-    /// Resource consumption of the tool itself, independent of the LLM call's Usage
-    pub usage: Usage,
+    /// Resource consumption of the tool's own execution (optional; independent of LLM call Usage; aligns with pi `AgentToolResult.usage?`)
+    pub usage: Option<Usage>,
     /// Whether the tool execution failed
     pub is_error: bool,
     /// List of new tool names introduced by this tool result (for the tools parameter of subsequent requests)

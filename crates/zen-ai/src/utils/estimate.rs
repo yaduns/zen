@@ -261,7 +261,6 @@ mod tests {
             &self,
             _tool_call_id: &str,
             _args: &serde_json::Value,
-            _ctx: &crate::tool::ToolContext,
             _cancel: &tokio_util::sync::CancellationToken,
             _on_update: crate::tool::ToolUpdateCallback,
         ) -> Result<crate::tool::ToolExecutionResult, crate::tool::ToolError> {
@@ -519,7 +518,7 @@ mod tests {
                 text_signature: None,
             })],
             details: None,
-            usage: Usage {
+            usage: Some(Usage {
                 total_tokens: 0,
                 input: 0,
                 output: 0,
@@ -534,7 +533,7 @@ mod tests {
                 },
                 cache_write_1h: None,
                 reasoning: None,
-            },
+            }),
             is_error: false,
             timestamp: 3000,
             added_tool_names: None,
@@ -568,7 +567,7 @@ mod tests {
                     text_signature: None,
                 })],
                 details: None,
-                usage: Usage {
+                usage: Some(Usage {
                     total_tokens: 0,
                     input: 0,
                     output: 0,
@@ -583,7 +582,7 @@ mod tests {
                     },
                     cache_write_1h: None,
                     reasoning: None,
-                },
+                }),
                 is_error: false,
                 timestamp: 2000,
                 added_tool_names: None,

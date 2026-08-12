@@ -43,12 +43,14 @@ enum TruncationKind {
 /// - `offset` (number, optional): starting line number (1-indexed), defaults to the beginning of the file
 /// - `limit` (number, optional): maximum number of lines to read, defaults to no limit (subject to truncation)
 #[derive(Debug)]
-pub struct ReadTool;
+pub struct ReadTool {
+    tool_context: ToolContext, // New: bind the session environment at construction
+}
 
 impl ReadTool {
     /// Creates a new ReadTool instance.
-    pub fn new() -> Self {
-        Self
+    pub fn new(tool_context: ToolContext) -> Self {
+        Self { tool_context }
     }
 }
 
@@ -113,13 +115,12 @@ impl Tool for ReadTool {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
-        ctx: &ToolContext,
         cancel: &CancellationToken,
         _on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
         let (file_path, offset, limit) = parse_read_args(params)?;
 
-        let resolved = resolve_read_path_async(file_path, &ctx.working_dir).await;
+        let resolved = resolve_read_path_async(file_path, &self.tool_context.working_dir).await;
         let (content, info) = read_file_content(&resolved, offset, limit, cancel).await?;
 
         let now = std::time::SystemTime::now()
@@ -140,7 +141,7 @@ impl Tool for ReadTool {
                 "offset": offset.unwrap_or(1),
                 "bytes": info.content.len(),
             })),
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error: false,
             added_tool_names: None,
             timestamp: now,

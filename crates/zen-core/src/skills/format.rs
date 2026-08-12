@@ -62,25 +62,6 @@ fn escape_xml(value: &str) -> String {
     out
 }
 
-/// Formats the explicit invocation prompt for a single skill.
-/// Generates `<skill name="..." location="...">\nReferences are relative to <parent directory>.\n\n<content>\n</skill>`,
-/// When `additional_instructions` is non-empty, appends it after the block separated by a blank line.
-pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&str>) -> String {
-    let file_path = skill.file_path.trim_end_matches('/');
-    let parent_dir = file_path
-        .rfind('/')
-        .filter(|&i| i > 0) // Corresponds to TS dirnameEnvPath: slashIndex <= 0 → "/"
-        .map_or("/", |i| &file_path[..i]);
-    let block = format!(
-        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-        skill.name, skill.file_path, parent_dir, skill.content
-    );
-    match additional_instructions {
-        Some(inst) if !inst.is_empty() => format!("{block}\n\n{inst}"),
-        _ => block,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,44 +173,4 @@ mod tests {
         assert!(first < second);
     }
 
-    // ─── format_skill_invocation ───────────────────────────────────
-    #[test]
-    fn test_format_skill_invocation_basic_block() {
-        let skill = make_skill("foo", "d", "/skills/foo/SKILL.md", false);
-        let out = format_skill_invocation(&skill, None);
-        assert!(out.contains("<skill name=\"foo\" location=\"/skills/foo/SKILL.md\">"));
-        assert!(out.contains("References are relative to /skills/foo."));
-        assert!(out.contains("skill content"));
-        assert!(out.ends_with("</skill>"));
-    }
-
-    #[test]
-    fn test_format_skill_invocation_parent_dir_top_level() {
-        let skill = make_skill("foo", "d", "/SKILL.md", false);
-        let out = format_skill_invocation(&skill, None);
-        assert!(out.contains("References are relative to /."));
-    }
-
-    #[test]
-    fn test_format_skill_invocation_parent_dir_no_slash() {
-        let skill = make_skill("foo", "d", "SKILL.md", false);
-        let out = format_skill_invocation(&skill, None);
-        assert!(out.contains("References are relative to /."));
-    }
-
-    #[test]
-    fn test_format_skill_invocation_with_instructions() {
-        let skill = make_skill("foo", "d", "/skills/foo/SKILL.md", false);
-        let out = format_skill_invocation(&skill, Some("extra instructions"));
-        assert!(out.ends_with("</skill>\n\nextra instructions"));
-    }
-
-    #[test]
-    fn test_format_skill_invocation_empty_instructions_ignored() {
-        let skill = make_skill("foo", "d", "/skills/foo/SKILL.md", false);
-        let out_none = format_skill_invocation(&skill, None);
-        let out_empty = format_skill_invocation(&skill, Some(""));
-        assert_eq!(out_none, out_empty);
-        assert!(out_empty.ends_with("</skill>"));
-    }
 }

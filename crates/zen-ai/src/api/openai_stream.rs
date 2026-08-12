@@ -1,7 +1,7 @@
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
-    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent,
-    ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
+    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ThinkingContent,
+    ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
 };
 use crate::utils::error_body::extract_error_body;
 use crate::utils::provider_env::get_provider_env_value;
@@ -337,7 +337,12 @@ pub async fn stream(
         .ok_or(StreamError::NoApiKey)?;
 
     // 2. Build request body
-    let body = build_request_body(model, context, cfg.tool_choice.as_ref(), cfg.reasoning_effort);
+    let body = build_request_body(
+        model,
+        context,
+        cfg.tool_choice.as_ref(),
+        cfg.reasoning_effort,
+    );
 
     // 3. Build HTTP request
     let client = reqwest::Client::new();
@@ -812,7 +817,9 @@ impl StreamAccumulator {
                 // This matches Pi's ensureTextBlock() pattern: text blocks are created
                 // when text content actually arrives, not when role: "assistant" is seen.
                 // This avoids creating empty text blocks for tool-call-only responses.
-                self.block_types.entry(index).or_insert_with(|| "text".to_string());
+                self.block_types
+                    .entry(index)
+                    .or_insert_with(|| "text".to_string());
                 self.partial_text.entry(index).or_default().push_str(&text);
             }
 
@@ -879,7 +886,6 @@ impl StreamAccumulator {
             }
         }
     }
-
 }
 
 // ── Event stream background task ────────────────────────────────
@@ -997,7 +1003,6 @@ async fn sse_event_loop(
     let mut content = Vec::new();
     std::mem::swap(&mut content, &mut accumulator.content_blocks);
 
-
     // 4a. Reconcile the relationship between stop_reason and error_message:
     //     - has finish_reason but also an error → keep finish_reason, write the error into error_message
     //     - Has error and no finish_reason → termination reason is Error
@@ -1031,8 +1036,6 @@ async fn sse_event_loop(
         msg.usage.output = estimated;
         msg.usage.total_tokens = estimated;
     }
-
-
 
     // ── Phase 5: Push Done / Error events ──────────────────────────
     // Error if there is an error and no finish_reason was received
@@ -1355,7 +1358,7 @@ mod tests {
                 text_signature: None,
             })],
             details: None,
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error: false,
             added_tool_names: None,
             timestamp: 0,
@@ -1387,7 +1390,7 @@ mod tests {
                 }),
             ],
             details: None,
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error: false,
             added_tool_names: None,
             timestamp: 0,
@@ -1446,7 +1449,6 @@ mod tests {
             &self,
             _tool_call_id: &str,
             _args: &serde_json::Value,
-            _ctx: &crate::tool::ToolContext,
             _cancel: &tokio_util::sync::CancellationToken,
             _on_update: crate::tool::ToolUpdateCallback,
         ) -> Result<crate::tool::ToolExecutionResult, crate::tool::ToolError> {
@@ -1692,7 +1694,9 @@ mod tests {
         });
         let events = parse_chunk(&chunk);
         // Only TextDelta, no MessageDelta
-        assert!(events.iter().all(|e| !matches!(e, StreamEvent::MessageDelta { .. })));
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, StreamEvent::MessageDelta { .. })));
     }
 
     // ═════════════════════════════════════════════════════════════

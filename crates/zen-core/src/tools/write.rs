@@ -33,12 +33,14 @@ use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 /// - Cancellation triggered → `ToolError::Cancelled`.
 /// - Write size exceeds filesystem limits → `ToolError::Execution`.
 #[derive(Debug)]
-pub struct WriteTool;
+pub struct WriteTool {
+    tool_context: ToolContext, // New: bind the session environment at construction
+}
 
 impl WriteTool {
     /// Create a new WriteTool instance.
-    pub fn new() -> Self {
-        Self
+    pub fn new(tool_context: ToolContext) -> Self {
+        Self { tool_context }
     }
 }
 
@@ -91,13 +93,12 @@ impl Tool for WriteTool {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
-        ctx: &ToolContext,
         cancel: &CancellationToken,
         _on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
         let (file_path, content) = parse_write_args(params)?;
 
-        let absolute_path = resolve_to_cwd(&file_path, &ctx.working_dir);
+        let absolute_path = resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path());
         let success_msg = write_file(&absolute_path, &content, cancel).await?;
 
         let now = std::time::SystemTime::now()
@@ -116,7 +117,7 @@ impl Tool for WriteTool {
                 "path": absolute_path.to_string_lossy(),
                 "bytes": content.len(),
             })),
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error: false,
             added_tool_names: None,
             timestamp: now,
@@ -247,6 +248,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Construct a test ToolContext (metadata tests don't care about the specific working_dir value)
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(std::path::PathBuf::from("/tmp"), None, None)
+    }
+
     // -- parse_write_args --
 
     #[test]
@@ -357,19 +363,19 @@ mod tests {
 
     #[test]
     fn test_write_tool_name() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         assert_eq!(tool.name(), "write");
     }
 
     #[test]
     fn test_write_tool_label() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         assert_eq!(tool.label(), "write");
     }
 
     #[test]
     fn test_write_tool_description() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let desc = tool.description();
         assert!(!desc.is_empty());
         assert!(desc.contains("Write content"));
@@ -379,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_write_tool_parameters_schema() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["path"].is_object());
@@ -397,14 +403,14 @@ mod tests {
 
     #[test]
     fn test_write_tool_parameters_path_type() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let params = tool.parameters();
         assert_eq!(params["properties"]["path"]["type"], "string");
     }
 
     #[test]
     fn test_write_tool_parameters_content_type() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let params = tool.parameters();
         assert_eq!(params["properties"]["content"]["type"], "string");
     }
@@ -424,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_cancelled() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let cancel = CancellationToken::new();
         cancel.cancel();
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"), None, None);
@@ -433,7 +439,7 @@ mod tests {
             "content": "hello"
         });
         let result = tool
-            .execute("call-1", &params, &ctx, &cancel, Box::new(|_| {}))
+            .execute("call-1", &params, &cancel, Box::new(|_| {}))
             .await;
         assert!(matches!(result, Err(ToolError::Cancelled)));
     }
@@ -442,28 +448,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_path() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let cancel = CancellationToken::new();
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"), None, None);
         let params = json!({
             "content": "hello"
         });
         let result = tool
-            .execute("call-1", &params, &ctx, &cancel, Box::new(|_| {}))
+            .execute("call-1", &params, &cancel, Box::new(|_| {}))
             .await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
 
     #[tokio::test]
     async fn test_execute_missing_content() {
-        let tool = WriteTool::new();
+        let tool = WriteTool::new(test_ctx());
         let cancel = CancellationToken::new();
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"), None, None);
         let params = json!({
             "path": "test.txt"
         });
         let result = tool
-            .execute("call-1", &params, &ctx, &cancel, Box::new(|_| {}))
+            .execute("call-1", &params, &cancel, Box::new(|_| {}))
             .await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
@@ -521,11 +527,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_success() {
-        let tool = WriteTool::new();
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("output.txt");
         let file_path_str = file_path.to_string_lossy().to_string();
         let ctx = ToolContext::new(dir.path().to_path_buf(), None, None);
+        let tool = WriteTool::new(ctx);
         let params = json!({
             "path": "output.txt",
             "content": "file content"
@@ -534,7 +540,6 @@ mod tests {
             .execute(
                 "call-1",
                 &params,
-                &ctx,
                 &CancellationToken::new(),
                 Box::new(|_| {}),
             )

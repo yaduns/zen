@@ -24,12 +24,14 @@ use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 /// - On timeout, `ToolError::Execution` contains the text "timed out".
 /// - On cancellation, returns `ToolError::Cancelled`.
 #[derive(Debug)]
-pub struct BashTool;
+pub struct BashTool {
+    tool_context: ToolContext, // New: bind the session environment at construction
+}
 
 impl BashTool {
     /// Creates a new BashTool instance.
-    pub fn new() -> Self {
-        Self
+    pub fn new(tool_context: ToolContext) -> Self {
+        Self { tool_context }
     }
 }
 
@@ -85,14 +87,13 @@ impl Tool for BashTool {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
-        ctx: &ToolContext,
         cancel: &CancellationToken,
         on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
         let (command, timeout) = parse_bash_args(params)?;
         let (content, exit_code, info) = execute_command(
             &command,
-            &ctx.working_dir,
+            &self.tool_context.working_dir,
             timeout,
             cancel,
             Some(&on_update),
@@ -119,7 +120,7 @@ impl Tool for BashTool {
                 "outputLines": info.output_lines,
                 "truncated": info.truncated,
             })),
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             is_error,
             added_tool_names: None,
             timestamp: now,
@@ -354,6 +355,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Construct a test ToolContext (metadata tests don't care about the specific working_dir value)
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(std::path::PathBuf::from("/tmp"), None, None)
+    }
     // ─── parse_bash_args ───────────────────────────────────────────────────
 
     #[test]
@@ -414,26 +419,26 @@ mod tests {
 
     #[test]
     fn test_bash_tool_name() {
-        let tool = BashTool::new();
+        let tool = BashTool::new(test_ctx());
         assert_eq!(tool.name(), "bash");
     }
 
     #[test]
     fn test_bash_tool_label() {
-        let tool = BashTool::new();
+        let tool = BashTool::new(test_ctx());
         assert_eq!(tool.label(), "bash");
     }
 
     #[test]
     fn test_bash_tool_description_not_empty() {
-        let tool = BashTool::new();
+        let tool = BashTool::new(test_ctx());
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("truncated"));
     }
 
     #[test]
     fn test_bash_tool_parameters_schema() {
-        let tool = BashTool::new();
+        let tool = BashTool::new(test_ctx());
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["command"].is_object());

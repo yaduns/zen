@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::tool::{Tool, ToolContext};
+use zen_ai::tool::{Tool, ToolContext, ToolExecutionMode};
 use zen_ai::types::{
     ContentBlock, ContentBlockList, Context, Message, Model, StopReason, ToolResultMessage, Usage,
 };
@@ -22,8 +22,8 @@ use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
 use zen_core::harness::types::ShouldStopAfterTurnContext;
-use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn, ToolExecutionMode};
-use zen_core::tools::create_coding_tools;
+use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn};
+use zen_core::tools::factory::ToolFactory;
 
 // ─── Mock Hooks ──────────────────────────────────────────────────
 
@@ -123,6 +123,11 @@ fn user_message(text: &str) -> Message {
     })
 }
 
+/// Construct a test ToolContext (metadata tests don't care about the specific working_dir value)
+fn test_ctx() -> ToolContext {
+    ToolContext::new(std::path::PathBuf::from("/tmp"), None, None)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Tests
 // ═══════════════════════════════════════════════════════════════════
@@ -149,7 +154,7 @@ async fn real_test_multi_tool_chain() {
     let hooks = MockHooks::new().with_verbose().with_max_turns(5);
     let cancel = CancellationToken::new();
 
-    let registry = create_coding_tools();
+    let registry = ToolFactory::new(test_ctx()).create_coding();
     eprintln!("Registered tools: {:?}", registry.names());
     let tools: Vec<Arc<dyn Tool>> = registry.tools;
 
@@ -185,7 +190,6 @@ async fn real_test_multi_tool_chain() {
         &hooks,
         &cancel,
         stream_fn.clone(),
-        &ToolContext::new(project_root.clone(), None, None),
     )
     .await;
 
@@ -382,7 +386,7 @@ async fn real_test_multi_tool_chain() {
 /// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
 ///
 /// Validation:
-/// 1. The tool registry returned by `create_coding_tools()` is correctly injected into the agent loop
+/// 1. The tool registry returned by `create_coding()` is correctly injected into the agent loop
 /// 2. The agent can call the bash tool to run `ls -la` or similar commands
 /// 3. Tool results are correctly injected into the subsequent LLM context
 /// 4. Returns a structured directory description in the end
@@ -402,7 +406,7 @@ async fn real_test_tools_list_directory() {
     let hooks = MockHooks::new();
     let cancel = CancellationToken::new();
 
-    let registry = create_coding_tools();
+    let registry = ToolFactory::new(test_ctx()).create_coding();
     println!("Registered tools: {:?}", registry.names());
     let tools: Vec<Arc<dyn Tool>> = registry.tools;
 
@@ -437,7 +441,6 @@ async fn real_test_tools_list_directory() {
         &hooks,
         &cancel,
         stream_fn,
-        &ToolContext::new(project_root.clone(), None, None),
     )
     .await;
 

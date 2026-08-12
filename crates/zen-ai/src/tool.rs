@@ -61,6 +61,14 @@ impl ToolContext {
     }
 }
 
+/// Controls the execution order of multiple tool calls within a single assistant message.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolExecutionMode {
+    Sequential,
+    Parallel,
+}
+
 /// Tool execution error type.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -213,6 +221,12 @@ pub trait Tool: std::fmt::Debug + Send + Sync {
         Ok(args.clone())
     }
 
+    /// Per-tool execution mode override.
+    /// `None` = use global `AgentLoopConfig.tool_execution`; `Some(mode)` = override global.
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        None
+    }
+
     /// Executes the tool call.
     ///
     /// # Parameters
@@ -228,7 +242,6 @@ pub trait Tool: std::fmt::Debug + Send + Sync {
         &self,
         tool_call_id: &str,
         params: &serde_json::Value,
-        ctx: &ToolContext,
         cancel: &CancellationToken,
         on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError>;

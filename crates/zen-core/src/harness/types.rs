@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::openai_stream::{StreamConfig, StreamError};
-use zen_ai::tool::{Tool, ToolExecutionResult};
+use zen_ai::tool::{Tool, ToolExecutionMode, ToolExecutionResult};
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, Context, Message, Model, ThinkingLevel, ToolCall,
     ToolResultMessage, Usage,
@@ -36,14 +36,6 @@ pub type StreamFn = Arc<
         > + Send
         + Sync,
 >;
-
-/// Controls the execution order of multiple tool calls within a single assistant message.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolExecutionMode {
-    Sequential,
-    Parallel,
-}
 
 /// Public runtime snapshot of the agent, containing current configuration, transcript messages, streaming state, and error info.
 /// Pure runtime struct; does not derive serde.
