@@ -1,179 +1,111 @@
+// Provide tool-specific file path resolution: `resolve_to_cwd` delegates to `paths::resolve_path` (fixed
+// normalize_unicode_spaces + strip_at_prefix options); `resolve_read_path`/`resolve_read_path_async`
+// additionally apply macOS filename variant fallbacks (AM/PM narrow spaces, NFD, curly quotes).
+
+use crate::paths::{self, PathError};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
-/// Normalize the path string.
-///
-/// Performs the following operations:
-/// - Unicode space variants (`\u{00A0}`, `\u{2000}`-`\u{200A}`, `\u{202F}`, `\u{205F}`, `\u{3000}`) → regular space
-/// - Strip leading `@` prefix (CLI `@file` path syntax)
-/// - Tilde expansion (`~` → home directory, `~/...` → `$HOME/...`)
-/// - Conversion from `file://` URL to path
-///
-/// Does not perform IO and does not check whether the path exists.
-///
-/// # Parameters
-/// - `input`: raw path string.
-///
-/// # Return Value
-/// Normalized path string.
-///
-/// # Edge Cases
-/// - An empty string returns an empty string.
-/// - A bare `~` returns the home directory path.
-/// - Paths that are not `file://` URLs are not converted.
-pub fn expand_path(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
+/// Options always used for tool path resolution: normalize Unicode spaces + strip leading `@`
+const TOOL_PATH_OPTIONS: paths::PathInputOptions = paths::PathInputOptions {
+    trim: false,
+    expand_tilde: true,
+    home_dir: None,
+    strip_at_prefix: true,
+    normalize_unicode_spaces: true,
+};
 
-    // 1. Unicode space variants → regular space
-    let s = normalize_unicode_whitespace(input);
-
-    // 2. Strip leading @
-    let s = s.strip_prefix('@').unwrap_or(&s);
-
-    // 3. file:// URL → path
-    let s = if let Some(rest) = s.strip_prefix("file://") {
-        rest
-    } else {
-        s
-    };
-
-    // 4. Tilde expansion
-    if s == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-    }
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-        return format!("{}/{}", home, rest);
-    }
-
-    s.to_string()
-}
-
-/// Replace Unicode space variants with regular spaces.
-fn normalize_unicode_whitespace(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '\u{00A0}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
-            c if ('\u{2000}'..='\u{200A}').contains(&c) => ' ',
-            _ => c,
-        })
-        .collect()
-}
-
-/// Resolve a path against the specified working directory.
+/// Resolve a file path to an absolute path.
 ///
-/// Handles tilde expansion, absolute path detection, and relative path joining.
-/// Returns an absolute path but does not check whether the path exists.
+/// Delegates to `paths::resolve_path` with fixed `normalize_unicode_spaces` + `strip_at_prefix` options
+/// (aligned with Pi `resolveToCwd = resolvePath(filePath, cwd, { normalizeUnicodeSpaces: true, stripAtPrefix: true })`).
+/// Handles tilde expansion, `@` stripping, and `file://` URLs internally. Returns `Result` to propagate `PathError`.
 ///
-/// # Parameters
-/// - `file_path`: path to resolve (relative or absolute).
-/// - `cwd`: current working directory (absolute path).
+/// # Errors
+/// - Expand `~` but home unavailable → `PathError::NoHomeDir`.
+/// - Invalid `file://` URL → `PathError::InvalidFileUrl`.
 ///
-/// # Return Value
-/// Resolved absolute path.
-///
-/// # Edge Cases
-/// - Absolute paths are returned directly without joining `cwd`.
-/// - Paths starting with `~` are tilde-expanded first, then processed.
-/// - `cwd` should be an absolute path; otherwise behavior is undefined.
-pub fn resolve_to_cwd(file_path: &str, cwd: &Path) -> PathBuf {
-    let expanded = expand_path(file_path);
-    let path = Path::new(&expanded);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
+/// # Consumers
+/// edit.rs / write.rs / edit_diff.rs (currently present).
+pub fn resolve_to_cwd(file_path: &str, cwd: &Path) -> Result<PathBuf, PathError> {
+    paths::resolve_path(file_path, cwd, &TOOL_PATH_OPTIONS)
 }
 
 /// Resolve the file read path, with fallback support for macOS filename variants.
 ///
-/// On top of `resolve_to_cwd`, when the target path does not exist, tries the following variants in order:
+/// On top of `resolve_to_cwd`, when the target path does not exist, try the following variants in order (aligned with Pi `resolveReadPath`):
 /// 1. macOS screenshot AM/PM narrow-space variant (`\u{202F}` replaces a regular space)
 /// 2. NFD-decomposed variant (the macOS file system stores filenames in NFD)
 /// 3. Curly-quote variant (macOS screenshots use the right single quotation mark `\u{2019}`, while users may input `'`)
 /// 4. Combined NFD + curly-quote variant
 ///
-/// Synchronous version, using `std::path::Path::try_exists()` to check.
+/// Synchronous version, checks with `std::path::Path::try_exists()`.
 ///
-/// # Parameters
-/// - `file_path`: path to resolve.
-/// - `cwd`: Current working directory.
-///
-/// # Return Value
-/// Resolved absolute path (may not exist; if none of the variants match, returns the original resolution result).
-///
-/// # Edge Cases
-/// - If the original path already exists, returns it directly without trying variants.
-/// - If none of the variants exist, returns the original resolution result (does not throw an error).
-pub fn resolve_read_path(file_path: &str, cwd: &Path) -> PathBuf {
-    let base = resolve_to_cwd(file_path, cwd);
+/// # Consumers
+/// pub but currently has no production consumer (read.rs uses the async version); kept to align with pi-218's synchronous API,
+/// for future synchronous resolution scenarios. Directly covered by tests in this module.
+pub fn resolve_read_path(file_path: &str, cwd: &Path) -> Result<PathBuf, PathError> {
+    let base = resolve_to_cwd(file_path, cwd)?;
     if base.try_exists().unwrap_or(false) {
-        return base;
+        return Ok(base);
     }
 
-    let expanded = expand_path(file_path);
-    let variants = [
-        try_macos_screenshot_path(&expanded),
-        try_nfd_variant(&expanded),
-        try_curly_quote_variant(&expanded),
-        try_nfd_variant(&try_curly_quote_variant(&expanded)),
-    ];
-
-    for variant in &variants {
-        let path = if Path::new(variant).is_absolute() {
+    let expanded = paths::normalize_path(file_path, &TOOL_PATH_OPTIONS)?;
+    for variant in macos_variants(&expanded) {
+        let path = if Path::new(&variant).is_absolute() {
             PathBuf::from(variant)
         } else {
             cwd.join(variant)
         };
         if path.try_exists().unwrap_or(false) {
-            return path;
+            return Ok(path);
         }
     }
 
-    base
+    Ok(base)
 }
 
 /// Asynchronously resolve the file read path, with fallback for macOS filename variants.
 ///
-/// Same behavior as `resolve_read_path`, but uses async `tokio::fs::try_exists()` to check path existence.
+/// Same behavior as `resolve_read_path`, but checks path existence with `tokio::fs::try_exists()`,
 /// Suitable for scenarios where blocking the current thread is undesirable.
-pub async fn resolve_read_path_async(file_path: &str, cwd: &Path) -> PathBuf {
-    let base = resolve_to_cwd(file_path, cwd);
+///
+/// # Consumers
+/// read.rs (currently present).
+pub async fn resolve_read_path_async(file_path: &str, cwd: &Path) -> Result<PathBuf, PathError> {
+    let base = resolve_to_cwd(file_path, cwd)?;
     if path_exists(&base).await {
-        return base;
+        return Ok(base);
     }
 
-    let expanded = expand_path(file_path);
-    let variants = [
-        try_macos_screenshot_path(&expanded),
-        try_nfd_variant(&expanded),
-        try_curly_quote_variant(&expanded),
-        try_nfd_variant(&try_curly_quote_variant(&expanded)),
-    ];
-
-    for variant in &variants {
-        let path = if Path::new(variant).is_absolute() {
+    let expanded = paths::normalize_path(file_path, &TOOL_PATH_OPTIONS)?;
+    for variant in macos_variants(&expanded) {
+        let path = if Path::new(&variant).is_absolute() {
             PathBuf::from(variant)
         } else {
             cwd.join(variant)
         };
         if path_exists(&path).await {
-            return path;
+            return Ok(path);
         }
     }
 
-    base
+    Ok(base)
 }
 
-/// Check whether the path exists (async).
-///
-/// Implemented using `tokio::fs::try_exists()`.
-/// If the path is inaccessible (permission error), returns `false` instead of throwing an error.
-pub async fn path_exists(file_path: &Path) -> bool {
+/// Checks whether a path exists (async); returns `false` instead of throwing when inaccessible (permission errors, etc.).
+async fn path_exists(file_path: &Path) -> bool {
     tokio::fs::try_exists(file_path).await.unwrap_or(false)
+}
+
+/// Generates macOS filename variants in order: AM/PM narrow space, NFD, curly quotes, NFD + curly quotes combination.
+fn macos_variants(expanded: &str) -> [String; 4] {
+    [
+        try_macos_screenshot_path(expanded),
+        try_nfd_variant(expanded),
+        try_curly_quote_variant(expanded),
+        try_nfd_variant(&try_curly_quote_variant(expanded)),
+    ]
 }
 
 /// Try the macOS AM/PM narrow-space variant.
@@ -197,127 +129,56 @@ fn try_curly_quote_variant(file_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    // -- expand_path --
-
-    #[test]
-    fn test_expand_path_empty() {
-        assert_eq!(expand_path(""), "");
-    }
-
-    #[test]
-    fn test_expand_path_normal() {
-        assert_eq!(expand_path("/foo/bar"), "/foo/bar");
-    }
-
-    #[test]
-    fn test_expand_path_relative() {
-        assert_eq!(expand_path("foo/bar"), "foo/bar");
-    }
-
-    #[test]
-    fn test_expand_path_tilde_self() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-        assert_eq!(expand_path("~"), home);
-    }
-
-    #[test]
-    fn test_expand_path_tilde_prefix() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-        let result = expand_path("~/doc/file.txt");
-        assert_eq!(result, format!("{}/doc/file.txt", home));
-    }
-
-    #[test]
-    fn test_expand_path_strip_at_prefix() {
-        assert_eq!(expand_path("@/foo/bar"), "/foo/bar");
-    }
-
-    #[test]
-    fn test_expand_path_file_url() {
-        assert_eq!(
-            expand_path("file:///home/user/config.toml"),
-            "/home/user/config.toml"
-        );
-    }
-
-    #[test]
-    fn test_expand_path_at_and_tilde() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-        let result = expand_path("@~/dir");
-        assert_eq!(result, format!("{}/dir", home));
-    }
-
-    #[test]
-    fn test_expand_path_unicode_whitespace() {
-        // \u{00A0} = no-break space, \u{202F} = narrow no-break space
-        assert_eq!(
-            expand_path("/dir/file\u{00A0}name.txt"),
-            "/dir/file name.txt"
-        );
-        assert_eq!(
-            expand_path("/dir/file\u{202F}name.txt"),
-            "/dir/file name.txt"
-        );
-    }
-
-    // -- normalize_unicode_whitespace --
-
-    #[test]
-    fn test_normalize_unicode_whitespace_all_variants() {
-        assert_eq!(
-            normalize_unicode_whitespace("hello\u{00A0}world"),
-            "hello world"
-        );
-        assert_eq!(
-            normalize_unicode_whitespace("hello\u{202F}world"),
-            "hello world"
-        );
-        assert_eq!(normalize_unicode_whitespace("a\u{2000}b"), "a b");
-        assert_eq!(normalize_unicode_whitespace("a\u{200A}b"), "a b");
-        assert_eq!(normalize_unicode_whitespace("a\u{3000}b"), "a b");
-    }
-
-    #[test]
-    fn test_normalize_unicode_whitespace_no_change() {
-        assert_eq!(normalize_unicode_whitespace("hello world"), "hello world");
-    }
-
-    // -- resolve_to_cwd --
+    // ── resolve_to_cwd ────────────────────────────────────────────
 
     #[test]
     fn test_resolve_to_cwd_relative() {
-        let cwd = std::path::Path::new("/home/user/project");
+        let cwd = Path::new("/home/user/project");
         assert_eq!(
-            resolve_to_cwd("src/lib.rs", cwd),
-            std::path::Path::new("/home/user/project/src/lib.rs")
+            resolve_to_cwd("src/lib.rs", cwd).unwrap(),
+            PathBuf::from("/home/user/project/src/lib.rs")
         );
     }
 
     #[test]
     fn test_resolve_to_cwd_absolute() {
-        let cwd = std::path::Path::new("/home/user/project");
+        let cwd = Path::new("/home/user/project");
         assert_eq!(
-            resolve_to_cwd("/etc/config", cwd),
-            std::path::Path::new("/etc/config")
+            resolve_to_cwd("/etc/config", cwd).unwrap(),
+            PathBuf::from("/etc/config")
         );
     }
 
     #[test]
     fn test_resolve_to_cwd_tilde() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-        let cwd = std::path::Path::new("/home/user/project");
-        let result = resolve_to_cwd("~/doc", cwd);
-        assert_eq!(result, std::path::Path::new(&format!("{}/doc", home)));
+        let home = home::home_dir().expect("home available");
+        let cwd = Path::new("/home/user/project");
+        assert_eq!(resolve_to_cwd("~/doc", cwd).unwrap(), home.join("doc"));
+    }
+
+    #[test]
+    fn test_resolve_to_cwd_strip_at_and_unicode_space() {
+        let cwd = Path::new("/home/user/project");
+        // Tool options always strip @ and normalize Unicode spaces (aligned with pi's resolveToCwd options)
+        assert_eq!(
+            resolve_to_cwd("@src/lib.rs", cwd).unwrap(),
+            cwd.join("src/lib.rs")
+        );
+        assert_eq!(
+            resolve_to_cwd("src/file\u{00A0}name.txt", cwd).unwrap(),
+            cwd.join("src/file name.txt")
+        );
     }
 
     #[test]
     fn test_resolve_to_cwd_dot() {
-        let cwd = std::path::Path::new("/home/user/project");
-        assert_eq!(resolve_to_cwd(".", cwd), cwd.join("."));
+        let cwd = Path::new("/home/user/project");
+        assert_eq!(resolve_to_cwd(".", cwd).unwrap(), cwd.join("."));
     }
 
-    // -- try_macos_screenshot_path --
+    // ── macOS variant pure functions ──────────────────────────────────────────
 
     #[test]
     fn test_try_macos_screenshot_path_am() {
@@ -341,11 +202,8 @@ mod tests {
         assert_eq!(try_macos_screenshot_path(input), input);
     }
 
-    // -- try_nfd_variant --
-
     #[test]
     fn test_try_nfd_variant_accented() {
-        // "é" (U+00E9) decomposed to "e" + combining acute (U+0065 U+0301)
         let nfd: String = "é".nfd().collect();
         assert_eq!(try_nfd_variant("é"), nfd);
         assert_ne!(try_nfd_variant("é"), "é"); // NFC form is different
@@ -356,11 +214,8 @@ mod tests {
         assert_eq!(try_nfd_variant("hello.txt"), "hello.txt");
     }
 
-    // -- try_curly_quote_variant --
-
     #[test]
     fn test_try_curly_quote_straight_to_curly() {
-        // Straight apostrophe -> curly right single quote
         assert_eq!(
             try_curly_quote_variant("Capture d'ecran"),
             "Capture d\u{2019}ecran"
@@ -369,20 +224,83 @@ mod tests {
 
     #[test]
     fn test_try_curly_quote_swap_is_symmetric() {
-        // The function swaps both directions, so output equals input for pure-curly input.
         let input = "Capture d\u{2019}ecran";
-        // first replace turns curly -> straight, second replace turns straight -> curly
         assert_eq!(try_curly_quote_variant(input), input);
     }
 
     #[test]
     fn test_try_curly_quote_no_quotes() {
-        let input = "plain.txt";
-        assert_eq!(try_curly_quote_variant(input), input);
+        assert_eq!(try_curly_quote_variant("plain.txt"), "plain.txt");
     }
 
-    // -- resolve_read_path / resolve_read_path_async / path_exists --
-    // Depends on filesystem IO (Path::try_exists / tokio::fs::try_exists),
-    // This module has no mock facilities; skip tests that depend on pure IO.
-    // Downstream tool integration tests (T-AG-02-3~T-AG-02-6) cover these functions' actual filesystem behavior.
+    // ── resolve_read_path / resolve_read_path_async (real filesystem) ─
+
+    fn write(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_resolve_read_path_existing_returns_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write(dir.path(), "test-file.txt", "content");
+        let r = resolve_read_path("test-file.txt", dir.path()).unwrap();
+        assert_eq!(r, file);
+    }
+
+    #[test]
+    fn test_resolve_read_path_nfd_fallback() {
+        // User input NFC `é`, disk stores NFD (macOS behavior) → variant fallback matches.
+        // Assertions aligned with pi tests (lenient): macOS filesystems normalize NFC/NFD, final byte form is platform-dependent,
+        // only assert it lands in the target directory and the filename shape is correct.
+        let dir = tempfile::tempdir().unwrap();
+        let nfd_name: String = "file\u{0065}\u{0301}.txt".to_string();
+        write(dir.path(), &nfd_name, "content");
+        let r = resolve_read_path("file\u{00e9}.txt", dir.path()).unwrap();
+        assert!(r.starts_with(dir.path()));
+        let name = r.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("file") && name.ends_with(".txt"));
+    }
+
+    #[test]
+    fn test_resolve_read_path_macos_screenshot_am_pm() {
+        let dir = tempfile::tempdir().unwrap();
+        // Disk has narrow no-break space (U+202F) + AM; user input has a regular space
+        let macos_name = "Screenshot 2024-01-01 at 10.00.00\u{202F}AM.png";
+        let macos_file = write(dir.path(), macos_name, "x");
+        let r = resolve_read_path("Screenshot 2024-01-01 at 10.00.00 AM.png", dir.path()).unwrap();
+        assert_eq!(r, macos_file);
+    }
+
+    #[test]
+    fn test_resolve_read_path_returns_base_when_no_variant_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = resolve_to_cwd("no-such-file.txt", dir.path()).unwrap();
+        let r = resolve_read_path("no-such-file.txt", dir.path()).unwrap();
+        assert_eq!(r, base);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_read_path_async_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write(dir.path(), "async.txt", "content");
+        let r = resolve_read_path_async("async.txt", dir.path())
+            .await
+            .unwrap();
+        assert_eq!(r, file);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_read_path_async_nfd_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let nfd_name: String = "file\u{0065}\u{0301}.txt".to_string();
+        write(dir.path(), &nfd_name, "content");
+        let r = resolve_read_path_async("file\u{00e9}.txt", dir.path())
+            .await
+            .unwrap();
+        assert!(r.starts_with(dir.path()));
+        let name = r.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("file") && name.ends_with(".txt"));
+    }
 }

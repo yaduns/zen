@@ -552,7 +552,11 @@ pub async fn compute_edits_diff(
     edits: &[Edit],
     cwd: &Path,
 ) -> Result<EditDiffDetails, EditError> {
-    let abs = crate::tools::path_utils::resolve_to_cwd(path, cwd);
+    let abs =
+        crate::tools::path_utils::resolve_to_cwd(path, cwd).map_err(|e| EditError::FileAccess {
+            path: path.into(),
+            reason: format!("Cannot resolve path: {e}"),
+        })?;
     let _meta = tokio::fs::metadata(&abs)
         .await
         .map_err(|e| EditError::FileAccess {

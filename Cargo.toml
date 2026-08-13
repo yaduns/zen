@@ -104,3 +104,7 @@ tempfile = "3"
 similar = "2"
 ignore = "0.4"
 libc = "0.2"
+
+# ── path utilities (tilde expansion home dir, file:// URL parsing, T-AP-09-1) ──
+home = "0.5"
+url = "2"

@@ -318,6 +318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1774,6 +1783,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "home",
  "ignore",
  "libc",
  "serde",
@@ -1786,6 +1796,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
  "zen-ai",
 ]
 

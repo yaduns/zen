@@ -202,7 +202,10 @@ impl Tool for EditTool {
         _on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
         let (file_path, edits) = parse_edit_args(params)?;
-        let abs = resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path());
+        let abs =
+            resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path()).map_err(|e| {
+                ToolError::Execution(format!("Failed to resolve path '{file_path}': {e}"))
+            })?;
         let details = edit_file(&abs, &edits, cancel)
             .await
             .map_err(|e| map_edit_error(e, &file_path))?;

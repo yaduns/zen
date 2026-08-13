@@ -20,5 +20,7 @@ chrono = { workspace = true }
 ignore = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }
+home = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]

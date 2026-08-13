@@ -98,7 +98,10 @@ impl Tool for WriteTool {
     ) -> Result<ToolExecutionResult, ToolError> {
         let (file_path, content) = parse_write_args(params)?;
 
-        let absolute_path = resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path());
+        let absolute_path = resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path())
+            .map_err(|e| {
+                ToolError::Execution(format!("Failed to resolve path '{file_path}': {e}"))
+            })?;
         let success_msg = write_file(&absolute_path, &content, cancel).await?;
 
         let now = std::time::SystemTime::now()

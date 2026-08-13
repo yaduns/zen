@@ -120,7 +120,11 @@ impl Tool for ReadTool {
     ) -> Result<ToolExecutionResult, ToolError> {
         let (file_path, offset, limit) = parse_read_args(params)?;
 
-        let resolved = resolve_read_path_async(file_path, &self.tool_context.working_dir).await;
+        let resolved = resolve_read_path_async(file_path, &self.tool_context.working_dir)
+            .await
+            .map_err(|e| {
+                ToolError::Execution(format!("Failed to resolve read path '{file_path}': {e}"))
+            })?;
         let (content, info) = read_file_content(&resolved, offset, limit, cancel).await?;
 
         let now = std::time::SystemTime::now()
