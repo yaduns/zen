@@ -4,6 +4,16 @@ use tokio::io::AsyncReadExt;
 /// Grace period (ms) that stdout/stderr remains idle after exit, aligned with pi `EXIT_STDIO_GRACE_MS = 100`.
 const EXIT_STDIO_GRACE_MS: u64 = 100;
 
+/// Process-level detached child process pid registry (module-private).
+/// `LazyLock` initializes on first access; `Mutex` ensures concurrency safety; `HashSet` provides O(1) deduplicated registration.
+// About Mutex:
+// 1. Make static contents mutable. static is immutable; cannot directly &mut the HashSet inside. Mutex provides interior mutability: get &mut HashSet via lock()
+// 2. Multi-thread concurrency safety.
+// 3. Uses std::sync::Mutex (blocking lock), not tokio::sync::Mutex. This is intentional — track/untrack are both synchronous, O(1) short operations
+// and never cross .await while holding the lock (does not block the async runtime), so no async mutex is needed; std::sync::Mutex is zero-overhead and simple.
+static REGISTRY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 /// Reads the next chunk from `reader` (may be `None`, meaning the stream is disabled or already ended).
 ///
 /// When `None`, returns a future that never completes, to be used with the outer `select!`'s `if !..._eof`
@@ -165,6 +175,76 @@ pub async fn wait_for_child_process(
     }
 }
 
+/// Register a detached child process pid (aligned with pi `trackDetachedChildPid`).
+///
+/// # Behavior
+/// Add `pid` to the process-level registry `REGISTRY` (`REGISTRY.lock().insert(pid)`); once registered, the pid
+/// will be batch-terminated by `kill_tracked_detached_children` when the parent receives a shutdown signal (SIGHUP/SIGTERM).
+/// The registry is process-global (`LazyLock<Mutex<HashSet<u32>>>`) and idempotent: registering the same pid repeatedly has no side effects.
+///
+/// # Parameters
+/// - `pid`: the pid of a child started in its own process group (unix `process_group(0)`, aligning with pi `detached: true`)
+///   child process pid, ensuring `kill_process_tree` can terminate the whole tree by process group.
+///
+/// # Edge Cases
+/// - Only registers; does not validate pid validity. Callers must register immediately after successful spawn and, after the child exits normally, use
+///   `untrack_detached_child_pid` to remove it, preventing pid reuse from killing unrelated processes by mistake.
+pub fn track_detached_child_pid(pid: u32) {
+    // Poisoned-lock recovery: if a thread panics while holding the lock, `.lock()` returns Err; use `into_inner()` to recover
+    // the internal data and continue registering instead of unwrap-panicking — this is the shutdown cleanup path; registration must never be lost due to a panic,
+    // otherwise the detached child process will not be killed when the parent exits (AGENTS.md rule 4).
+    REGISTRY
+        .lock()
+        // into_inner() recovers the internal HashSet for continued use — registration/cleanup paths must "best-effort"; prefer continuing over panicking
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pid);
+}
+
+/// Remove a pid from the registry (aligned with pi `untrackDetachedChildPid`).
+///
+/// # Behavior
+/// Remove `pid` from the process-level registry `REGISTRY` (`REGISTRY.lock().remove(&pid)`) so it is no longer
+/// terminated by `kill_tracked_detached_children`. Idempotent: no side effects when the pid is not in the registry.
+///
+/// # Parameters
+/// - `pid`: child process pid to remove (usually a process that has already exited normally).
+///
+/// # Edge Cases
+/// - Must be called after the child process exits; otherwise the pid may be reused by the system, leading to killing unrelated processes later.
+pub fn untrack_detached_child_pid(pid: u32) {
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&pid);
+}
+
+/// Terminate all registered detached child process trees and clear the registry (aligned with pi `killTrackedDetachedChildren`).
+///
+/// # Behavior
+/// Lock `REGISTRY`, take a snapshot, then `clear()`, and for each pid in the snapshot call
+/// `crate::env::shell::kill_process_tree` (unix sends SIGKILL to process group `-pid`; windows spawns
+/// `taskkill /T /F`）。
+///
+/// # When to Call
+/// Called from the parent process's signal (SIGHUP/SIGTERM) handlers: print-mode receives SIGTERM/SIGHUP,
+/// on interactive-mode terminal loss/close and RPC shutdown (aligning with pi's signal handling per mode).
+///
+/// # Edge Cases
+/// - `kill_process_tree` is best-effort and does not throw (the process may have already exited); this function likewise returns no error.
+/// - After the call the registry is empty; subsequent `track_detached_child_pid` calls start registering again.
+pub fn kill_tracked_detached_children() {
+    // Take snapshot and clear first, then kill one by one outside the lock — avoid holding the lock for long (kill is an external syscall)
+    let pids: Vec<u32> = {
+        let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        let pids = reg.iter().copied().collect();
+        reg.clear();
+        pids
+    };
+    for pid in pids {
+        crate::env::shell::kill_process_tree(pid); // Depends on the T-AG environment shell task; this call is left pending implementation until it lands
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +398,115 @@ mod tests {
             .expect("wait ok");
         assert_eq!(code, Some(0));
         assert_eq!(out.lock().unwrap().len(), n);
+    }
+
+    // ── detached child process registry (track / untrack / kill_tracked) ────────
+    // REGISTRY is a process-level global static: parallel Rust tests will overwrite each other's registrations,
+    // Therefore all tests that touch the registry are serialized with registry_guard() first; and use synthetic values far above real pids
+    // (pid limits: Linux about 2^22=4194304, macOS 99999) to avoid killing real process groups.
+
+    /// Serializes tests that touch the global `REGISTRY`. The returned guard's lifetime is the critical section.
+    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_track_detached_pid_dedups_and_records() {
+        let _g = registry_guard();
+        let (p1, p2) = (100_000_000u32, 100_000_001u32);
+        untrack_detached_child_pid(p1); // Defensive cleanup of registrations possibly left by the previous test case
+        untrack_detached_child_pid(p2);
+
+        track_detached_child_pid(p1);
+        track_detached_child_pid(p1); // Idempotent: duplicate registration still results in 1 entry
+        track_detached_child_pid(p2);
+
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(reg.len(), 2, "duplicate pid should be registered only once");
+        assert!(reg.contains(&p1));
+        assert!(reg.contains(&p2));
+        drop(reg);
+
+        // Clean up and keep the registry empty
+        untrack_detached_child_pid(p1);
+        untrack_detached_child_pid(p2);
+    }
+
+    #[test]
+    fn test_untrack_detached_pid_removes_idempotently() {
+        let _g = registry_guard();
+        let (p1, p2) = (100_000_002u32, 100_000_003u32);
+        untrack_detached_child_pid(p1);
+        untrack_detached_child_pid(p2);
+
+        track_detached_child_pid(p1);
+        untrack_detached_child_pid(p1);
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!reg.contains(&p1));
+        drop(reg);
+
+        // Idempotent: duplicate removal and removal of a nonexistent pid both have no side effects
+        untrack_detached_child_pid(p1);
+        untrack_detached_child_pid(p2);
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(reg.is_empty());
+        drop(reg);
+    }
+
+    #[test]
+    fn test_kill_tracked_clears_registry_and_survives_dead_pids() {
+        let _g = registry_guard();
+        let (p1, p2) = (100_000_004u32, 100_000_005u32);
+        untrack_detached_child_pid(p1);
+        untrack_detached_child_pid(p2);
+
+        track_detached_child_pid(p1);
+        track_detached_child_pid(p2);
+
+        // Nonexistent process group: kill_process_tree is best-effort and does not throw
+        kill_tracked_detached_children();
+
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(reg.is_empty(), "registry should be empty after kill_tracked");
+        drop(reg);
+
+        // Can re-register after clearing
+        track_detached_child_pid(p1);
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(reg.contains(&p1));
+        drop(reg);
+        untrack_detached_child_pid(p1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_kill_tracked_terminates_real_detached_process() {
+        use std::os::unix::process::CommandExt;
+
+        let _g = registry_guard();
+
+        // Start a long-sleeping process in a separate process group (aligns with pi detached: true + process_group(0))
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn detached sleeper");
+        let pid = child.id();
+
+        track_detached_child_pid(pid);
+        kill_tracked_detached_children();
+
+        // Reap the child process and assert it was terminated by SIGKILL (avoid leaving zombies)
+        let mut status: libc::c_int = 0;
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(
+            reaped, pid as libc::pid_t,
+            "should reap killed detached child processes"
+        );
+        assert!(libc::WIFSIGNALED(status), "child process should be terminated by signal");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
     }
 }
