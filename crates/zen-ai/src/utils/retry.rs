@@ -165,7 +165,10 @@ mod tests {
 
     // ── helpers ──
 
-    fn make_assistant_msg(stop_reason: StopReason, error_message: Option<&str>) -> AssistantMessage {
+    fn make_assistant_msg(
+        stop_reason: StopReason,
+        error_message: Option<&str>,
+    ) -> AssistantMessage {
         AssistantMessage {
             content: vec![],
             api: String::new(),
@@ -247,115 +250,181 @@ mod tests {
 
     #[test]
     fn test_non_retryable_go_usage_limit_error() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("GoUsageLimitError: you've hit your free tier limit")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "GoUsageLimitError: you've hit your free tier limit"
+        )));
     }
 
     #[test]
     fn test_non_retryable_free_usage_limit_error() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("FreeUsageLimitError: upgrade to continue")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "FreeUsageLimitError: upgrade to continue"
+        )));
     }
 
     #[test]
     fn test_non_retryable_monthly_usage_limit() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("Monthly usage limit reached, please wait")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "Monthly usage limit reached, please wait"
+        )));
     }
 
     #[test]
     fn test_non_retryable_insufficient_quota() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("insufficient_quota")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "insufficient_quota"
+        )));
     }
 
     #[test]
     fn test_non_retryable_out_of_budget() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("out of budget")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "out of budget"
+        )));
     }
 
     #[test]
     fn test_non_retryable_quota_exceeded() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("quota exceeded for this API key")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "quota exceeded for this API key"
+        )));
     }
 
     #[test]
     fn test_non_retryable_billing() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("billing error: payment required")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "billing error: payment required"
+        )));
     }
 
     #[test]
     fn test_non_retryable_available_balance() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("no available balance, please add funds")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "no available balance, please add funds"
+        )));
     }
 
     // ── retryable patterns ──
 
     #[test]
     fn test_retryable_overloaded() {
-        assert!(is_retryable_assistant_error(&make_error_msg("upstream service is overloaded")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "upstream service is overloaded"
+        )));
     }
 
     #[test]
     fn test_retryable_rate_limit() {
-        assert!(is_retryable_assistant_error(&make_error_msg("rate limit exceeded")));
-        assert!(is_retryable_assistant_error(&make_error_msg("rate_limit exceeded")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "rate limit exceeded"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "rate_limit exceeded"
+        )));
     }
 
     #[test]
     fn test_retryable_too_many_requests() {
-        assert!(is_retryable_assistant_error(&make_error_msg("too many requests")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "too many requests"
+        )));
     }
 
     #[test]
     fn test_retryable_http_status_codes() {
         assert!(is_retryable_assistant_error(&make_error_msg("HTTP 429")));
-        assert!(is_retryable_assistant_error(&make_error_msg("HTTP 500 Internal Server Error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("502 Bad Gateway")));
-        assert!(is_retryable_assistant_error(&make_error_msg("503 Service Unavailable")));
-        assert!(is_retryable_assistant_error(&make_error_msg("504 Gateway Timeout")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "HTTP 500 Internal Server Error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "502 Bad Gateway"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "503 Service Unavailable"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "504 Gateway Timeout"
+        )));
         assert!(is_retryable_assistant_error(&make_error_msg("524")));
     }
 
     #[test]
     fn test_retryable_service_unavailable() {
-        assert!(is_retryable_assistant_error(&make_error_msg("service unavailable")));
-        assert!(is_retryable_assistant_error(&make_error_msg("service_unavailable")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "service unavailable"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "service_unavailable"
+        )));
     }
 
     #[test]
     fn test_retryable_server_error() {
-        assert!(is_retryable_assistant_error(&make_error_msg("server error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("server_error")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "server error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "server_error"
+        )));
     }
 
     #[test]
     fn test_retryable_internal_error() {
-        assert!(is_retryable_assistant_error(&make_error_msg("internal error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("internal_error")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "internal error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "internal_error"
+        )));
     }
 
     #[test]
     fn test_retryable_provider_returned_error() {
-        assert!(is_retryable_assistant_error(&make_error_msg("provider returned error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("provider_returned_error")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "provider returned error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "provider_returned_error"
+        )));
     }
 
     #[test]
     fn test_retryable_network_errors() {
-        assert!(is_retryable_assistant_error(&make_error_msg("network error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("network_error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("connection error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("connection refused")));
-        assert!(is_retryable_assistant_error(&make_error_msg("connection lost")));
-        assert!(is_retryable_assistant_error(&make_error_msg("connection_lost")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "network error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "network_error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "connection error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "connection refused"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "connection lost"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "connection_lost"
+        )));
     }
 
     #[test]
     fn test_retryable_fetch_failed() {
-        assert!(is_retryable_assistant_error(&make_error_msg("fetch failed")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "fetch failed"
+        )));
     }
 
     #[test]
     fn test_retryable_socket_errors() {
-        assert!(is_retryable_assistant_error(&make_error_msg("socket hang up")));
-        assert!(is_retryable_assistant_error(&make_error_msg("socket connection was closed")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "socket hang up"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "socket connection was closed"
+        )));
     }
 
     #[test]
@@ -371,53 +440,83 @@ mod tests {
 
     #[test]
     fn test_retryable_websocket_errors() {
-        assert!(is_retryable_assistant_error(&make_error_msg("websocket closed")));
-        assert!(is_retryable_assistant_error(&make_error_msg("websocket error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("websocket_error")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "websocket closed"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "websocket error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "websocket_error"
+        )));
     }
 
     #[test]
     fn test_retryable_stream_ended_errors() {
-        assert!(is_retryable_assistant_error(&make_error_msg("stream ended without message_stop")));
-        assert!(is_retryable_assistant_error(&make_error_msg("ended without")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "stream ended without message_stop"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "ended without"
+        )));
     }
 
     #[test]
     fn test_retryable_http2_error() {
-        assert!(is_retryable_assistant_error(&make_error_msg("http2 request did not get a response")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "http2 request did not get a response"
+        )));
     }
 
     #[test]
     fn test_retryable_retry_delay() {
-        assert!(is_retryable_assistant_error(&make_error_msg("retry delay cap reached")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "retry delay cap reached"
+        )));
     }
 
     #[test]
     fn test_retryable_retry_suggestion() {
-        assert!(is_retryable_assistant_error(&make_error_msg("you can retry your request")));
-        assert!(is_retryable_assistant_error(&make_error_msg("please retry your request")));
-        assert!(is_retryable_assistant_error(&make_error_msg("try your request again")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "you can retry your request"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "please retry your request"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "try your request again"
+        )));
     }
 
     #[test]
     fn test_retryable_resource_exhausted() {
-        assert!(is_retryable_assistant_error(&make_error_msg("ResourceExhausted")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "ResourceExhausted"
+        )));
     }
 
     #[test]
     fn test_retryable_upstream_connect() {
-        assert!(is_retryable_assistant_error(&make_error_msg("upstream connect error")));
-        assert!(is_retryable_assistant_error(&make_error_msg("upstream_connect")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "upstream connect error"
+        )));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "upstream_connect"
+        )));
     }
 
     #[test]
     fn test_retryable_reset_before_headers() {
-        assert!(is_retryable_assistant_error(&make_error_msg("reset before headers")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "reset before headers"
+        )));
     }
 
     #[test]
     fn test_retryable_other_side_closed() {
-        assert!(is_retryable_assistant_error(&make_error_msg("other side closed")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "other side closed"
+        )));
     }
 
     // ── case insensitivity ──
@@ -426,12 +525,16 @@ mod tests {
     fn test_case_insensitive_retryable() {
         assert!(is_retryable_assistant_error(&make_error_msg("TIMEOUT")));
         assert!(is_retryable_assistant_error(&make_error_msg("Overloaded")));
-        assert!(is_retryable_assistant_error(&make_error_msg("RATE_LIMIT Exceeded")));
+        assert!(is_retryable_assistant_error(&make_error_msg(
+            "RATE_LIMIT Exceeded"
+        )));
     }
 
     #[test]
     fn test_case_insensitive_non_retryable() {
-        assert!(!is_retryable_assistant_error(&make_error_msg("Insufficient_Quota")));
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "Insufficient_Quota"
+        )));
         assert!(!is_retryable_assistant_error(&make_error_msg("BILLING")));
     }
 
@@ -674,7 +777,9 @@ mod tests {
         let result = retry_assistant_call(
             || {
                 call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready(make_error_msg("some weird error that doesn't match any pattern"))
+                std::future::ready(make_error_msg(
+                    "some weird error that doesn't match any pattern",
+                ))
             },
             Some(RetryPolicy {
                 enabled: true,

@@ -154,10 +154,8 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
                 if tools.is_empty() {
                     0
                 } else {
-                    let definitions: Vec<ToolDefinition> = tools
-                        .iter()
-                        .map(|t| t.to_api_definition())
-                        .collect();
+                    let definitions: Vec<ToolDefinition> =
+                        tools.iter().map(|t| t.to_api_definition()).collect();
                     let json = serde_json::to_string(&definitions).unwrap_or_default();
                     estimate_text_tokens(&json)
                 }
@@ -373,11 +371,11 @@ mod tests {
     fn test_estimate_content_blocks_tokens_text_blocks() {
         let blocks = vec![
             ContentBlock::Text(TextContent {
-                text: "hello".to_string(),          // 5 -> ceil(5/4) = 2
+                text: "hello".to_string(), // 5 -> ceil(5/4) = 2
                 text_signature: None,
             }),
             ContentBlock::Text(TextContent {
-                text: "world".to_string(),          // 5 -> ceil(5/4) = 2
+                text: "world".to_string(), // 5 -> ceil(5/4) = 2
                 text_signature: None,
             }),
         ];
@@ -404,13 +402,13 @@ mod tests {
     fn test_estimate_content_blocks_tokens_mixed() {
         let blocks = vec![
             ContentBlock::Text(TextContent {
-                text: "abcd".to_string(),            // 4 -> ceil(4/4) = 1
+                text: "abcd".to_string(), // 4 -> ceil(4/4) = 1
                 text_signature: None,
             }),
             ContentBlock::Image(ImageContent {
                 data: "img".to_string(),
                 mime_type: "image/png".to_string(),
-            }),                                      // 4800/4 = 1200
+            }), // 4800/4 = 1200
         ];
         assert_eq!(estimate_content_blocks_tokens(&blocks), 1201);
     }
@@ -418,7 +416,7 @@ mod tests {
     #[test]
     fn test_estimate_content_blocks_tokens_thinking() {
         let blocks = vec![ContentBlock::Thinking(ThinkingContent {
-            thinking: "deep thought".to_string(),  // 12 -> ceil(12/4) = 3
+            thinking: "deep thought".to_string(), // 12 -> ceil(12/4) = 3
             thinking_signature: None,
             redacted: None,
         })];
@@ -429,8 +427,8 @@ mod tests {
     fn test_estimate_content_blocks_tokens_tool_call() {
         let blocks = vec![ContentBlock::ToolCall(ToolCall {
             id: "call_1".to_string(),
-            name: "read_file".to_string(),    // 8 -> ceil(8/4) = 2
-            arguments: json!({"path": "/tmp/test.txt"}),  // ~26 chars -> ceil(26/4) = 7
+            name: "read_file".to_string(), // 8 -> ceil(8/4) = 2
+            arguments: json!({"path": "/tmp/test.txt"}), // ~26 chars -> ceil(26/4) = 7
             thought_signature: None,
         })];
         // 2 + 7 = 9
@@ -442,7 +440,7 @@ mod tests {
     #[test]
     fn test_estimate_message_tokens_user_text() {
         let msg = Message::User(UserMessage {
-            content: ContentBlockList::Text("hello world".to_string()),  // 11 -> ceil(11/4) = 3
+            content: ContentBlockList::Text("hello world".to_string()), // 11 -> ceil(11/4) = 3
             timestamp: 1000,
         });
         assert_eq!(estimate_message_tokens(&msg), 3);
@@ -453,13 +451,13 @@ mod tests {
         let msg = Message::User(UserMessage {
             content: ContentBlockList::Blocks(vec![
                 ContentBlock::Text(TextContent {
-                    text: "hello".to_string(),     // 5 -> ceil(5/4) = 2
+                    text: "hello".to_string(), // 5 -> ceil(5/4) = 2
                     text_signature: None,
                 }),
                 ContentBlock::Image(ImageContent {
                     data: "data".to_string(),
                     mime_type: "image/png".to_string(),
-                }),                                 // 4800/4 = 1200
+                }), // 4800/4 = 1200
             ]),
             timestamp: 1000,
         });
@@ -471,11 +469,11 @@ mod tests {
         let msg = Message::Assistant(AssistantMessage {
             content: vec![
                 ContentBlock::Text(TextContent {
-                    text: "abcd".to_string(),       // 4 -> 1
+                    text: "abcd".to_string(), // 4 -> 1
                     text_signature: None,
                 }),
                 ContentBlock::Thinking(ThinkingContent {
-                    thinking: "Thinking".to_string(),    // 6 bytes -> ceil(6/4) = 2
+                    thinking: "Thinking".to_string(), // 6 bytes -> ceil(6/4) = 2
                     thinking_signature: None,
                     redacted: None,
                 }),
@@ -505,7 +503,7 @@ mod tests {
             response_id: None,
             error_message: None,
         });
-        assert_eq!(estimate_message_tokens(&msg), 3);  // 1 + 2
+        assert_eq!(estimate_message_tokens(&msg), 3); // 1 + 2
     }
 
     #[test]
@@ -514,7 +512,7 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent {
-                text: "file content".to_string(),  // 12 -> ceil(12/4) = 3
+                text: "file content".to_string(), // 12 -> ceil(12/4) = 3
                 text_signature: None,
             })],
             details: None,
@@ -556,14 +554,14 @@ mod tests {
     fn test_estimate_messages_no_assistant_usage() {
         let messages = vec![
             Message::User(UserMessage {
-                content: ContentBlockList::Text("hello".to_string()),  // 5 -> 2
+                content: ContentBlockList::Text("hello".to_string()), // 5 -> 2
                 timestamp: 1000,
             }),
             Message::ToolResult(ToolResultMessage {
                 tool_call_id: "c1".to_string(),
                 tool_name: "read".to_string(),
                 content: vec![ContentBlock::Text(TextContent {
-                    text: "result".to_string(),                        // 6 -> 2
+                    text: "result".to_string(), // 6 -> 2
                     text_signature: None,
                 })],
                 details: None,
@@ -589,7 +587,7 @@ mod tests {
             }),
         ];
         let result = estimate_messages(&messages);
-        assert_eq!(result.tokens, 4);   // 2 + 2
+        assert_eq!(result.tokens, 4); // 2 + 2
         assert_eq!(result.usage_tokens, 0);
         assert_eq!(result.trailing_tokens, 4);
         assert_eq!(result.last_usage_index, None);
@@ -633,7 +631,7 @@ mod tests {
                 error_message: None,
             }),
             Message::User(UserMessage {
-                content: ContentBlockList::Text("follow up".to_string()),  // 9 -> 3
+                content: ContentBlockList::Text("follow up".to_string()), // 9 -> 3
                 timestamp: 3000,
             }),
         ];
@@ -647,40 +645,38 @@ mod tests {
 
     #[test]
     fn test_estimate_messages_skips_aborted_usage() {
-        let messages = vec![
-            Message::Assistant(AssistantMessage {
-                content: vec![],
-                timestamp: 1000,
-                stop_reason: StopReason::Aborted,
-                usage: Usage {
-                    total_tokens: 100,
-                    input: 0,
-                    output: 0,
-                    cache_read: 0,
-                    cache_write: 0,
-                    cost: Cost {
-                        input: 0.0,
-                        output: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                        total: 0.0,
-                    },
-                    cache_write_1h: None,
-                    reasoning: None,
+        let messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![],
+            timestamp: 1000,
+            stop_reason: StopReason::Aborted,
+            usage: Usage {
+                total_tokens: 100,
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cost: Cost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    total: 0.0,
                 },
-                api: "o".to_string(),
-                provider: "d".to_string(),
-                model: "m".to_string(),
-                response_model: None,
-                response_id: None,
-                error_message: None,
-            }),
-        ];
+                cache_write_1h: None,
+                reasoning: None,
+            },
+            api: "o".to_string(),
+            provider: "d".to_string(),
+            model: "m".to_string(),
+            response_model: None,
+            response_id: None,
+            error_message: None,
+        })];
         let result = estimate_messages(&messages);
         // Aborted assistant should be skipped for usage, falls back to per-message estimation
         assert_eq!(result.last_usage_index, None);
         assert_eq!(result.usage_tokens, 0);
-        assert_eq!(result.tokens, 0);  // content is empty
+        assert_eq!(result.tokens, 0); // content is empty
     }
 
     // ── estimate_context_tokens ─────────────────────────────────
@@ -688,13 +684,11 @@ mod tests {
     #[test]
     fn test_estimate_context_tokens_with_system_prompt_and_tools() {
         let context = Context {
-            system_prompt: Some("You are a helpful assistant".to_string()),  // 29 -> 8
-            messages: vec![
-                Message::User(UserMessage {
-                    content: ContentBlockList::Text("hello".to_string()),    // 5 -> 2
-                    timestamp: 1000,
-                }),
-            ],
+            system_prompt: Some("You are a helpful assistant".to_string()), // 29 -> 8
+            messages: vec![Message::User(UserMessage {
+                content: ContentBlockList::Text("hello".to_string()), // 5 -> 2
+                timestamp: 1000,
+            })],
             tools: Some(vec![std::sync::Arc::new(MockTool {
                 name: "read",
                 description: "Read a file",

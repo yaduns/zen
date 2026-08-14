@@ -117,7 +117,12 @@ mod tests {
         // No base-36 encoded value (except "0" itself) should start with '0'
         for n in [1u64, 36, 1296, 46656, 1679616, 60466176, u64::MAX] {
             let encoded = encode_base36(n);
-            assert!(!encoded.starts_with('0'), "{} encoded as {} starts with '0'", n, encoded);
+            assert!(
+                !encoded.starts_with('0'),
+                "{} encoded as {} starts with '0'",
+                n,
+                encoded
+            );
         }
     }
 
@@ -190,7 +195,9 @@ mod tests {
             "hash '{}' contains non-alphanumeric characters",
             result
         );
-        assert!(result.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(result
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]
@@ -205,4 +212,3 @@ mod tests {
         );
     }
 }
-

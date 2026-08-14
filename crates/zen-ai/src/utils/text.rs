@@ -146,11 +146,8 @@ mod tests {
 
     #[test]
     fn from_list_blocks_variant_extracts_text() {
-        let list = ContentBlockList::Blocks(vec![
-            make_text("first"),
-            make_image(),
-            make_text("second"),
-        ]);
+        let list =
+            ContentBlockList::Blocks(vec![make_text("first"), make_image(), make_text("second")]);
         assert_eq!(content_text_from_list(&list, "\n"), "first\nsecond");
     }
 

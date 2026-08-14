@@ -159,13 +159,25 @@ mod tests {
 
     #[test]
     fn test_overflow_detected_by_error_message() {
-        let msg = make_msg(StopReason::Error, Some("prompt is too long: 213462 tokens > 200000 maximum"), 0, 0, 0);
+        let msg = make_msg(
+            StopReason::Error,
+            Some("prompt is too long: 213462 tokens > 200000 maximum"),
+            0,
+            0,
+            0,
+        );
         assert!(is_context_overflow(&msg, None));
     }
 
     #[test]
     fn test_overflow_detected_by_exceeds_context_window() {
-        let msg = make_msg(StopReason::Error, Some("Your input exceeds the context window of this model"), 0, 0, 0);
+        let msg = make_msg(
+            StopReason::Error,
+            Some("Your input exceeds the context window of this model"),
+            0,
+            0,
+            0,
+        );
         assert!(is_context_overflow(&msg, None));
     }
 
@@ -173,8 +185,12 @@ mod tests {
     fn test_overflow_detected_by_maximum_context_length() {
         let msg = make_msg(
             StopReason::Error,
-            Some("Requested token count exceeds the model's maximum context length of 131072 tokens"),
-            0, 0, 0,
+            Some(
+                "Requested token count exceeds the model's maximum context length of 131072 tokens",
+            ),
+            0,
+            0,
+            0,
         );
         assert!(is_context_overflow(&msg, None));
     }
@@ -200,7 +216,9 @@ mod tests {
         let msg = make_msg(
             StopReason::Error,
             Some("An unexpected error occurred during processing"),
-            0, 0, 0,
+            0,
+            0,
+            0,
         );
         assert!(!is_context_overflow(&msg, None));
     }
@@ -211,7 +229,9 @@ mod tests {
         let msg = make_msg(
             StopReason::Error,
             Some("rate limit exceeded, please try again later"),
-            0, 0, 0,
+            0,
+            0,
+            0,
         );
         assert!(!is_context_overflow(&msg, None));
     }
@@ -222,7 +242,9 @@ mod tests {
         let msg = make_msg(
             StopReason::Error,
             Some("Throttling error: Too many tokens, please wait before trying again."),
-            0, 0, 0,
+            0,
+            0,
+            0,
         );
         assert!(!is_context_overflow(&msg, None));
     }
@@ -326,7 +348,7 @@ mod tests {
     #[test]
     fn test_overflow_with_cache_read_considered() {
         // Path 2: input + cache_read computed together
-        let msg = make_msg(StopReason::Stop, None, 60, 0, 50);  // 110 > 100
+        let msg = make_msg(StopReason::Stop, None, 60, 0, 50); // 110 > 100
         assert!(is_context_overflow(&msg, Some(100)));
     }
 
@@ -336,7 +358,9 @@ mod tests {
         let msg = make_msg(
             StopReason::Error,
             Some("range of input length should be [1, 128000]"),
-            0, 0, 0,
+            0,
+            0,
+            0,
         );
         assert!(is_context_overflow(&msg, None));
     }
@@ -347,9 +371,10 @@ mod tests {
         let msg = make_msg(
             StopReason::Error,
             Some("prompt is too long"),
-            5, 0, 0,  // Small input, but the error message matches
+            5,
+            0,
+            0, // Small input, but the error message matches
         );
         assert!(is_context_overflow(&msg, Some(100)));
     }
 }
-

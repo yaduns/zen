@@ -42,7 +42,10 @@ mod tests {
     fn test_headers_to_record_empty() {
         let headers = HeaderMap::new();
         let result = headers_to_record(&headers);
-        assert!(result.is_empty(), "empty HeaderMap should produce empty HashMap");
+        assert!(
+            result.is_empty(),
+            "empty HeaderMap should produce empty HashMap"
+        );
     }
 
     #[test]
@@ -68,7 +71,10 @@ mod tests {
         let result = headers_to_record(&headers);
         assert_eq!(result.len(), 1, "non-UTF-8 header should be skipped");
         assert_eq!(result.get("valid").unwrap(), "hello");
-        assert!(result.get("invalid").is_none(), "invalid header should not appear");
+        assert!(
+            result.get("invalid").is_none(),
+            "invalid header should not appear"
+        );
     }
 
     // ── provider_headers_to_record ─────────────────────────────
@@ -106,7 +112,10 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("keep").unwrap(), "value");
         assert_eq!(result.get("also_keep").unwrap(), "also");
-        assert!(result.get("drop").is_none(), "null value should be filtered out");
+        assert!(
+            result.get("drop").is_none(),
+            "null value should be filtered out"
+        );
     }
 
     #[test]
@@ -131,4 +140,3 @@ mod tests {
         assert_eq!(result.get("empty").unwrap(), "");
     }
 }
-
