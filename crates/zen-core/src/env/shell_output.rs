@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-struct ShellCaptureOptions {
+pub struct ShellCaptureOptions {
     // Working directory of the command, passed through as ExecOptions.cwd
     cwd: Option<PathBuf>,
     // Additional environment variable overrides, passed through as ExecOptions.env
@@ -23,7 +23,7 @@ struct ShellCaptureOptions {
 }
 
 // Complete result of a capture call returned to the caller
-struct ShellCaptureResult {
+pub struct ShellCaptureResult {
     // Content after tail truncation (truncateTail semantics: keep last 2000 lines / 50KB)
     output: String,
     // Process exit code; None when cancelled, Some(code) on normal exit
@@ -256,7 +256,7 @@ pub async fn execute_shell_with_capture(
         on_stdout: Some(on_stdout),
         on_stderr: Some(on_stderr),
     };
-    let exec_result = env.exec(command, &exec_options).await;
+    let exec_result = env.exec(command, exec_options).await;
 
     // 6) Aggregate tail buffer + final truncation
     let tail_output: String = match state.lock() {
@@ -280,9 +280,9 @@ pub async fn execute_shell_with_capture(
 
     // 7) Close all senders, wait for the writer to drain and collect errors.
     //    Key point: the channel has three senders — the main tx, and tx_handler captured by the handler closure.
-    //    the local handler Arc holds tx_handler, and on_stdout/on_stderr inside exec_options each hold one clone
-    //    handler clone. All three must be dropped, otherwise rx.recv() never returns None and the writer task hangs.
-    drop(exec_options); // Drop the on_stdout/on_stderr Boxes → release the two handler clones
+    //    handler holds tx_handler in a local Arc; on_stdout/on_stderr each hold a clone of the handler.
+    //    exec consumes ExecOptions by value; on return the Box for on_stdout/on_stderr (and its handler
+    //    clone) has already been released, so we only need to drop the local handler and the main tx; the channel then closes and writer recv() returns None.
     drop(handler); // Drop the local handler Arc (holds tx_handler)
     drop(tx); // Drop the main tx → channel closes → writer recv() returns None
     let write_result = match write_task.await {

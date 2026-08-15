@@ -36,7 +36,8 @@ async fn read_chunk<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// stdout/stderr chunk callback type: called on each raw byte chunk received; infallible contract (must not panic).
-type ChunkCallback = dyn Fn(&[u8]) + Send + Sync;
+/// `pub(crate)`: The `ExecutionEnv::exec` in `env/mod.rs` (T-AP-04-2) also uses it to declare the byte callback, providing a single source of truth.
+pub(crate) type ChunkCallback = dyn Fn(&[u8]) + Send + Sync;
 
 /// Waits for the child process to exit while draining its stdout/stderr pipes, and does not hang on the inherited stdio handles held by detached descendants
 /// (restores the pi#5303 fix semantics, see
@@ -245,6 +246,20 @@ pub fn kill_tracked_detached_children() {
     }
 }
 
+/// For tests: serialize all tests that touch the global `REGISTRY`.
+///
+/// `REGISTRY` is a process-level global static; Rust's parallel test execution would let tests overwrite each other's registrations,
+/// so all tests that touch the registry (this module's track/untrack/kill_tracked tests, and
+/// the detached-tracking test for `ExecutionEnv::exec` in `env/mod.rs`—the new consumer added by T-AP-04-2)
+/// must be serialized through **the same lock**, otherwise each other's kill_tracked may kill the other's processes,
+/// or the other's registration may cause the "registry should be empty" assertion to fail due to a race.
+#[cfg(test)]
+pub(crate) fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,15 +417,10 @@ mod tests {
 
     // ── detached child process registry (track / untrack / kill_tracked) ────────
     // REGISTRY is a process-level global static: parallel Rust tests will overwrite each other's registrations,
-    // Therefore all tests that touch the registry are serialized with registry_guard() first; and use synthetic values far above real pids
-    // (pid limits: Linux about 2^22=4194304, macOS 99999) to avoid killing real process groups.
-
-    /// Serializes tests that touch the global `REGISTRY`. The returned guard's lifetime is the critical section.
-    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-            std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // so all tests that touch the registry are serialized first via registry_guard() (a module-level shared lock;
+    // the exec tracking test in env/mod.rs also reuses it via crate::process::registry_guard());
+    // and use synthetic values far exceeding real pids (pid limits: Linux ~2^22=4194304, macOS 99999)
+    // Avoid accidentally killing the real process group.
 
     #[test]
     fn test_track_detached_pid_dedups_and_records() {
