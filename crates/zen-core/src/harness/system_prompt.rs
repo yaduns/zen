@@ -4,42 +4,42 @@ use std::collections::BTreeMap;
 use zen_ai::tool::Tool;
 
 // All runtime inputs for a single build_system_prompt call. Every field is an assembly input with a single-call lifetime; no serializable business data.
-struct BuildSystemPromptOptions {
+pub struct BuildSystemPromptOptions {
     /// When non-empty, replaces the default identity + tools + guidelines template
-    custom_prompt: Option<String>,
+    pub custom_prompt: Option<String>,
     /// Tool names that should be included; defaults to ["read","bash","edit","write"] when None
     /// Tools in selected_tools appear in the json tools array
     /// Tools with snippets are listed in the system prompt's available tools
     /// The selected_tools set is a superset of the set of tools with snippets
-    selected_tools: Option<Vec<String>>,
+    pub selected_tools: Option<Vec<String>>,
     /// Tool name -> one-line description; only tools with a snippet appear in Available tools; upstream is collect_tool_prompt_metadata aggregating Tool::prompt_snippet()
-    tool_snippets: BTreeMap<String, String>,
+    pub tool_snippets: BTreeMap<String, String>,
     /// Additional guideline entries appended after the default guidelines (deduplicated, trimmed); upstream is collect_tool_prompt_metadata aggregating Tool::prompt_guidelines()
-    prompt_guidelines: Vec<String>,
+    pub prompt_guidelines: Vec<String>,
     /// Text appended to the end of the system prompt
-    append_system_prompt: Option<String>,
+    pub append_system_prompt: Option<String>,
     /// Working directory
-    cwd: String,
+    pub cwd: String,
     /// Injected skills
-    skills: Vec<Skill>,
+    pub skills: Vec<Skill>,
     /// Project context files (AGENTS.md/CLAUDE.md); loaded by the caller via load_project_context_files then injected, assembled into <project_context> / <project_instructions> blocks
-    context_files: Vec<ContextFile>,
+    pub context_files: Vec<ContextFile>,
 }
 
 // Path and content of a project context file (e.g. AGENTS.md), loaded by load_project_context_files from cwd up through ancestor directories, injected into BuildSystemPromptOptions.context_files, and assembled by build_system_prompt into <project_instructions>.
-struct ContextFile {
+pub struct ContextFile {
     // File path (relative to cwd or absolute)
-    path: String,
+    pub path: String,
     // Full file content
-    content: String,
+    pub content: String,
 }
 
 // Aggregated output of collect_tool_prompt_metadata, produced once and passed by the caller into BuildSystemPromptOptions.
-struct ToolPromptMetadata {
+pub struct ToolPromptMetadata {
     // Tool name -> one-line summary; includes only tools that provided a snippet
-    tool_snippets: BTreeMap<String, String>,
+    pub tool_snippets: BTreeMap<String, String>,
     // Flat list of per-tool usage guidelines (may contain duplicates; build_system_prompt deduplicates)
-    prompt_guidelines: Vec<String>,
+    pub prompt_guidelines: Vec<String>,
 }
 
 /// Assemble the system prompt (full zen-core assembler):
