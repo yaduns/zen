@@ -1,4 +1,4 @@
-//! Real integration tests (real_ prefix, require the OPENAI_API_KEY environment variable).
+//! Real integration tests (real_ prefix; depend on the API key environment variables of the selected default provider).
 //!
 //! Covers the "session tree and persistence" part of Phase 1 Step 5 (JSONL lives in zen-app, so this test goes in zen-app/tests):
 //! - REQ-AGENT-03 (T-AG-03-1): session tree structure (SessionTree construction + tree navigation).
@@ -27,6 +27,14 @@ use zen_core::harness::engine::Agent;
 use zen_core::harness::types::{AgentEvent, AgentState, ShouldStopAfterTurnContext, StreamFn};
 use zen_core::session::context::build_context;
 use zen_core::session::tree::{SessionTree, SessionTreeEntry};
+
+/// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).
+fn provider_key_var() -> &'static str {
+    match zen_ai::provider::default_provider_name().as_str() {
+        "opencode-go" => "OPENCODE_API_KEY",
+        _ => "ARK_API_KEY",
+    }
+}
 
 // ─── Mock Hooks (lightweight collectors, following zen-core integration test conventions) ──────────────
 
@@ -84,11 +92,11 @@ fn real_stream_fn() -> StreamFn {
 fn agent_state(system_prompt: &str, history: Vec<Message>) -> AgentState {
     AgentState {
         system_prompt: system_prompt.to_string(),
-        model: Model::from_env().with_env_overrides(),
+        model: Model::from_env(),
         thinking_level: ThinkingLevel::Off,
         tools: vec![],
         messages: history,
-        is_streaming: false,
+        is_run: false,
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,
@@ -160,7 +168,7 @@ async fn run_turn(base_prompt: &str, prompt: &str) -> Vec<Message> {
 
 /// Real integration test: session tree ↔ JSONL persistence ↔ build_context restore → cross-turn LLM continuity.
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 ///
 /// Validation:
 /// 1. Real LLM round 1 remembers the passphrase ORANGE.
@@ -170,9 +178,10 @@ async fn run_turn(base_prompt: &str, prompt: &str) -> Vec<Message> {
 /// 5. Real LLM round 2 follows up based on the restored context and can answer ORANGE (context not lost).
 #[tokio::test]
 async fn real_test_session_persist_recover_continuity() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 
@@ -248,7 +257,7 @@ async fn real_test_session_persist_recover_continuity() {
 
 /// Real integration test: fork branch semantics (JSONL `get_entries_to_fork` + branch context restoration + LLM continuity).
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 ///
 /// Validation:
 /// 1. Round 1 remembers ORANGE, round 2 continues remembering PURPLE → chain [u1, a1, u2, a2].
@@ -256,9 +265,10 @@ async fn real_test_session_persist_recover_continuity() {
 /// 3. Rebuild tree from branch → build_context → follow-up question in round 3: should remember ORANGE (branch history is before the fork point).
 #[tokio::test]
 async fn real_test_session_fork_roundtrip() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 

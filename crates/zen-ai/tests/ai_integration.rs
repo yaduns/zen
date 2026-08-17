@@ -10,16 +10,20 @@ use zen_ai::types::{
 /// Reads environment variables, builds a Context, calls stream_collect(), and validates the returned AssistantMessage
 /// contains non-empty content and valid usage/stop_reason.
 ///
-/// Skip condition: automatically skipped when the OPENAI_API_KEY environment variable is not set (checked inside the test function body,
-/// rather than using the #[ignore] attribute, since the latter cannot be decided at compile time and must be determined at runtime).
+/// Skip condition: automatically skipped when the API key env var for the selected default provider is not set
+/// (detected inside the test function body rather than using the #[ignore] attribute).
 #[tokio::test]
 async fn test_simple_chat() {
-    // Check the environment variable, skip if not set
-    let _ =
-        std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set; skipping integration test");
+    // Check the corresponding API key for the default provider (ZEN_PROVIDER, default opencode-go)
+    let provider = zen_ai::provider::default_provider_name();
+    let key_var = match provider.as_str() {
+        "opencode-go" => "OPENCODE_API_KEY",
+        _ => "ARK_API_KEY",
+    };
+    let _ = std::env::var(key_var).unwrap_or_else(|_| panic!("{} not set; skipping integration test", key_var));
 
-    // 1. Create the model from environment variables
-    let model = Model::from_env().with_env_overrides();
+    // 1. Create the model from environment variables (constructed for the default provider)
+    let model = Model::from_env();
 
     // 2. Build a simple Context
     let context = Context {

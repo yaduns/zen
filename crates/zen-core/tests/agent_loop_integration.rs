@@ -23,6 +23,14 @@ use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
 use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn};
 
+/// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).
+fn provider_key_var() -> &'static str {
+    match zen_ai::provider::default_provider_name().as_str() {
+        "opencode-go" => "OPENCODE_API_KEY",
+        _ => "ARK_API_KEY",
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Mock helpers
 // ═══════════════════════════════════════════════════════════════════
@@ -276,6 +284,7 @@ fn default_model() -> Model {
     Model {
         id: "test-model".into(),
         name: Some("Test Model".into()),
+        provider: "deepseek".into(),
         base_url: "https://api.test.com".into(),
         context_window: 128_000,
         max_tokens: 4096,
@@ -533,11 +542,11 @@ async fn mock_test_tool_call_execution() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Real integration tests (real_ prefix, require OPENAI_API_KEY env var)
+//  Real integration tests (real_ prefix, requires the API key env var for the selected default provider)
 
 /// Real LLM integration test: the agent loop receives a user message and returns the LLM response.
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 /// Validation:
 /// 1. `create_context` assembles the Context correctly
 /// 2. `run_agent_loop` uses the real `stream()` function to make the LLM call
@@ -549,9 +558,10 @@ async fn mock_test_tool_call_execution() {
 /// ```
 #[tokio::test]
 async fn real_test_agent_loop_simple_chat() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 
@@ -559,7 +569,7 @@ async fn real_test_agent_loop_simple_chat() {
     let cancel = CancellationToken::new();
     let tools: Vec<Arc<dyn Tool>> = vec![];
 
-    let model = Model::from_env().with_env_overrides();
+    let model = Model::from_env();
 
     let mut ctx = create_context(
         "You are a helpful assistant. Answer concisely.".into(),

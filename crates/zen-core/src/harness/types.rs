@@ -47,7 +47,7 @@ pub struct AgentState {
     pub tools: Vec<Arc<dyn Tool>>,
     /// Completed conversation history (all messages are finalized)
     pub messages: Vec<Message>,
-    pub is_streaming: bool,
+    pub is_run: bool,
     /// Current assistant message under construction, not yet finished
     pub streaming_message: Option<Message>,
     /// Set of tool call IDs currently executing
@@ -67,29 +67,29 @@ pub struct AlreadyRunningError;
 impl AgentState {
     /// Start a new run from the idle state (aligned with pi `runWithLifecycle`, `agent.ts:483`).
     ///
-    /// Sets `is_streaming = true` and clears `streaming_message`.
+    /// Sets `is_run = true`, clears `streaming_message`.
     ///
     /// # Return Value
-    /// - `Ok(())`: started, `is_streaming` is true.
+    /// - `Ok(())`: started, `is_run` is true.
     /// - `Err(AlreadyRunningError)`: already running.
     ///
     /// # Edge Cases
     /// - Ensure `is_idle()` is true before calling.
     pub fn start_run(&mut self) -> Result<(), AlreadyRunningError> {
-        if self.is_streaming {
+        if self.is_run {
             return Err(AlreadyRunningError);
         }
-        self.is_streaming = true;
+        self.is_run = true;
         self.streaming_message = None;
         Ok(())
     }
 
     /// Finish the current run and reset transient fields (aligned with pi `finishRun`, `agent.ts:515`).
     ///
-    /// Resets `is_streaming`, clears `streaming_message`, clears `pending_tool_calls`.
+    /// Resets `is_run`, clears `streaming_message`, clears `pending_tool_calls`.
     /// `error_message` is **not** cleared (aligned with pi: handled by `reset`). No-op when idle.
     pub fn finish_run(&mut self) {
-        self.is_streaming = false;
+        self.is_run = false;
         self.streaming_message = None;
         self.pending_tool_calls.clear();
     }
@@ -98,20 +98,20 @@ impl AgentState {
     ///
     /// Note: clearing `messages` is handled by the engine (`Agent::reset`); this method only resets transient fields.
     pub fn reset(&mut self) {
-        self.is_streaming = false;
+        self.is_run = false;
         self.streaming_message = None;
         self.pending_tool_calls.clear();
         self.error_message = None;
     }
 
-    /// Whether it is currently running (`is_streaming`).
-    pub fn is_streaming(&self) -> bool {
-        self.is_streaming
+    /// Whether it is currently running (`is_run`).
+    pub fn is_run(&self) -> bool {
+        self.is_run
     }
 
-    /// Whether it is currently idle (`!is_streaming`).
+    /// Whether it is currently idle (`!is_run`).
     pub fn is_idle(&self) -> bool {
-        !self.is_streaming
+        !self.is_run
     }
 
     /// Whether there is a pending tool call to execute.
@@ -322,6 +322,7 @@ mod tests {
         Model {
             id: "test-model".into(),
             name: None,
+            provider: "test".into(),
             base_url: "https://api.test.com".into(),
             context_window: 128_000,
             max_tokens: 4096,
@@ -338,7 +339,7 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             tools: vec![],
             messages: vec![],
-            is_streaming: false,
+            is_run: false,
             streaming_message: None,
             pending_tool_calls: HashSet::new(),
             error_message: None,
@@ -450,7 +451,7 @@ mod tests {
     fn test_start_run_from_idle() {
         let mut state = test_state();
         assert!(state.start_run().is_ok());
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         assert!(state.streaming_message().is_none());
     }
 
@@ -459,7 +460,7 @@ mod tests {
         let mut state = running_state();
         let result = state.start_run();
         assert_eq!(result, Err(AlreadyRunningError));
-        assert!(state.is_streaming());
+        assert!(state.is_run());
     }
 
     #[test]
@@ -467,7 +468,7 @@ mod tests {
         let mut state = toolcalling_state(&["call-1"]);
         let result = state.start_run();
         assert_eq!(result, Err(AlreadyRunningError));
-        assert!(state.is_streaming());
+        assert!(state.is_run());
     }
 
     // ---- finish_run ----
@@ -504,13 +505,13 @@ mod tests {
         assert_eq!(state.error_message.as_deref(), Some("boom"));
     }
 
-    // ---- is_streaming / is_idle ----
+    // ---- is_run / is_idle ----
 
     #[test]
-    fn test_is_streaming() {
-        assert!(!test_state().is_streaming());
-        assert!(running_state().is_streaming());
-        assert!(toolcalling_state(&["x"]).is_streaming());
+    fn test_is_run() {
+        assert!(!test_state().is_run());
+        assert!(running_state().is_run());
+        assert!(toolcalling_state(&["x"]).is_run());
     }
 
     #[test]
@@ -617,7 +618,7 @@ mod tests {
         state.apply_event(&AgentEvent::MessageStart {
             message: test_user_message(),
         });
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         assert_streaming_msg_text(&state, "hello");
     }
 
@@ -637,9 +638,9 @@ mod tests {
         state.apply_event(&AgentEvent::MessageStart {
             message: test_user_message(),
         });
-        // Aligned with pi processEvents: set streaming_message unconditionally; is_streaming is controlled by start_run
+        // Aligned with pi processEvents: set streaming_message unconditionally; is_run is controlled by start_run
         assert!(state.streaming_message().is_some());
-        assert!(!state.is_streaming());
+        assert!(!state.is_run());
     }
 
     // ---- apply_event: MessageUpdate ----
@@ -686,7 +687,7 @@ mod tests {
             message: test_user_message(),
         });
         assert!(state.streaming_message().is_none());
-        assert!(state.is_streaming());
+        assert!(state.is_run());
     }
 
     #[test]
@@ -748,7 +749,7 @@ mod tests {
             args: json!({}),
             partial_result: json!({}),
         });
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         assert!(!state.has_pending_tool_calls());
     }
 
@@ -758,18 +759,18 @@ mod tests {
     fn test_apply_noop_events_do_not_change_state() {
         let mut state = running_state();
         state.apply_event(&AgentEvent::TurnStart);
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         state.apply_event(&AgentEvent::TurnEnd {
             message: test_user_message(), // User messages have no error_message, so transients are unaffected
             tool_results: vec![],
         });
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         state.apply_event(&AgentEvent::AgentStart);
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         state.apply_event(&AgentEvent::AgentEnd {
             messages: vec![test_user_message()],
         });
-        assert!(state.is_streaming());
+        assert!(state.is_run());
     }
 
     #[test]
@@ -841,7 +842,7 @@ mod tests {
     fn test_full_lifecycle_idle_running_idle() {
         let mut state = test_state();
         state.start_run().unwrap();
-        assert!(state.is_streaming());
+        assert!(state.is_run());
         state.apply_event(&AgentEvent::MessageStart {
             message: test_user_message(),
         });
@@ -894,6 +895,6 @@ mod tests {
         state.reset();
         assert!(state.is_idle());
         state.start_run().unwrap();
-        assert!(state.is_streaming());
+        assert!(state.is_run());
     }
 }

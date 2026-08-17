@@ -4,11 +4,20 @@ use std::collections::HashMap;
 use std::env;
 
 /// List of known provider environment variable names, used for config discovery and diagnostics.
+/// Per-provider variables (aligned with pi `envApiKeyAuth`); no global `OPENAI_*`.
 pub const KNOWN_PROVIDER_ENV_VARS: &[&str] = &[
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-    "OPENAI_MODEL",
-    "OPENAI_MAX_TOKENS",
+    // zen selection layer
+    "ZEN_PROVIDER",
+    // opencode-go (default provider)
+    "OPENCODE_API_KEY",
+    "OPENCODE_BASE_URL",
+    "OPENCODE_MODEL",
+    "OPENCODE_MAX_TOKENS",
+    // huoshan (Volcano Engine Ark)
+    "ARK_API_KEY",
+    "ARK_BASE_URL",
+    "ARK_MODEL",
+    "ARK_MAX_TOKENS",
 ];
 
 /// Config file takes precedence, provider environment variables as fallback,
@@ -54,7 +63,7 @@ pub fn get_all_provider_env_values(
         .iter()
         .filter_map(|name| {
             let value = get_provider_env_value(name, env_overrides)?;
-            let value = if *name == "OPENAI_API_KEY" {
+            let value = if name.ends_with("API_KEY") {
                 truncate_sensitive_value(&value)
             } else {
                 value
@@ -90,9 +99,9 @@ mod tests {
     #[test]
     fn test_override_takes_precedence() {
         let mut overrides = HashMap::new();
-        overrides.insert("OPENAI_API_KEY".to_string(), "override-key".to_string());
+        overrides.insert("ARK_API_KEY".to_string(), "override-key".to_string());
         // Even if the real environment variable exists, the override should take precedence
-        let result = get_provider_env_value("OPENAI_API_KEY", Some(&overrides));
+        let result = get_provider_env_value("ARK_API_KEY", Some(&overrides));
         assert_eq!(result, Some("override-key".to_string()));
     }
 
@@ -115,9 +124,9 @@ mod tests {
     #[test]
     fn test_is_configured_true_when_override_present() {
         let mut overrides = HashMap::new();
-        overrides.insert("OPENAI_API_KEY".to_string(), "key".to_string());
+        overrides.insert("OPENCODE_API_KEY".to_string(), "key".to_string());
         assert!(is_provider_configured(
-            &["OPENAI_API_KEY"],
+            &["OPENCODE_API_KEY"],
             Some(&overrides)
         ));
     }
@@ -125,10 +134,10 @@ mod tests {
     #[test]
     fn test_is_configured_any_match() {
         let mut overrides = HashMap::new();
-        overrides.insert("OPENAI_BASE_URL".to_string(), "url".to_string());
+        overrides.insert("ARK_BASE_URL".to_string(), "url".to_string());
         // Return true as soon as one matches
         assert!(is_provider_configured(
-            &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+            &["ARK_API_KEY", "ARK_BASE_URL"],
             Some(&overrides),
         ));
     }

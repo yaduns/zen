@@ -1,19 +1,34 @@
 use std::collections::HashMap;
 use std::env;
 
+use crate::provider::{default_provider_name, resolve_provider, Provider};
 use crate::types::{Cost, CostRates, Model};
 
 impl Model {
-    /// Create the default model config from environment variables, falling back to DeepSeek V4 Flash defaults.
+    /// Create the default model config from environment variables (default provider opencode-go, model deepseek-v4-flash).
+    ///
+    /// Provider selection: env `ZEN_PROVIDER` (default `opencode-go`); model id / base_url /
+    /// max_tokens are read from per-provider env vars (see the env var conventions in the `provider` module).
     pub fn from_env() -> Self {
+        let name = default_provider_name();
+        let provider = resolve_provider(&name)
+            .unwrap_or_else(|| panic!("unknown default provider: {}", name));
+        Self::from_provider(provider.as_ref())
+    }
+
+    /// Build the model for the selected provider.
+    ///
+    /// Model id and max_tokens are read from per-provider env vars (`OPENCODE_MODEL`/
+    /// `ARK_MODEL`, `OPENCODE_MAX_TOKENS`/`ARK_MAX_TOKENS`), defaulting to
+    /// `deepseek-v4-flash` and 384000 respectively (aligned with DeepSeek-V4-Flash max output length); base_url
+    /// comes from `provider.base_url()` (which internally reads
+    /// `OPENCODE_BASE_URL`/`ARK_BASE_URL` and falls back to the default endpoint); the `provider` field is set to `provider.id()`.
+    pub fn from_provider(provider: &dyn Provider) -> Self {
         Self {
-            id: env::var("OPENAI_MODEL").unwrap_or("deepseek-v4-flash".to_string()),
-            base_url: env::var("OPENAI_BASE_URL")
-                .unwrap_or("https://ark.cn-beijing.volces.com/api/coding/v3".to_string()),
-            max_tokens: env::var("OPENAI_MAX_TOKENS")
-                .unwrap_or(8192.to_string())
-                .parse()
-                .unwrap_or(8192),
+            id: provider_model_id(provider.id()).unwrap_or_else(|| "deepseek-v4-flash".to_string()),
+            provider: provider.id().to_string(),
+            base_url: provider.base_url(),
+            max_tokens: provider_max_tokens(provider.id()),
             context_window: 65536,
             reasoning: true,
             name: None,
@@ -25,29 +40,6 @@ impl Model {
                 cache_write: 0.5,
             }),
         }
-    }
-
-    /// Apply environment variable overrides and return a new `Model` instance.
-    ///
-    /// Read environment variables such as `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_MAX_TOKENS`,
-    /// Override the corresponding fields in the model config. Environment variables take precedence over defaults.
-    ///
-    /// Corresponds to the environment variable reading and merging logic in Pi's `provider-env.ts`, but simplifies the scope override chain.
-    /// Works with T-AI-02-3 (provider environment variable reading): T-AI-02-3 provides raw environment variable reading,
-    /// This function applies environment variable values to the Model config.
-    pub fn with_env_overrides(mut self) -> Self {
-        if let Ok(val) = env::var("OPENAI_MODEL") {
-            self.id = val;
-        }
-        if let Ok(val) = env::var("OPENAI_BASE_URL") {
-            self.base_url = val;
-        }
-        if let Ok(val) = env::var("OPENAI_MAX_TOKENS") {
-            if let Ok(parsed) = val.parse() {
-                self.max_tokens = parsed;
-            }
-        }
-        self
     }
 
     /// Set model ID.
@@ -143,6 +135,29 @@ impl Model {
     }
 }
 
+/// Read the model id env var per provider (`OPENCODE_MODEL`/`ARK_MODEL`); returns None for unknown providers.
+fn provider_model_id(provider: &str) -> Option<String> {
+    match provider {
+        "opencode-go" => env::var("OPENCODE_MODEL").ok(),
+        "huoshan" => env::var("ARK_MODEL").ok(),
+        _ => None,
+    }
+}
+
+/// Read the max_tokens env var per provider (`OPENCODE_MAX_TOKENS`/`ARK_MAX_TOKENS`);
+/// defaults to 384000 when unset or unparsable (aligned with DeepSeek-V4-Flash max output length).
+fn provider_max_tokens(provider: &str) -> u64 {
+    let var = match provider {
+        "opencode-go" => "OPENCODE_MAX_TOKENS",
+        "huoshan" => "ARK_MAX_TOKENS",
+        _ => return 384_000,
+    };
+    env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(384_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +168,7 @@ mod tests {
         Model {
             id: "test-model".to_string(),
             name: None,
+            provider: "deepseek".to_string(),
             base_url: "https://api.test.com".to_string(),
             context_window: 4096,
             max_tokens: 1024,
@@ -302,8 +318,9 @@ mod tests {
         assert!((cost.total - 8000.0).abs() < 1e-6);
     }
 
-    // ── from_env / with_env_overrides ──
-    // Depends on process environment variables; not a pure function. For testing, explicitly set env vars inside the test function and
-    // Use the serial_test crate to serialize and prevent interference between parallel tests.
+    // ── from_env / from_provider ──
+    // Depends on process env vars (ZEN_PROVIDER / OPENCODE_* / ARK_*), not a pure function. For testing,
+    // Recommend explicitly setting env vars inside the test function and using the serial_test crate for serialization,
+    // to prevent interference between parallel tests.
     // Not implemented yet; will add once serial_test or a mocking approach is introduced.
 }

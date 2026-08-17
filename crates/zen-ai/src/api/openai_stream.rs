@@ -336,7 +336,11 @@ pub async fn stream(
     let api_key = cfg
         .api_key
         .clone()
-        .or_else(|| get_provider_env_value("OPENAI_API_KEY", None))
+        .or_else(|| match model.provider.as_str() {
+            // Per-provider env variable (aligned with pi `envApiKeyAuth`)
+            "opencode-go" => get_provider_env_value("OPENCODE_API_KEY", None),
+            _ => get_provider_env_value("ARK_API_KEY", None),
+        })
         .ok_or(StreamError::NoApiKey)?;
 
     // 2. Build request body
@@ -1407,6 +1411,7 @@ mod tests {
         Model {
             id: "deepseek-v4-flash".into(),
             name: None,
+            provider: "deepseek".into(),
             base_url: "https://api.example.com".into(),
             context_window: 65536,
             max_tokens: 8192,

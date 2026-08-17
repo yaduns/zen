@@ -1,4 +1,4 @@
-//! Real integration tests (real_ prefix, require the OPENAI_API_KEY environment variable).
+//! Real integration tests (real_ prefix; depend on the API key environment variables of the selected default provider).
 //!
 //! Inject `zen_ai::api::openai_stream::stream()` as the real StreamFn into the agent loop,
 //! verifying the end-to-end chain: LLM call → tool loop → result return.
@@ -24,6 +24,14 @@ use zen_core::harness::context::create_context;
 use zen_core::harness::types::ShouldStopAfterTurnContext;
 use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn};
 use zen_core::tools::factory::ToolFactory;
+
+/// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).
+fn provider_key_var() -> &'static str {
+    match zen_ai::provider::default_provider_name().as_str() {
+        "opencode-go" => "OPENCODE_API_KEY",
+        _ => "ARK_API_KEY",
+    }
+}
 
 // ─── Mock Hooks ──────────────────────────────────────────────────
 
@@ -134,7 +142,7 @@ fn test_ctx() -> ToolContext {
 
 /// Real integration test: multi-turn tool calls — first use bash to list files, then use read to read file contents.
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 ///
 /// The loop in `agent_loop_inner` automatically feeds tool results back to the LLM for the next turn,
 /// until the LLM returns plain text to finish. A single `run_agent_loop` here runs all the turns.
@@ -145,9 +153,10 @@ fn test_ctx() -> ToolContext {
 /// ```
 #[tokio::test]
 async fn real_test_multi_tool_chain() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 
@@ -158,7 +167,7 @@ async fn real_test_multi_tool_chain() {
     eprintln!("Registered tools: {:?}", registry.names());
     let tools: Vec<Arc<dyn Tool>> = registry.tools;
 
-    let model = Model::from_env().with_env_overrides();
+    let model = Model::from_env();
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let mut ctx = create_context(
@@ -382,7 +391,7 @@ async fn real_test_multi_tool_chain() {
 
 /// Real integration test: use real tools (bash/read/write/edit) to have the agent list the file structure of the current project directory.
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 ///
 /// Validation:
 /// 1. The tool registry returned by `create_coding()` is correctly injected into the agent loop
@@ -396,9 +405,10 @@ async fn real_test_multi_tool_chain() {
 /// ```
 #[tokio::test]
 async fn real_test_tools_list_directory() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 
@@ -409,7 +419,7 @@ async fn real_test_tools_list_directory() {
     println!("Registered tools: {:?}", registry.names());
     let tools: Vec<Arc<dyn Tool>> = registry.tools;
 
-    let model = Model::from_env().with_env_overrides();
+    let model = Model::from_env();
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let mut ctx = create_context(

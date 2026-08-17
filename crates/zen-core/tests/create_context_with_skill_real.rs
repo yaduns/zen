@@ -1,4 +1,4 @@
-//! Real integration tests (real_ prefix, require the OPENAI_API_KEY environment variable).
+//! Real integration tests (real_ prefix; depend on the API key environment variables of the selected default provider).
 //!
 //! Covers the "Skills and System Prompt" section of Phase 1 Step 5:
 //! - REQ-AGENT-05 (T-AG-05-2): skill system — `load_skills` loads SKILL.md → `format_skills_for_system_prompt`
@@ -22,6 +22,14 @@ use zen_core::harness::engine::Agent;
 use zen_core::harness::types::{AgentEvent, AgentState, ShouldStopAfterTurnContext, StreamFn};
 use zen_core::skills::format::format_skills_for_system_prompt;
 use zen_core::skills::load::load_skills;
+
+/// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).
+fn provider_key_var() -> &'static str {
+    match zen_ai::provider::default_provider_name().as_str() {
+        "opencode-go" => "OPENCODE_API_KEY",
+        _ => "ARK_API_KEY",
+    }
+}
 
 // ─── Mock Hooks (lightweight collectors, following the conventions in agent_loop_real_tools.rs) ───
 
@@ -83,11 +91,11 @@ fn real_stream_fn() -> StreamFn {
 fn agent_state(system_prompt: String) -> AgentState {
     AgentState {
         system_prompt,
-        model: Model::from_env().with_env_overrides(),
+        model: Model::from_env(),
         thinking_level: ThinkingLevel::Off,
         tools: vec![],
         messages: vec![],
-        is_streaming: false,
+        is_run: false,
         streaming_message: None,
         pending_tool_calls: HashSet::new(),
         error_message: None,
@@ -118,7 +126,7 @@ fn last_assistant_text(messages: &[Message]) -> String {
 
 /// Real integration test: load SKILL.md skills and verify that the LLM follows them in the agent loop.
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 ///
 /// Validation:
 /// 1. `load_skills` discovers and loads SKILL.md from a temp directory (name/description/content are correct).
@@ -126,9 +134,10 @@ fn last_assistant_text(messages: &[Message]) -> String {
 /// 3. Constraints in the skill description are followed by the LLM (the final answer contains the `<<SKILLED>>` end token).
 #[tokio::test]
 async fn real_test_skills_loaded_and_followed_by_llm() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 
@@ -191,7 +200,7 @@ async fn real_test_skills_loaded_and_followed_by_llm() {
 
 /// Real integration test: a constraint-bearing system prompt is executed by the LLM in the agent loop.
 ///
-/// Skip condition: automatically skipped when the `OPENAI_API_KEY` env var is not set.
+/// Skip condition: automatically skipped when the API key env var of the selected default provider is not set.
 ///
 /// Validation:
 /// 1. `create_context` assembles a system prompt carrying a strong constraint ("answer only BANANA").
@@ -199,9 +208,10 @@ async fn real_test_skills_loaded_and_followed_by_llm() {
 /// 3. No tool calls occur at any point (guaranteed both by the system prompt prohibition and the empty tool list).
 #[tokio::test]
 async fn real_test_system_prompt_constraint_honored() {
-    let api_key = std::env::var("OPENAI_API_KEY");
+    let key_var = provider_key_var();
+    let api_key = std::env::var(key_var);
     if api_key.is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping real integration test");
+        eprintln!("{} not set; skipping real integration test", key_var);
         return;
     }
 

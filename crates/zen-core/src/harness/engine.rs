@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolExecutionMode};
-use zen_ai::types::{ContentBlockList, Message, Model, ThinkingLevel, UserMessage};
+use zen_ai::types::{ContentBlock, ContentBlockList, Message, Model, ThinkingLevel, UserMessage};
 
 /// Stateful, session-level agent engine. Holds AgentState (accumulated across turns) and two message queues: steer and follow-up,
 /// exposing prompt/continue_turn/steer/follow_up/set_model/set_tools/abort/wait_for_idle/reset etc. externally;
@@ -20,7 +20,7 @@ use zen_ai::types::{ContentBlockList, Message, Model, ThinkingLevel, UserMessage
 /// Each prompt/continue_turn builds a fresh Context (with tools) and AgentLoopConfig from state (model derived from state.model + scattered settings),
 ///  syncing newly added messages back into state.messages when done.
 pub struct Agent {
-    /// system_prompt (the finished string assembled by the app layer), model, thinking_level, tools (single source; created per session by the application layer via ToolFactory and bound to the environment), messages (accumulated across turns); transient fields (is_streaming/streaming_message/pending_tool_calls/error_message) are maintained by AgentState's start_run/finish_run/apply_event (aligned with pi MutableAgentState transient fields, option A)
+    /// system_prompt (a fully assembled string produced at the app layer), model, thinking_level, tools (single source, created per-session by the application layer via ToolFactory and bound to the environment), messages (accumulated across turns); transient fields (is_run/streaming_message/pending_tool_calls/error_message) are maintained by AgentState's start_run/finish_run/apply_event (aligned with pi's MutableAgentState transient fields, plan A)
     state: AgentState,
     tool_execution: ToolExecutionMode,
     /// User-behavior hooks; delegation target for Agent's non-queue methods
@@ -33,6 +33,14 @@ pub struct Agent {
     steer_queue: Arc<Mutex<VecDeque<Message>>>,
     /// Consumed by the Agent's own impl AgentLoopHooks
     follow_up_queue: Arc<Mutex<VecDeque<Message>>>,
+    // New Agent fields (initialized in new: next_id: 0, entries: vec![])
+    event_listeners: Arc<Mutex<EventListenerList>>,
+}
+
+// Engine-private implementation details (not pub)
+struct EventListenerList {
+    next_id: u64,
+    entries: Vec<(u64, Arc<dyn Fn(&AgentEvent) + Send + Sync>)>,
 }
 
 #[async_trait]
@@ -93,6 +101,16 @@ impl AgentLoopHooks for Agent {
         self.hooks.after_tool_call(context, cancel).await
     }
     async fn on_event(&self, event: &AgentEvent) {
+        // (1) Snapshot inside the lock (Arc clone, shallow copy only; lock is held only very briefly)
+        let snapshot: Vec<Arc<dyn Fn(&AgentEvent) + Send + Sync>> = {
+            let guard = self.event_listeners.lock().unwrap();
+            guard.entries.iter().map(|(_, l)| Arc::clone(l)).collect()
+        };
+        // (2) Invoke one by one outside the lock (no lock held; a listener panic does not poison the lock; a listener re-entering subscribe does not deadlock)
+        for l in &snapshot {
+            l(event);
+        }
+        // (3) The lock is now released, so delegating to hooks can safely await
         self.hooks.on_event(event).await
     }
 }
@@ -128,6 +146,10 @@ impl Agent {
             // Both queues are created in new and kept as engine fields (aligns with the comment's edge cases).
             steer_queue: Arc::new(Mutex::new(VecDeque::new())),
             follow_up_queue: Arc::new(Mutex::new(VecDeque::new())),
+            event_listeners: Arc::new(Mutex::new(EventListenerList {
+                next_id: 0,
+                entries: Vec::new(),
+            })),
         }
     }
 
@@ -325,7 +347,7 @@ impl Agent {
     /// Reset session (= route A `reset()`, `agent.ts:326`).
     ///
     /// Clear `state.messages` and transient runtime fields (via `AgentState::reset`,
-    /// including `is_streaming`/`streaming_message`/`pending_tool_calls`/`error_message`) + the steer/follow_up queues.
+    /// (including `is_run`/`streaming_message`/`pending_tool_calls`/`error_message`) + the steer/follow_up queues.
     /// config in AgentState (system_prompt/model/thinking_level/tools) is preserved — after reset the same instance can continue `prompt()`.
     pub fn reset(&mut self) {
         self.state.reset();
@@ -336,5 +358,371 @@ impl Agent {
         if let Ok(mut queue) = self.follow_up_queue.lock() {
             queue.clear();
         }
+    }
+
+    /// Register an event listener (aligned with pi's low-level `Agent.subscribe`, agent.ts:243).
+    ///
+    /// Listeners are stored in the engine's internal listener list and cleaned up when the `Agent` is dropped (no global/static table is created).
+    /// The engine's own `AgentLoopHooks::on_event` implementation becomes: first synchronously notify all subscribed listeners,
+    /// then delegate to the user hooks (`self.hooks.on_event`) — a dual channel of subscribe + hooks, see "Open Issue 1".
+    ///
+    /// # Return Value
+    /// Returns an unsubscribe closure (calling it removes the listener from the list).
+    pub fn subscribe(
+        &self,
+        listener: Box<dyn Fn(&AgentEvent) + Send + Sync>,
+    ) -> Box<dyn FnOnce() + Send> {
+        // Box<dyn Fn> → Arc<dyn Fn> (unsized coercion, Arc::from converts directly)
+        let listener: Arc<dyn Fn(&AgentEvent) + Send + Sync> = Arc::from(listener);
+        let mut guard = self.event_listeners.lock().unwrap();
+        let id = guard.next_id;
+        guard.next_id += 1;
+        guard.entries.push((id, listener));
+        // Arc::clone does two things: reference count +1 and copy a pointer — adds another owner of the same shared object
+        let list = self.event_listeners.clone();
+        // Return the unsubscriber function to the subscriber
+        // The values of id and list (note: it is an Arc pointer holder) are copied into the closure
+        Box::new(move || {
+            if let Ok(mut g) = list.lock() {
+                g.entries.retain(|(i, _)| *i != id);
+            }
+        })
+    }
+
+    // Consumer: T-AP-01-1 (persistent subscription via AgentSession::new + pass-through in AgentSession::subscribe)
+
+    pub fn state(&self) -> &AgentState {
+        &self.state
+    }
+
+    pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
+        self.state.thinking_level = level;
+    }
+
+    /// Read-only snapshot of the steer queue (for displaying pending steer message text in the UI).
+    pub fn steering_messages(&self) -> Vec<String> {
+        queue_texts(&self.steer_queue)
+    }
+
+    /// Read-only snapshot of the follow-up queue (for displaying pending follow-up message text in the UI).
+    pub fn follow_up_messages(&self) -> Vec<String> {
+        queue_texts(&self.follow_up_queue)
+    }
+}
+
+/// Helper that takes a plain-text snapshot of all messages in the queue (read-only, no drain).
+///
+/// Messages currently constructed via `steer`/`follow_up` are all `ContentBlockList::Text`;
+/// Defensive handling of the `Blocks` variant — concatenate text blocks, ignore non-text blocks like image/thinking.
+fn queue_texts(queue: &Arc<Mutex<VecDeque<Message>>>) -> Vec<String> {
+    queue
+        .lock()
+        .unwrap() // Lock poisoning only occurs when the lock-holding thread panics, consistent with the existing drain path in this file (get_steering_messages)
+        .iter()
+        .map(|msg| match msg {
+            Message::User(user) => match &user.content {
+                ContentBlockList::Text(text) => text.clone(),
+                ContentBlockList::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(t) => Some(t.text.clone()),
+                        _ => None, // Image/Thinking/ToolCall blocks are not included in text display
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+            _ => String::new(), // The queue can only hold User messages; defensive fallback
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zen_ai::types::{AssistantMessageEvent, Context, TextContent};
+
+    // ── Test helper construction ──
+
+    /// Minimal AgentLoopHooks: records only on_event, other methods use trait defaults.
+    /// If a trait method has no default and causes a compile error, add an empty implementation.
+    struct MockHooks;
+
+    #[async_trait]
+    impl AgentLoopHooks for MockHooks {
+        async fn on_event(&self, _event: &AgentEvent) {}
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "deepseek-v4-flash".into(),
+            name: None,
+            provider: "opencode-go".into(),
+            base_url: "https://opencode.ai/zen/go/v1".into(),
+            context_window: 65536,
+            max_tokens: 8192,
+            reasoning: true,
+            headers: None,
+            cost_rates: None,
+        }
+    }
+
+    /// Returns a mock StreamFn of an empty stream (tests in this file don't invoke the prompt; this is only a placeholder).
+    fn mock_stream_fn() -> StreamFn {
+        Arc::new(
+            |_model: &Model,
+             _ctx: &Context,
+             _cfg: Option<zen_ai::api::openai_stream::StreamConfig>,
+             _cancel: Option<CancellationToken>| {
+                Box::pin(async move {
+                    let (_tx, rx): (
+                        tokio::sync::mpsc::UnboundedSender<AssistantMessageEvent>,
+                        tokio::sync::mpsc::UnboundedReceiver<AssistantMessageEvent>,
+                    ) = tokio::sync::mpsc::unbounded_channel();
+                    Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
+                })
+            },
+        )
+    }
+
+    fn agent_state() -> AgentState {
+        AgentState {
+            system_prompt: "test".into(),
+            model: test_model(),
+            thinking_level: ThinkingLevel::Off,
+            tools: vec![],
+            messages: vec![],
+            is_run: false,
+            streaming_message: None,
+            pending_tool_calls: HashSet::new(),
+            error_message: None,
+        }
+    }
+
+    fn test_agent_with_cancel(cancel: CancellationToken) -> Agent {
+        Agent::new(
+            agent_state(),
+            ToolExecutionMode::Sequential,
+            Arc::new(MockHooks),
+            mock_stream_fn(),
+            cancel,
+        )
+    }
+
+    fn test_agent() -> Agent {
+        test_agent_with_cancel(CancellationToken::new())
+    }
+
+    // ── subscribe / on_event ──
+
+    #[tokio::test]
+    async fn test_subscribe_receives_event() {
+        let agent = test_agent();
+        let received: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recv = received.clone();
+        let _unsub = agent.subscribe(Box::new(move |e: &AgentEvent| {
+            recv.lock().unwrap().push(e.clone());
+        }));
+
+        agent.on_event(&AgentEvent::AgentStart).await;
+
+        assert_eq!(received.lock().unwrap().len(), 1);
+        assert!(matches!(received.lock().unwrap()[0], AgentEvent::AgentStart));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_multiple_listeners_all_receive() {
+        let agent = test_agent();
+        let c1 = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::new(AtomicUsize::new(0));
+        let (a, b) = (c1.clone(), c2.clone());
+        let _u1 = agent.subscribe(Box::new(move |_: &AgentEvent| {
+            a.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _u2 = agent.subscribe(Box::new(move |_: &AgentEvent| {
+            b.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        agent.on_event(&AgentEvent::TurnStart).await;
+
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_unsubscribe_stops_events() {
+        let agent = test_agent();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let unsub = agent.subscribe(Box::new(move |_: &AgentEvent| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        agent.on_event(&AgentEvent::AgentStart).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        unsub();
+        agent.on_event(&AgentEvent::AgentStart).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "no events received after unsubscribe");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_ids_are_unique() {
+        let agent = test_agent();
+        let drop_a = Arc::new(AtomicUsize::new(0));
+        let drop_b = Arc::new(AtomicUsize::new(0));
+        let (da, db) = (drop_a.clone(), drop_b.clone());
+        let _ua = agent.subscribe(Box::new(move |_: &AgentEvent| {
+            da.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _ub = agent.subscribe(Box::new(move |_: &AgentEvent| {
+            db.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Unsubscribing the first one should only decrease the first's count, not affecting the second (ids are unique)
+        _ua();
+        agent.on_event(&AgentEvent::AgentStart).await;
+        assert_eq!(drop_a.load(Ordering::SeqCst), 0);
+        assert_eq!(drop_b.load(Ordering::SeqCst), 1);
+    }
+
+    // ── steer / follow_up / queue snapshot ──
+
+    #[test]
+    fn test_steer_enqueues_and_snapshot() {
+        let agent = test_agent();
+        agent.steer("hello");
+        agent.steer("world");
+        assert_eq!(
+            agent.steering_messages(),
+            vec!["hello".to_string(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_follow_up_enqueues_and_snapshot() {
+        let agent = test_agent();
+        agent.follow_up("please continue");
+        assert_eq!(agent.follow_up_messages(), vec!["please continue".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_get_steering_messages_drains_one() {
+        let agent = test_agent();
+        agent.steer("a");
+        agent.steer("b");
+
+        let drained = agent.get_steering_messages().await;
+        assert_eq!(drained.len(), 1, "each round drains one");
+        // One message remains undrained
+        assert_eq!(agent.steering_messages(), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn test_queue_texts_blocks_variant_joins_text() {
+        let queue: Arc<Mutex<VecDeque<Message>>> =
+            Arc::new(Mutex::new(VecDeque::from(vec![Message::User(UserMessage {
+                content: ContentBlockList::Blocks(vec![
+                    ContentBlock::Text(TextContent {
+                        text: "first".into(),
+                        text_signature: None,
+                    }),
+                    ContentBlock::Text(TextContent {
+                        text: "second".into(),
+                        text_signature: None,
+                    }),
+                ]),
+                timestamp: 0,
+            })])));
+        assert_eq!(queue_texts(&queue), vec!["first\nsecond".to_string()]);
+    }
+
+    // ── set_model / set_thinking_level / set_tools / state ──
+
+    #[test]
+    fn test_set_model_updates_single_source() {
+        let mut agent = test_agent();
+        let m = test_model();
+        agent.set_model(m.clone());
+        assert_eq!(agent.state().model, m);
+    }
+
+    #[test]
+    fn test_set_thinking_level_updates_state() {
+        let mut agent = test_agent();
+        agent.set_thinking_level(ThinkingLevel::High);
+        assert_eq!(agent.state().thinking_level, ThinkingLevel::High);
+    }
+
+    #[test]
+    fn test_set_tools_replaces_state() {
+        let mut agent = test_agent();
+        agent.set_tools(vec![]);
+        assert!(agent.state().tools.is_empty());
+    }
+
+    #[test]
+    fn test_state_returns_latest_state() {
+        let agent = test_agent();
+        assert_eq!(agent.state().system_prompt, "test");
+        assert_eq!(agent.state().is_run, false);
+    }
+
+    // ── reset ──
+
+    #[tokio::test]
+    async fn test_reset_clears_queue_but_preserves_config() {
+        let mut agent = test_agent();
+        agent.steer("queued");
+        let m = test_model();
+        agent.set_model(m.clone());
+
+        agent.reset();
+
+        // Configuration is preserved (model is not cleared)
+        assert_eq!(agent.state().model, m);
+        // Queue is emptied
+        assert!(agent.steering_messages().is_empty());
+        assert!(agent.follow_up_messages().is_empty());
+        // messages is empty
+        assert!(agent.state().messages.is_empty());
+    }
+
+    // ── abort ──
+
+    #[test]
+    fn test_abort_cancels_token() {
+        let cancel = CancellationToken::new();
+        let agent = test_agent_with_cancel(cancel.clone());
+        assert!(!cancel.is_cancelled());
+        agent.abort();
+        assert!(cancel.is_cancelled());
+    }
+
+    // ── make_config (private, testable within this module) ──
+
+    #[test]
+    fn test_make_config_reasoning_off_is_none() {
+        let agent = test_agent(); // thinking_level = Off
+        let cfg = agent.make_config();
+        assert_eq!(cfg.reasoning, None, "Off → do not send reasoning_effort");
+        assert_eq!(cfg.api_key, None, "api_key fixed to None, uses hooks.get_api_key");
+    }
+
+    #[test]
+    fn test_make_config_reasoning_level_passthrough() {
+        let mut agent = test_agent();
+        agent.set_thinking_level(ThinkingLevel::Low);
+        let cfg = agent.make_config();
+        assert_eq!(cfg.reasoning, Some(ThinkingLevel::Low));
+    }
+
+    #[test]
+    fn test_make_config_derives_model_and_tool_execution() {
+        let agent = test_agent();
+        let cfg = agent.make_config();
+        assert_eq!(cfg.model, agent.state().model);
+        assert_eq!(cfg.tool_execution, ToolExecutionMode::Sequential);
     }
 }

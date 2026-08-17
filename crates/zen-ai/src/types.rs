@@ -364,6 +364,9 @@ pub struct Model {
     pub id: String,
     /// Human-readable name (e.g. "DeepSeek V4 Flash")
     pub name: Option<String>,
+    /// Provider identifier (aligned with pi `ProviderId`, types.ts:73). Phase 1 single provider is fixed
+    /// "deepseek"; string equality with `Provider::id()` associates it with that provider.
+    pub provider: String,
     /// API endpoint base URL (e.g. "https://api.deepseek.com"), without the /chat/completions path
     pub base_url: String,
     /// Maximum context window (token count), used for overflow detection
@@ -412,6 +415,20 @@ pub enum ThinkingLevel {
     XHigh,
     /// Maximum thinking effort
     Max,
+}
+
+impl std::fmt::Display for ThinkingLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "Off",
+            Self::Minimal => "Minimal",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::XHigh => "XHigh",
+            Self::Max => "Max",
+        })
+    }
 }
 
 /// Controls whether the LLM calls a tool and which tool, corresponding to the OpenAI API's tool_choice parameter.
