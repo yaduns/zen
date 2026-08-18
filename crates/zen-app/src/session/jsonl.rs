@@ -4,42 +4,44 @@ use std::path::PathBuf;
 use zen_ai::types::Message;
 use zen_core::session::tree::SessionTreeEntry;
 
+pub const CURRENT_SESSION_VERSION: u64 = 3;
+
 /// First line of the JSONL file, identifying session metadata. Contains session ID, creation timestamp, working directory, parent session path (for fork tracking), and arbitrary metadata
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
     /// Fixed to "session", used for format discrimination
     #[serde(rename = "type")]
-    ty: String,
+    pub(crate) ty: String,
     /// Fixed to 3, used for version compatibility checking
-    version: u8,
+    pub(crate) version: u8,
     /// Session ID (UUIDv7)
-    id: String,
+    pub(crate) id: String,
     /// ISO 8601 timestamp
-    timestamp: String,
+    pub(crate) timestamp: String,
     /// Working directory at session creation
-    cwd: String,
+    pub(crate) cwd: String,
     /// Path of the forked source session, used for fork tracking
-    parent_session: Option<String>,
+    pub(crate) parent_session: Option<String>,
     /// Arbitrary metadata (e.g. session name, tags, etc.)
-    metadata: Option<serde_json::Value>,
+    pub(crate) metadata: Option<serde_json::Value>,
 }
 
 /// Metadata summary of the session list, read from SessionHeader.
 /// Used as the return value of SessionManager::list_sessions(); not written directly to the JSONL file (constructed after reading from the header).
 pub struct JsonlSessionMetadata {
     /// Session ID
-    id: String,
+    pub(crate) id: String,
     /// ISO 8601 creation timestamp
-    created_at: String,
+    pub(crate) created_at: String,
     /// Working directory
-    cwd: String,
+    pub(crate) cwd: String,
     /// Absolute path to the JSONL file
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Path of the fork source
-    parent_session_path: Option<String>,
+    pub(crate) parent_session_path: Option<String>,
     /// Header metadata
-    metadata: Option<serde_json::Value>,
+    pub(crate) metadata: Option<serde_json::Value>,
 }
 
 /// Error types that can occur during JSONL persistence operations. Derived via thiserror, covering file I/O errors, format errors, entry parsing errors, etc.
@@ -155,7 +157,7 @@ pub fn parse_header_line(
 
     // validate version
     match value.get("version").and_then(|v| v.as_u64()) {
-        Some(3) => {}
+        Some(CURRENT_SESSION_VERSION) => {}
         _ => {
             return Err(JsonlError::InvalidSession(format!(
                 "invalid version in {}: expected 3",
@@ -327,7 +329,7 @@ pub fn create_session_file(
 
     let header = SessionHeader {
         ty: "session".to_string(),
-        version: 3,
+        version: CURRENT_SESSION_VERSION as u8,
         id: session_id,
         timestamp,
         cwd: cwd.to_string(),
@@ -694,7 +696,7 @@ mod tests {
     fn test_serialize_header_roundtrip() {
         let header = SessionHeader {
             ty: "session".to_string(),
-            version: 3,
+            version: CURRENT_SESSION_VERSION as u8,
             id: "s1".to_string(),
             timestamp: "2025-01-15T10:30:00.000Z".to_string(),
             cwd: "/home/user".to_string(),
@@ -797,7 +799,7 @@ mod tests {
     fn test_header_to_metadata_copies_fields() {
         let header = SessionHeader {
             ty: "session".to_string(),
-            version: 3,
+            version: CURRENT_SESSION_VERSION as u8,
             id: "s1".to_string(),
             timestamp: "2025-01-15T10:30:00.000Z".to_string(),
             cwd: "/home/user".to_string(),

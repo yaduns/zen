@@ -221,6 +221,24 @@ impl SessionTree {
         SessionTree { entries, leaf_id }
     }
 
+    /// Generate entry ID
+    ///
+    /// Take the first 8 hex chars of a UUIDv4; retry on collision (up to 100 times),
+    /// fall back to a full UUIDv7 if all attempts fail.
+    pub fn generate_entry_id(&self) -> String {
+        let existing: std::collections::HashSet<&str> =
+            self.entries.iter().map(|e| e.id()).collect();
+
+        for _ in 0..100 {
+            let full = uuid::Uuid::now_v7().to_string();
+            let short = full[..8].to_string();
+            if !existing.contains(short.as_str()) {
+                return short;
+            }
+        }
+        uuid::Uuid::now_v7().to_string()
+    }
+
     /// Walk from the given leaf (or the current leaf_id) up the parentId chain to the root.
     /// Returns an ordered slice of entries from root to leaf (root first, leaf last).
     ///
@@ -344,6 +362,42 @@ impl SessionTree {
             total_tokens,
             cost_total,
         }
+    }
+
+    /// Read-only slice of all session entries (preserving append order).
+    pub fn entries(&self) -> &[SessionTreeEntry] {
+        &self.entries
+    }
+
+    /// Current leaf node id (None means empty tree / reset).
+    pub fn leaf_id(&self) -> Option<&str> {
+        self.leaf_id.as_deref()
+    }
+
+    /// Append an entry and advance the leaf pointer (maintaining the "leaf = last appended entry" invariant).
+    pub fn append(&mut self, entry: SessionTreeEntry) {
+        self.leaf_id = Some(entry.id().to_string());
+        self.entries.push(entry);
+    }
+
+    /// Move the leaf pointer to an existing entry (forms a new branch; existing entries are not modified).
+    pub fn branch(&mut self, branch_from_id: &str) -> Result<(), SessionTreeError> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.id() == branch_from_id)
+        {
+            self.leaf_id = Some(branch_from_id.to_string());
+            Ok(())
+        } else {
+            Err(SessionTreeError::EntryNotFound(branch_from_id.to_string()))
+        }
+    }
+
+    /// Reset the leaf pointer to None (next append becomes the root).
+    /// New entry, always uses the previous leaf_id as parent id
+    pub fn reset_leaf(&mut self) {
+        self.leaf_id = None
     }
 }
 

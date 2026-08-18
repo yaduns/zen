@@ -23,7 +23,7 @@ pub trait SessionStore: Send + Sync {
     fn append_thinking_level_change(&self, level: &str);
 
     /// Gets the current session ID.
-    fn session_id(&self) -> &str;
+    fn session_id(&self) -> String;
 
     /// Gets the working directory.
     fn cwd(&self) -> &str;
@@ -164,7 +164,7 @@ impl AgentSession {
     }
 
     /// Session ID (read via delegation to `session_store.session_id()`).
-    pub fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> String {
         self.session_store.session_id()
     }
 
@@ -284,8 +284,8 @@ mod tests {
                 .unwrap()
                 .push(level.to_string());
         }
-        fn session_id(&self) -> &str {
-            "session-1"
+        fn session_id(&self) -> String {
+            "session-1".to_string()
         }
         fn cwd(&self) -> &str {
             "/work/dir"

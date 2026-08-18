@@ -1804,6 +1804,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "url",
+ "uuid",
  "zen-ai",
 ]
 

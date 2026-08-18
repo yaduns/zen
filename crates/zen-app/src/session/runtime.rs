@@ -119,8 +119,8 @@ mod tests {
         fn append_message(&self, _message: &zen_ai::types::Message) {}
         fn append_model_change(&self, _provider: &str, _model_id: &str) {}
         fn append_thinking_level_change(&self, _level: &str) {}
-        fn session_id(&self) -> &str {
-            &self.session_id_val
+        fn session_id(&self) -> String {
+            self.session_id_val.clone()
         }
         fn cwd(&self) -> &str {
             &self.cwd_val
@@ -231,7 +231,9 @@ mod tests {
         let rt = create_initial_runtime(session, services, reason);
 
         match &rt.start_reason {
-            SessionStartReason::Resume(path) => assert_eq!(path, &PathBuf::from("/sessions/abc.jsonl")),
+            SessionStartReason::Resume(path) => {
+                assert_eq!(path, &PathBuf::from("/sessions/abc.jsonl"))
+            }
             _ => panic!("expected Resume variant"),
         }
     }
