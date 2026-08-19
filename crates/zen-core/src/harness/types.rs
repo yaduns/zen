@@ -1,11 +1,6 @@
 use serde::Serialize;
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio_util::sync::CancellationToken;
-use zen_ai::api::openai_stream::{StreamConfig, StreamError};
 use zen_ai::tool::{Tool, ToolExecutionMode, ToolExecutionResult};
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, Context, Message, Model, ThinkingLevel, ToolCall,
@@ -13,29 +8,6 @@ use zen_ai::types::{
 };
 
 // REQ-AGENT-01 (pi-232, pi-205): Agent core types
-
-/// StreamFn is the signature of the LLM call function used by the agent loop.
-/// - Must return an event stream (`UnboundedReceiver<AssistantMessageEvent>`).
-/// - Failures must be encoded via protocol events in the stream (`AssistantMessageEvent::Error`) and the final
-///   `AssistantMessage` (stop_reason = "error" / "aborted").
-/// - The caller (agent loop) controls cancellation via the `cancel` parameter; on cancellation the stream should close as soon as possible.
-///
-/// StreamFn is passed explicitly via the `run_agent_loop` parameter; no global static is kept.
-/// Can be migrated to a `Provider` trait when multiple providers are supported.
-pub type StreamFn = Arc<
-    dyn Fn(
-            &Model,
-            &Context,
-            Option<StreamConfig>,
-            Option<CancellationToken>,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<UnboundedReceiver<AssistantMessageEvent>, StreamError>>
-                    + Send,
-            >,
-        > + Send
-        + Sync,
->;
 
 /// Public runtime snapshot of the agent, containing current configuration, transcript messages, streaming state, and error info.
 /// Pure runtime struct; does not derive serde.
@@ -323,6 +295,7 @@ mod tests {
             id: "test-model".into(),
             name: None,
             provider: "test".into(),
+            api: zen_ai::provider::Api::OpenAiCompletions,
             base_url: "https://api.test.com".into(),
             context_window: 128_000,
             max_tokens: 4096,

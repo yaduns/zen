@@ -250,8 +250,9 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
     use zen_ai::tool::ToolExecutionMode;
+    use zen_ai::types::StreamFn;
     use zen_core::harness::agent_hooks::AgentLoopHooks;
-    use zen_core::harness::types::{AgentState, StreamFn};
+    use zen_core::harness::types::AgentState;
 
     // ── Recording SessionStore mock ──
 
@@ -306,6 +307,7 @@ mod tests {
             id: "deepseek-v4-flash".into(),
             name: None,
             provider: "opencode-go".into(),
+            api: zen_ai::provider::Api::OpenAiCompletions,
             base_url: "https://opencode.ai/zen/go/v1".into(),
             context_window: 65536,
             max_tokens: 8192,

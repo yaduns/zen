@@ -133,7 +133,8 @@ async fn real_test_session_agent_runtime_fork() {
 
         // New AgentSession + new services (session_store points to the branch manager)
         let new_store: Arc<dyn SessionStore> = Arc::new(new_manager);
-        let new_session = AgentSession::new(common::new_agent(BASE_PROMPT, history), new_store.clone());
+        let new_session =
+            AgentSession::new(common::new_agent(BASE_PROMPT, history), new_store.clone());
         let new_services = AgentSessionServices {
             cwd,
             agent_dir,
@@ -144,7 +145,11 @@ async fn real_test_session_agent_runtime_fork() {
     .expect("replace_runtime");
 
     // 6) New runtime validation: new session id, 2 session files on disk (original + branch)
-    assert_ne!(rt2.session.session_id(), original_id, "forked session gets new id");
+    assert_ne!(
+        rt2.session.session_id(),
+        original_id,
+        "forked session gets new id"
+    );
     let sessions = SessionManager::list("proj", &root).expect("list");
     assert_eq!(sessions.len(), 2, "original + forked session files");
 

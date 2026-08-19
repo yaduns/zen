@@ -8,12 +8,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionMode;
-use zen_ai::types::{
-    ContentBlock, ContentBlockList, Context, Message, Model, ThinkingLevel,
-};
+use zen_ai::types::StreamFn;
+use zen_ai::types::{ContentBlock, ContentBlockList, Context, Message, Model, ThinkingLevel};
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::engine::Agent;
-use zen_core::harness::types::{AgentState, ShouldStopAfterTurnContext, StreamFn};
+use zen_core::harness::types::{AgentState, ShouldStopAfterTurnContext};
 
 /// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).
 pub fn provider_key_var() -> &'static str {

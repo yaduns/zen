@@ -1,0 +1,247 @@
+// REQ-APP-08 (pi-360): implement the main entry point main (CLI assembly + mode dispatch)
+// See reference/pi-original/packages/coding-agent/src/main.ts
+// Implementation notes in tasks/T-AP-08-3-implemented.md (thin-shell main + assembly factory, dual delivery)
+
+use clap::Parser;
+use tracing::info;
+use zen_ai::types::ImageContent;
+use zen_app::cli::{build_initial_message, read_piped_stdin, stdin_is_terminal, CliArgs, Mode};
+use zen_app::config::VERSION;
+use zen_app::session::runtime::AgentSessionRuntime;
+use zen_app::session::services::create_initial_runtime_from_cli;
+
+/// Application run mode.
+/// Corresponds to pi's `AppMode` (`"print" | "interactive"`; `"rpc"` removed for simplification per REQ-APP-08).
+/// `Print(Mode)` carries the output format (text/json); `Interactive` carries none (supported only in Phase 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppMode {
+    /// print mode: process the prompt then exit
+    Print(Mode),
+    /// interactive mode: interactive session
+    Interactive,
+}
+
+/// zen binary entry point (thin shell: parse → assembly factory → dispatch, three layers).
+///
+/// All assembly logic (model resolution/tool assembly/system prompt/Agent construction/runtime assembly) is in
+/// Done inside `zen_app::session::services::create_initial_runtime_from_cli` (rework point 3/4),
+/// main retains only three glue layers: CLI parsing, initial message construction, mode dispatch.
+///
+/// Flow:
+/// 1. `CliArgs::parse()` parses CLI arguments
+/// 2. `--version` / `--export` fast paths
+/// 3. Mode determination (`--mode` > `--print` > stdin not a TTY > interactive)
+/// 4. Read stdin + build initial message (T-AP-08-2)
+/// 5. Call the assembly factory to obtain `AgentSessionRuntime` (rework point 3)
+/// 6. Dispatch by mode: print → `run_print_mode`, interactive → T-AP-11-1 (Phase 2)
+///
+/// Exit code: print mode returns the exit code of `run_print_mode`; interactive mode defaults to 0.
+///
+/// # Errors
+/// Returns Err when runtime creation fails (aggregated by anyhow; `#[tokio::main]` prints to stderr and exits with 1).
+/// Phase 1 does not implement graceful SIGTERM/SIGHUP shutdown (print is a stub that returns immediately;
+/// `CancellationToken` + `tokio::select!` will be added when real print lands in T-AP-07-1, see "Open Issues #4" in the task doc).
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // tracing subscriber setup (REQ-OBS-01 refactor note: inlined directly in main.rs, not wrapped in a separate function;
+    // code ownership under T-OB-01-1 Drop). Logs go to stderr (stdout contains only structured output, see T-AP-06-1).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    // Layer 1: parsing + fast paths + mode determination
+    let args = CliArgs::parse();
+    info!(
+        mode = ?args.mode,
+        print = args.print,
+        provider = ?args.provider,
+        model = ?args.model,
+        thinking = ?args.thinking,
+        "[main] node 1: CliArgs::parse()"
+    );
+
+    // --version: print the version and exit (clap disable_version_flag, needs manual handling)
+    if args.version {
+        println!("{VERSION}");
+        return Ok(());
+    }
+
+    // --export: not supported in Phase 1 (HTML export belongs to the T-AP-08-3 extension in Phase 2)
+    if args.export.is_some() {
+        anyhow::bail!("--export is not supported yet (Phase 2)");
+    }
+
+    let app_mode = resolve_app_mode(&args, stdin_is_terminal());
+    info!(
+        app_mode = ?app_mode,
+        "[main] node 2: mode resolution (--mode > --print > non-TTY stdin > interactive)"
+    );
+
+    // Layer 2: read stdin + initial message (T-AP-08-2)
+    let stdin_content = read_piped_stdin().await?;
+    let messages: Vec<&str> = args.messages();
+    let initial = build_initial_message(&messages, stdin_content, None, vec![]);
+    info!(
+        has_initial = initial.initial_message.is_some(),
+        remaining = initial.remaining_messages.len(),
+        "[main] node 3: read stdin + build initial message"
+    );
+
+    // Layer 3: assembly factory (refactor point 3—assembly logic has been extracted to services.rs)
+    let cwd = std::env::current_dir()?;
+    let runtime = create_initial_runtime_from_cli(&args, cwd)?;
+    info!(
+        session_id = runtime.session.session_id(),
+        model_id = %runtime.session.model().id,
+        "[main] node 4: assemble factory -> AgentSessionRuntime ready"
+    );
+
+    // Layer 4: mode dispatch
+    match app_mode {
+        AppMode::Print(mode) => {
+            let exit_code = run_print_mode(
+                runtime,
+                mode,
+                initial
+                    .remaining_messages
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                initial.initial_message,
+                initial.initial_images,
+            )?;
+            info!(exit_code, "[main] node 5: print mode dispatch complete");
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        AppMode::Interactive => {
+            let exit_code = run_interactive_mode(
+                runtime,
+                initial.initial_message,
+                initial.initial_images,
+                args.messages().iter().map(|s| s.to_string()).collect(),
+            )?;
+            info!(exit_code, "[main] node 5: interactive mode dispatch complete");
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Determine the application run mode (print / interactive).
+///
+/// Decision rules (aligned with pi `resolveAppMode`):
+/// 1. `args.mode` explicitly specified → use directly (`Mode::Text` → print "text", `Mode::Json` → print "json")
+/// 2. `args.print` flag is true → print "text"
+/// 3. stdin is not a TTY (piped input) → print "text"
+/// 4. none of the above → interactive
+///
+/// # Parameters
+/// - `args`: parsed CLI arguments
+/// - `stdin_is_tty`: whether stdin is a terminal (passed by caller for testability)
+///
+/// # Consumers
+/// Called only internally within `main` (this file).
+fn resolve_app_mode(args: &CliArgs, stdin_is_tty: bool) -> AppMode {
+    // 1. --mode explicitly specified → use directly
+    if let Some(mode) = args.mode {
+        return AppMode::Print(mode);
+    }
+
+    // 2. --print flag → print "text"
+    if args.print {
+        return AppMode::Print(Mode::Text);
+    }
+
+    // 3. stdin is not a TTY (piped input) → print "text"
+    if !stdin_is_tty {
+        return AppMode::Print(Mode::Text);
+    }
+
+    // 4. default → interactive
+    AppMode::Interactive
+}
+
+/// Phase 1 print mode dispatch function.
+///
+/// Receives an assembled `AgentSessionRuntime` + initial messages + output format,
+/// Invokes the print mode logic (moved to `modes/print_mode.rs` when T-AP-07-1 is implemented).
+///
+/// Phase 1 simplification: only outputs "print mode stub" and returns exit code 0.
+/// Replaced with the real print logic once T-AP-07-1 is implemented (send prompt → receive events → output → exit).
+///
+/// # Return Value
+/// Exit code: 0 = success, non-zero = failure
+fn run_print_mode(
+    _runtime: AgentSessionRuntime,
+    _output_mode: Mode,
+    _messages: Vec<String>,
+    _initial_message: Option<String>,
+    _initial_images: Vec<ImageContent>,
+) -> anyhow::Result<i32> {
+    eprintln!("print mode stub");
+    Ok(0)
+}
+
+/// Phase 1 interactive mode stub.
+///
+/// Replace this with the actual interactive logic in Phase 2 (T-AP-11-1).
+/// Phase 1 prints a prompt and returns an error (interactive mode is supported only in Phase 2).
+fn run_interactive_mode(
+    _runtime: AgentSessionRuntime,
+    _initial_message: Option<String>,
+    _initial_images: Vec<ImageContent>,
+    _messages: Vec<String>,
+) -> anyhow::Result<i32> {
+    anyhow::bail!("interactive mode will be implemented in Phase 2 (T-AP-11-1)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test helper: construct CliArgs (aligned with args.rs test conventions).
+    fn parse(args: &[&str]) -> CliArgs {
+        let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
+        full.push("zen");
+        full.extend_from_slice(args);
+        CliArgs::try_parse_from(full).unwrap()
+    }
+
+    // ── resolve_app_mode ─────────────────────────────────────────
+
+    #[test]
+    fn explicit_mode_wins_over_other_signals() {
+        // --mode json explicitly specified → print json (even if stdin is a TTY)
+        let args = parse(&["--mode", "json"]);
+        assert_eq!(resolve_app_mode(&args, true), AppMode::Print(Mode::Json));
+        assert_eq!(resolve_app_mode(&args, false), AppMode::Print(Mode::Json));
+    }
+
+    #[test]
+    fn print_flag_forces_print_text() {
+        let args = parse(&["--print"]);
+        assert_eq!(resolve_app_mode(&args, true), AppMode::Print(Mode::Text));
+        assert_eq!(resolve_app_mode(&args, false), AppMode::Print(Mode::Text));
+    }
+
+    #[test]
+    fn piped_stdin_forces_print() {
+        // no flags + stdin not a TTY → print text
+        let args = parse(&[]);
+        assert_eq!(resolve_app_mode(&args, false), AppMode::Print(Mode::Text));
+    }
+
+    #[test]
+    fn tty_without_flags_defaults_to_interactive() {
+        let args = parse(&[]);
+        assert_eq!(resolve_app_mode(&args, true), AppMode::Interactive);
+    }
+}

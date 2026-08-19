@@ -631,7 +631,10 @@ mod tests {
         let mgr = SessionManager::in_memory("/proj");
 
         assert_eq!(mgr.get_cwd(), "/proj");
-        assert!(mgr.get_session_file().is_none(), "memory session has no file");
+        assert!(
+            mgr.get_session_file().is_none(),
+            "memory session has no file"
+        );
         assert!(!mgr.get_session_id().is_empty());
         assert!(mgr.get_entries().is_empty());
         assert!(mgr.get_leaf_id().is_none());
@@ -738,7 +741,11 @@ mod tests {
 
         assert_eq!(forked.get_cwd(), "/target");
         assert_eq!(forked.get_entries().len(), 2);
-        assert_eq!(forked.get_session_id().len(), 8, "forked session gets new id");
+        assert_eq!(
+            forked.get_session_id().len(),
+            8,
+            "forked session gets new id"
+        );
         assert_ne!(forked.get_session_id(), src.get_session_id());
         // Leaf advanced to the last source entry
         let leaf = forked.get_leaf_id().unwrap();
@@ -783,7 +790,10 @@ mod tests {
                 metadata: None,
             },
         );
-        assert!(matches!(result, Err(SessionManagerError::InvalidSession(_))));
+        assert!(matches!(
+            result,
+            Err(SessionManagerError::InvalidSession(_))
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -896,7 +906,10 @@ mod tests {
         mgr.append_message(&user_message("world"));
 
         let ctx = mgr.build_context();
-        assert!(!ctx.messages.is_empty(), "user messages should be recovered");
+        assert!(
+            !ctx.messages.is_empty(),
+            "user messages should be recovered"
+        );
         assert!(ctx.model.is_none(), "no assistant/model entries yet");
     }
 
@@ -927,7 +940,9 @@ mod tests {
         let result = mgr.branch("nope");
         assert!(matches!(
             result,
-            Err(SessionManagerError::Tree(SessionTreeError::EntryNotFound(_)))
+            Err(SessionManagerError::Tree(SessionTreeError::EntryNotFound(
+                _
+            )))
         ));
     }
 

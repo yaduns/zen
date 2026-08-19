@@ -76,7 +76,8 @@ async fn real_test_agent_session_persist_and_resume_continuity() {
     let history = reopened.build_context().messages;
     assert!(!history.is_empty(), "recovered history should not be empty");
 
-    let mut session2 = AgentSession::new(common::new_agent(BASE_PROMPT, history), Arc::new(reopened));
+    let mut session2 =
+        AgentSession::new(common::new_agent(BASE_PROMPT, history), Arc::new(reopened));
     let turn2 = session2
         .prompt("What is the codeword? Reply with only the word.")
         .await
@@ -128,7 +129,10 @@ async fn real_test_agent_session_continue_recent_continuity() {
     // restore the most recent session via continue_recent
     let resumed = Arc::new(SessionManager::continue_recent("proj", &root).expect("continue"));
     assert_eq!(resumed.get_cwd(), "proj");
-    assert!(!resumed.get_entries().is_empty(), "entries restored from disk");
+    assert!(
+        !resumed.get_entries().is_empty(),
+        "entries restored from disk"
+    );
 
     // rebuild AgentSession from the restored history, follow-up continuity
     let history = resumed.build_context().messages;

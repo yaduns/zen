@@ -5,13 +5,14 @@ use crate::harness::types::AgentLoopConfig;
 use crate::harness::types::{
     AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentLoopTurnUpdate, AgentState,
     BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
-    ShouldStopAfterTurnContext, StreamFn,
+    ShouldStopAfterTurnContext,
 };
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolExecutionMode};
+use zen_ai::types::StreamFn;
 use zen_ai::types::{ContentBlock, ContentBlockList, Message, Model, ThinkingLevel, UserMessage};
 
 /// Stateful, session-level agent engine. Holds AgentState (accumulated across turns) and two message queues: steer and follow-up,
@@ -459,6 +460,7 @@ mod tests {
             id: "deepseek-v4-flash".into(),
             name: None,
             provider: "opencode-go".into(),
+            api: zen_ai::provider::Api::OpenAiCompletions,
             base_url: "https://opencode.ai/zen/go/v1".into(),
             context_window: 65536,
             max_tokens: 8192,
@@ -528,7 +530,10 @@ mod tests {
         agent.on_event(&AgentEvent::AgentStart).await;
 
         assert_eq!(received.lock().unwrap().len(), 1);
-        assert!(matches!(received.lock().unwrap()[0], AgentEvent::AgentStart));
+        assert!(matches!(
+            received.lock().unwrap()[0],
+            AgentEvent::AgentStart
+        ));
     }
 
     #[tokio::test]
@@ -604,7 +609,10 @@ mod tests {
     fn test_follow_up_enqueues_and_snapshot() {
         let agent = test_agent();
         agent.follow_up("please continue");
-        assert_eq!(agent.follow_up_messages(), vec!["please continue".to_string()]);
+        assert_eq!(
+            agent.follow_up_messages(),
+            vec!["please continue".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -622,19 +630,21 @@ mod tests {
     #[test]
     fn test_queue_texts_blocks_variant_joins_text() {
         let queue: Arc<Mutex<VecDeque<Message>>> =
-            Arc::new(Mutex::new(VecDeque::from(vec![Message::User(UserMessage {
-                content: ContentBlockList::Blocks(vec![
-                    ContentBlock::Text(TextContent {
-                        text: "first".into(),
-                        text_signature: None,
-                    }),
-                    ContentBlock::Text(TextContent {
-                        text: "second".into(),
-                        text_signature: None,
-                    }),
-                ]),
-                timestamp: 0,
-            })])));
+            Arc::new(Mutex::new(VecDeque::from(vec![Message::User(
+                UserMessage {
+                    content: ContentBlockList::Blocks(vec![
+                        ContentBlock::Text(TextContent {
+                            text: "first".into(),
+                            text_signature: None,
+                        }),
+                        ContentBlock::Text(TextContent {
+                            text: "second".into(),
+                            text_signature: None,
+                        }),
+                    ]),
+                    timestamp: 0,
+                },
+            )])));
         assert_eq!(queue_texts(&queue), vec!["first\nsecond".to_string()]);
     }
 

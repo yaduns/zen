@@ -4,11 +4,12 @@ use crate::harness::agent_hooks::{
     FinalizedToolCallOutcome,
 };
 use crate::harness::types::{
-    AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamFn,
+    AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext,
 };
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::openai_stream::StreamConfig;
 use zen_ai::tool::{ToolContext, ToolExecutionMode};
+use zen_ai::types::StreamFn;
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, StopReason,
     ThinkingLevel, ToolCall, ToolResultMessage, Usage,

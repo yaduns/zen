@@ -20,7 +20,8 @@ async fn test_simple_chat() {
         "opencode-go" => "OPENCODE_API_KEY",
         _ => "ARK_API_KEY",
     };
-    let _ = std::env::var(key_var).unwrap_or_else(|_| panic!("{} not set; skipping integration test", key_var));
+    let _ = std::env::var(key_var)
+        .unwrap_or_else(|_| panic!("{} not set; skipping integration test", key_var));
 
     // 1. Create the model from environment variables (constructed for the default provider)
     let model = Model::from_env();

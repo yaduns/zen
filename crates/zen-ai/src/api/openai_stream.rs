@@ -1,13 +1,14 @@
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
-    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ThinkingContent,
-    ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
+    ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, StreamFn, TextContent,
+    ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
 };
 use crate::utils::error_body::extract_error_body;
 use crate::utils::provider_env::get_provider_env_value;
 use eventsource_stream::Eventsource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
@@ -1058,9 +1059,26 @@ async fn sse_event_loop(
     }
 }
 
+/// `StreamFn` wrapper around the existing OpenAI Chat Completions streaming implementation.
+///
+/// Wrap `pub async fn stream(model, context, options, cancel)` as a `StreamFn`
+/// (clone model/context inside the closure then move into the async block, resolving the `'static` future constraint,
+/// consistent with the current T-AP-08-3 style).
+///
+/// # Consumers
+/// Called only internally by `stream_for` (same crate).
+pub fn openai_completions_stream() -> StreamFn {
+    Arc::new(|model, context, options, cancel| {
+        let model = model.clone();
+        let context = context.clone();
+        Box::pin(async move { stream(&model, &context, options, cancel).await })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Api;
     use crate::types::{
         AssistantMessage, ContentBlock, ContentBlockList, ImageContent, Message, TextContent,
         ThinkingContent, ToolCall, ToolResultMessage, Usage, UserMessage,
@@ -1412,6 +1430,7 @@ mod tests {
             id: "deepseek-v4-flash".into(),
             name: None,
             provider: "deepseek".into(),
+            api: Api::OpenAiCompletions,
             base_url: "https://api.example.com".into(),
             context_window: 65536,
             max_tokens: 8192,

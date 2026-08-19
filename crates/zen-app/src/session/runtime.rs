@@ -103,9 +103,10 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zen_ai::tool::ToolExecutionMode;
+    use zen_ai::types::StreamFn;
     use zen_ai::types::{AssistantMessageEvent, Context};
     use zen_core::harness::agent_hooks::AgentLoopHooks;
-    use zen_core::harness::types::{AgentState, StreamFn};
+    use zen_core::harness::types::AgentState;
 
     // ── Mock helpers ──
 
@@ -139,6 +140,7 @@ mod tests {
             id: "test-model".into(),
             name: None,
             provider: "test".into(),
+            api: zen_ai::provider::Api::OpenAiCompletions,
             base_url: "http://localhost".into(),
             context_window: 8192,
             max_tokens: 1024,

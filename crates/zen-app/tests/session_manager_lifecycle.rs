@@ -20,11 +20,8 @@ use zen_app::session::session_manager::SessionManager;
 
 /// Create a unique test directory under the system temp directory (std-only).
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zen_it_lifecycle_{}_{}",
-        name,
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("zen_it_lifecycle_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -199,6 +196,8 @@ fn test_list_and_list_all() {
 #[test]
 fn test_list_empty_dir_returns_empty() {
     let root = temp_dir("list_empty");
-    assert!(SessionManager::list("/proj", &root).expect("list").is_empty());
+    assert!(SessionManager::list("/proj", &root)
+        .expect("list")
+        .is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }

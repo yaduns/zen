@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionMode;
+use zen_ai::types::StreamFn;
 use zen_ai::types::{ContentBlock, Context, Message, Model, ThinkingLevel};
 use zen_app::session::jsonl::{
     append_entry, create_session_file, create_session_id, create_timestamp, get_entries_to_fork,
@@ -24,7 +25,7 @@ use zen_app::session::jsonl::{
 };
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::engine::Agent;
-use zen_core::harness::types::{AgentEvent, AgentState, ShouldStopAfterTurnContext, StreamFn};
+use zen_core::harness::types::{AgentEvent, AgentState, ShouldStopAfterTurnContext};
 use zen_core::session::context::build_context;
 use zen_core::session::tree::{SessionTree, SessionTreeEntry};
 

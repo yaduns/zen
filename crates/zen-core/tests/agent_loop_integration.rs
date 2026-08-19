@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{
     Tool, ToolContext, ToolError, ToolExecutionMode, ToolExecutionResult, ToolUpdateCallback,
 };
+use zen_ai::types::StreamFn;
 use zen_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, TextContent, ThinkingLevel,
@@ -21,7 +22,7 @@ use zen_ai::types::{
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
-use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn};
+use zen_core::harness::types::{AgentEvent, AgentLoopConfig};
 
 /// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).
 fn provider_key_var() -> &'static str {
@@ -285,6 +286,7 @@ fn default_model() -> Model {
         id: "test-model".into(),
         name: Some("Test Model".into()),
         provider: "deepseek".into(),
+        api: zen_ai::provider::Api::OpenAiCompletions,
         base_url: "https://api.test.com".into(),
         context_window: 128_000,
         max_tokens: 4096,

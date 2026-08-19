@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::sync::CancellationToken;
 
+use crate::api::openai_stream::{StreamConfig, StreamError};
 use crate::tool::Tool;
 
 /// Reason the LLM response terminated, used to decide the agent loop's next action
@@ -379,6 +384,8 @@ pub struct Model {
     pub headers: Option<HashMap<String, String>>,
     /// Token rates, used for cost calculation. When None, no cost is calculated
     pub cost_rates: Option<CostRates>,
+    /// Protocol binding
+    pub api: crate::provider::Api,
 }
 
 /// Describes per-million-token rates for a model, used to compute actual cost from token usage.
@@ -443,3 +450,26 @@ pub enum ToolChoice {
     /// {"type": "function", "function": {"name": "..."}}	force the model to call the tool with the specified name
     Function { name: String },
 }
+
+/// StreamFn is the signature of the LLM call function used by the agent loop.
+/// - Must return an event stream (`UnboundedReceiver<AssistantMessageEvent>`).
+/// - Failures must be encoded via protocol events in the stream (`AssistantMessageEvent::Error`) and the final
+///   `AssistantMessage` (stop_reason = "error" / "aborted").
+/// - The caller (agent loop) controls cancellation via the `cancel` parameter; on cancellation the stream should close as soon as possible.
+///
+/// StreamFn is passed explicitly via the `run_agent_loop` parameter; no global static is kept.
+/// Can migrate to a `Provider` trait in the future with multiple providers (see the T-AI-02-8 `stream_for` binding table).
+pub type StreamFn = Arc<
+    dyn Fn(
+            &Model,
+            &Context,
+            Option<StreamConfig>,
+            Option<CancellationToken>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<UnboundedReceiver<AssistantMessageEvent>, StreamError>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;

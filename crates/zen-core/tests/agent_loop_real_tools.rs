@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolExecutionMode};
+use zen_ai::types::StreamFn;
 use zen_ai::types::{
     ContentBlock, ContentBlockList, Context, Message, Model, StopReason, ToolResultMessage, Usage,
 };
@@ -22,7 +23,7 @@ use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::agent_loop::run_agent_loop;
 use zen_core::harness::context::create_context;
 use zen_core::harness::types::ShouldStopAfterTurnContext;
-use zen_core::harness::types::{AgentEvent, AgentLoopConfig, StreamFn};
+use zen_core::harness::types::{AgentEvent, AgentLoopConfig};
 use zen_core::tools::factory::ToolFactory;
 
 /// Returns the required API key environment variable name for the default provider (`ZEN_PROVIDER`, default opencode-go).

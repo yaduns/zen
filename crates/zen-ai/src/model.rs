@@ -11,8 +11,8 @@ impl Model {
     /// max_tokens are read from per-provider env vars (see the env var conventions in the `provider` module).
     pub fn from_env() -> Self {
         let name = default_provider_name();
-        let provider = resolve_provider(&name)
-            .unwrap_or_else(|| panic!("unknown default provider: {}", name));
+        let provider =
+            resolve_provider(&name).unwrap_or_else(|| panic!("unknown default provider: {}", name));
         Self::from_provider(provider.as_ref())
     }
 
@@ -27,6 +27,7 @@ impl Model {
         Self {
             id: provider_model_id(provider.id()).unwrap_or_else(|| "deepseek-v4-flash".to_string()),
             provider: provider.id().to_string(),
+            api: provider.api(),
             base_url: provider.base_url(),
             max_tokens: provider_max_tokens(provider.id()),
             context_window: 65536,
@@ -161,6 +162,7 @@ fn provider_max_tokens(provider: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Api;
 
     // ── helper ──
 
@@ -169,6 +171,7 @@ mod tests {
             id: "test-model".to_string(),
             name: None,
             provider: "deepseek".to_string(),
+            api: Api::OpenAiCompletions,
             base_url: "https://api.test.com".to_string(),
             context_window: 4096,
             max_tokens: 1024,

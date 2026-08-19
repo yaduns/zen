@@ -15,14 +15,18 @@
 //!
 //! Traceability: `pi-120` (models.ts) / `pi-118` (provider-env) → REQ-AI-02 → this module + `Model::from_provider`.
 
+use serde::{Deserialize, Serialize};
+
 use crate::utils::provider_env::get_provider_env_value;
 
 /// Protocol type. Aligned with pi's `Api` (types.ts KnownApi). zen currently only supports
 /// OpenAI Chat Completions compatible protocol (both providers use it); add variants when integrating new protocols.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Api {
     /// OpenAI Chat Completions compatible protocol
     OpenAiCompletions,
+    // Placeholder: enable when implementing the OpenAI Responses protocol in the future
+    OpenAiResponses,
 }
 
 /// Multi-provider extension interface. Aligns with pi's `Provider<TApi>` (models.ts:67).
@@ -115,10 +119,7 @@ mod tests {
         assert_eq!(p.id(), "opencode-go");
         assert_eq!(p.api(), Api::OpenAiCompletions);
         // Endpoint defaults (when OPENCODE_BASE_URL is not set)
-        assert_eq!(
-            p.base_url(),
-            "https://opencode.ai/zen/go/v1"
-        );
+        assert_eq!(p.base_url(), "https://opencode.ai/zen/go/v1");
     }
 
     #[test]
