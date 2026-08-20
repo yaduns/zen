@@ -204,6 +204,7 @@ pub fn create_initial_runtime_from_cli(
         cwd,
         agent_dir,
         session_store,
+        registry: zen_core::process::ProcessRegistry::new(),
     };
     Ok(create_initial_runtime(
         session,

@@ -70,6 +70,7 @@ async fn real_test_session_agent_runtime_fork() {
             cwd: PathBuf::from("proj"),
             agent_dir: PathBuf::from("/tmp/zen-test-agent"),
             session_store: store,
+            registry: zen_core::process::ProcessRegistry::new(),
         },
         SessionStartReason::Startup,
     );
@@ -139,6 +140,7 @@ async fn real_test_session_agent_runtime_fork() {
             cwd,
             agent_dir,
             session_store: new_store,
+            registry: zen_core::process::ProcessRegistry::new(),
         };
         Ok::<_, anyhow::Error>((new_session, new_services, SessionStartReason::Fork(a1_id)))
     })

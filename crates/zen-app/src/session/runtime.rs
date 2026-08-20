@@ -1,6 +1,7 @@
 use crate::session::agent_session::{AgentSession, SessionStore};
 use std::path::PathBuf;
 use std::sync::Arc;
+use zen_core::process::ProcessRegistry;
 
 /// Reason for session creation/restoration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,8 @@ pub struct AgentSessionServices {
     pub agent_dir: PathBuf,
     /// Persistence delegate
     pub session_store: Arc<dyn SessionStore>,
+    /// Registry of detached child processes, used to batch-terminate the child process tree on shutdown signal
+    pub registry: Arc<ProcessRegistry>,
 }
 
 /// Runtime wrapper holding `AgentSession` + `AgentSessionServices`.
@@ -204,6 +207,7 @@ mod tests {
             cwd: cwd.into(),
             agent_dir: agent_dir.into(),
             session_store: test_session_store("s1", cwd),
+            registry: ProcessRegistry::new(),
         }
     }
 

@@ -2,9 +2,7 @@ pub mod shell;
 pub mod shell_output;
 
 use crate::env::shell::{kill_process_tree, resolve_shell, ShellTransport};
-use crate::process::{
-    track_detached_child_pid, untrack_detached_child_pid, wait_for_child_process, ChunkCallback,
-};
+use crate::process::{wait_for_child_process, ChunkCallback, ProcessRegistry};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +19,9 @@ pub struct ExecutionEnv {
     shell_path: Option<PathBuf>,
     /// Session base environment variable overrides, layered on top of the process environment, with lower precedence than ExecOptions.env
     base_env: Option<HashMap<String, String>>,
+    /// detached child-process registry; when `Some`, exec tracks/untracks the child-process pid,
+    /// Used by the parent process to batch-terminate child processes upon receiving a shutdown signal; no tracking when `None`.
+    registry: Option<Arc<ProcessRegistry>>,
 }
 
 /// All options for a single exec call. Lifetimes to one invocation
@@ -75,15 +76,20 @@ pub enum ExecutionError {
 
 impl ExecutionEnv {
     /// Create an execution environment.
+    ///
+    /// # Parameters
+    /// - `registry`: detached child-process registry; when `Some`, exec tracks/untracks the child-process pid.
     pub fn new(
         base_dir: PathBuf,
         shell_path: Option<PathBuf>,
         base_env: Option<HashMap<String, String>>,
+        registry: Option<Arc<ProcessRegistry>>,
     ) -> Self {
         Self {
             base_dir,
             shell_path,
             base_env,
+            registry,
         }
     }
 
@@ -179,8 +185,8 @@ impl ExecutionEnv {
         let pid = child.id();
 
         // 4.5) detached tracking: register pid to ensure the parent-process close signal cleans the whole tree (aligned with pi trackDetachedChildPid)
-        if let Some(pid) = pid {
-            track_detached_child_pid(pid);
+        if let (Some(pid), Some(reg)) = (pid, &self.registry) {
+            reg.track(pid);
         }
 
         // 5) stdin transport: write the command in the background and close it (avoids mutual deadlock when child output fills the pipe)
@@ -259,8 +265,8 @@ impl ExecutionEnv {
 
         // 8) Untrack on all paths: the detached registration only covers the process lifetime
         //    (normal exit / cancellation / timeout / wait failure all end the registration, preventing accidental kill via pid reuse).
-        if let Some(pid) = pid {
-            untrack_detached_child_pid(pid);
+        if let (Some(pid), Some(reg)) = (pid, &self.registry) {
+            reg.untrack(pid);
         }
 
         // 9) Map results: wait failure → SpawnError; the cancel/timeout branches first reap the child process (to avoid zombies) then return the error.
@@ -400,6 +406,7 @@ mod tests {
             PathBuf::from("/tmp/zen-env-test"),
             Some(PathBuf::from("/bin/bash")),
             Some(HashMap::from([("FOO".to_string(), "bar".to_string())])),
+            None,
         );
         assert_eq!(env.base_dir, PathBuf::from("/tmp/zen-env-test"));
         assert_eq!(env.shell_path, Some(PathBuf::from("/bin/bash")));
@@ -526,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_echo_stdout() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let out = env
             .exec("echo hello", empty_options())
             .await
@@ -538,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_empty_command() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let out = env.exec("", empty_options()).await.expect("exec ok");
         assert_eq!(out.stdout, "");
         assert_eq!(out.stderr, "");
@@ -547,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_stdout_stderr_separation() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let out = env
             .exec("echo to-out; echo to-err >&2", empty_options())
             .await
@@ -559,14 +566,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_nonzero_exit_code() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let out = env.exec("exit 3", empty_options()).await.expect("exec ok");
         assert_eq!(out.exit_code, 3);
     }
 
     #[tokio::test]
     async fn test_exec_on_stdout_callback() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let received = Arc::new(Mutex::new(String::new()));
         let got = received.clone();
         let opts = ExecOptions {
@@ -584,6 +591,7 @@ mod tests {
             PathBuf::from("/"),
             None,
             Some(HashMap::from([("FOO".to_string(), "bar".to_string())])),
+            None,
         );
         // only base_env takes effect
         let out = env
@@ -609,7 +617,7 @@ mod tests {
         let base = tokio::fs::canonicalize(dir.path())
             .await
             .expect("canonicalize");
-        let env = ExecutionEnv::new(base.clone(), None, None);
+        let env = ExecutionEnv::new(base.clone(), None, None, None);
         let out = env.exec("pwd", empty_options()).await.expect("exec ok");
         assert_eq!(out.stdout.trim_end(), base.to_str().unwrap());
         assert_eq!(out.exit_code, 0);
@@ -623,7 +631,7 @@ mod tests {
             .expect("canonicalize");
         let sub = base.join("sub");
         tokio::fs::create_dir_all(&sub).await.expect("create sub");
-        let env = ExecutionEnv::new(base, None, None);
+        let env = ExecutionEnv::new(base, None, None, None);
         let opts = ExecOptions {
             cwd: Some(PathBuf::from("sub")),
             ..empty_options()
@@ -638,7 +646,7 @@ mod tests {
         let abs = tokio::fs::canonicalize(dir.path())
             .await
             .expect("canonicalize");
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let opts = ExecOptions {
             cwd: Some(abs.clone()),
             ..empty_options()
@@ -649,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_precancelled_aborts() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let ct = CancellationToken::new();
         ct.cancel();
         let opts = ExecOptions {
@@ -662,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_cancelled_during_execution() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let ct = CancellationToken::new();
         let ct2 = ct.clone();
         let canceller = tokio::spawn(async move {
@@ -680,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_timeout() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let opts = ExecOptions {
             timeout: Some(Duration::from_millis(200)),
             ..empty_options()
@@ -696,6 +704,7 @@ mod tests {
             PathBuf::from("/"),
             Some(PathBuf::from("/nonexistent/shell")),
             None,
+            None,
         );
         let res = env.exec("echo hi", empty_options()).await;
         assert!(matches!(res, Err(ExecutionError::ShellUnavailable(_))));
@@ -708,7 +717,7 @@ mod tests {
         // Resolved working directory does not exist → Unknown (aligned with pi createLocalBashOperations fsAccess F_OK)
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist");
-        let env = ExecutionEnv::new(missing, None, None);
+        let env = ExecutionEnv::new(missing, None, None, None);
         let res = env.exec("echo hi", empty_options()).await;
         match res {
             Err(ExecutionError::Unknown(msg)) => {
@@ -726,7 +735,7 @@ mod tests {
     async fn test_exec_relative_cwd_not_exists_returns_unknown() {
         // Relative cwd resolving to a nonexistent path is likewise blocked by the precheck
         let dir = tempfile::tempdir().expect("tempdir");
-        let env = ExecutionEnv::new(dir.path().to_path_buf(), None, None);
+        let env = ExecutionEnv::new(dir.path().to_path_buf(), None, None, None);
         let opts = ExecOptions {
             cwd: Some(PathBuf::from("nope")),
             ..empty_options()
@@ -741,7 +750,7 @@ mod tests {
     async fn test_exec_detached_descendant_holding_stdout_does_not_hang() {
         // Regression pi#5303: after the shell exits, background subshells inherit the stdout/stderr pipes and silently keep them open.
         // The old implementation (join! read then wait) would hang forever; wait_for_child_process should release after a 100ms idle grace period.
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let start = std::time::Instant::now();
         let out = env
             .exec("printf 'DONE\\n'; ( sleep 2 ) &", empty_options())
@@ -763,7 +772,7 @@ mod tests {
         // Use a "large volume continuous burst" (yes|head writing 50000 lines) instead of timed ticks: data flows continuously → the grace
         // timer is re-armed on every chunk and never fires due to idleness, making it immune to scheduling stretching under parallel load (previously 20ms×15 ticks
         // occasionally lost the tail when background sleeps were CPU-starved while the full env test suite ran in parallel).
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let out = env
             .exec(
                 "printf 'HEAD\\n'; ( yes 'TAIL-LINE' | head -n 50000 ) &",
@@ -784,7 +793,7 @@ mod tests {
     #[tokio::test]
     async fn test_exec_on_stdout_chunk_granularity_within_tick_sequence() {
         // Callbacks are delivered per chunk: multi-line output may be accumulated by the callback (a chunk can merge multiple lines, but no content is lost).
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let received = Arc::new(Mutex::new(String::new()));
         let got = received.clone();
         let opts = ExecOptions {
@@ -799,19 +808,24 @@ mod tests {
         assert_eq!(*received.lock().unwrap(), "a\nb\nc\n");
     }
 
-    // ── detached tracking (kill_tracked can clean up the whole exec child process tree) ────
+    // ── detached tracking (kill_all can clean up exec's entire child-process tree) ────
 
     #[tokio::test]
     async fn test_exec_tracks_detached_child_for_shutdown_kill() {
-        // Verify that exec registers child processes in the global detached registry: simulate a parent shutdown signal calling
-        // after kill_tracked_detached_children(), exec's long-running child process should be SIGKILLed across its whole tree,
+        // Verify that exec registers child processes in ProcessRegistry: simulate a parent-process shutdown-signal call
+        // After registry.kill_all(), exec's long-running child processes should be SIGKILLed across the entire tree,
         // exec returns on its own when the token is not cancelled (signal termination → exit_code 0).
         //
-        // if tracking is not wired up (exec never tracks), kill_tracked cannot kill it, and exec will keep running
+        // If tracking is not wired up (exec never tracks), kill_all cannot kill it, and exec will keep running
         // `sleep 30`; assertion fails as soon as the timeout fires.
-        let _g = crate::process::registry_guard(); // Shares the same lock as the registry tests in process.rs
+        let registry = crate::process::ProcessRegistry::new();
 
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(
+            PathBuf::from("/"),
+            None,
+            None,
+            Some(registry.clone()),
+        );
         let ct = CancellationToken::new();
         let opts = ExecOptions {
             cancellation: Some(ct.clone()),
@@ -823,20 +837,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Simulate parent shutdown signal: batch-kill all registered detached process trees
-        crate::process::kill_tracked_detached_children();
+        registry.kill_all();
 
         // If tracking is wired: process is SIGKILLed → wait_for_child_process returns (token not canceled) →
-        // exec returns Ok(exit_code 0) on its own; not returning within 3s means kill_tracked failed to kill it.
+        // exec returns Ok(exit_code 0) on its own; if it does not return within 3s, kill_all did not kill it.
         let res = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
         match res {
             Ok(Ok(Ok(out))) => assert_eq!(out.exit_code, 0, "signal termination should map to exit_code 0"),
             Ok(Ok(Err(e))) => panic!("exec should not error (token not cancelled): {e}"),
             Ok(Err(_)) => panic!("exec task panic"),
             Err(_elapsed) => {
-                // kill_tracked did not take effect → tracking not wired up: cancel teardown and fail
+                // kill_all ineffective → tracing not wired up: cancel finalization and fail
                 ct.cancel();
                 let _ = task.await;
-                panic!("kill_tracked failed to terminate the exec child process (detached tracking not wired?)");
+                panic!("kill_all failed to terminate exec's child process (detached tracking not wired?)");
             }
         }
     }

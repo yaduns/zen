@@ -5,6 +5,7 @@ use crate::session::runtime::AgentSessionRuntime;
 use std::sync::Arc;
 use zen_ai::types::{AssistantMessage, ContentBlock, ImageContent, Message};
 use zen_core::harness::types::AgentEvent;
+use zen_core::process::ProcessRegistry;
 
 /// print (single-run) mode entry point: send prompts → output → exit.
 ///
@@ -87,9 +88,10 @@ pub async fn run_print_mode(
     };
 
     // race condition
+    let registry = runtime.services.registry.clone();
     let exit_code = tokio::select! {
         biased;
-        code = await_signal_exit_code() => code,
+        code = await_signal_exit_code(registry) => code,
         res = send_prompts => {
             if let Err(e) = res {
                 eprintln!("Error: {e}");
@@ -101,7 +103,7 @@ pub async fn run_print_mode(
     };
 
     if exit_code != 0 {
-        zen_core::process::kill_tracked_detached_children();
+        runtime.services.registry.kill_all();
         writer.flush().await?;
         return Ok(exit_code);
     }
@@ -198,8 +200,11 @@ pub fn stop_error_message(assistant: &AssistantMessage) -> Option<String> {
 // The shutdown signal is only awaited racily during a print run; internal to the module, so not marked pub.
 
 /// Waits for the first shutdown signal (SIGTERM/SIGHUP) and returns the corresponding exit code (SIGTERM→143, SIGHUP→129).
-/// After receiving the signal, first call `zen_core::process::kill_tracked_detached_children()` to terminate tracked
+/// On receiving the signal, first call `registry.kill_all()` to terminate already-tracked
 /// detached child process tree (aligned with pi's `killTrackedDetachedChildren`), then returns the exit code.
+///
+/// # Parameters
+/// - `registry`: registry of detached child processes, used to batch-terminate the child process tree on shutdown signal
 ///
 /// # Edge Cases
 /// - Unix only: `SIGHUP` uses `SignalKind::hangup()`, `SIGTERM` uses `SignalKind::terminate()`
@@ -209,7 +214,7 @@ pub fn stop_error_message(assistant: &AssistantMessage) -> Option<String> {
 /// # Return Value
 /// 1xx exit code (143 / 129), for `run_print_mode` to return directly
 #[cfg(unix)]
-async fn await_signal_exit_code() -> i32 {
+async fn await_signal_exit_code(registry: Arc<ProcessRegistry>) -> i32 {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
@@ -221,7 +226,7 @@ async fn await_signal_exit_code() -> i32 {
     };
 
     // Clean up detached child processes
-    zen_core::process::kill_tracked_detached_children();
+    registry.kill_all();
 
     exit_code
 }

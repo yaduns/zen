@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         cwd: PathBuf::from(&cwd),
         agent_dir: get_agent_dir()?,
         session_store: store,
+        registry: zen_core::process::ProcessRegistry::new(),
     };
     let runtime = create_initial_runtime(session, services, SessionStartReason::Startup);
 

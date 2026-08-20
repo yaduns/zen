@@ -640,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_basic_echo() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let res = execute_shell_with_capture(&env, "echo hello", &default_options())
             .await
             .expect("capture ok");
@@ -653,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_nonzero_exit_code() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let res = execute_shell_with_capture(&env, "exit 3", &default_options())
             .await
             .expect("capture ok");
@@ -663,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_merges_stdout_and_stderr() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let res =
             execute_shell_with_capture(&env, "echo to-out; echo to-err >&2", &default_options())
                 .await
@@ -675,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_strips_carriage_returns() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let res = execute_shell_with_capture(&env, "printf 'a\\r\\nb\\r\\n'", &default_options())
             .await
             .expect("capture ok");
@@ -684,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_on_chunk_receives_sanitized_chunks() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let received = Arc::new(Mutex::new(String::new()));
         let got = received.clone();
         let opts = ShellCaptureOptions {
@@ -700,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_precancelled_returns_cancelled() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let ct = CancellationToken::new();
         ct.cancel();
         let opts = ShellCaptureOptions {
@@ -716,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_capture_large_output_spills_to_file() {
-        let env = ExecutionEnv::new(PathBuf::from("/"), None, None);
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
         let res = execute_shell_with_capture(&env, "yes line | head -n 15000", &default_options())
             .await
             .expect("capture ok");
