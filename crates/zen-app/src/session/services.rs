@@ -36,12 +36,16 @@ use zen_core::harness::system_prompt::{
     build_system_prompt, collect_tool_prompt_metadata, BuildSystemPromptOptions,
 };
 use zen_core::harness::types::AgentState;
+use zen_core::session::tree::{SessionContext, SessionModel};
 use zen_core::tools::factory::ToolFactory;
 
-/// Phase 1 empty-hook implementation: all hook methods use the `AgentLoopHooks` trait default implementations
+/// Phase 1 default empty hook implementation: all hook methods use `AgentLoopHooks` trait defaults
 /// (no filtering, no transformation, no key injection, no tool-call interception, no event handling).
-/// Later replaced by T-AP-07-1 (print mode) with a real `on_event` serialization implementation.
-struct NoopHooks;
+///
+/// `pub` so examples / quick starts can directly construct an empty `Arc<dyn AgentLoopHooks>` and inject it
+/// `create_agent_session`; modes needing events/transformation (print json / TUI) should pass custom hooks.
+/// Note: print mode actually goes through `AgentSession::subscribe` serializing events rather than hooks (see T-AP-07-1).
+pub struct NoopHooks;
 
 impl AgentLoopHooks for NoopHooks {}
 
@@ -101,45 +105,52 @@ pub fn create_agent_session(
     AgentSession::new(agent, session_store)
 }
 
-/// Thin CLI-specific glue: parse `CliArgs` into model/tools/system prompt and assemble the full runtime.
+/// Thin CLI-specific glue: parse `CliArgs` + the already-selected session manager into model/tools/system prompt, and assemble the full runtime.
 ///
-/// This is main's core call site — main only does parse → call this function → dispatch, these three layers.
+/// This is main's core call point — main only does parse → (select session) → call this function → dispatch, these layers.
 ///
 /// # Parameters
 /// - `args`: parsed CLI arguments
 /// - `cwd`: current working directory (obtained by the caller, for test injection)
+/// - `session_manager`: **session manager selected by the caller (main)**. Session selection (`in_memory`/`create`/`open`/
+///   `continue_recent`/`fork_from`) is the caller's responsibility; this function only "assembles a runnable session from the given manager".
 ///
 /// # Behavior
-/// 1. Resolve model and thinking level (`resolve_model`, including --provider/--model/--thinking overrides)
+/// 1. Resolve model and thinking (CLI flags take precedence, otherwise restore from session `build_context`, then defaults)
 /// 2. Create the tool factory and assemble the tool list (binds cwd + session_id)
 /// 3. Assemble the system prompt (AGENTS.md context + --system-prompt/--append-system-prompt)
 /// 4. Look up the protocol stream implementation from the binding table by model.api (stream_for from T-AI-02-8)
-/// 5. Build the AgentSession with the generic factory create_agent_session
+/// 5. Build AgentSession via the generic factory create_agent_session, and feed back the `build_context()` session history
+///    (`set_messages`, aligned with pi `agent.state.messages = buildSessionContext().messages`; empty for a new session)
 /// 6. Assemble AgentSessionServices + create_initial_runtime
 ///
 /// # Return Value
 /// The fully assembled `AgentSessionRuntime` (session + services + session store)
 ///
 /// # Edge Cases
-/// - Phase 1 uses a fixed in-memory session (--session/--resume/--fork belong to T-AP-08-5)
 /// - Phase 1 injects no skills (append here after T-AP-03-3 lands)
+/// - `--session` only supports full paths (partial UUID resolution is T-AP-08-5)
 /// - Phase 2's SettingsManager/ResourceLoader append their assembly steps within this function.
 ///
 /// # Consumers
-/// T-AP-08-3 (main's node 2 call site)
+/// T-AP-08-3 (main's node 4 call point, session selected by main)
 pub fn create_initial_runtime_from_cli(
     args: &CliArgs,
     cwd: PathBuf,
+    session_manager: SessionManager,
 ) -> anyhow::Result<AgentSessionRuntime> {
-    // 1. Resolve model and thinking (--provider/--model/--thinking)
-    let (model, thinking_level) = resolve_model(args);
+    // 0. Restore context from session (model/thinking/history). New session (empty tree) → messages empty, model None, naturally unified.
+    let ctx = session_manager.build_context();
+
+    // 1. Resolve model and thinking: CLI flags take precedence, otherwise restore from session ctx, then defaults
+    let (mut model, mut thinking_level) = resolve_model(args);
+    apply_session_restore(args, &ctx, &mut model, &mut thinking_level);
 
     // 2. Agent config directory (needed for AGENTS.md loading and default paths)
     let agent_dir = get_agent_dir()?;
 
-    // 3. Session manager: Phase 1 uses a fixed in-memory session (file sessions belong to T-AP-08-5)
+    // 3. Session ID (supplied by a manager chosen by the caller; the session_id of the persisted/forked session)
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let session_manager = SessionManager::in_memory(&cwd_str);
     let session_id = session_manager.session_id();
 
     // 4. Tool factory: bind cwd + session_id
@@ -176,7 +187,7 @@ pub fn create_initial_runtime_from_cli(
     );
 
     let session_store: Arc<dyn SessionStore> = Arc::new(session_manager);
-    let session = create_agent_session(
+    let mut session = create_agent_session(
         model,
         system_prompt,
         tools,
@@ -185,6 +196,8 @@ pub fn create_initial_runtime_from_cli(
         stream_fn,
         session_store.clone(),
     );
+    // Replay session history (aligned with pi; new session ctx.messages is empty)
+    session.set_messages(ctx.messages);
 
     // 7. Runtime assembly
     let services = AgentSessionServices {
@@ -197,6 +210,40 @@ pub fn create_initial_runtime_from_cli(
         services,
         SessionStartReason::Startup,
     ))
+}
+
+/// When the CLI does not explicitly override provider/model/thinking, restore them from the session `SessionContext`.
+/// Aligned with pi `createAgentSession`: the `existingSession.model`/`existingSession.thinkingLevel` fallback chain.
+///
+/// # Rules
+/// - model: restore from `ctx.model` (provider+model_id) only when neither `--provider` nor `--model` is given;
+/// - thinking: restore from `ctx.thinking_level` only when neither `--thinking` nor the `model id:thinking` shorthand is given.
+///
+/// # Consumers
+/// Called only internally by `create_initial_runtime_from_cli` (same file).
+fn apply_session_restore(
+    args: &CliArgs,
+    ctx: &SessionContext,
+    model: &mut Model,
+    thinking: &mut ThinkingLevel,
+) {
+    // model: not specified via CLI → restore from session
+    if args.provider.is_none() && args.model.is_none() {
+        if let Some(SessionModel { provider, model_id }) = &ctx.model {
+            if let Some(p) = resolve_provider(provider) {
+                let mut restored = Model::from_provider(p.as_ref());
+                restored.id = model_id.clone();
+                *model = restored;
+            }
+        }
+    }
+    // thinking: not specified via CLI (incl. model:thinking shorthand) → restore from session
+    let has_model_thinking_short = args.model.as_deref().is_some_and(|s| s.contains(':'));
+    if args.thinking.is_none() && !has_model_thinking_short {
+        if let Ok(level) = parse_thinking_level(&ctx.thinking_level) {
+            *thinking = level;
+        }
+    }
 }
 
 /// Resolve the model and thinking level specified on the CLI.
@@ -339,9 +386,95 @@ mod tests {
     fn create_runtime_zero_config_smoke() {
         let args = parse(&[]);
         let cwd = std::env::temp_dir();
-        let runtime = create_initial_runtime_from_cli(&args, cwd).expect("Zero config should be able to assemble runtime");
+        let manager = SessionManager::in_memory(&cwd.to_string_lossy());
+        let runtime = create_initial_runtime_from_cli(&args, cwd.clone(), manager)
+            .expect("Zero config should be able to assemble runtime");
         // Model has a default value (env or provider default chain); session is accessible
-        assert_eq!(runtime.services.cwd, std::env::temp_dir());
+        assert_eq!(runtime.services.cwd, cwd);
         assert_eq!(runtime.session.session_id().len() >= 36, true);
+    }
+
+    // ── apply_session_restore ──────────────────────────────────
+
+    /// Construct a session context carrying model/thinking records (directly builds zen-core SessionContext, avoiding file I/O).
+    fn restored_ctx(
+        provider: &str,
+        model_id: &str,
+        thinking: &str,
+    ) -> zen_core::session::tree::SessionContext {
+        zen_core::session::tree::SessionContext {
+            messages: vec![],
+            thinking_level: thinking.into(),
+            model: Some(zen_core::session::tree::SessionModel {
+                provider: provider.into(),
+                model_id: model_id.into(),
+            }),
+            active_tool_names: None,
+        }
+    }
+
+    fn restored_ctx_from_none() -> zen_core::session::tree::SessionContext {
+        zen_core::session::tree::SessionContext {
+            messages: vec![],
+            thinking_level: "off".into(),
+            model: None,
+            active_tool_names: None,
+        }
+    }
+
+    #[test]
+    fn restore_applies_when_cli_has_no_model_flags() {
+        let args = parse(&[]);
+        let (mut model, mut thinking) = resolve_model(&args);
+        let ctx = restored_ctx("huoshan", "ark-restored-model", "high");
+
+        apply_session_restore(&args, &ctx, &mut model, &mut thinking);
+
+        assert_eq!(model.provider, "huoshan");
+        assert_eq!(model.id, "ark-restored-model");
+        assert_eq!(thinking, ThinkingLevel::High);
+    }
+
+    #[test]
+    fn restore_skipped_when_cli_provides_model() {
+        // --model explicit → don't restore session model (but still… restore thinking when not given)
+        let args = parse(&["--model", "my-model"]);
+        let (mut model, mut thinking) = resolve_model(&args);
+        let ctx = restored_ctx("huoshan", "ark-restored-model", "high");
+
+        apply_session_restore(&args, &ctx, &mut model, &mut thinking);
+
+        assert_eq!(model.id, "my-model", "CLI --model takes precedence, not overridden");
+        assert_eq!(model.provider, "opencode-go", "provider not overridden");
+        // thinking not explicitly specified (model shorthand has no colon) → restore
+        assert_eq!(thinking, ThinkingLevel::High);
+    }
+
+    #[test]
+    fn restore_skipped_when_cli_provides_thinking() {
+        let args = parse(&["--thinking", "low"]);
+        let (mut model, mut thinking) = resolve_model(&args);
+        let ctx = restored_ctx("huoshan", "ark", "high");
+
+        apply_session_restore(&args, &ctx, &mut model, &mut thinking);
+
+        assert_eq!(thinking, ThinkingLevel::Low, "CLI --thinking takes precedence");
+        // model not provided → restore
+        assert_eq!(model.provider, "huoshan");
+    }
+
+    #[test]
+    fn restore_noop_on_empty_session_context() {
+        let args = parse(&[]);
+        let (model, thinking) = resolve_model(&args);
+        let ctx = restored_ctx_from_none();
+        let mut model = model;
+        let mut thinking = thinking;
+
+        apply_session_restore(&args, &ctx, &mut model, &mut thinking);
+
+        // New session: no session model/thinking to restore, keep resolve_model defaults (leave untouched)
+        assert!(!model.id.is_empty());
+        assert_eq!(thinking, ThinkingLevel::Off);
     }
 }

@@ -3,13 +3,16 @@
 // Implementation notes in tasks/T-AP-08-3-implemented.md (thin-shell main + assembly factory, dual delivery)
 
 use clap::Parser;
+use std::path::Path;
 use tracing::info;
 use zen_ai::types::ImageContent;
 use zen_app::cli::{build_initial_message, read_piped_stdin, stdin_is_terminal, CliArgs, Mode};
-use zen_app::config::VERSION;
+use zen_app::config::{get_sessions_dir, VERSION};
 use zen_app::modes::print_mode::run_print_mode;
+use zen_app::session::jsonl::CreateSessionOptions;
 use zen_app::session::runtime::AgentSessionRuntime;
 use zen_app::session::services::create_initial_runtime_from_cli;
+use zen_app::session::session_manager::SessionManager;
 
 /// Application run mode.
 /// Corresponds to pi's `AppMode` (`"print" | "interactive"`; `"rpc"` removed for simplification per REQ-APP-08).
@@ -91,9 +94,10 @@ async fn main() -> anyhow::Result<()> {
         "[main] node 3: read stdin + build initial message"
     );
 
-    // Layer 3: assembly factory (refactor point 3—assembly logic has been extracted to services.rs)
+    // Layer 3: assembly factory (refactoring point 3 — assembly logic extracted to services.rs; session chosen by main)
     let cwd = std::env::current_dir()?;
-    let runtime = create_initial_runtime_from_cli(&args, cwd)?;
+    let session_manager = select_session_manager(&args, &cwd)?;
+    let runtime = create_initial_runtime_from_cli(&args, cwd, session_manager)?;
     info!(
         session_id = runtime.session.session_id(),
         model_id = %runtime.session.model().id,
@@ -169,6 +173,54 @@ fn resolve_app_mode(args: &CliArgs, stdin_is_tty: bool) -> AppMode {
 
     // 4. default → interactive
     AppMode::Interactive
+}
+
+/// Select `SessionManager` based on CLI session flags (reuse `SessionManager`'s existing constructor, don't roll your own).
+///
+/// # Mapping
+/// - `--no-session` → `in_memory` (ephemeral, not persisted)
+/// - `--fork <source>` → `fork_from` (fork from source session)
+/// - `--resume` / `--continue` → `continue_recent` (resume most recent session, create new if none)
+/// - `--session <file>` / `--session-id` → `open` (full path; partial UUID resolution assigned to T-AP-08-5)
+/// - default → `create` (new file-backed session, **persisted**, aligned with pi)
+/// - `--session-dir <dir>` overrides the session root directory, affecting all the `*_root` values above
+///
+/// # Consumers
+/// Called internally by `main` (this file) only. (Decision: persist/restore model+thinking by default; session by full path only)
+fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionManager> {
+    let cwd_str = cwd.to_string_lossy();
+    let root = match &args.session_dir {
+        Some(dir) => dir.clone(),
+        None => get_sessions_dir()?,
+    };
+    let default_opts = CreateSessionOptions {
+        session_id: None,
+        parent_session_path: None,
+        metadata: None,
+    };
+
+    if args.no_session {
+        return Ok(SessionManager::in_memory(&cwd_str));
+    }
+    if let Some(fork_src) = &args.fork {
+        return Ok(SessionManager::fork_from(
+            Path::new(fork_src),
+            &cwd_str,
+            &root,
+            default_opts,
+        )?);
+    }
+    if args.resume || args.continue_flag {
+        return Ok(SessionManager::continue_recent(&cwd_str, &root)?);
+    }
+    if let Some(session) = args.session.as_ref().or(args.session_id.as_ref()) {
+        return Ok(SessionManager::open(
+            Path::new(session),
+            Some(&cwd_str),
+            &root,
+        )?);
+    }
+    Ok(SessionManager::create(&cwd_str, &root, default_opts)?)
 }
 
 /// Phase 1 interactive mode stub.

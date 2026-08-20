@@ -333,6 +333,15 @@ impl Agent {
         self.state.tools = tools;
     }
 
+    /// Restore session history after construction (mirrors pi's `agent.state.messages = buildSessionContext().messages`).
+    ///
+    /// Symmetric to `set_model`/`set_tools`: only modifies `state.messages` (single source of truth). Used by the assembly phase (T-AP-08-3
+    /// `create_initial_runtime_from_cli`) to load back a persisted/forked session's history; the next `prompt`'s
+    /// Context is derived from `state`. For a new session, pass an empty `Vec` for empty history (no forking needed).
+    pub fn set_messages(&mut self, messages: Vec<Message>) {
+        self.state.messages = messages;
+    }
+
     /// Cancel the current/subsequent run (= route A `abort()`).
     ///
     /// Calls `self.cancel.cancel()` internally. The lower-level loop exits at a safe point after receiving the cancellation signal.
@@ -670,6 +679,23 @@ mod tests {
         let mut agent = test_agent();
         agent.set_tools(vec![]);
         assert!(agent.state().tools.is_empty());
+    }
+
+    #[test]
+    fn test_set_messages_restores_history() {
+        let mut agent = test_agent();
+        // Initially empty history
+        assert!(agent.state().messages.is_empty());
+        // Reload persisted session history (align with pi `agent.state.messages = buildContext().messages`)
+        let msg = Message::User(UserMessage {
+            content: ContentBlockList::Text("History messages".into()),
+            timestamp: 0,
+        });
+        agent.set_messages(vec![msg.clone()]);
+        assert_eq!(agent.state().messages, vec![msg]);
+        // Empty Vec restores empty history (new session)
+        agent.set_messages(vec![]);
+        assert!(agent.state().messages.is_empty());
     }
 
     #[test]

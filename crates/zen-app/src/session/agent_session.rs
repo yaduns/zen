@@ -206,6 +206,17 @@ impl AgentSession {
             .append_thinking_level_change(&level.to_string())
     }
 
+    /// Restore session history after construction (mirrors engine `Agent::set_messages`).
+    ///
+    /// Mutates only the underlying `AgentState.messages` (single source of truth), for use by the assembly phase (`create_initial_runtime_from_cli`)
+    /// to seed the history of `SessionManager::build_context()`; pass an empty value for a new session to get empty history.
+    ///
+    /// # Consumers
+    /// `create_initial_runtime_from_cli` (session/fork/resume assembly)
+    pub fn set_messages(&mut self, messages: Vec<Message>) {
+        self.agent.set_messages(messages);
+    }
+
     // ── Queue operations (agent engine queue + read-only UI snapshot) ──────────────
 
     /// Queue a steer message (injected after tool execution, before the next LLM call).
@@ -427,6 +438,25 @@ mod tests {
         // Record one thinking-level change
         assert_eq!(store.thinking_changes().len(), 1);
         assert_eq!(session.thinking_level(), ThinkingLevel::High);
+    }
+
+    #[test]
+    fn test_set_messages_restores_history_on_delegate() {
+        // set_messages delegates to the engine and only mutates state.messages, without triggering any persistence
+        let store = Arc::new(MockStore::default());
+        let mut session = test_session(store.clone());
+
+        let msg = Message::User(zen_ai::types::UserMessage {
+            content: zen_ai::types::ContentBlockList::Text("History messages".into()),
+            timestamp: 0,
+        });
+        session.set_messages(vec![msg]);
+        // An empty restore (new session) neither panics nor triggers persistence
+        session.set_messages(vec![]);
+
+        // Delegates to the engine to mutate state directly: does not write model/thinking changes
+        assert!(store.model_changes().is_empty());
+        assert!(store.thinking_changes().is_empty());
     }
 
     // ── steer / follow_up / queue snapshot ──
