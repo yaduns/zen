@@ -29,6 +29,15 @@ pub enum Api {
     OpenAiResponses,
 }
 
+impl std::fmt::Display for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Api::OpenAiCompletions => write!(f, "openai-completions"),
+            Api::OpenAiResponses => write!(f, "openai-responses"),
+        }
+    }
+}
+
 /// Multi-provider extension interface. Aligns with pi's `Provider<TApi>` (models.ts:67).
 ///
 /// Association with `Model`: `Provider::id()` string-equals `Model.provider` (`String`)

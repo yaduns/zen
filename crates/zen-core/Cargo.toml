@@ -23,5 +23,6 @@ tempfile = { workspace = true }
 home = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]

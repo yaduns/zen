@@ -1,6 +1,7 @@
 // REQ-AGENT-02 (pi-213): write tool
 
 use crate::tools::path_utils::resolve_to_cwd;
+use crate::util::now_millis;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
@@ -104,10 +105,7 @@ impl Tool for WriteTool {
             })?;
         let success_msg = write_file(&absolute_path, &content, cancel).await?;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = now_millis();
 
         let message = ToolResultMessage {
             tool_call_id: tool_call_id.to_string(),

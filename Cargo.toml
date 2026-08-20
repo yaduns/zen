@@ -96,6 +96,7 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
 futures-util = "0.3"
+futures = "0.3"
 
 # ── async trait (dyn-compatible async methods in AgentTool) ─────
 async-trait = "0.1"

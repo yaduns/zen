@@ -54,9 +54,9 @@ impl ToolContext {
         allowed_directories: Option<Vec<PathBuf>>,
     ) -> Self {
         Self {
-            working_dir: working_dir,
-            session_id: session_id,
-            allowed_directories: allowed_directories,
+            working_dir,
+            session_id,
+            allowed_directories,
         }
     }
 }

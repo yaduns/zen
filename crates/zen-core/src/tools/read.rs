@@ -1,4 +1,5 @@
 use crate::tools::path_utils::resolve_read_path_async;
+use crate::util::now_millis;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
@@ -127,10 +128,7 @@ impl Tool for ReadTool {
             })?;
         let (content, info) = read_file_content(&resolved, offset, limit, cancel).await?;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = now_millis();
 
         let message = ToolResultMessage {
             tool_call_id: tool_call_id.to_string(),

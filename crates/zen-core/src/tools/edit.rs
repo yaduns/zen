@@ -12,6 +12,7 @@ use crate::tools::edit_diff::{
     strip_bom, Edit, EditError, EditToolDetails,
 };
 use crate::tools::path_utils::resolve_to_cwd;
+use crate::util::now_millis;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
@@ -209,10 +210,7 @@ impl Tool for EditTool {
         let details = edit_file(&abs, &edits, cancel)
             .await
             .map_err(|e| map_edit_error(e, &file_path))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = now_millis();
         let msg = ToolResultMessage {
             tool_call_id: tool_call_id.into(),
             tool_name: "edit".into(),

@@ -7,6 +7,7 @@ use crate::harness::types::{
     BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
     ShouldStopAfterTurnContext,
 };
+use crate::util::now_millis;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -242,10 +243,7 @@ pub(crate) async fn prepare_tool_call(
 
 /// Construct a failed tool execution result.
 fn error_tool_result(tool_call: &ToolCall, text: String) -> ToolExecutionResult {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now = now_millis();
     ToolExecutionResult {
         message: ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
@@ -353,10 +351,7 @@ pub(crate) async fn execute_prepared_tool_call(
                         usage: Some(Usage::default()),
                         is_error: true,
                         added_tool_names: None,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i64,
+                        timestamp: now_millis(),
                     },
                     terminate: false,
                 },
@@ -467,33 +462,23 @@ pub(crate) async fn fail_tool_calls_from_truncated_message(
         // - message: a single text whose content is the error message above; details carries no structured metadata
         // - usage: the tool never executed, zero cost
         // - terminate: false — don't end the loop; let the LLM retry
-        let result = ToolExecutionResult {
-            message: ToolResultMessage {
-                tool_call_id: "".into(),
-                tool_name: "".into(),
-                content: vec![ContentBlock::Text(TextContent {
-                    text: error_text,
-                    text_signature: None,
-                })],
-                details: Some(serde_json::Value::Null),
-                usage: Some(Usage::default()),
-                is_error: true,
-                added_tool_names: None,
-                timestamp: 0,
-            },
-            terminate: false,
-        };
-
-        // Messages to inject into the LLM context; tool execution results are appended to this collection
         let tool_result_msg = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            content: result.message.content.clone(),
-            details: result.message.details.clone(),
-            usage: result.message.usage.clone(),
-            is_error: result.message.is_error,
-            added_tool_names: result.message.added_tool_names.clone(),
-            timestamp: result.message.timestamp,
+            content: vec![ContentBlock::Text(TextContent {
+                text: error_text,
+                text_signature: None,
+            })],
+            details: Some(serde_json::Value::Null),
+            usage: Some(Usage::default()),
+            is_error: true,
+            added_tool_names: None,
+            timestamp: 0,
+        };
+
+        let result = ToolExecutionResult {
+            message: tool_result_msg.clone(), // Or use a reference directly
+            terminate: false,
         };
 
         // Send tool_execution_end event

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
 use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
+use crate::util::now_millis;
 
 /// Bash command execution tool that allows the agent to run commands in a shell.
 /// Supports:
@@ -100,10 +101,7 @@ impl Tool for BashTool {
         )
         .await?;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = now_millis();
 
         let is_error = exit_code.map_or(false, |c| c != 0);
 

@@ -1,11 +1,12 @@
 use crate::harness::agent_hooks::{
     execute_prepared_tool_call, fail_tool_calls_from_truncated_message,
     finalize_executed_tool_call, prepare_tool_call, AgentLoopError, AgentLoopHooks,
-    FinalizedToolCallOutcome,
+    FinalizedToolCallOutcome, PreparedToolCall,
 };
 use crate::harness::types::{
     AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext,
 };
+use crate::util::now_millis;
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::openai_stream::StreamConfig;
 use zen_ai::tool::{ToolContext, ToolExecutionMode};
@@ -187,12 +188,7 @@ pub(crate) async fn stream_assistant_response(
     cancel: &CancellationToken,
     stream_fn: StreamFn,
 ) -> AssistantMessage {
-    let now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
-    };
+    let now = || now_millis();
 
     // 1. Filter and transform messages via hooks
     let filtered = hooks.filter_messages(context.messages.clone()).await;
@@ -207,7 +203,7 @@ pub(crate) async fn stream_assistant_response(
 
     // 3. Resolve API key via hooks (for side effects / logging; StreamConfig is opaque)
     if config.api_key.is_none() {
-        hooks.get_api_key(&config.model.id).await;
+        hooks.get_api_key(&config.model.provider).await;
     }
 
     // 4. Call stream_fn
@@ -227,8 +223,8 @@ pub(crate) async fn stream_assistant_response(
         Err(err) => {
             let msg = AssistantMessage {
                 content: vec![],
-                api: "openai-completions".to_string(),
-                provider: "unknown".to_string(),
+                api: config.model.api.to_string(),
+                provider: config.model.provider.clone(),
                 model: config.model.id.clone(),
                 response_model: None,
                 response_id: None,
@@ -323,8 +319,8 @@ pub(crate) async fn stream_assistant_response(
     // 6. Stream ended without a terminal event (shouldn't happen in practice)
     let msg = AssistantMessage {
         content: vec![],
-        api: "openai-completions".to_string(),
-        provider: "unknown".to_string(),
+        api: config.model.api.to_string(),
+        provider: config.model.provider.clone(),
         model: config.model.id.clone(),
         response_model: None,
         response_id: None,
@@ -637,6 +633,11 @@ pub(crate) async fn execute_tool_calls_sequential(
 ///
 /// Tool calls are preprocessed in order (`prepare_tool_call`), then the permitted tool calls are executed concurrently;
 /// Tool results are ordered by the tool call order in the original assistant message.
+///
+/// # Execution flow
+/// 1. Sequentially preprocess all tool calls (validate arguments, before_tool_call hooks)
+/// 2. Execute the preprocessed tool calls concurrently
+/// 3. Reorder results by original order and send events
 pub(crate) async fn execute_tool_calls_parallel(
     context: &mut Context,
     assistant_message: &AssistantMessage,
@@ -645,10 +646,13 @@ pub(crate) async fn execute_tool_calls_parallel(
     hooks: &dyn AgentLoopHooks,
     cancel: &CancellationToken,
 ) -> (Vec<ToolResultMessage>, bool) {
-    let mut finalized_calls: Vec<FinalizedToolCallOutcome> = Vec::new();
-    let mut messages: Vec<ToolResultMessage> = Vec::new();
+    // ── Phase 1: Sequential preprocessing ──────────────────────────────
+    // Preprocessing (argument validation, before_tool_call hooks) must run sequentially,
+    // because hooks may depend on state changes from the previous tool.
+    let mut prepared_calls: Vec<(usize, PreparedToolCall)> = Vec::new();
+    let mut immediate_results: Vec<(usize, FinalizedToolCallOutcome)> = Vec::new();
 
-    for tool_call in tool_calls {
+    for (idx, tool_call) in tool_calls.iter().enumerate() {
         // Send tool_execution_start event
         hooks
             .on_event(&AgentEvent::ToolExecutionStart {
@@ -658,43 +662,85 @@ pub(crate) async fn execute_tool_calls_parallel(
             })
             .await;
 
+        // Check cancel signal
+        if cancel.is_cancelled() {
+            break;
+        }
+
         // Preprocessing
-        let preparation =
-            prepare_tool_call(context, assistant_message, tool_call, hooks, cancel).await;
-
-        let finalized = match preparation {
-            Err(err_result) => FinalizedToolCallOutcome {
-                tool_call: tool_call.clone(),
-                result: err_result,
-                is_error: true,
-            },
-            Ok(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, cancel, hooks).await;
-                finalize_executed_tool_call(
-                    context,
-                    assistant_message,
-                    &prepared,
-                    &executed,
-                    hooks,
-                    cancel,
-                )
-                .await
+        match prepare_tool_call(context, assistant_message, tool_call, hooks, cancel).await {
+            Err(err_result) => {
+                // Preprocessing failed; record the result immediately (no execution needed)
+                let finalized = FinalizedToolCallOutcome {
+                    tool_call: tool_call.clone(),
+                    result: err_result,
+                    is_error: true,
+                };
+                // Send tool_execution_end event
+                hooks
+                    .on_event(&AgentEvent::ToolExecutionEnd {
+                        tool_call_id: finalized.tool_call.id.clone(),
+                        tool_name: finalized.tool_call.name.clone(),
+                        result: finalized.result.clone(),
+                        is_error: finalized.is_error,
+                    })
+                    .await;
+                immediate_results.push((idx, finalized));
             }
-        };
+            Ok(prepared) => {
+                prepared_calls.push((idx, prepared));
+            }
+        }
+    }
 
-        // Send tool_execution_end event
-        hooks
-            .on_event(&AgentEvent::ToolExecutionEnd {
-                tool_call_id: finalized.tool_call.id.clone(),
-                tool_name: finalized.tool_call.name.clone(),
-                result: finalized.result.clone(),
-                is_error: finalized.is_error,
-            })
+    // ── Phase 2: Concurrent execution ────────────────────────────────
+    // Use futures::future::join_all to execute all preprocessed tool calls concurrently.
+    let context_ref: &Context = &*context;
+    let mut execution_futures: Vec<_> = prepared_calls
+        .into_iter()
+        .map(|(idx, prepared)| async move {
+            let executed = execute_prepared_tool_call(&prepared, cancel, hooks).await;
+            let finalized = finalize_executed_tool_call(
+                context_ref,
+                assistant_message,
+                &prepared,
+                &executed,
+                hooks,
+                cancel,
+            )
             .await;
 
-        messages.push(finalized.result.message.clone());
-        finalized_calls.push(finalized);
-    }
+            // Send tool_execution_end event (sent immediately when each tool completes)
+            hooks
+                .on_event(&AgentEvent::ToolExecutionEnd {
+                    tool_call_id: finalized.tool_call.id.clone(),
+                    tool_name: finalized.tool_call.name.clone(),
+                    result: finalized.result.clone(),
+                    is_error: finalized.is_error,
+                })
+                .await;
+
+            (idx, finalized)
+        })
+        .collect();
+
+    // Execute all futures concurrently
+    let parallel_results = futures::future::join_all(execution_futures).await;
+
+    // ── Phase 3: Reorder results by original order ──────────────────────
+    // Merge immediate results and concurrent results, sorted by original index
+    let mut all_results: Vec<(usize, FinalizedToolCallOutcome)> = Vec::new();
+    all_results.extend(immediate_results);
+    all_results.extend(parallel_results);
+    all_results.sort_by_key(|(idx, _)| *idx);
+
+    // Extract messages (in original order)
+    let finalized_calls: Vec<FinalizedToolCallOutcome> =
+        all_results.into_iter().map(|(_, f)| f).collect();
+    let messages: Vec<ToolResultMessage> = finalized_calls
+        .iter()
+        .map(|f| f.result.message.clone())
+        .collect();
 
     (messages, should_terminate_tool_batch(&finalized_calls))
 }

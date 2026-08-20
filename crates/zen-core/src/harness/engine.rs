@@ -2,6 +2,7 @@ use crate::harness::agent_hooks::{AgentLoopError, AgentLoopHooks};
 use crate::harness::agent_loop::{run_agent_loop, run_agent_loop_continue};
 use crate::harness::context::create_context;
 use crate::harness::types::AgentLoopConfig;
+use crate::util::now_millis;
 use crate::harness::types::{
     AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentLoopTurnUpdate, AgentState,
     BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
@@ -211,10 +212,7 @@ impl Agent {
         // 3) User prompt message
         let user_msg = Message::User(UserMessage {
             content: ContentBlockList::Text(text.to_string()),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
+            timestamp: now_millis(),
         });
         // 4) Run the low-level loop: pass &*self as hooks (Agent implements AgentLoopHooks);
         //    ctx/run_config/cancel/stream_fn are owned locals cloned before the call, no borrow conflict with &mut self
@@ -287,10 +285,7 @@ impl Agent {
         // Construct user message (aligned with the Message::User construction pattern used across the zen codebase)
         let message = Message::User(UserMessage {
             content: ContentBlockList::Text(text.to_string()),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
+            timestamp: now_millis(),
         });
         // Push into steer_queue (&self: lock only, safe to call while running)
         if let Ok(mut queue) = self.steer_queue.lock() {
@@ -306,10 +301,7 @@ impl Agent {
         // Construct user message (aligned with the Message::User construction pattern used across the zen codebase)
         let message = Message::User(UserMessage {
             content: ContentBlockList::Text(text.to_string()),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
+            timestamp: now_millis(),
         });
         // Push into steer_queue (&self: lock only, safe to call while running)
         if let Ok(mut queue) = self.follow_up_queue.lock() {

@@ -91,8 +91,8 @@ impl Model {
         self
     }
 
-    pub fn api_url(self) -> String {
-        self.base_url + "/chat/completions"
+    pub fn api_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
     }
 
     /// Compute the actual cost from token usage and rates.
@@ -105,24 +105,20 @@ impl Model {
         cache_read_tokens: u64,
         cache_write_tokens: u64,
     ) -> crate::types::Cost {
-        let input_tokens = input_tokens;
-        let output_tokens = output_tokens;
-        let cache_read_tokens = cache_read_tokens;
-        let cache_write_tokens = cache_write_tokens;
         match &self.cost_rates {
             Some(cost_rates) => {
-                let input = input_tokens as f64 / 1000_1000.0 * cost_rates.input;
-                let output = output_tokens as f64 / 1000_1000.0 * cost_rates.output;
-                let cache_read = cache_read_tokens as f64 / 1000_1000.0 * cost_rates.cache_read;
-                let cache_write = cache_write_tokens as f64 / 1000_1000.0 * cost_rates.cache_write;
+                let input = input_tokens as f64 / 1_000_000.0 * cost_rates.input;
+                let output = output_tokens as f64 / 1_000_000.0 * cost_rates.output;
+                let cache_read = cache_read_tokens as f64 / 1_000_000.0 * cost_rates.cache_read;
+                let cache_write = cache_write_tokens as f64 / 1_000_000.0 * cost_rates.cache_write;
                 let total = input + output + cache_read + cache_write;
 
                 Cost {
-                    input: input,
-                    output: output,
-                    cache_read: cache_read,
-                    cache_write: cache_write,
-                    total: total,
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                    total,
                 }
             }
             None => Cost {
@@ -265,14 +261,13 @@ mod tests {
 
     #[test]
     fn test_calculate_cost_typical() {
-        // NOTE: implementation uses 1000_1000.0 (10,001,000) as the divisor.
         let m = default_model(); // rates: input=1.0, output=2.0, cache_read=0.5, cache_write=0.5
-        let cost = m.calculate_cost(10_001_000, 5_000_500, 2_000_200, 1_000_100);
+        let cost = m.calculate_cost(1_000_000, 500_000, 200_000, 100_000);
 
-        assert!((cost.input - 1.0).abs() < 1e-10); // 10,001,000 / 10,001,000 * 1.0
-        assert!((cost.output - 1.0).abs() < 1e-10); // 5,000,500 / 10,001,000 * 2.0
-        assert!((cost.cache_read - 0.1).abs() < 1e-10); // 2,000,200 / 10,001,000 * 0.5
-        assert!((cost.cache_write - 0.05).abs() < 1e-10); // 1,000,100 / 10,001,000 * 0.5
+        assert!((cost.input - 1.0).abs() < 1e-10); // 1,000,000 / 1,000,000 * 1.0
+        assert!((cost.output - 1.0).abs() < 1e-10); // 500,000 / 1,000,000 * 2.0
+        assert!((cost.cache_read - 0.1).abs() < 1e-10); // 200,000 / 1,000,000 * 0.5
+        assert!((cost.cache_write - 0.05).abs() < 1e-10); // 100,000 / 1,000,000 * 0.5
         assert!((cost.total - 2.15).abs() < 1e-10);
     }
 
@@ -306,19 +301,18 @@ mod tests {
     #[test]
     fn test_calculate_cost_large_values() {
         let m = default_model();
-        // 20,002,000,000 tokens each dimension (multiple of 10,001,000)
         let cost = m.calculate_cost(
-            20_002_000_000,
-            20_002_000_000,
-            20_002_000_000,
-            20_002_000_000,
+            20_000_000_000,
+            20_000_000_000,
+            20_000_000_000,
+            20_000_000_000,
         );
 
-        assert!((cost.input - 2000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 1.0
-        assert!((cost.output - 4000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 2.0
-        assert!((cost.cache_read - 1000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 0.5
-        assert!((cost.cache_write - 1000.0).abs() < 1e-6); // 20,002,000,000 / 10,001,000 * 0.5
-        assert!((cost.total - 8000.0).abs() < 1e-6);
+        assert!((cost.input - 20000.0).abs() < 1e-6); // 20,000,000,000 / 1,000,000 * 1.0
+        assert!((cost.output - 40000.0).abs() < 1e-6); // 20,000,000,000 / 1,000,000 * 2.0
+        assert!((cost.cache_read - 10000.0).abs() < 1e-6); // 20,000,000,000 / 1,000,000 * 0.5
+        assert!((cost.cache_write - 10000.0).abs() < 1e-6); // 20,000,000,000 / 1,000,000 * 0.5
+        assert!((cost.total - 80000.0).abs() < 1e-6);
     }
 
     // ── from_env / from_provider ──

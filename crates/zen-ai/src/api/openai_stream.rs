@@ -923,8 +923,8 @@ async fn sse_event_loop(
     // Send an empty partial message to notify the caller that the stream has started.
     let partial = AssistantMessage {
         content: Vec::new(),
-        api: "openai-completions".to_string(),
-        provider: "deepseek".to_string(),
+        api: model.api.to_string(),
+        provider: model.provider.clone(),
         model: model.id.clone(),
         response_model: None,
         response_id: None,
@@ -1017,8 +1017,8 @@ async fn sse_event_loop(
     // 4b. Assemble the final message
     let mut msg = AssistantMessage {
         content,
-        api: "openai-completions".to_string(),
-        provider: model.id.clone(),
+        api: model.api.to_string(),
+        provider: model.provider.clone(),
         model: model.id.clone(),
         response_model: None,
         response_id,
