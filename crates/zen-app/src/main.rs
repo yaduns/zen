@@ -7,6 +7,7 @@ use tracing::info;
 use zen_ai::types::ImageContent;
 use zen_app::cli::{build_initial_message, read_piped_stdin, stdin_is_terminal, CliArgs, Mode};
 use zen_app::config::VERSION;
+use zen_app::modes::print_mode::run_print_mode;
 use zen_app::session::runtime::AgentSessionRuntime;
 use zen_app::session::services::create_initial_runtime_from_cli;
 
@@ -112,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
                     .collect(),
                 initial.initial_message,
                 initial.initial_images,
-            )?;
+            )
+            .await?;
             info!(exit_code, "[main] node 5: print mode dispatch complete");
             if exit_code != 0 {
                 std::process::exit(exit_code);
@@ -167,27 +169,6 @@ fn resolve_app_mode(args: &CliArgs, stdin_is_tty: bool) -> AppMode {
 
     // 4. default → interactive
     AppMode::Interactive
-}
-
-/// Phase 1 print mode dispatch function.
-///
-/// Receives an assembled `AgentSessionRuntime` + initial messages + output format,
-/// Invokes the print mode logic (moved to `modes/print_mode.rs` when T-AP-07-1 is implemented).
-///
-/// Phase 1 simplification: only outputs "print mode stub" and returns exit code 0.
-/// Replaced with the real print logic once T-AP-07-1 is implemented (send prompt → receive events → output → exit).
-///
-/// # Return Value
-/// Exit code: 0 = success, non-zero = failure
-fn run_print_mode(
-    _runtime: AgentSessionRuntime,
-    _output_mode: Mode,
-    _messages: Vec<String>,
-    _initial_message: Option<String>,
-    _initial_images: Vec<ImageContent>,
-) -> anyhow::Result<i32> {
-    eprintln!("print mode stub");
-    Ok(0)
 }
 
 /// Phase 1 interactive mode stub.
