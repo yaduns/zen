@@ -168,6 +168,12 @@ impl Terminal {
         write!(self.out, "\x1b]9;4;{}m\x07", st).map_err(TerminalError::Io)?;
         self.out.flush().map_err(TerminalError::Io)
     }
+
+    /// Expose the stdout write end so the main loop can write out ScreenBuffer::flush diff commands. Internal crate seam, not public.
+    /// Consumer: this task's `render_frame` (sole consumer).
+    pub(crate) fn out_mut(&mut self) -> &mut std::io::Stdout {
+        &mut self.out
+    }
 }
 
 #[cfg(test)]
@@ -277,7 +283,9 @@ mod tests {
                 assert!(!t.cursor_hidden);
                 t.stop().unwrap();
             }
-            Err(TerminalError::RawMode { action: "enter", .. }) => {
+            Err(TerminalError::RawMode {
+                action: "enter", ..
+            }) => {
                 // Without tty: enable_raw_mode fails, flag not set
                 assert!(!t.raw_mode_active);
                 assert!(!t.cursor_hidden);

@@ -4,7 +4,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Describes the foreground color, background color, and text attribute set (bold/underline, etc.) of a cell. Colors are represented as crossterm Color tags, so the theme system (T-AP-11-3) only needs to resolve theme colors into crossterm Color to write them to the buffer; this type only carries "already-resolved concrete styles", not theme rendering logic. Whether a separate Style type is needed (instead of reusing crossterm's ContentStyle) is determined at implementation time — if crossterm's ContentStyle suffices, a type alias can replace this struct, in which case delete this design item and note it in the file.
 #[derive(Default, Clone, PartialEq, Debug)]
-struct Style {
+pub struct Style {
     fg: Option<crossterm::style::Color>, // Foreground color; None means inherit terminal default
     bg: Option<crossterm::style::Color>, // Background color; None means inherit terminal default
     attributes: Vec<crossterm::style::Attribute>, // Text attributes; whether to use a Vec is decided at implementation time; must be Default-able (empty) = no styles
@@ -31,7 +31,7 @@ enum CellKind {
 /// Memory buffer for the whole frame. Holds the current frame grid and size; components write content into the current frame via write;
 /// flush compares the current frame with the previous one cell by cell, generating crossterm commands only for changed cells (differential refresh); after writing, the current frame is promoted to become the new previous frame.
 /// resize handles terminal size changes (including clearing extra rows when content shrinks).
-struct ScreenBuffer {
+pub struct ScreenBuffer {
     cells: Vec<Cell>,    // Current frame grid; flattened vs nested is an implementation choice, indexed using width
     width: u16,          // Current frame column count
     height: u16,         // Current frame row count
@@ -85,6 +85,12 @@ impl ScreenBuffer {
     /// Clear the current frame (set all cells to the blank style), for use before a redraw.
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
+    }
+
+    /// Return buffer dimensions (columns, rows) for the draw callback to lay out (top padding, width distribution, etc.).
+    /// Consumer: this task's `draw` callback; planned consumers: T-TU-01-4 (component layout), T-AP-11-2 (app components) — reuse uniformly when it recurs.
+    pub fn size(&self) -> (u16, u16) {
+        (self.width, self.height)
     }
 
     /// Write text at (x,y) with the given style; out-of-range coordinates are silently ignored (or the implementation may choose to panic — must be documented).
@@ -362,10 +368,11 @@ mod tests {
         buf.resize(2, 2);
         assert_eq!(cell(&buf, 1, 1).content.as_deref(), Some("B"));
         // Out-of-bounds content is no longer in the new buffer
-        assert!(buf.cells.iter().all(|c| c != &Cell {
-            content: Some("A".to_string()),
-            ..Cell::default()
-        }));
+        assert!(buf.cells.iter().all(|c| c
+            != &Cell {
+                content: Some("A".to_string()),
+                ..Cell::default()
+            }));
     }
 
     // ── clear ──

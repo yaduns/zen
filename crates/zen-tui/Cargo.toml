@@ -10,18 +10,13 @@ tracing = { workspace=true }
 tracing-subscriber = { workspace = true }
 crossterm = { workspace = true }
 thiserror = { workspace = true }
+futures-util = { workspace = true }
 unicode-width = { workspace = true }
-uuid = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
-tokio = { workspace = true }
 tokio-util = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
-zen-app = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
