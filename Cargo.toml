@@ -4,6 +4,7 @@ members = [
     "crates/zen-ai",
     "crates/zen-app",
     "crates/zen-core",
+    "crates/zen-tui",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ authors = ["Zen Contributors"]
 # Workspace crates
 zen-ai = { path = "crates/zen-ai" }
 zen-core = { path = "crates/zen-core" }
+zen-app = { path = "crates/zen-app" }
 
 # ── async runtime ────────────────────────────────────────────────
 tokio = { version = "1", features = [
@@ -62,10 +64,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # ── TUI ──────────────────────────────────────────────────────────
-# ratatui + crossterm: alternative to Pi's own TUI framework.
-# crossterm is the backend; ratatui each release pins a crossterm
-# range – keep both in sync.
-ratatui = { version = "0.29", features = ["crossterm"] }
+# crossterm: terminal manipulation library for TUI (raw mode, cursor, colors, keyboard).
+# Used directly instead of ratatui — better fit for chat-style TUI.
 crossterm = "0.28"
 
 # ── Markdown rendering (terminal output in TUI & print mode) ────
@@ -110,3 +110,4 @@ libc = "0.2"
 # ── path utilities (tilde expansion home dir, file:// URL parsing, T-AP-09-1) ──
 home = "0.5"
 url = "2"
+unicode-width = "0.1"
