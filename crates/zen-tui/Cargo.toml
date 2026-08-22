@@ -12,6 +12,7 @@ crossterm = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 tokio-util = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

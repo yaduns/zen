@@ -110,4 +110,6 @@ libc = "0.2"
 # ── path utilities (tilde expansion home dir, file:// URL parsing, T-AP-09-1) ──
 home = "0.5"
 url = "2"
+
 unicode-width = "0.1"
+unicode-segmentation = "1"

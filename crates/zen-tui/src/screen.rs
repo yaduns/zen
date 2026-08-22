@@ -5,9 +5,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Describes the foreground color, background color, and text attribute set (bold/underline, etc.) of a cell. Colors are represented as crossterm Color tags, so the theme system (T-AP-11-3) only needs to resolve theme colors into crossterm Color to write them to the buffer; this type only carries "already-resolved concrete styles", not theme rendering logic. Whether a separate Style type is needed (instead of reusing crossterm's ContentStyle) is determined at implementation time — if crossterm's ContentStyle suffices, a type alias can replace this struct, in which case delete this design item and note it in the file.
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Style {
-    fg: Option<crossterm::style::Color>, // Foreground color; None means inherit terminal default
-    bg: Option<crossterm::style::Color>, // Background color; None means inherit terminal default
-    attributes: Vec<crossterm::style::Attribute>, // Text attributes; whether to use a Vec is decided at implementation time; must be Default-able (empty) = no styles
+    pub fg: Option<crossterm::style::Color>, // Foreground color; None means inherit terminal default
+    pub bg: Option<crossterm::style::Color>, // Background color; None means inherit terminal default
+    pub attributes: Vec<crossterm::style::Attribute>, // Text attributes; whether to use a Vec is decided at implementation time; must be Default-able (empty) = no styles
 }
 
 /// A single position cell in the screen grid, carrying the display content and style of that column/row.
