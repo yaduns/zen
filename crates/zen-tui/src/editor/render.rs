@@ -1,8 +1,8 @@
 // REQ-TUI-01 (pi-413): editor component — layout and rendering: layout_text / render / cursor_position.
 // render writes ScreenBuffer and computes layout width using effective padding (shares last_width with cursor_position /
 // last_effective_padding / scroll_offset caches); layout_text is private to this module.
-use super::wrap::word_wrap_line;
 use super::{Editor, LayoutLine};
+use crate::wrap::word_wrap_line;
 
 impl Editor {
     /// Render the editor into the screen buffer at (x,y), with width width and height height. Design:

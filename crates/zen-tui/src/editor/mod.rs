@@ -1,9 +1,10 @@
 // Editor component — data types and public API (accessors/callbacks).
 // Internal operations split into submodules by domain: cursor.rs (cursor movement), text.rs (editing operations),
 // history.rs (commit/history/session state), input.rs (keypress/paste/action routing),
-// render.rs (layout/rendering/cursor positioning), wrap.rs (pure word-wrap functions).
-// Layout shared types (TextChunk/LayoutLine/VisualLine) stay here for submodules to reference via `use super::`;
-// A submodule's `impl Editor` block can access this module's private fields (submodules are descendants of the defining module, so privacy permits access).
+// render.rs (layout/rendering/cursor positioning).
+// Shared layout types (LayoutLine/VisualLine) live here for submodules to reference via `use super::`;
+// TextChunk and word-wrapping logic have been moved to crate::wrap (the width-text family) per the T-TU-01-4 integration plan,
+// see `tasks/T-TU-01-4-implemented.md`; `impl Editor` blocks in submodules can access this module's private fields.
 use crate::screen::Style;
 
 mod cursor;
@@ -11,7 +12,6 @@ mod history;
 mod input;
 mod render;
 mod text;
-mod wrap;
 
 /// Editor text core state: multi-line text + logical cursor (row/column)
 #[derive(Clone)]
@@ -113,14 +113,6 @@ pub struct Editor {
     on_submit: Option<Box<dyn FnMut(&str)>>, // Submit callback; receives the expanded text after trim (no marker in this task, i.e. trim of the full text)
     on_change: Option<Box<dyn FnMut(&str)>>, // Called on every text change
     disable_submit: bool,                    // When set, Submit is not triggered
-}
-
-/// Text fragment: a contiguous slice of the source text (text == line[start_index..end_index], byte offset).
-/// Produced by `wrap::word_wrap_line`, consumed by `render::layout_text` / `cursor::build_visual_line_map`.
-struct TextChunk {
-    text: String,       // Fragment text (visible text after wrapping; display is the buffer's source text)
-    start_index: usize, // Starting byte offset in the source text (UTF-8, same unit as cursor_col/grapheme_indices)
-    end_index: usize,   // Ending byte offset in the source text (exclusive; used for cursor attribution / range checks)
 }
 
 /// Rendered layout line: one line of visible text + whether it carries the cursor (with its position within the line when it does).

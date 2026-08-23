@@ -1,15 +1,32 @@
-// REQ-TUI-01 (pi-413): editor component — pure word-wrap functions (word_wrap_line / make_chunk / is_cjk).
-// No Editor state dependency; independently testable; promote to pub when needed for T-TU-02-1 (markdown wrapping).
-// Consumers: render::layout_text, cursor::build_visual_line_map (via `use super::wrap::...`).
-use super::TextChunk;
+// REQ-TUI-01 (pi-413): width-aware text processing family — word wrapping / truncation / column slicing / tab expansion.
+// The original word-wrapping logic was moved in from editor/wrap.rs (T-TU-01-3): consumers have expanded from "editor/ only" to
+// editor/ + components/ (T-TU-01-4), moved up to a crate-level module per the T-TU-01-4 integration plan.
+// Planned consumers: T-TU-02-1 (markdown wrapping/truncation), T-TU-03-6 (pi-408 utils.ts claim,
+// this family is its actual successor in this repository).
+// Width measurement uniformly goes through screen::visible_width (unicode-width), not reimplemented here.
+// TextChunk/word_wrap_line promoted from pub(super) to pub (components reads the text field);
+// make_chunk/is_cjk reduced to module-private. Text styling always goes through Style (zen text does not embed ANSI),
+// so no ANSI-aware branch from pi utils.ts is implemented (extractAnsiCode etc. are resolved with T-TU-03-6).
+use crate::screen::visible_width;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Wrap a single line at word boundaries: within maxWidth prefer word boundaries, adjacent CJK may break, over-wide atomic segments become their own chunks.
+/// Text fragment: a contiguous slice of the source text (text == line[start_index..end_index], byte offset).
+/// Produced by `word_wrap_line`; consumed by both the editor (cursor column mapping) and components (display line text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextChunk {
+    pub text: String,       // Fragment text (visible text after wrapping; display is the buffer's source text)
+    pub start_index: usize, // Starting byte offset in the source text (UTF-8, same unit as cursor_col/grapheme_indices)
+    pub end_index: usize,   // Ending byte offset in the source text (exclusive; used for cursor attribution / range checks)
+}
+
+/// Wrap a single line at word boundaries: prefer word boundaries within max_width, allow breaks between adjacent CJK, and split overwide atomic segments into separate chunks.
 /// **A fragment is a contiguous slice of the source text** (text == line[start_index..end_index], byte offset); whitespace belongs to the end of the previous fragment,
-/// Never rebuild text — ensure displayed text matches the buffer character-for-character and cursor column mapping is linear
-/// Consumers: render::layout_text, cursor::build_visual_line_map; no external consumers, visibility pub(super).
-/// Promote to pub later if needed (T-TU-02-1 markdown wrapping).
-pub(super) fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
+/// Never rebuild text — ensures displayed text matches the buffer character-for-character and cursor column mapping is linear.
+/// Edge cases: an empty line or max_width = 0 returns a single empty chunk (preserving the caller's invariant of "at least 1 visual line per logical line");
+/// If the whole line fits, return a single chunk; if a single grapheme's column width > max_width (extremely narrow terminal), it becomes its own chunk (1 column visual overflow, acceptable).
+/// Consumers: editor::render::layout_text, editor::cursor::build_visual_line_map,
+/// T-TU-01-4 components::text (text wrapping), components::settings_list (description wrapping), T-TU-02-1.
+pub fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
     // Degenerate input: return a single empty slice,
     // ensuring the caller's "every logical line >= 1 visual line" invariant holds.
     if line.is_empty() || max_width == 0 {
@@ -21,7 +38,7 @@ pub(super) fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
     }
 
     // Whole row fits: return a single slice (aligns with pi fast path).
-    if crate::screen::visible_width(line) <= max_width {
+    if visible_width(line) <= max_width {
         return vec![TextChunk {
             text: line.to_string(),
             start_index: 0,
@@ -42,7 +59,7 @@ pub(super) fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
     let mut opp_width = 0usize;
 
     for (i, (char_index, grapheme)) in segments.iter().enumerate() {
-        let g_width = crate::screen::visible_width(grapheme);
+        let g_width = visible_width(grapheme);
         let is_ws = grapheme.chars().all(|c| c.is_whitespace());
 
         // ── Bounds check (before advancing) ──
@@ -66,7 +83,7 @@ pub(super) fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
             opp_index = None;
         }
 
-        // ── A single atomic segment wider than maxWidth (extremely narrow terminal: max_width=1 and grapheme column width=2) ──
+        // ── A single atomic segment wider than max_width (extremely narrow terminal: max_width=1 and grapheme column width=2) ──
         // pi re-slices paste-marker atomic segments recursively by grapheme; zen has no markers, so the sole over-wide atomic segment is already
         // a single grapheme and cannot be subdivided further (recursion wouldn't converge) — make it an independent slice (1-column visual overflow, acceptable).
         if g_width > max_width {
@@ -117,6 +134,95 @@ fn make_chunk(line: &str, start: usize, end: usize) -> TextChunk {
     }
 }
 
+/// Truncate and append ellipsis when it does not fit
+/// Truncate text by display columns (grapheme-aware: never split a wide character/emoji; width counted by `visible_width` columns).
+/// If the entire text fits within max_width, **return it unchanged** (no ellipsis, matching pi `truncateToWidth` semantics);
+/// If it does not fit, keep the longest fitting grapheme prefix and append ellipsis; the ellipsis is also width-constrained,
+/// when max_width cannot fit the full ellipsis, keep only its prefix.
+/// Edge cases: max_width = 0 or empty text returns an empty string; a wide character falling within the keep boundary is kept whole,
+/// otherwise it is discarded whole (never split in half).
+/// Consumers: T-TU-01-4 TruncatedText (pending messages), SelectList (main column/scroll info),
+/// SettingsList (values/hints), T-TU-02-1 (markdown overflow handling).
+pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str) -> String {
+    if max_width == 0 || text.is_empty() {
+        return String::new();
+    }
+    // Whole text fits: return unchanged (no ellipsis)
+    if visible_width(text) <= max_width {
+        return text.to_string();
+    }
+
+    let ellipsis_width = visible_width(ellipsis);
+    if ellipsis_width >= max_width {
+        // Even the ellipsis itself does not fit: keep only its visible prefix
+        return truncate_graphemes(ellipsis, max_width);
+    }
+
+    // Keep the longest prefix of max_width - ellipsis_width columns + ellipsis
+    let keep = max_width - ellipsis_width;
+    let mut result = String::new();
+    let mut width = 0usize;
+    for g in text.graphemes(true) {
+        let w = visible_width(g);
+        if width + w > keep {
+            break;
+        }
+        result.push_str(g);
+        width += w;
+    }
+    result.push_str(ellipsis);
+    result
+}
+
+/// Take the longest grapheme prefix by display columns (private helper for truncate_to_width; never split a wide character).
+fn truncate_graphemes(text: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut width = 0usize;
+    for g in text.graphemes(true) {
+        let w = visible_width(g);
+        if width + w > max_width {
+            break;
+        }
+        result.push_str(g);
+        width += w;
+    }
+    result
+}
+
+/// The "visible window" during single-line horizontal scrolling
+/// Return the text in line's display column range [start_col, start_col+length) (grapheme-aware)
+/// Wide characters intersecting the window boundary are **skipped whole** (never split a wide character):
+/// Wide characters starting before the window are not kept, nor are those whose left edge is inside the window but right edge extends beyond it.
+/// Edge cases: length = 0 returns an empty string; when the window is entirely past the text width, returns an empty string (iteration naturally exhausts).
+/// Consumer: T-TU-01-4 Input (horizontal-scroll visible window).
+pub fn slice_by_column(line: &str, start_col: usize, length: usize) -> String {
+    if length == 0 {
+        return String::new();
+    }
+    let end_col = start_col + length;
+    let mut result = String::new();
+    let mut col = 0usize;
+    for g in line.graphemes(true) {
+        let w = visible_width(g);
+        // Keep only what falls entirely within the window; discard wide characters crossing the boundary whole
+        if col >= start_col && col + w <= end_col {
+            result.push_str(g);
+        }
+        col += w;
+        if col >= end_col {
+            break;
+        }
+    }
+    result
+}
+
+/// Expand `\t` to 3 spaces for terminal tab stops
+/// may break logical line wrapping; the display layer uniformly expands it to a fixed width, with width semantics consistent with `visible_width`).
+/// Consumer: T-TU-01-4 components::text (normalization before Text rendering).
+pub fn normalize_tabs(text: &str) -> String {
+    text.replace('\t', "   ")
+}
+
 /// Whether the char is a CJK line-break character (aligns with pi's `cjkBreakRegex`: Han / Hiragana / Katakana / Hangul / Bopomofo).
 /// Grapheme clusters are identified by their first char (the base of a combined cluster); blocks approximate Unicode Script_Extensions,
 /// avoiding the unicode-script dependency; differences from pi are limited to narrow edge cases (e.g. pi doesn't break before full-width Latin letters).
@@ -154,7 +260,7 @@ fn is_cjk(c: char) -> bool {
 mod tests {
     use super::*;
 
-    // ── word_wrap_line ──
+    // ── word_wrap_line (moved from editor/wrap.rs, T-TU-01-3) ──
 
     #[test]
     fn test_word_wrap_empty_line() {
@@ -231,7 +337,7 @@ mod tests {
         // "ab" = 2 + one CJK char = 2 → total 4, fits
         // But CJK boundary allows break after "ab" if needed
         // Actually: "ab" (2) + CJK (2) = 4 fits, then CJK (2) + "cd" (2) = 4
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         // Verify continuity
         assert_eq!(chunks[0].start_index, 0);
         assert_eq!(chunks.last().unwrap().end_index, "ab你好cd".len());
@@ -282,7 +388,7 @@ mod tests {
         }
     }
 
-    // ── is_cjk ──
+    // ── is_cjk (moved from editor/wrap.rs) ──
 
     #[test]
     fn test_is_cjk_han() {
@@ -343,5 +449,106 @@ mod tests {
         assert_eq!(chunks[0].start_index, 0);
         assert_eq!(chunks[0].end_index, 3);
         assert_eq!(chunks[0].text, "abc");
+    }
+
+    // ── truncate_to_width ──
+
+    #[test]
+    fn test_truncate_fits_returns_original_without_ellipsis() {
+        assert_eq!(truncate_to_width("hello", 10, "..."), "hello");
+        assert_eq!(truncate_to_width("hello world", 11, "..."), "hello world");
+    }
+
+    #[test]
+    fn test_truncate_overflow_appends_ellipsis() {
+        assert_eq!(truncate_to_width("hello world", 8, "..."), "hello...");
+        assert_eq!(truncate_to_width("hello world", 11, "..."), "hello world");
+    }
+
+    #[test]
+    fn test_truncate_zero_width_or_empty() {
+        assert_eq!(truncate_to_width("hello", 0, "..."), "");
+        assert_eq!(truncate_to_width("", 10, "..."), "");
+    }
+
+    #[test]
+    fn test_truncate_does_not_split_wide_char() {
+        // "ABCD" each wide 2; max_width 5 → keep 2 columns = "A", otherwise it would split in half
+        assert_eq!(truncate_to_width("一二三四", 5, "..."), "一...");
+        // max_width 7 → keep 4 = "AB"; keep 3 cannot fit two wide characters (4 > 3), so only "A" remains
+        assert_eq!(truncate_to_width("一二三四", 7, "..."), "一二...");
+        assert_eq!(truncate_to_width("一二三四", 6, "..."), "一...");
+    }
+
+    #[test]
+    fn test_truncate_ellipsis_wider_than_max() {
+        // ellipsis "……" (width 2, each "…" width 1) ≥ max_width 1 → keep only the ellipsis prefix (grapheme-aware)
+        assert_eq!(truncate_to_width("abcdef", 1, "……"), "…");
+        // max 2 exactly fits the full ellipsis
+        assert_eq!(truncate_to_width("abcdef", 2, "……"), "……");
+    }
+
+    #[test]
+    fn test_truncate_exact_width_keeps_whole_wide_at_boundary() {
+        // "Aabcde" width 7 > max 6 → keep 3; A(2)+a(1) exactly fills, wide character kept whole, b truncated
+        assert_eq!(truncate_to_width("你abcde", 6, "..."), "你a...");
+    }
+
+    // ── slice_by_column ──
+
+    #[test]
+    fn test_slice_by_column_ascii_window() {
+        assert_eq!(slice_by_column("hello world", 0, 5), "hello");
+        assert_eq!(slice_by_column("hello world", 6, 5), "world");
+    }
+
+    #[test]
+    fn test_slice_by_column_zero_length() {
+        assert_eq!(slice_by_column("hello", 0, 0), "");
+    }
+
+    #[test]
+    fn test_slice_window_past_text_width_returns_empty() {
+        assert_eq!(slice_by_column("ab", 5, 3), "");
+    }
+
+    #[test]
+    fn test_slice_by_column_skips_wide_char_crossing_window() {
+        // "aXb": a at column 0, X at columns 1-2, b at column 3. Window [1,2) → does X fall entirely within the window?
+        // X starts at column 1 and ends at column 3; its right edge exceeds end_col=2 → discarded whole → empty
+        assert_eq!(slice_by_column("a中b", 1, 1), "");
+        // Window [1,3) → X starts at 1 and ends at 3, entirely inside → kept
+        assert_eq!(slice_by_column("a中b", 1, 2), "中");
+        // Window [3,4) → b
+        assert_eq!(slice_by_column("a中b", 3, 1), "b");
+    }
+
+    #[test]
+    fn test_slice_by_column_start_mid_wide_char_skips_it() {
+        // Window starts in the middle of a wide character (start_col=2, X occupies 1-2) → X's start column 1 < start_col,
+        // so it is not kept; only its right half remains in window [2,3) → empty (matching pi strict semantics: discard whole characters crossing the boundary)
+        assert_eq!(slice_by_column("a中b", 2, 1), "");
+        // b immediately adjacent to window [3,4) is kept whole
+        assert_eq!(slice_by_column("a中b", 3, 1), "b");
+    }
+
+    #[test]
+    fn test_slice_by_column_full_line_context() {
+        // Covers the typical Input windowing scenario: wide characters fully preserved in the middle of the window
+        assert_eq!(slice_by_column("你好世界", 2, 4), "好世");
+    }
+
+    // ── normalize_tabs ──
+
+    #[test]
+    fn test_normalize_tabs_expands_to_three_spaces() {
+        assert_eq!(normalize_tabs("\t"), "   ");
+        assert_eq!(normalize_tabs("a\tb"), "a   b");
+    }
+
+    #[test]
+    fn test_normalize_tabs_no_tabs_unchanged() {
+        assert_eq!(normalize_tabs("no tabs here"), "no tabs here");
+        assert_eq!(normalize_tabs(""), "");
     }
 }

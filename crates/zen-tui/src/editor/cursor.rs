@@ -1,8 +1,8 @@
 // REQ-TUI-01 (pi-413): Editor component — cursor movement (grapheme/word/line start & end/vertical movement across wrapped lines + visual line mapping and sticky column).
 // Consumed by input.rs (arrow-key/word-movement actions, ↑↓ first/last line transitions) and text.rs (word deletion boundary), hence `pub(super)` on the related methods;
 // cursor_visual_col / build_visual_line_map / find_current_visual_line are only used within this module and stay private.
-use super::wrap::word_wrap_line;
 use super::{Editor, VisualLine};
+use crate::wrap::word_wrap_line;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 

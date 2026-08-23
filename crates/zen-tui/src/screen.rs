@@ -170,6 +170,22 @@ impl ScreenBuffer {
         }
     }
 
+    /// Fill a width×height rectangle starting at (x,y) with style (full-row background fill).
+    /// Semantics = write styled spaces cell by cell: out-of-bounds silently ignored, wide-char awareness and orphan-cell cleanup identical to [`Self::write`]
+    /// (overwriting a wide char's start cell clears its continuation cells too; overwriting a continuation cell clears its start cell — no half wide chars left).
+    /// Implementation delegates to per-row [`Self::write`], reusing its orphan-cell cleanup logic rather than reimplementing it here.
+    /// no-op when width/height is 0; out-of-bounds parts of the rectangle are clipped.
+    /// Consumers: T-TU-01-4 components (Box/Text/TruncatedText background fill and placeholder rows).
+    pub fn fill(&mut self, x: u16, y: u16, width: u16, height: u16, style: &Style) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let row = " ".repeat(width as usize);
+        for dy in 0..height {
+            self.write(x, y + dy, style, &row);
+        }
+    }
+
     /// Differential refresh: compare the current frame with the previous frame cell by cell, writing crossterm commands (MoveTo + style + content) for changed cells to `out`;
     /// Cells whose content became empty/cleared are written as blanks to overwrite; afterwards promote the current frame to the previous frame. Returns io errors.
     /// Consumer: T-TU-01-1 (called after each render in the main loop).
@@ -471,6 +487,78 @@ mod tests {
         buf.write(1, 0, &color_style(), "B");
         assert_eq!(cell(&buf, 0, 0).kind, CellKind::Empty);
         assert_eq!(cell(&buf, 1, 0).content.as_deref(), Some("B"));
+    }
+
+    // ── fill ──
+
+    #[test]
+    fn test_fill_writes_styled_spaces_in_rect() {
+        let mut buf = ScreenBuffer::new(4, 3);
+        let style = color_style();
+        buf.fill(1, 0, 2, 2, &style);
+        // (1,0)(2,0)(1,1)(2,1) filled with styled spaces
+        for (x, y) in [(1, 0), (2, 0), (1, 1), (2, 1)] {
+            let c = cell(&buf, x, y);
+            assert_eq!(c.kind, CellKind::Char);
+            assert_eq!(c.content.as_deref(), Some(" "));
+            assert_eq!(c.style, style);
+        }
+        // Outside the rectangle unaffected
+        assert_eq!(cell(&buf, 0, 0).kind, CellKind::Empty);
+        assert_eq!(cell(&buf, 3, 0).kind, CellKind::Empty);
+        assert_eq!(cell(&buf, 0, 2).kind, CellKind::Empty);
+    }
+
+    #[test]
+    fn test_fill_zero_size_is_noop() {
+        let mut buf = ScreenBuffer::new(3, 3);
+        buf.write(0, 0, &color_style(), "A");
+        buf.fill(0, 0, 0, 2, &color_style());
+        buf.fill(1, 1, 2, 0, &color_style());
+        assert_eq!(cell(&buf, 0, 0).content.as_deref(), Some("A"));
+        assert!(buf
+            .cells
+            .iter()
+            .enumerate()
+            .all(|(i, c)| i == 0 || c == &Cell::default()));
+    }
+
+    #[test]
+    fn test_fill_out_of_bounds_ignored() {
+        let mut buf = ScreenBuffer::new(3, 3);
+        buf.fill(3, 0, 2, 2, &color_style()); // x == width
+        buf.fill(0, 3, 2, 2, &color_style()); // y == height
+        assert!(buf.cells.iter().all(|c| c == &Cell::default()));
+    }
+
+    #[test]
+    fn test_fill_over_wide_char_start_clears_continuation() {
+        let mut buf = ScreenBuffer::new(4, 1);
+        buf.write(0, 0, &color_style(), "中");
+        assert_eq!(cell(&buf, 1, 0).kind, CellKind::Continuation);
+
+        // Fill overwrites a wide char's start cell → continuation cells cleared too; both cells become fill spaces
+        buf.fill(0, 0, 1, 1, &color_style());
+        assert_eq!(cell(&buf, 0, 0).content.as_deref(), Some(" "));
+        assert_eq!(cell(&buf, 1, 0).kind, CellKind::Empty);
+    }
+
+    #[test]
+    fn test_fill_over_continuation_clears_wide_start() {
+        let mut buf = ScreenBuffer::new(4, 1);
+        buf.write(0, 0, &color_style(), "中");
+        // Fill overwrites a continuation cell → wide char's start cell cleared too (no half wide char left)
+        buf.fill(1, 0, 1, 1, &color_style());
+        assert_eq!(cell(&buf, 0, 0).kind, CellKind::Empty);
+        assert_eq!(cell(&buf, 1, 0).content.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn test_fill_rect_clips_at_buffer_edge() {
+        let mut buf = ScreenBuffer::new(3, 2);
+        buf.fill(1, 1, 10, 10, &color_style()); // Out-of-bounds parts clipped
+        assert_eq!(cell(&buf, 2, 1).content.as_deref(), Some(" "));
+        assert_eq!(cell(&buf, 0, 0).kind, CellKind::Empty);
     }
 
     // ── visible_width ──
