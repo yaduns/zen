@@ -174,8 +174,7 @@ mod tests {
 
     #[test]
     fn test_from_key_event_repeat_treated_as_press() {
-        let k =
-            KeyId::from_key_event(event(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Repeat));
+        let k = KeyId::from_key_event(event(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Repeat));
         assert!(k.is_some());
         assert_eq!(k.unwrap().code, KeyCode::Up);
     }
@@ -203,7 +202,10 @@ mod tests {
     fn test_parse_plain_char_no_modifiers() {
         assert_eq!(
             KeyId::parse("a"),
-            Some(KeyId { code: KeyCode::Char('a'), modifiers: KeyModifiers::NONE })
+            Some(KeyId {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::NONE
+            })
         );
     }
 
@@ -211,7 +213,10 @@ mod tests {
     fn test_parse_ctrl_char() {
         assert_eq!(
             KeyId::parse("ctrl+b"),
-            Some(KeyId { code: KeyCode::Char('b'), modifiers: KeyModifiers::CONTROL })
+            Some(KeyId {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL
+            })
         );
     }
 
@@ -219,7 +224,10 @@ mod tests {
     fn test_parse_alt_char() {
         assert_eq!(
             KeyId::parse("alt+f"),
-            Some(KeyId { code: KeyCode::Char('f'), modifiers: KeyModifiers::ALT })
+            Some(KeyId {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::ALT
+            })
         );
     }
 
@@ -239,7 +247,10 @@ mod tests {
         // Follow crossterm's 'uppercase Char ⇔ SHIFT' invariant: shift+lowercase → uppercase+SHIFT
         assert_eq!(
             KeyId::parse("shift+a"),
-            Some(KeyId { code: KeyCode::Char('A'), modifiers: KeyModifiers::SHIFT })
+            Some(KeyId {
+                code: KeyCode::Char('A'),
+                modifiers: KeyModifiers::SHIFT
+            })
         );
     }
 
@@ -248,13 +259,19 @@ mod tests {
         // Follow crossterm's 'uppercase Char ⇔ SHIFT' invariant: uppercase chars get SHIFT added automatically
         assert_eq!(
             KeyId::parse("A"),
-            Some(KeyId { code: KeyCode::Char('A'), modifiers: KeyModifiers::SHIFT })
+            Some(KeyId {
+                code: KeyCode::Char('A'),
+                modifiers: KeyModifiers::SHIFT
+            })
         );
     }
 
     #[test]
     fn test_parse_super_modifier() {
-        assert_eq!(KeyId::parse("super+k").unwrap().modifiers, KeyModifiers::SUPER);
+        assert_eq!(
+            KeyId::parse("super+k").unwrap().modifiers,
+            KeyModifiers::SUPER
+        );
     }
 
     #[test]
@@ -269,14 +286,20 @@ mod tests {
 
     #[test]
     fn test_parse_shift_modifier() {
-        assert_eq!(KeyId::parse("shift+p").unwrap().modifiers, KeyModifiers::SHIFT);
+        assert_eq!(
+            KeyId::parse("shift+p").unwrap().modifiers,
+            KeyModifiers::SHIFT
+        );
     }
 
     #[test]
     fn test_parse_space_with_modifier() {
         assert_eq!(
             KeyId::parse("ctrl+space"),
-            Some(KeyId { code: KeyCode::Char(' '), modifiers: KeyModifiers::CONTROL })
+            Some(KeyId {
+                code: KeyCode::Char(' '),
+                modifiers: KeyModifiers::CONTROL
+            })
         );
     }
 
@@ -304,7 +327,10 @@ mod tests {
         for (s, code) in cases {
             assert_eq!(
                 KeyId::parse(s),
-                Some(KeyId { code, modifiers: KeyModifiers::NONE }),
+                Some(KeyId {
+                    code,
+                    modifiers: KeyModifiers::NONE
+                }),
                 "case {s:?}"
             );
         }
@@ -315,11 +341,17 @@ mod tests {
         // Letter f alone is a key by itself (the f-key branch should only match f1..f12)
         assert_eq!(
             KeyId::parse("f"),
-            Some(KeyId { code: KeyCode::Char('f'), modifiers: KeyModifiers::NONE })
+            Some(KeyId {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::NONE
+            })
         );
         assert_eq!(
             KeyId::parse("ctrl+f"),
-            Some(KeyId { code: KeyCode::Char('f'), modifiers: KeyModifiers::CONTROL })
+            Some(KeyId {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL
+            })
         );
     }
 
@@ -327,7 +359,10 @@ mod tests {
     fn test_parse_space_key() {
         assert_eq!(
             KeyId::parse("space"),
-            Some(KeyId { code: KeyCode::Char(' '), modifiers: KeyModifiers::NONE })
+            Some(KeyId {
+                code: KeyCode::Char(' '),
+                modifiers: KeyModifiers::NONE
+            })
         );
     }
 
@@ -337,7 +372,10 @@ mod tests {
             let s = format!("f{n}");
             assert_eq!(
                 KeyId::parse(&s),
-                Some(KeyId { code: KeyCode::F(n), modifiers: KeyModifiers::NONE }),
+                Some(KeyId {
+                    code: KeyCode::F(n),
+                    modifiers: KeyModifiers::NONE
+                }),
                 "case {s:?}"
             );
         }
@@ -352,7 +390,10 @@ mod tests {
     fn test_parse_page_keys_with_modifier() {
         assert_eq!(
             KeyId::parse("ctrl+pageup"),
-            Some(KeyId { code: KeyCode::PageUp, modifiers: KeyModifiers::CONTROL })
+            Some(KeyId {
+                code: KeyCode::PageUp,
+                modifiers: KeyModifiers::CONTROL
+            })
         );
     }
 
@@ -391,33 +432,52 @@ mod tests {
     #[test]
     fn test_matches_press_hit() {
         let id = KeyId::parse("ctrl+b").unwrap();
-        assert!(KeyId::matches(press(KeyCode::Char('b'), KeyModifiers::CONTROL), &id));
+        assert!(KeyId::matches(
+            press(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &id
+        ));
     }
 
     #[test]
     fn test_matches_repeat_hit() {
         let id = KeyId::parse("up").unwrap();
-        assert!(KeyId::matches(event(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Repeat), &id));
+        assert!(KeyId::matches(
+            event(KeyCode::Up, KeyModifiers::NONE, KeyEventKind::Repeat),
+            &id
+        ));
     }
 
     #[test]
     fn test_matches_modifier_mismatch_misses() {
         let id = KeyId::parse("ctrl+b").unwrap();
-        assert!(!KeyId::matches(press(KeyCode::Char('b'), KeyModifiers::ALT), &id));
-        assert!(!KeyId::matches(press(KeyCode::Char('b'), KeyModifiers::NONE), &id));
+        assert!(!KeyId::matches(
+            press(KeyCode::Char('b'), KeyModifiers::ALT),
+            &id
+        ));
+        assert!(!KeyId::matches(
+            press(KeyCode::Char('b'), KeyModifiers::NONE),
+            &id
+        ));
     }
 
     #[test]
     fn test_matches_code_mismatch_misses() {
         let id = KeyId::parse("ctrl+b").unwrap();
-        assert!(!KeyId::matches(press(KeyCode::Char('c'), KeyModifiers::CONTROL), &id));
+        assert!(!KeyId::matches(
+            press(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &id
+        ));
     }
 
     #[test]
     fn test_matches_release_misses() {
         let id = KeyId::parse("x").unwrap();
         assert!(!KeyId::matches(
-            event(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Release),
+            event(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            ),
             &id
         ));
     }
@@ -432,7 +492,10 @@ mod tests {
     #[test]
     fn test_display_modifier_order_is_ctrl_alt_shift() {
         // SHIFT normalization uppercases the char, displayed as "P"
-        assert_eq!(format!("{}", KeyId::parse("alt+shift+ctrl+p").unwrap()), "ctrl+alt+shift+P");
+        assert_eq!(
+            format!("{}", KeyId::parse("alt+shift+ctrl+p").unwrap()),
+            "ctrl+alt+shift+P"
+        );
     }
 
     #[test]
@@ -441,7 +504,10 @@ mod tests {
         assert_eq!(format!("{}", KeyId::parse("space").unwrap()), "space");
         assert_eq!(format!("{}", KeyId::parse("pageup").unwrap()), "pageup");
         assert_eq!(format!("{}", KeyId::parse("f5").unwrap()), "f5");
-        assert_eq!(format!("{}", KeyId::parse("backspace").unwrap()), "backspace");
+        assert_eq!(
+            format!("{}", KeyId::parse("backspace").unwrap()),
+            "backspace"
+        );
     }
 
     #[test]
@@ -449,4 +515,3 @@ mod tests {
         assert_eq!(format!("{}", KeyId::parse("ctrl+b").unwrap()), "ctrl+b");
     }
 }
-

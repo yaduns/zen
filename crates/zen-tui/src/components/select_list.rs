@@ -2,6 +2,7 @@ use crate::screen::{ScreenBuffer, Style};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Input semantics contract for selection-type components
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectAction {
     MoveUp,   // ↑: move selection up, wrap from top to last item
     MoveDown, // ↓: move selection down, wrap from bottom to first item
