@@ -16,9 +16,6 @@ unicode-segmentation = { workspace = true }
 tokio-util = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-viuer = { workspace = true }
-image  = { workspace = true }
-base64 = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
 

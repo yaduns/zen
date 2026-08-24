@@ -198,6 +198,10 @@ impl TuiLoop {
     where
         D: FnMut(&mut ScreenBuffer),
     {
+        // Start each frame from a clean frame: cells not redrawn are judged as "content→empty" in the subsequent flush diff and erased,
+        // Components need not self-clear (the zen-grid-level counterpart of pi composite layer clear-extra-lines);
+        // Identical cells across two frames are still not written after diff, so differential efficiency is unaffected.
+        self.buffer.clear();
         (draw)(&mut self.buffer);
         self.buffer.flush(self.terminal.out_mut())?;
         Ok(())
@@ -239,7 +243,9 @@ mod tests {
                 loop_.start().unwrap();
                 assert!(loop_.started);
             }
-            Err(TuiError::Terminal(TerminalError::RawMode { action: "enter", .. })) => {
+            Err(TuiError::Terminal(TerminalError::RawMode {
+                action: "enter", ..
+            })) => {
                 // non-tty: enable_raw_mode fails, flag is not set
                 assert!(!loop_.started);
                 assert!(!loop_.render_requested);

@@ -113,7 +113,3 @@ url = "2"
 
 unicode-width = "0.1"
 unicode-segmentation = "1"
-
-viuer = "0.11"
-image  = { version = "0.25", default-features = true }
-base64 = { version = "0.23" }
