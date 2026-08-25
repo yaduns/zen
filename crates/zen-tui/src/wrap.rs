@@ -256,6 +256,48 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Intra-word punctuation boundary check: used by word navigation (T-TU-03-8 intra-word breakpoint positioning) and future text tools to determine “whether it is ASCII punctuation”.
+/// Returns whether `c` belongs to the ASCII punctuation set of pi `PUNCTUATION_REGEX`
+/// `(){}[]<>.,;:'"!?+-=*/\\|&%^$#@~\`` (note: **does not include** `_`, so `is_ascii_punctuation` cannot be used as a substitute,
+/// the latter includes extra `_`, which would diverge from pi's intra-word breakpoint semantics).
+/// Parameter: a single `char`; return value: bool. Boundary: non-ASCII characters always return `false`.
+/// Current consumers: none (pub but currently unused; reserved for T-TU-03-8 word navigation).
+pub fn is_punctuation_char(c: char) -> bool {
+    matches!(
+        c,
+        '(' | ')'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '<'
+            | '>'
+            | '.'
+            | ','
+            | ';'
+            | ':'
+            | '\''
+            | '"'
+            | '!'
+            | '?'
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '='
+            | '\\'
+            | '|'
+            | '&'
+            | '%'
+            | '^'
+            | '$'
+            | '#'
+            | '@'
+            | '~'
+            | '`'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
