@@ -40,6 +40,23 @@ const LANG_ALIASES: &[(&str, &str)] = &[
     ("jsx", "js"),
 ];
 
+/// List of supported languages explicitly required by REQ-APP-10 (Rust/TS/Python/Go/JSON/YAML/Markdown).
+/// Runtime support comes from native matches in the built-in syntect syntax set (direct token/extension lookup in the lower-level parsing chain) + LANG_ALIASES to fill gaps
+/// jointly determined—all rust/python/go/json/yaml/markdown entries in this list are natively matched and require no alias entries,
+/// Only `typescript` is mapped via an alias to the JS superset (see LANG_ALIASES).
+/// This constant is only an explicit code-level declaration of the requirements list, used by the iteration guard test (test_required_language_set_highlightable),
+/// It is not used during parsing; if the requirements list changes in the future (adding/removing languages), update this location + the tests to keep them in sync.
+#[cfg(test)]
+const REQUIRED_LANGUAGES: [&str; 7] = [
+    "rust",
+    "typescript",
+    "python",
+    "go",
+    "json",
+    "yaml",
+    "markdown",
+];
+
 /// Syntax set singleton: embeds 160+ grammars (workspace syntect feature `default-syntaxes`),
 /// lazily initialized once per process; shared by language resolution (resolve_syntax) and highlighting to avoid duplicate loading.
 static SYNTAX_SET: std::sync::OnceLock<SyntaxSet> = std::sync::OnceLock::new();
@@ -355,8 +372,8 @@ mod tests {
 
     #[test]
     fn test_required_language_set_highlightable() {
-        // REQ-APP-10 requires: Rust/TS/Python/Go/JSON/YAML/Markdown
-        for (lang, snippet) in [
+        // REQ-APP-10 requires: Rust/TS/Python/Go/JSON/YAML/Markdown (see REQUIRED_LANGUAGES for the list)
+        let snippets: std::collections::HashMap<&str, &str> = [
             ("rust", "fn main() {}"),
             ("typescript", "const x: number = 1;"),
             ("python", "def f(x):\n    return x"),
@@ -364,9 +381,13 @@ mod tests {
             ("json", "{\"a\": 1}"),
             ("yaml", "key: value"),
             ("markdown", "# Title"),
-        ] {
+        ]
+        .into_iter()
+        .collect();
+
+        for lang in REQUIRED_LANGUAGES {
             assert!(supports_language(lang), "{lang} should be in the supported list");
-            let rows = highlight(snippet, Some(lang));
+            let rows = highlight(snippets[lang], Some(lang));
             assert!(!rows.is_empty(), "Highlighting {lang} should produce at least one line");
         }
     }
