@@ -1,15 +1,25 @@
 // REQ-TUI-01 (pi-413): Editor component — text editing operations (insert/delete/line break).
 // All via mutating state.lines and triggering on_change; consumed by input.rs (action routing) and history.rs (backslash fallback),
 // so methods are pub(super); snap_cursor_to_grapheme_boundary is only used within this module and stays private.
-use super::Editor;
+// Undo (T-TU-03-5): each operation pushes a snapshot per pi's condition before actually mutating state (no-ops don't push),
+// and resets the last_action merge state; insert_char implements fish-style word-character merging.
+use super::{Editor, LastAction};
 use unicode_segmentation::UnicodeSegmentation;
 
 impl Editor {
     /// Insert a single grapheme at the cursor and move the cursor right; when the inserted character merges with the preceding character into a single grapheme (combining characters),
     /// snap to the end of the merged grapheme (maintaining the "cursor is always at a grapheme boundary" invariant). Triggers on_change.
-    /// Undo coalescing reserved; see T-TU-03-5.
+    /// Undo coalescing (fish style, aligned with pi insertCharacter): consecutive word characters merge into one undo unit;
+    /// whitespace captures state ahead of itself (one undo also removes the word after the space); each space is individually undoable.
     pub(super) fn insert_char(&mut self, c: char) {
         self.exit_history_browsing();
+
+        // Merge decision: only whitespace (or after a non-insert operation) pushes a new snapshot (aligned with pi:
+        // isWhitespaceChar(char) || lastAction !== "type-word" → pushUndoSnapshot）
+        if c.is_whitespace() || self.last_action != Some(LastAction::TypeWord) {
+            self.push_undo_snapshot();
+        }
+        self.last_action = Some(LastAction::TypeWord);
 
         let col = self.state.cursor_col;
         {
@@ -45,12 +55,15 @@ impl Editor {
     }
 
     /// Backspace: delete the grapheme before the cursor; at line start, merge with the previous line (cursor moves to the end of the previous line). Triggers on_change.
+    /// Undo: push a snapshot before an actual deletion (in-line deletion or cross-line merge); no-op (line start) doesn't push (aligned with pi).
     pub(super) fn backspace(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
 
         let col = self.state.cursor_col;
 
         if col > 0 {
+            self.push_undo_snapshot();
             // Collect only (byte offset, grapheme byte length); no &str borrow
             let graphemes: Vec<(usize, usize)> = self.state.lines[self.state.cursor_line]
                 .grapheme_indices(true)
@@ -68,6 +81,7 @@ impl Editor {
             self.emit_change();
         } else if self.state.cursor_line > 0 {
             // ── Backspace at line start: merge with previous line ──
+            self.push_undo_snapshot();
             let current_line = self.state.lines.remove(self.state.cursor_line);
             self.state.cursor_line -= 1;
             let prev_len = self.state.lines[self.state.cursor_line].len();
@@ -80,14 +94,17 @@ impl Editor {
     }
 
     /// Delete forward: delete the grapheme at (or containing) the cursor; at line end, merge with the next line. Triggers on_change.
+    /// Undo: push a snapshot before an actual deletion; no-op (line end) doesn't push (aligned with pi).
     pub(super) fn delete_forward(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
 
         let line_len = self.state.lines[self.state.cursor_line].len();
         let col = self.state.cursor_col;
 
         if col < line_len {
             // ── Delete forward in line: delete the grapheme at (or containing) the cursor ──
+            self.push_undo_snapshot();
             // Condition = grapheme end passes col: delete the grapheme starting at col when the cursor is at a boundary,
             // delete the containing grapheme when the cursor is inside one (symmetric to backspace's rfind(bo < col)).
             let graphemes: Vec<(usize, usize)> = self.state.lines[self.state.cursor_line]
@@ -106,6 +123,7 @@ impl Editor {
             self.emit_change();
         } else if self.state.cursor_line + 1 < self.state.lines.len() {
             // ── Delete forward at line end: merge with next line ──
+            self.push_undo_snapshot();
             let next_line = self.state.lines.remove(self.state.cursor_line + 1);
             self.state.lines[self.state.cursor_line].push_str(&next_line);
             // Cursor stays put (remains at the old line end, i.e. the merge point)
@@ -118,8 +136,15 @@ impl Editor {
     /// Insert multi-line text at the cursor (shared by enter/paste/yank); newlines split lines at the cursor.
     /// Normalize newlines (\r\n/\r → \n) and tabs (\t → 4 spaces, aligned with pi normalizeText),
     /// so this function is the sole insertion entry point; callers need not normalize. Triggers on_change.
+    /// Undo atomicity: non-empty insertion always pushes a single snapshot (aligned with pi's skipUndoCoalescing atomic path: paste /
+    /// insertTextAtCursor); a single undo restores the state before the entire insertion.
     pub(super) fn insert_text(&mut self, text: &str) {
         self.exit_history_browsing();
+        self.last_action = None;
+        // Empty text produces no actual change: no snapshot is pushed (aligned with pi insertTextAtCursor's `if (!text) return`)
+        if !text.is_empty() {
+            self.push_undo_snapshot();
+        }
 
         let col = self.state.cursor_col;
         let normalized = normalize_text(text);
@@ -161,8 +186,11 @@ impl Editor {
     }
 
     /// Line split: truncate the current line at the cursor; the second half becomes a new line and the cursor moves to the new line's start. Triggers on_change.
+    /// Undo: always pushes a snapshot (aligned with pi addNewLine); a single undo reverts the entire newline.
     pub(super) fn newline(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
+        self.push_undo_snapshot();
 
         let col = self.state.cursor_col;
         let line = &mut self.state.lines[self.state.cursor_line];
@@ -182,18 +210,21 @@ impl Editor {
     }
 
     /// Delete from cursor to line start (everything before the cursor); at line start, merge into the previous line (aligns with pi deleteToStartOfLine's col==0 cross-line branch).
-    /// Trigger on_change. kill ring push is wired in by T-TU-03-7.
+    /// Trigger on_change. Undo: push a snapshot before actual deletion; a no-op (at the start of the first line) does not push; the kill ring is integrated by T-TU-03-7.
     pub(super) fn delete_to_line_start(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
 
         let col = self.state.cursor_col;
         if col > 0 {
             // ── In-line: delete everything before the cursor ──
+            self.push_undo_snapshot();
             let line = &mut self.state.lines[self.state.cursor_line];
             line.replace_range(..col, "");
             self.set_cursor_col(0);
         } else if self.state.cursor_line > 0 {
             // ── Start of line: merge into previous line (the deleted newline is recorded by the kill ring, T-TU-03-7) ──
+            self.push_undo_snapshot();
             let current_line = self.state.lines.remove(self.state.cursor_line);
             self.state.cursor_line -= 1;
             let prev_len = self.state.lines[self.state.cursor_line].len();
@@ -206,8 +237,10 @@ impl Editor {
     }
 
     /// Delete from cursor to line end; at line end, merge into the next line (aligns with pi deleteToEndOfLine). Triggers on_change.
+    /// Undo: push a snapshot before an actual deletion (truncation or cross-line merge); no-op doesn't push.
     pub(super) fn delete_to_line_end(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
 
         let col = self.state.cursor_col;
         let line_len = self.state.lines[self.state.cursor_line].len();
@@ -215,6 +248,7 @@ impl Editor {
         if col >= line_len {
             // Line end: merge with the next line (aligns with pi deleteToEndOfLine cross-line semantics)
             if self.state.cursor_line + 1 < self.state.lines.len() {
+                self.push_undo_snapshot();
                 let next_line = self.state.lines.remove(self.state.cursor_line + 1);
                 self.state.lines[self.state.cursor_line].push_str(&next_line);
                 self.emit_change();
@@ -222,6 +256,7 @@ impl Editor {
             return;
         }
 
+        self.push_undo_snapshot();
         let line = &mut self.state.lines[self.state.cursor_line];
         line.truncate(col);
 
@@ -230,15 +265,17 @@ impl Editor {
 
     /// Delete one word backward (before the cursor); at line start, merge into the previous line. Word boundary reuses `move_word_backward`
     /// (aligns with pi structure: deleteWordBackwards calls moveWordBackwards to get the boundary); deletion and movement
-    /// Always use the same word-boundary semantics. Fires on_change. Kill ring is wired in via T-TU-03-7.
+    /// Always uses the same word-boundary semantics. Triggers on_change. Undo: push snapshot before actual deletion; kill ring hooked up in T-TU-03-7.
     pub(super) fn delete_word_backward(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
 
         let col = self.state.cursor_col;
 
         if col == 0 {
             // Line start: merge into the previous line (aligns with pi deleteWordBackwards's col==0 branch)
             if self.state.cursor_line > 0 {
+                self.push_undo_snapshot();
                 let current_line = self.state.lines.remove(self.state.cursor_line);
                 self.state.cursor_line -= 1;
                 let prev_len = self.state.lines[self.state.cursor_line].len();
@@ -252,6 +289,7 @@ impl Editor {
         // Use move_word_backward to find the word boundary (aligns with pi: moveWordBackwards gets deleteFrom);
         // if the word fills the entire line before the cursor (and it's not the first line), it wraps across lines — deletion semantics must not cross lines,
         // so restore the current line and set the boundary to line start (the whole prefix is the word; delete it all).
+        self.push_undo_snapshot();
         let old_line = self.state.cursor_line;
         self.move_word_backward();
         let delete_from = if self.state.cursor_line == old_line {
@@ -271,9 +309,10 @@ impl Editor {
 
     /// Delete one word forward (after the cursor); at line end, merge into the next line. Word boundary reuses `move_word_forward`
     /// (aligns with pi structure: deleteWordForward calls moveWordForwards for the boundary) delete and move
-    /// Always use the same word-boundary semantics. Fires on_change. Kill ring is wired in via T-TU-03-7.
+    /// Always uses the same word-boundary semantics. Triggers on_change. Undo: push snapshot before actual deletion; kill ring hooked up in T-TU-03-7.
     pub(super) fn delete_word_forward(&mut self) {
         self.exit_history_browsing();
+        self.last_action = None;
 
         let col = self.state.cursor_col;
         let line_len = self.state.lines[self.state.cursor_line].len();
@@ -281,6 +320,7 @@ impl Editor {
         if col >= line_len {
             // End of line: merge into next line (aligns with pi deleteWordForward's cross-line branch)
             if self.state.cursor_line + 1 < self.state.lines.len() {
+                self.push_undo_snapshot();
                 let next_line = self.state.lines.remove(self.state.cursor_line + 1);
                 self.state.lines[self.state.cursor_line].push_str(&next_line);
                 self.emit_change();
@@ -291,6 +331,7 @@ impl Editor {
         // Use move_word_forward to find the word boundary (aligns with pi: moveWordForwards obtains deleteTo);
         // If the word/whitespace extends to end of line, it wraps across lines — delete semantics don't cross lines,
         // so restore the current line and set the boundary to end of line (delete the whole segment from cursor to end of line).
+        self.push_undo_snapshot();
         let old_line = self.state.cursor_line;
         self.move_word_forward();
         let delete_to = if self.state.cursor_line == old_line && self.state.cursor_col > col {

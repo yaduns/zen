@@ -1,7 +1,7 @@
 // Editor component — data types and public API (accessors/callbacks).
 // Internal operations split into submodules by domain: cursor.rs (cursor movement), text.rs (editing operations),
 // history.rs (commit/history/session state), input.rs (keypress/paste/action routing),
-// render.rs (layout/rendering/cursor positioning).
+// render.rs (layout/rendering/cursor positioning), undo.rs (undo stack, T-TU-03-5).
 // Shared layout types (LayoutLine/VisualLine) live here for submodules to reference via `use super::`;
 // TextChunk and word-wrapping logic have been moved to crate::wrap (the width-text family) per the T-TU-01-4 integration plan,
 // see `tasks/T-TU-01-4-implemented.md`; `impl Editor` blocks in submodules can access this module's private fields.
@@ -12,6 +12,9 @@ mod history;
 mod input;
 mod render;
 mod text;
+mod undo;
+
+use undo::LastAction;
 
 /// Editor text core state: multi-line text + logical cursor (row/column)
 #[derive(Clone)]
@@ -82,7 +85,7 @@ pub enum EditorAction {
     Yank,
     /// Rotate the kill ring (only valid immediately after yank/yank-pop) (default `Alt+Y`; T-TU-03-7).
     YankPop,
-    /// Undo the most recent edit (default `Ctrl+-`; behavior is integrated by T-TU-03-5).
+    /// Undo the most recent edit: pop the stack and restore the text + cursor from before the last edit (default `Ctrl+-`).
     Undo,
     /// Insert a newline at the cursor (default `Shift+Enter` / `Ctrl+J`).
     NewLine,
@@ -110,6 +113,8 @@ pub struct Editor {
     history_draft: Option<EditorState>, // Draft stashed when first entering history browsing; restored on exit
     preferred_visual_col: Option<usize>, // Sticky column; only valid during vertical movement (e.g. 9th character in the current row, cursor moves down to 6th character in row 2, then 16th in row 3: cursor should end at the last character of row 2, i.e. the 9th character of row 3)
     snapped_from_cursor_col: Option<usize>, // Original cursor column before snapping to an atomic segment (unbreakable atomic rows break the snapped_from_cursor_col memory; in that case snapped_from_cursor_col takes precedence)
+    undo_stack: Vec<EditorState>, // Undo stack (T-TU-03-5, pi-406): before an edit operation mutates state, push a clone of EditorState; Undo pops to restore; submit clears. Snapshots exclude view state (scroll/sticky etc.), which is rebuilt per pi semantics on undo
+    last_action: Option<LastAction>, // Last input action category (aligned with pi lastAction; T-TU-03-5 only uses TypeWord to decide word/char insertion merging; kill/yank extended by T-TU-03-7)
     on_submit: Option<Box<dyn FnMut(&str)>>, // Submit callback; receives the expanded text after trim (no marker in this task, i.e. trim of the full text)
     on_change: Option<Box<dyn FnMut(&str)>>, // Called on every text change
     disable_submit: bool,                    // When set, Submit is not triggered
@@ -153,6 +158,8 @@ impl Editor {
             history_draft: None,
             preferred_visual_col: None,
             snapped_from_cursor_col: None,
+            undo_stack: Vec::new(),
+            last_action: None,
             on_submit: None,
             on_change: None,
             disable_submit: false,
@@ -167,13 +174,20 @@ impl Editor {
 
     /// Replace the text and reset the cursor to the end of the line (programmatic setting: initial value, external editor write-back T-AP-11-4, history restore).
     /// Normalize newlines (\r\n/\r → \n) and expand tabs (→ 4 spaces, aligning with pi normalizeText).
+    /// If content differs from the current text, push an undo snapshot and reset the coalescing state (aligned with pi setText: programmatic changes are undoable;
+    /// identical content, e.g. set_text("") on the initial value, is a no-op and is not pushed).
     /// Consumers: T-AP-11-2, T-AP-11-4.
     pub fn set_text(&mut self, text: &str) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.state.lines = normalized
-            .split('\n')
-            .map(|s| s.replace('\t', "    "))
-            .collect();
+        let normalized = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        self.last_action = None;
+        // Aligned with pi setText:
+        if self.text() != normalized {
+            self.push_undo_snapshot();
+        }
+        self.state.lines = normalized.split('\n').map(str::to_string).collect();
         if self.state.lines.is_empty() {
             self.state.lines.push(String::new());
         }
@@ -199,7 +213,8 @@ impl Editor {
         (self.state.cursor_line, self.state.cursor_col)
     }
 
-    /// Programmatically insert text at cursor (multi-line supported). Atomic for undo (guarantees a single snapshot after T-TU-03-5 is hooked up).
+    /// Programmatically insert text at the cursor (multi-line supported). Undo atomicity: a single call = a single snapshot (T-TU-03-5,
+    /// insert_text always pushes internally; one undo restores the entire state before the insertion).
     /// Consumers: T-AP-11-2, T-AP-11-4.
     pub fn insert_text_at_cursor(&mut self, text: &str) {
         self.insert_text(text);

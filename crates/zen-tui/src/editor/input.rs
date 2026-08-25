@@ -1,6 +1,7 @@
 // REQ-TUI-01 (pi-413): Editor component — input intake: keys / paste / action routing.
 // The keybinding→action mapping uses inline defaults (aligned with pi TUI_KEYBINDINGS) and is replaced by the keybinding definition table after T-TU-03-1 is implemented
-// (A cross-reference comment is left inline); this module is the hook point for T-TU-03-5 (undo) to add a snapshot outside handle_action.
+// (comparison comments left inline); undo (T-TU-03-5) snapshot pushes happen inside each edit operation (text.rs/history.rs,
+// see their header comments); the action layer only routes EditorAction::Undo to undo().
 use super::{Editor, EditorAction};
 
 impl Editor {
@@ -60,6 +61,7 @@ impl Editor {
             KeyCode::Char('k') if ctrl => self.handle_action(EditorAction::DeleteToLineEnd),
             KeyCode::Char('d') if ctrl => self.handle_action(EditorAction::DeleteCharForward),
             KeyCode::Char('y') if ctrl => self.handle_action(EditorAction::Yank),
+            KeyCode::Char('-') if ctrl => self.handle_action(EditorAction::Undo),
 
             // ── Alt+character actions (aligned with pi TUI_KEYBINDINGS defaults: alt+b/f/d/y) ──
             KeyCode::Char('b') if alt => self.handle_action(EditorAction::MoveCursorWordLeft),
@@ -114,8 +116,8 @@ impl Editor {
         self.insert_text(&filtered);
     }
 
-    /// Dispatch editing behavior by action. **Unified entry point for all mutating operations** (T-TU-03-5 adds undo snapshot at this outer layer).
-    /// Unimplemented actions (Undo/Yank/YankPop/Tab/Jump*) are documented no-ops; see the EditorAction table in the Data Model section.
+    /// Dispatch editing behavior by action. **Centralized handling for all mutating operations**; mutating operations push undo snapshots internally according to pi's conditions.
+    /// Unimplemented actions (Yank/YankPop/Tab/Jump*) are documented no-ops; see the EditorAction table in "Data Model".
     /// Consumer: called by `handle_key`; unit tests call directly; T-TU-03-1 key mapping tests consume.
     pub fn handle_action(&mut self, action: EditorAction) {
         match action {
@@ -187,11 +189,13 @@ impl Editor {
                 }
             }
 
-            // ── Unimplemented (reserved for T-TU-03-5/-7/-3) ──
+            // ── Not implemented (reserved for T-TU-03-7/-3) ──
             EditorAction::Yank => { /* no-op */ }
             EditorAction::YankPop => { /* no-op */ }
-            EditorAction::Undo => { /* no-op */ }
             EditorAction::Tab => { /* no-op */ }
+
+            // ── Undo (T-TU-03-5): pop the stack to restore the state before the last edit ──
+            EditorAction::Undo => self.undo(),
 
             // ── Jump mode (reserved for T-TU-03) ──
             EditorAction::JumpForward => { /* no-op */ }
@@ -591,11 +595,22 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_action_undo_noop() {
+    fn test_handle_action_undo_restores() {
         let mut e = Editor::new(0);
         e.insert_text_at_cursor("hello");
         e.handle_action(EditorAction::Undo);
-        assert_eq!(e.text(), "hello");
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn test_handle_key_ctrl_minus_routes_to_undo() {
+        let mut e = Editor::new(0);
+        e.insert_char('a');
+        assert_eq!(e.undo_stack.len(), 1);
+
+        // The inline default Ctrl+- (undo) keybinding routes to EditorAction::Undo
+        e.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::CONTROL));
+        assert_eq!(e.text(), "");
     }
 
     #[test]

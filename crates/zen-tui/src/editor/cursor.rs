@@ -1,6 +1,8 @@
 // REQ-TUI-01 (pi-413): Editor component — cursor movement (grapheme/word/line start & end/vertical movement across wrapped lines + visual line mapping and sticky column).
 // Consumed by input.rs (arrow-key/word-movement actions, ↑↓ first/last line transitions) and text.rs (word deletion boundary), hence `pub(super)` on the related methods;
 // cursor_visual_col / build_visual_line_map / find_current_visual_line are only used within this module and stay private.
+// Undo (T-TU-03-5): Each movement function sets last_action = None (matching lastAction = null throughout pi),
+// Make the next insertion after movement start a new undo unit; do not put the reset in set_cursor_col (it will be overwritten when reused by insert_char).
 use super::{Editor, VisualLine};
 use crate::wrap::word_wrap_line;
 use unicode_segmentation::UnicodeSegmentation;
@@ -9,7 +11,9 @@ use unicode_width::UnicodeWidthStr;
 impl Editor {
     /// Move cursor left/right by grapheme (cross-line wrap: right at line end → next line start, left at line start → previous line end).
     /// At line end the coordinates also record preferred_visual_col (matching pi moveCursor's last-line case).
+    /// Reset last_action: input after movement starts a new undo unit (aligned with pi moveCursor).
     pub(super) fn move_char(&mut self, delta_col: i32) {
+        self.last_action = None;
         if delta_col == 0 {
             return;
         }
@@ -77,7 +81,9 @@ impl Editor {
 
     /// Jump forward by word: skip past current word end → skip whitespace → stop at the start of the next word. Wraps across lines.
     /// Consumed by text::delete_word_forward to get the deletion boundary, hence `pub(super)`.
+    /// Reset last_action (aligned with pi moveWordForwards).
     pub(super) fn move_word_forward(&mut self) {
+        self.last_action = None;
         let line = &self.state.lines[self.state.cursor_line];
         let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
         let g_count = graphemes.len();
@@ -125,7 +131,9 @@ impl Editor {
 
     /// Jump backward by word: skip whitespace backward → skip the previous word → stop at that word's start. Wraps across lines.
     /// Consumed by text::delete_word_backward to get the deletion boundary, hence `pub(super)`.
+    /// Reset last_action (aligned with pi moveWordBackwards).
     pub(super) fn move_word_backward(&mut self) {
+        self.last_action = None;
         let line = &self.state.lines[self.state.cursor_line];
         let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
 
@@ -166,10 +174,13 @@ impl Editor {
     }
 
     /// Move cursor to logical line start/end (explicit set_cursor_col, resets sticky state).
+    /// Reset last_action (aligned with pi moveToLineStart/moveToLineEnd).
     pub(super) fn move_to_line_start(&mut self) {
+        self.last_action = None;
         self.set_cursor_col(0);
     }
     pub(super) fn move_to_line_end(&mut self) {
+        self.last_action = None;
         let len = self.state.lines[self.state.cursor_line].len();
         self.set_cursor_col(len);
     }
@@ -178,8 +189,10 @@ impl Editor {
     /// `computeVerticalMoveColumn` decision table):
     /// - Target too short (stops at line end) → lock preferred_visual_col, so the next move preserves the column;
     /// - Target long enough and lands back on preferred → clear preferred, re-derive from the new cursor column next time.
-    /// No atomic-segment snapping/skipping (zen has no paste-marker; a wide segment is 2-column CJK, and the cursor always lands at the grapheme start).
+    ///   Do not snap to or skip atomic segments (zen has no paste-marker; wide text uses 2-column CJK, and the cursor always lands at the start of a grapheme cluster).
+    ///   Reset last_action (aligned with the vertical branch of pi moveCursor/pageScroll).
     pub(super) fn move_vertical(&mut self, delta: i32) {
+        self.last_action = None;
         if delta == 0 {
             return;
         }

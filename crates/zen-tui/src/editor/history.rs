@@ -1,11 +1,13 @@
 // REQ-TUI-01 (pi-413): editor component — submit, history navigation, and session state (history browse/exit/backslash fallback).
 // Consumed by input.rs (Enter family, Submit action, ↑↓ history movement) and text.rs (edit operations exiting browse),
 // hence the pub(super) methods; set_text_without_history is used only inside this module and stays private.
+// Undo (T-TU-03-5): submit clears the undo stack (aligned with pi submitValue); navigate_history
+// pushes a snapshot on first entry into browsing (the original text remains recoverable via Ctrl+- after editing a history entry); both reset last_action.
 use super::{Editor, EditorState};
 
 impl Editor {
     /// Submit: take full text trim(), clear state and history browsing state, call on_change("") then on_submit(text).
-    /// (No paste marker; expansion step omitted; undo/kill cleanup is hooked up by T-TU-03-5/-7.)
+    /// (no paste marker, so the expansion step is skipped; the undo stack is cleared on submit — new input starts from an empty stack; kill ring is wired in by T-TU-03-7.)
     pub(super) fn submit(&mut self) {
         let text = self.text().trim().to_string();
 
@@ -15,6 +17,9 @@ impl Editor {
         self.preferred_visual_col = None;
         self.snapped_from_cursor_col = None;
         self.scroll_offset = 0;
+        // Align with pi submitValue: undoStack.clear() + lastAction = null; after submission, undo has nothing to roll back to (new session)
+        self.undo_stack.clear();
+        self.last_action = None;
 
         // Call on_change("") first (notify clear), then on_submit(text) (pass content)
         if let Some(cb) = &mut self.on_change {
@@ -27,9 +32,13 @@ impl Editor {
 
     /// History browsing: direction=-1 older (up), +1 newer (down). Index semantics: 0=most recent, 1=older
     /// (History prepended, aligned with pi navigateHistory's `newIndex = historyIndex - direction`).
-    /// On first entering browsing (any direction leaving -1), stash the current draft; on switching back to -1, restore the draft.
+    /// On first entering browse mode (moving away from -1 in either direction), stash the current draft and push an undo snapshot (after editing a history item
+    /// the original draft can still be recovered with Ctrl+-, matching pi navigateHistory); switch back to -1 to restore the draft.
     /// Switching/restoring both trigger on_change (aligned with pi setTextInternal/draft restore path).
+    /// Reset last_action (matching pi navigateHistory).
     pub(super) fn navigate_history(&mut self, direction: i8) {
+        self.last_action = None;
+
         if self.history.is_empty() {
             return;
         }
@@ -44,9 +53,11 @@ impl Editor {
             return;
         }
 
-        // First entering browsing (first move out of -1, regardless of direction): stash the current draft
+        // First entry into browse mode (the first move away from -1, in either direction): stash the current draft and push a rollback point
         if self.history_index == -1 && new_index >= 0 {
             self.history_draft = Some(self.state.clone());
+            // Align with pi navigateHistory: push a snapshot immediately upon entering browse mode; after editing or abandoning a history item, the original draft can be recovered via undo
+            self.push_undo_snapshot();
         }
 
         self.history_index = new_index;
