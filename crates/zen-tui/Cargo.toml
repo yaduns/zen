@@ -16,6 +16,9 @@ tokio-util = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+# Syntax highlighting (T-AP-10-1, REQ-APP-10): workspace pre-declares dependency slots (default-fancy = pure Rust regex,
+# avoids onig C dependency; embeds default-syntaxes/default-themes, covering Rust/TS/Python/Go/JSON/YAML/Markdown).
+syntect = { workspace = true }
 # Home directory resolution (~ expansion, autocomplete expand_home_path) — workspace's existing `home` crate
 # (aligned with zen-core/src/paths.rs and zen-app config precedent); the `dirs` originally proposed in the task doc is no longer introduced.
 home = { workspace = true }
