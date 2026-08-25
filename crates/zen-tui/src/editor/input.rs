@@ -90,8 +90,6 @@ impl Editor {
         }
     }
 
-
-
     /// Handle one bracketed-paste: normalize newlines/tabs, filter non-printable chars, insert the whole block atomically.
     /// Consumer: T-AP-11-1 (routes Event::Paste).
     pub fn handle_paste(&mut self, text: &str) {

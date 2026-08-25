@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(i.cursor, 3);
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Left)));
         assert_eq!(i.cursor, 0);
-        // Move right back to
+        // Move right back
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Right)));
         assert_eq!(i.cursor, 3);
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Right)));
@@ -442,7 +442,10 @@ mod tests {
         let mut i = Input::new();
         i.set_value("abc");
         let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
-        let ctrl_alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl_alt = KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         assert!(!i.handle_key(&f1));
         assert!(!i.handle_key(&ctrl_alt));
         assert_eq!(i.value, "abc");
@@ -483,7 +486,7 @@ mod tests {
         // Cursor column 0 − starting point 3 → 0 → 2
         assert_eq!(i.cursor_position(), (2, 0));
         assert!(i.handle_key(&KeyEvent::from(KeyCode::End))); // cursor 6
-        // 6 − 3 = 3 → 2+3=5
+                                                              // 6 − 3 = 3 → 2+3=5
         assert_eq!(i.cursor_position(), (5, 0));
     }
 
@@ -511,7 +514,7 @@ mod tests {
         let mut buf = ScreenBuffer::new(20, 2);
         let mut i = Input::new();
         i.set_value("abcdefghijklmnop"); // 16 columns
-        // width=5 → available=3; cursor at end of line → scroll_w=2, start flush right at 14
+                                         // width=5 → available=3; cursor at end of line → scroll_w=2, start flush right at 14
         assert_eq!(i.render(&mut buf, 0, 0, 5, 2), 1);
         assert_eq!(i.scroll_start_col, 14);
         // cursor column 16 − 14 = 2 → prompt 2 + 2 = 4

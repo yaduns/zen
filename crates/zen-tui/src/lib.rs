@@ -1,6 +1,8 @@
 pub mod app_loop;
+pub mod autocomplete;
 pub mod components;
 pub mod editor;
+pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
 pub mod screen;

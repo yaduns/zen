@@ -1,4 +1,3 @@
-
 [package]
 name = "zen-tui"
 version.workspace = true
@@ -16,10 +15,15 @@ unicode-segmentation = { workspace = true }
 tokio-util = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
+# Home directory resolution (~ expansion, autocomplete expand_home_path) — workspace's existing `home` crate
+# (aligned with zen-core/src/paths.rs and zen-app config precedent); the `dirs` originally proposed in the task doc is no longer introduced.
+home = { workspace = true }
+# 进程内目录递归遍历（@ 附件自动补全，替代 pi 的外部 fd 二进制）
+walkdir = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
 tempfile = { workspace = true }
-async-trait = { workspace = true }

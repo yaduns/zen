@@ -113,3 +113,7 @@ url = "2"
 
 unicode-width = "0.1"
 unicode-segmentation = "1"
+
+# ── directory traversal (recursive walk for @-attachment autocomplete, T-TU-03-3) ──
+walkdir = "2"
+

@@ -583,7 +583,12 @@ mod tests {
     fn render_scroll_info_omitted_when_no_room() {
         let mut buf = ScreenBuffer::new(40, 10);
         // 10 items, max_visible=5, height=3 → window fills 3 rows, no scroll-info row
-        let mut l = SelectList::new(items(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]), 5, theme(), layout());
+        let mut l = SelectList::new(
+            items(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]),
+            5,
+            theme(),
+            layout(),
+        );
         assert_eq!(l.render(&mut buf, 0, 0, 40, 3), 3);
     }
 
@@ -611,7 +616,11 @@ mod tests {
         assert_eq!(l.render(&mut buf, 0, 0, 80, 10), 3);
         assert_eq!(l.render(&mut buf, 0, 0, 80, 10), 3);
         let got = ctxs.borrow();
-        assert_eq!(got.len(), 6, "Two renders × 3 items → callbacks are reused (take/put-back works)");
+        assert_eq!(
+            got.len(),
+            6,
+            "Two renders × 3 items → callbacks are reused (take/put-back works)"
+        );
         // width=80 > 40 → two columns; primary = clamp(max(32, 40)) = 40; max_width = 40-2 = 38
         assert_eq!(got[0], ("a".to_string(), 38, 40, true)); // First item selected
         assert_eq!(got[1], ("b".to_string(), 38, 40, false));
