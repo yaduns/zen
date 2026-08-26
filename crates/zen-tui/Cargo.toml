@@ -24,6 +24,7 @@ syntect = { workspace = true }
 home = { workspace = true }
 # 进程内目录递归遍历（@ 附件自动补全，替代 pi 的外部 fd 二进制）
 walkdir = { workspace = true }
+pulldown-cmark = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
 

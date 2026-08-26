@@ -1,4 +1,4 @@
-// REQ-APP-10 (pi-347): syntax highlighting — syntect implementation (not porting highlight.js).
+// REQ-APP-10 : syntax highlighting — syntect implementation (highlight.js is not ported).
 // Placement exception: the spec module lands in zen-tui (consumer = zen-tui's markdown renderer T-TU-02-1; the dependency direction forbids landing in zen-app);
 // see the placement exception note under "REQ prefix → crate mapping" in AGENTS.md and tasks/T-AP-10-1-implemented.md.
 // Ecosystem paradigm: syntect `(Style, &str)` spans map directly onto zen `screen::Style` carriers (text styles always go through Style,

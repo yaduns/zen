@@ -6,6 +6,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod keybindings;
 pub mod keys;
+pub mod markdown;
 pub mod screen;
 pub mod terminal;
 pub mod wrap;
