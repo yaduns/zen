@@ -262,6 +262,29 @@ impl Editor {
             cb(&text);
         }
     }
+
+    /// Register submit callback (triggered by Enter; argument is the trimmed full text).
+    /// Consumers: T-AP-11-2 (CustomEditor pass-through), T-AP-11-1.
+    pub fn set_on_submit(&mut self, f: impl FnMut(&str) + 'static) {
+        self.on_submit = Some(Box::new(f));
+    }
+
+    /// Register text-change callback (triggered after each edit operation; argument is the current full text).
+    /// Consumers: T-AP-11-2 (CustomEditor pass-through), T-AP-11-1.
+    pub fn set_on_change(&mut self, f: impl FnMut(&str) + 'static) {
+        self.on_change = Some(Box::new(f));
+    }
+
+    /// Set focus state (when focused, renders the inverse block cursor and allows cursor positioning; called by the application layer on focus changes).
+    /// Consumers: T-AP-11-2 (CustomEditor pass-through), T-AP-11-1.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Current focus state.
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
 }
 
 #[cfg(test)]

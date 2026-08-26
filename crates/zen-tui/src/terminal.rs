@@ -6,7 +6,7 @@ pub(crate) struct Terminal {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TerminalError {
+pub enum TerminalError {
     #[error("terminal I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to {action} raw mode: {source}")]

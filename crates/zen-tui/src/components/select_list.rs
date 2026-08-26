@@ -32,7 +32,43 @@ pub struct SelectItem {
     description: Option<String>, // Description column shown in wide rows (line breaks/whitespace normalized to a single line)
 }
 
+impl SelectItem {
+    /// Constructs a list item (called when building items for T-AP-11-2's thinking-selector / T-AP-08-6 config selection).
+    /// When `label` is empty, display falls back to `value`; `description` is the description column shown on wide lines.
+    pub fn new(
+        value: impl Into<String>,
+        label: impl Into<String>,
+        description: Option<String>,
+    ) -> Self {
+        SelectItem {
+            value: value.into(),
+            label: label.into(),
+            description,
+        }
+    }
+
+    /// Match key/callback identifier (read access: get the selected item's identity in the on_select callback).
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Display name (falls back to value when empty, consistent with the render path).
+    pub fn label(&self) -> &str {
+        if self.label.is_empty() {
+            &self.value
+        } else {
+            &self.label
+        }
+    }
+
+    /// Description column text.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
 /// Resolved styles for each table region (
+#[derive(Clone)]
 pub struct SelectListTheme {
     selected_style: Style,    // Full-row style for the selected row
     description_style: Style, // Description column style
@@ -40,11 +76,38 @@ pub struct SelectListTheme {
     no_match_style: Style,    // No-match hint row style
 }
 
+impl SelectListTheme {
+    /// Constructs the selection list theme.
+    pub fn new(
+        selected_style: Style,
+        description_style: Style,
+        scroll_info_style: Style,
+        no_match_style: Style,
+    ) -> Self {
+        SelectListTheme {
+            selected_style,
+            description_style,
+            scroll_info_style,
+            no_match_style,
+        }
+    }
+}
+
 /// Primary column layout constraints and custom truncation callback
 pub struct SelectListLayoutOptions {
-    min_primary_column_width: Option<usize>, // Lower bound of primary column width (default 32; if both are set, min/max are swapped and clamped)
-    max_primary_column_width: Option<usize>, // Upper bound of primary column width
-    truncate_primary: Option<Box<dyn FnMut(&SelectListTruncatePrimaryContext) -> String>>, // Custom primary column truncation (default wrap::truncate_to_width)
+    pub min_primary_column_width: Option<usize>, // Lower bound of primary column width (default 32; if both are set, min/max are swapped and clamped)
+    pub max_primary_column_width: Option<usize>, // Upper bound of primary column width
+    pub truncate_primary: Option<Box<dyn FnMut(&SelectListTruncatePrimaryContext) -> String>>, // Custom primary column truncation (default wrap::truncate_to_width)
+}
+
+impl Default for SelectListLayoutOptions {
+    fn default() -> Self {
+        SelectListLayoutOptions {
+            min_primary_column_width: None,
+            max_primary_column_width: None,
+            truncate_primary: None,
+        }
+    }
 }
 
 /// Primary column truncation callback args (pi `SelectListTruncatePrimaryContext`).
