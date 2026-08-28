@@ -316,7 +316,7 @@ impl InteractiveMode {
                     }
                 }),
             );
-            tui.run(
+            tui.run_scrollback(
                 &cancel,
                 move |event| {
                     if let crossterm::event::Event::Key(key) = event {
@@ -327,8 +327,8 @@ impl InteractiveMode {
                     }
                     EventOutcome::Continue
                 },
-                move |buf| {
-                    // Consume pending events first, then render the current frame
+                move |canvas| {
+                    // first consume pending events, then render the current frame (content line stream + fixed bottom area; scrollback holds off-screen history)
                     let mut ui = ui_draw.borrow_mut();
                     loop {
                         let ev = pending_draw
@@ -340,7 +340,7 @@ impl InteractiveMode {
                             None => break,
                         }
                     }
-                    ui.render(buf);
+                    ui.render_scrollback(canvas);
                 },
             )
             .await

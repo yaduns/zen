@@ -10,4 +10,5 @@ pub mod markdown;
 pub mod screen;
 pub mod terminal;
 pub mod theme;
+pub mod viewport;
 pub mod wrap;

@@ -1,5 +1,6 @@
 use crate::screen::ScreenBuffer;
 use crate::terminal::{Terminal, TerminalError};
+use crate::viewport::ScrollbackCanvas;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -113,17 +114,100 @@ impl TuiLoop {
         self.min_render_interval = interval
     }
 
-    /// Main TUI event loop: polls three async sources—event stream / periodic tick / cancellation signal—to drive diff-based refreshes.
-    /// Prerequisite: [`TuiLoop::start`] must be called first; see inline comments for exit paths.
+    /// TUI main event loop (cell-level diff mode): multiplexes four async sources: polled event stream / timed tick / cancellation signal / external wakeup.
+    /// Prerequisite: [`TuiLoop::start`] must be called first; see `run_loop` for the exit path.
+    /// draw renders the current frame into `ScreenBuffer` (`run_loop` calls `render_frame` each frame to output diffs).
+    /// Default path for interactive mode; use [`TuiLoop::run_scrollback`] for scrollback mode.
     pub async fn run<E, D>(
         &mut self,
         cancel: &CancellationToken,
-        mut on_event: E,
-        mut draw: D,
+        on_event: E,
+        draw: D,
     ) -> Result<(), TuiError>
     where
         E: FnMut(crossterm::event::Event) -> EventOutcome,
         D: FnMut(&mut ScreenBuffer),
+    {
+        let mut draw = draw;
+        self.run_loop(
+            cancel,
+            on_event,
+            // Cell-level diff frame: render into buffer → flush emits cell-by-cell diffs (render_frame semantics remain unchanged).
+            |this| this.render_frame(&mut draw),
+            // In cell-level diff mode, Resize is handled by ScreenBuffer::resize (reset the diff baseline → full-screen redraw).
+            |this, cols, rows| this.buffer.resize(cols, rows),
+        )
+        .await
+    }
+
+    /// Drives the TUI main loop in scrollback rendering mode: uses the same four-way select as [`TuiLoop::run`] (events/timed
+    /// tick/cancel/external wakeup), but the draw contract changes from 「render into the ScreenBuffer grid」 to 「push content rows into
+    /// `ScrollbackCanvas` — change per-frame diff output to line-level diffing + real terminal scrolling when content overflows the screen (write
+    /// scrollback), allowing chat history to be viewed via native terminal scrolling. Coexists with `run` and does not affect it by default.
+    /// # Behavior
+    /// 1. Use the same pre-validation as `run` (call `start()` first; return NotStarted for non-tty)
+    /// 2. Reuse the private `run_loop` extracted from `run` (event forwarding/merge-bit/Resize semantics remain unchanged)
+    /// 3. Per frame: `canvas.clear()` → `draw(&mut canvas)` → `canvas.flush` (line-level diffing + advancement + terminal write);
+    ///    On Resize, synchronize the canvas size within the frame and trigger a full redraw
+    /// # Consumers
+    /// zen-app `modes/interactive/mod.rs` (T-AP-11-1 init; wires up scrollback mode)
+    pub async fn run_scrollback<E, D>(
+        &mut self,
+        cancel: &CancellationToken,
+        on_event: E,
+        draw: D,
+    ) -> Result<(), TuiError>
+    where
+        E: FnMut(crossterm::event::Event) -> EventOutcome,
+        D: FnMut(&mut ScrollbackCanvas),
+    {
+        let mut draw = draw;
+        let (cols, rows) = (self.terminal.columns(), self.terminal.rows());
+        let mut canvas = ScrollbackCanvas::new(cols, rows);
+        self.run_loop(
+            cancel,
+            on_event,
+            // scrollback frame: synchronize the terminal size first each frame (if changed → reset diff baseline → full redraw),
+            // Then clear the current frame's line stream, draw, and flush line-level diffs to the terminal.
+            |this| {
+                let (cols, rows) = (this.terminal.columns(), this.terminal.rows());
+                canvas.set_size(cols, rows);
+                canvas.clear();
+                (draw)(&mut canvas);
+                canvas
+                    .flush(this.terminal.out_mut())
+                    .map_err(TuiError::from)?;
+                Ok(())
+            },
+            // scrollback mode handles sizing/full redraw within the frame (canvas size sync); this callback is a no-op.
+            |_, _, _| {},
+        )
+        .await
+    }
+
+    /// Shared skeleton for the TUI main event loop: four asynchronous sources (event stream polling / timed tick / cancellation signal / external wakeup),
+    /// Drives `frame` (per-frame rendering) and `on_resize` (size changes). `run`/`run_scrollback` only provide different
+    /// frame and resize callbacks; event forwarding / coalescing bits / tick throttling semantics are identical in both modes.
+    /// # Prerequisites
+    /// [`TuiLoop::start`] must be called first; precondition checks occur before any IO (EventStream/interval), so no real terminal is required.
+    /// # Exit paths
+    /// - `on_event` returns `EventOutcome::Stop`;
+    /// - The event stream ends (stdin is closed);
+    /// - Cancellation via `cancel`;
+    /// - The external wakeup channel is disconnected.
+    ///
+    /// Unified return Ok; error paths (terminal IO / underlying event stream errors) return Err.
+    async fn run_loop<E, F, R>(
+        &mut self,
+        cancel: &CancellationToken,
+        mut on_event: E,
+        mut frame: F,
+        mut on_resize: R,
+    ) -> Result<(), TuiError>
+    where
+        E: FnMut(crossterm::event::Event) -> EventOutcome,
+        F: FnMut(&mut Self) -> Result<(), TuiError>,
+        R: FnMut(&mut Self, u16, u16),
     {
         // ── Precondition checks: start() must have entered raw mode first (cursor already hidden),
         //    Otherwise event loop / rendering is meaningless — reject execution outright ──
@@ -148,24 +232,21 @@ impl TuiLoop {
 
         // ── First-frame render: draw one frame before entering the loop to avoid a blank screen ──
         // start() already set the coalescing flag via request_render(); honor it here directly
-        self.render_frame(&mut draw)?; // draw writes to the buffer → flush emits the diff; on failure, loop startup fails entirely
+        frame(&mut *self)?; // draw writes to the buffer → flush emits the diff; on failure, loop startup fails entirely
         self.render_requested = false; // First frame drawn; clear the coalescing flag
         self.last_render_at = std::time::Instant::now(); // Record this render's timestamp for throttling reference
 
         loop {
-            // ── Listen to all three async sources concurrently: whichever becomes ready first executes (tokio's randomized fairness does not favor any one source)──
+            // ── Monitor four asynchronous sources concurrently: the first ready source runs (tokio uses random fairness, with no source favored)──
             tokio::select! {
                 // ① Event stream: user input arrives (key press, mouse, paste, window resize, etc.)
                 maybe_event = event_stream.next() => {
                     match maybe_event {
                         Some(Ok(event)) => {
                             // Resize is a "window size changed" event; the loop must handle it itself:
-                            // Resize the buffer grid size. Note that this matches by value, but the Event is not consumed—
-                            // The cols/rows bound by Resize are Copy types, so matching does not move the scrutinee,
-                            // The code below can still forward event unchanged to on_event
+                            // Pass to on_resize (cell-level → buffer.resize; scrollback → synchronize canvas dimensions)
                             if let crossterm::event::Event::Resize(cols, rows) = event {
-                                self.buffer.resize(cols, rows);
-                                // resize resets the diff buffer's previous frame → the next flush naturally performs a full-screen redraw
+                                on_resize(&mut *self, cols, rows);
                                 self.request_render(); // Size changed → must redraw
                             }
 
@@ -188,7 +269,7 @@ impl TuiLoop {
                     // actually draw only when a redraw was requested or animation mode is on; other ticks idle —
                     // this is render coalescing: high-frequency events do not produce one frame per event; screen updates are coalesced at tick granularity (≤16ms latency)
                     if self.render_requested || self.animation_enabled {
-                        self.render_frame(&mut draw)?; // draw renders the current frame → flush outputs cell-by-cell diffs
+                        frame(&mut *self)?; // Render the current frame → flush the diff output
                         self.render_requested = false; // frame already realized, clear the coalescing flag (the next event will set it again)
                         self.last_render_at = std::time::Instant::now(); // record the render time
                     }
@@ -400,6 +481,17 @@ mod tests {
         // precondition checks run before any IO (EventStream/interval) —
         // hence this error branch can be verified without a real terminal
         let result = loop_.run(&cancel, |_| EventOutcome::Continue, |_| {}).await;
+        assert!(matches!(result, Err(TuiError::NotStarted)));
+    }
+
+    #[tokio::test]
+    async fn test_run_scrollback_without_start_returns_not_started() {
+        let mut loop_ = TuiLoop::new().unwrap();
+        let cancel = CancellationToken::new();
+        // Scrollback mode reuses the same run_loop preflight validation: reject before start; no real terminal required.
+        let result = loop_
+            .run_scrollback(&cancel, |_| EventOutcome::Continue, |_| {})
+            .await;
         assert!(matches!(result, Err(TuiError::NotStarted)));
     }
 

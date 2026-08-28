@@ -30,6 +30,7 @@ use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
 use zen_tui::screen::{ScreenBuffer, Style};
 use zen_tui::theme::{ColorToken, Theme};
+use zen_tui::viewport::ScrollbackCanvas;
 
 /// Height cap for single-line metrics of message blocks (the measure stage enlarges the cap and takes the real height; lines exceeding it are truncated by this value for scroll computation;
 /// the vast majority of lines in the chat window are far below this value, and truncating giant lines (e.g. very long bash output) is an acceptable v1 approximation).
@@ -441,11 +442,17 @@ impl InteractiveUi {
         }
     }
 
-    /// Per-frame composite rendering: top-down cursor advance — message area (chat_rows scroll window + pending queue)
-    /// → status line → editor → footer; **construct components on the fly** per line (borrowing `&self.theme`, not stored).
+    /// Per-frame composited rendering (**cell-level diff mode**): top-down cursor advance — message area (chat_rows scrolling window + pending
+    /// queue) → status line → editor → footer; each line **instantiates** components on the fly (borrowing `&self.theme`, not storing them).
     ///
     /// Layout budget (fixed bottom-up): footer 2 lines + editor 3 lines + status line 2 lines (busy indicator 1 line +
     /// idle placeholder to keep the bottom stable); everything else is allocated to the message area (bottom follows scrolling, see render_chat).
+    ///
+    /// **Current assembly note**: after T-TU-01-5, interactive mode init has switched to scrollback mode (`run_scrollback` +
+    /// [`Self::render_scrollback`]); this method and its windowed subpaths (render_chat/paint_row) follow the task
+    /// Scope discipline: keep original as-is (no old code removed, regression surface minimized) for future rollback/comparison use (T-AP-11-4 external
+    /// editor suspend/resume may revert to the old path); not called yet, hence marked allow(dead_code).
+    #[allow(dead_code)] // Old cell-level path retained (see note above), not invoked under scrollback mode
     pub(crate) fn render(&mut self, buf: &mut ScreenBuffer) {
         let (width, height) = buf.size();
         if height == 0 {
@@ -515,6 +522,116 @@ impl InteractiveUi {
             footer.set_data(data.clone());
         }
         let _ = footer.render(buf, 0, editor_y + editor_h, width, footer_h);
+    }
+
+    /// The message area and other bottom fixed regions render as a "content line stream" (scrollback mode): chat lines are pushed into the canvas continuously
+    /// (off-screen content is carried by the terminal scrollback, so render's hard-cropped window is no longer needed); status line/editor/footer act as
+    /// the tail of the fixed-region line stream — users can scroll the terminal to review the full history. Scrollback-mode assembly is selected by `init` in mod.rs
+    /// （`tui.run_scrollback` + `draw = |c| ui.render_scrollback(c)`）。
+    /// Reuses render_chat's measurement/component construction logic, but renders each row into a temporary ScreenBuffer and then extracts it for streaming via
+    /// `ScreenBuffer::line_segments` (components unchanged); fixed regions are still drawn into a screen-height ScreenBuffer
+    /// and then bridged wholesale as the line stream tail.
+    pub(crate) fn render_scrollback(&mut self, canvas: &mut ScrollbackCanvas) {
+        let width = canvas.width();
+        if width == 0 {
+            return;
+        }
+        let theme = &self.theme;
+
+        // ── 1. Message area content line stream: all chat rows (no window, full history; off-screen content carried by scrollback) ──
+        let mut scratch = ScreenBuffer::new(width, MEASURE_HEIGHT_CAP);
+        for (i, row) in self.chat_rows.iter().enumerate() {
+            // Info line does not use a component: semantic-colored text drawn directly (aligned with paint_row).
+            if let ChatRow::Info { text, kind } = row {
+                let token = match kind {
+                    InfoKind::Error => ColorToken::Error,
+                    InfoKind::Warning => ColorToken::Warning,
+                    InfoKind::Status => ColorToken::Muted,
+                };
+                let style = Style::fg(theme.fg(token));
+                canvas.push_text(text.clone(), style);
+                continue;
+            }
+            // Measure-as-render (same temporary buffer), then extract per row into style segments for streaming.
+            let used = self.measure_row(row, i, &mut scratch, width);
+            for r in 0..used {
+                let segs = scratch.line_segments(r);
+                if !segs.is_empty() {
+                    canvas.push_line(segs);
+                }
+            }
+            scratch.clear();
+        }
+        // Pending queue rows (dim, appended at the end of the message area, aligned with render_chat).
+        for text in &self.pending_rows {
+            let style = Style::fg(theme.fg(ColorToken::Dim));
+            let line = format!("↳ Follow-up: {text}");
+            canvas.push_text(line, style);
+        }
+
+        // ── 2. Fixed-region tail (status line + editor + footer) drawn into a screen-height buffer → bridged wholesale into the line stream ──
+        let status_h: u16 = 2;
+        let editor_h: u16 = 3;
+        let footer_h: u16 = 2;
+        let fixed_h = status_h + editor_h + footer_h;
+        let mut fixed = ScreenBuffer::new(width, fixed_h);
+
+        match &self.status {
+            Some(StatusSpec::Working { message }) => {
+                let mut comp = StatusIndicator::working(message.clone(), theme);
+                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
+            }
+            Some(StatusSpec::Retry {
+                attempt,
+                max_attempts,
+                delay_ms,
+            }) => {
+                let mut comp =
+                    StatusIndicator::retry(*attempt, *max_attempts, *delay_ms, &self.kb, theme);
+                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
+            }
+            Some(StatusSpec::Compaction) => {
+                let mut comp = StatusIndicator::compaction(
+                    crate::components::status_indicator::CompactionStatusReason::Manual,
+                    &self.kb,
+                    theme,
+                );
+                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
+            }
+            Some(StatusSpec::BranchSummary) => {
+                let mut comp = StatusIndicator::branch_summary(&self.kb, theme);
+                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
+            }
+            Some(StatusSpec::Error(msg)) => {
+                let style = Style::fg(theme.fg(ColorToken::Error));
+                fixed.write(0, 0, &style, msg);
+            }
+            Some(StatusSpec::Warning(msg)) => {
+                let style = Style::fg(theme.fg(ColorToken::Warning));
+                fixed.write(0, 0, &style, msg);
+            }
+            None => {
+                let mut idle = IdleStatus;
+                let _ = idle.render(&mut fixed, 0, 0, width, status_h);
+            }
+        }
+        // Editor (fixed 3 rows)
+        self.editor
+            .render_editor(&mut fixed, 0, status_h, width, editor_h);
+        // Footer (fixed 2 rows)
+        let mut footer = FooterComponent::new(theme);
+        if let Some(data) = &self.footer_data {
+            footer.set_data(data.clone());
+        }
+        let _ = footer.render(&mut fixed, 0, status_h + editor_h, width, footer_h);
+
+        // Bridge the fixed region as the line stream tail (only non-empty rows are pushed, to avoid blank rows appearing in scrollback).
+        for r in 0..fixed_h {
+            let segs = fixed.line_segments(r);
+            if !segs.is_empty() {
+                canvas.push_line(segs);
+            }
+        }
     }
 
     /// Message area rendering: measure each row's actual height → bottom-following scroll window → draw sequentially.
@@ -1144,6 +1261,77 @@ mod tests {
         // Row height 3 * visible window ≤ 17 → window of ~5 trailing rows → start ≥ 45
         // Do not read the buffer (no public cell read), just confirm render does not panic
         let _ = buf.size();
+    }
+
+    // ── render_scrollback: line stream output + fixed-region tail ──────────────────
+
+    #[test]
+    fn test_render_scrollback_empty_ui_produces_fixed_area_tail() {
+        let mut u = ui();
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        // Even with an empty session, the fixed region (status line 2 + editor 3 + footer 2 = 7 rows) is bridged as the line stream tail,
+        // and it does not panic; canvas width matches construction.
+        assert_eq!(canvas.width(), 80);
+        assert!(canvas.content_height() > 0);
+        assert!(
+            canvas.content_height() >= 6,
+            "fixed area should have at least 6-7 non-empty lines, actual {} lines",
+            canvas.content_height()
+        );
+    }
+
+    #[test]
+    fn test_render_scrollback_chat_rows_grow_line_flow() {
+        let mut u = ui();
+        let width = 80;
+        let mut empty = ScrollbackCanvas::new(width, 24);
+        u.render_scrollback(&mut empty);
+        let baseline = empty.content_height();
+
+        // Append two user messages (containing multi-line text) → line stream grows with content
+        u.apply(UiEvent::MessageStart(Message::User(user_message(
+            "hello\nsecond line\nthird",
+        ))));
+        u.apply(UiEvent::MessageStart(Message::User(user_message("world"))));
+        let mut canvas = ScrollbackCanvas::new(width, 24);
+        u.render_scrollback(&mut canvas);
+        assert!(
+            canvas.content_height() > baseline,
+            "line stream should grow after appending a chat line ({} > {})",
+            canvas.content_height(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn test_render_scrollback_pending_rows_appended() {
+        let mut u = ui();
+        let width = 80;
+        let mut empty = ScrollbackCanvas::new(width, 24);
+        u.render_scrollback(&mut empty);
+        let baseline = empty.content_height();
+
+        u.apply(UiEvent::PendingChanged(vec!["queued".into()]));
+        let mut canvas = ScrollbackCanvas::new(width, 24);
+        u.render_scrollback(&mut canvas);
+        assert!(
+            canvas.content_height() > baseline,
+            "pending line should be appended to the end of the line stream"
+        );
+    }
+
+    #[test]
+    fn test_render_scrollback_status_rows_in_tail() {
+        let mut u = ui();
+        u.apply(UiEvent::Status(StatusSpec::Working {
+            message: "Thinking...".into(),
+        }));
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        assert!(canvas.content_height() > 0);
+        // Working status line + editor + footer are all non-empty line stream tail
+        assert!(canvas.content_height() >= 6);
     }
 
     // ── handle_key: routing / localized actions ────────────────────────────

@@ -1,3 +1,4 @@
+use crate::highlight::StyledSegment;
 use crate::terminal::TerminalError;
 use crossterm::queue;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -120,6 +121,87 @@ impl ScreenBuffer {
     /// Consumer: this task's `draw` callback; planned consumers: T-TU-01-4 (component layout), T-AP-11-2 (app components) — reuse uniformly when it recurs.
     pub fn size(&self) -> (u16, u16) {
         (self.width, self.height)
+    }
+
+    /// Extract an already-drawn row's content into a list of styled segments: in scrollback mode, message rows are first drawn into a temporary ScreenBuffer
+    /// rendered, then converted by this method into `Vec<StyledSegment>` and pushed into the row stream — bridging "components draw onto a grid" and "canvas row stream"
+    /// two rendering targets, with zero changes to the components themselves. Adjacent consecutive cells with the same style merge into one segment; interior space segments are kept
+    /// (needed by the fixed-area placeholder bridge); trailing all-empty rows are dropped; wide-char continuation cells (placeholders, not printed) are skipped; out-of-range rows return an empty Vec.
+    /// # Parameters
+    /// - `row`: target row index (0-based; ≥ height returns empty)
+    /// # Consumers
+    /// zen-app `modes/interactive/ui.rs::render_scrollback`
+    pub fn line_segments(&self, row: u16) -> Vec<StyledSegment> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let row = row as usize;
+        if row >= h {
+            return Vec::new();
+        }
+        let row_offset = row * w;
+
+        // 1. Determine extent: the column after the last "non-empty" cell (explicit space / wide-char start or continuation).
+        let mut end = 0usize;
+        for col in 0..w {
+            if !matches!(self.cells[row_offset + col].kind, CellKind::Empty) {
+                end = col + 1;
+            }
+        }
+        if end == 0 {
+            return Vec::new();
+        }
+
+        // 2. Scan columns in order, merging adjacent segments with the same style.
+        let mut out: Vec<StyledSegment> = Vec::new();
+        let mut cur_style: Option<Style> = None;
+        let mut cur_text = String::new();
+        for col in 0..end {
+            let cell = &self.cells[row_offset + col];
+            match cell.kind {
+                CellKind::Char => {
+                    let ch = cell
+                        .content
+                        .as_deref()
+                        .and_then(|s| s.chars().next())
+                        .unwrap_or(' ');
+                    if cur_style.as_ref() == Some(&cell.style) {
+                        cur_text.push(ch);
+                    } else {
+                        if let Some(s) = cur_style.take() {
+                            if !cur_text.is_empty() {
+                                out.push(StyledSegment {
+                                    style: s,
+                                    text: std::mem::take(&mut cur_text),
+                                });
+                            }
+                        }
+                        cur_style = Some(cell.style.clone());
+                        cur_text.push(ch);
+                    }
+                }
+                CellKind::Continuation => {
+                    // Wide-char continuation cell: the start cell already covers two columns, so skip it (do not print the placeholder).
+                }
+                CellKind::Empty => {
+                    // Interior gap: append a space to the current segment to preserve position; an empty segment starts with the default style.
+                    if cur_style.is_some() {
+                        cur_text.push(' ');
+                    } else {
+                        cur_style = Some(Style::default());
+                        cur_text.push(' ');
+                    }
+                }
+            }
+        }
+        if let Some(s) = cur_style.take() {
+            if !cur_text.is_empty() {
+                out.push(StyledSegment {
+                    style: s,
+                    text: cur_text,
+                });
+            }
+        }
+        out
     }
 
     /// Write text at (x,y) with the given style; out-of-range coordinates are silently ignored (or the implementation may choose to panic — must be documented).
@@ -670,6 +752,81 @@ mod tests {
         // the continuation cell should be emitted as a space (the wide char's right half remaining on the terminal)
         // at least the second frame produces output (two overwrites: start cell + continuation cell)
         assert!(!second.is_empty());
+    }
+
+    // ── line_segments ──
+
+    #[test]
+    fn test_line_segments_empty_and_out_of_bounds() {
+        let buf = ScreenBuffer::new(5, 3);
+        // All-empty row → empty Vec
+        assert!(buf.line_segments(0).is_empty());
+        // Out-of-range row → empty Vec
+        assert!(buf.line_segments(3).is_empty());
+    }
+
+    #[test]
+    fn test_line_segments_merges_same_style_segments() {
+        let mut buf = ScreenBuffer::new(10, 1);
+        let red = color_style();
+        buf.write(0, 0, &red, "ab");
+        buf.write(2, 0, &Style::default(), "cd"); // Adjacent, no gap
+        let segs = buf.line_segments(0);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "ab");
+        assert_eq!(segs[0].style, red);
+        assert_eq!(segs[1].text, "cd");
+    }
+
+    #[test]
+    fn test_line_segments_trailing_empties_dropped() {
+        let mut buf = ScreenBuffer::new(8, 1);
+        let red = color_style();
+        buf.write(0, 0, &red, "ab"); // Last 6 columns all empty
+        let segs = buf.line_segments(0);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "ab");
+    }
+
+    #[test]
+    fn test_line_segments_interior_gap_preserved_as_spaces() {
+        let mut buf = ScreenBuffer::new(10, 1);
+        let red = color_style();
+        buf.write(0, 0, &red, "a");
+        buf.write(5, 0, &Style::default(), "b"); // Middle 1..5 empty
+        let segs = buf.line_segments(0);
+        let joined: String = segs.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(joined, "a    b", "Interior gaps should be preserved as spaces");
+    }
+
+    #[test]
+    fn test_line_segments_wide_char_not_duplicated() {
+        let mut buf = ScreenBuffer::new(6, 1);
+        let red = color_style();
+        buf.write(0, 0, &red, "中"); // Middle + continuation cell
+        buf.write(2, 0, &Style::default(), "x");
+        let segs = buf.line_segments(0);
+        let joined: String = segs.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(joined, "中x", "Wide character continuation cells should be skipped without producing placeholders");
+    }
+
+    #[test]
+    fn test_line_segments_multiline_isolated() {
+        let mut buf = ScreenBuffer::new(5, 2);
+        buf.write(0, 0, &color_style(), "A");
+        buf.write(0, 1, &color_style(), "B");
+        let row0: String = buf
+            .line_segments(0)
+            .iter()
+            .map(|s| s.text.clone())
+            .collect();
+        let row1: String = buf
+            .line_segments(1)
+            .iter()
+            .map(|s| s.text.clone())
+            .collect();
+        assert_eq!(row0, "A");
+        assert_eq!(row1, "B");
     }
 
     #[test]
