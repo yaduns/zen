@@ -109,6 +109,8 @@ pub fn compute_usage_totals(entries: &[SessionTreeEntry]) -> (UsageTotals, Optio
 }
 
 /// Data snapshot rendered by the footer each frame (plain data, assembled by T-AP-11-1 each frame from AgentSession).
+/// Clone/Debug for T-AP-11-1's UI event queue (UiEvent::Footer cloned across tasks with the message).
+#[derive(Debug, Clone)]
 pub struct FooterData {
     /// Current working directory (collapsed to `~` before display).
     pub pwd: String,

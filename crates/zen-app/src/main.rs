@@ -5,12 +5,11 @@
 use clap::Parser;
 use std::path::Path;
 use tracing::info;
-use zen_ai::types::ImageContent;
 use zen_app::cli::{build_initial_message, read_piped_stdin, stdin_is_terminal, CliArgs, Mode};
 use zen_app::config::{get_sessions_dir, VERSION};
+use zen_app::modes::interactive::run_interactive_mode;
 use zen_app::modes::print_mode::run_print_mode;
 use zen_app::session::jsonl::CreateSessionOptions;
-use zen_app::session::runtime::AgentSessionRuntime;
 use zen_app::session::services::create_initial_runtime_from_cli;
 use zen_app::session::session_manager::SessionManager;
 
@@ -130,7 +129,8 @@ async fn main() -> anyhow::Result<()> {
                 initial.initial_message,
                 initial.initial_images,
                 args.messages().iter().map(|s| s.to_string()).collect(),
-            )?;
+            )
+            .await?;
             info!(exit_code, "[main] node 5: interactive mode dispatch complete");
             if exit_code != 0 {
                 std::process::exit(exit_code);
@@ -221,19 +221,6 @@ fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionM
         )?);
     }
     Ok(SessionManager::create(&cwd_str, &root, default_opts)?)
-}
-
-/// Phase 1 interactive mode stub.
-///
-/// Replace this with the actual interactive logic in Phase 2 (T-AP-11-1).
-/// Phase 1 prints a prompt and returns an error (interactive mode is supported only in Phase 2).
-fn run_interactive_mode(
-    _runtime: AgentSessionRuntime,
-    _initial_message: Option<String>,
-    _initial_images: Vec<ImageContent>,
-    _messages: Vec<String>,
-) -> anyhow::Result<i32> {
-    anyhow::bail!("interactive mode will be implemented in Phase 2 (T-AP-11-1)")
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::screen::ScreenBuffer;
 use crate::terminal::{Terminal, TerminalError};
+use std::pin::Pin;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +19,7 @@ pub struct TuiLoop {
     min_render_interval: std::time::Duration, // Minimum render interval, default 16ms; the tick interval takes this value
     started: bool,                      // Set after start(); used for precondition checks before run()
     stopped: bool,                      // Lifecycle termination flag
+    wake_stream: Option<Pin<Box<dyn futures::Stream<Item = WakeOutcome> + Send>>>, // /// Fourth external wake path (T-AP-11-1 patch): the "message → WakeOutcome" stream registered at assembly; None if unregistered. Items are already erased to `WakeOutcome`, so TuiLoop needs no generics.
 }
 
 pub enum EventOutcome {
@@ -33,6 +35,16 @@ pub enum TuiError {
     EventStream(std::io::Error),
     #[error("TuiLoop::run() called before start()")]
     NotStarted,
+}
+
+/// Rendering intent for external wakes: `Render` = request a repaint; `Animate(bool)` = turn continuous animation on/off
+/// (loader scenarios); both set the merged bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeOutcome {
+    /// Repaint once as needed after an external event.
+    Render,
+    /// Turn on/off 16ms continuous repaint (streaming loader animation).
+    Animate(bool),
 }
 
 impl TuiLoop {
@@ -52,6 +64,7 @@ impl TuiLoop {
             min_render_interval: Duration::from_millis(16), // Aligned with pi MIN_RENDER_INTERVAL_MS
             started: false,
             stopped: false,
+            wake_stream: None,
         })
     }
 
@@ -185,6 +198,14 @@ impl TuiLoop {
                 _ = cancel.cancelled() => {
                     break; // graceful exit: only break the loop; do not restore the terminal (restoring is the caller stop()'s responsibility)
                 }
+                // ④ External wake (T-AP-11-1 patch): UI changes pushed by the main task during streaming (no key input).
+                   //    When unregistered it stays pending forever (never sleeps this path), so the existing three paths are unaffected.
+                   maybe_wake = self.next_wake() => {
+                       match maybe_wake {
+                           Some(outcome) => self.apply_wake_outcome(outcome),
+                           None => break, // Wake channel disconnected: coordinator ends, exits along with cancellation
+                       }
+                   }
             }
         }
 
@@ -205,6 +226,46 @@ impl TuiLoop {
         (draw)(&mut self.buffer);
         self.buffer.flush(self.terminal.out_mut())?;
         Ok(())
+    }
+
+    /// Fourth external wake channel (T-AP-11-1 patch): during streaming (no keypresses), the interactive coordinator must also deliver
+    /// agent events to the render layer — register a generic channel; when a message arrives inside the run() loop, call `on_wake`
+    /// (synchronous callback, must not await; generally used to apply changes + declare redraw intent via WakeOutcome).
+    /// R is specified by the caller at the assembly site (zen-app uses `UiEvent`); zen-tui is unaware of the concrete type.
+    /// # Consumers
+    /// zen-app `modes/interactive/ui.rs` (UI task assembly).
+    pub fn set_external_wakeup<R: Send + 'static>(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<R>,
+        on_wake: Box<dyn FnMut(&R) -> WakeOutcome + Send>,
+    ) {
+        // Type erasure: fold (receiver + synchronous callback) into `Stream<Item = WakeOutcome>`.
+        // One unfold iteration per message: recv().await → on_wake(&msg) (synchronous, must-not-await
+        // contract, guaranteed by the callback itself) → yield render intent; receiver/callback carried into the next round via state.
+        self.wake_stream = Some(Box::pin(futures::stream::unfold(
+            (rx, on_wake),
+            |(mut rx, mut on_wake)| async move {
+                let msg = rx.recv().await?; // Channel closed (all Senders dropped) → None → stream ends
+                Some(((on_wake)(&msg), (rx, on_wake)))
+            },
+        )));
+    }
+
+    /// Take the next wake intent; never ready when the fourth channel is unregistered (equivalent to infinite pending).
+    async fn next_wake(&mut self) -> Option<WakeOutcome> {
+        use futures::StreamExt;
+        let Some(stream) = &mut self.wake_stream else {
+            return std::future::pending::<Option<WakeOutcome>>().await;
+        };
+        stream.next().await
+    }
+
+    /// Set render flags per wake intent: Render → merge into one redraw; Animate(v) → toggle 16ms continuous rendering.
+    fn apply_wake_outcome(&mut self, outcome: WakeOutcome) {
+        match outcome {
+            WakeOutcome::Render => self.request_render(),
+            WakeOutcome::Animate(v) => self.animation_enabled = v,
+        }
     }
 }
 
@@ -340,5 +401,69 @@ mod tests {
         // hence this error branch can be verified without a real terminal
         let result = loop_.run(&cancel, |_| EventOutcome::Continue, |_| {}).await;
         assert!(matches!(result, Err(TuiError::NotStarted)));
+    }
+
+    // ── Fourth external wake (T-AP-11-1 patch): flag transitions and channel delivery ──
+
+    #[test]
+    fn test_apply_wake_outcome_sets_flags() {
+        let mut loop_ = TuiLoop::new().unwrap();
+        // By default neither flag is set
+        assert!(!loop_.render_requested);
+        assert!(!loop_.animation_enabled);
+        // Render → request one redraw
+        loop_.apply_wake_outcome(WakeOutcome::Render);
+        assert!(loop_.render_requested);
+        assert!(!loop_.animation_enabled, "Render does not affect animation state");
+        // Animate(true) → start continuous animation
+        loop_.apply_wake_outcome(WakeOutcome::Animate(true));
+        assert!(loop_.animation_enabled);
+        // Animate(false) → stop continuous animation (redraw flag stays set)
+        loop_.apply_wake_outcome(WakeOutcome::Animate(false));
+        assert!(!loop_.animation_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_external_wakeup_delivers_messages_and_outcomes() {
+        let mut loop_ = TuiLoop::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        // Generic channel: zen-tui is unaware of the concrete type (here u8 verifies the callback still yields intents after erasure)
+        loop_.set_external_wakeup(
+            rx,
+            Box::new(|msg: &u8| {
+                if *msg == 1 {
+                    WakeOutcome::Render
+                } else {
+                    WakeOutcome::Animate(*msg == 2)
+                }
+            }),
+        );
+        tx.send(1).unwrap();
+        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Render));
+        tx.send(2).unwrap();
+        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Animate(true)));
+        tx.send(3).unwrap();
+        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Animate(false)));
+    }
+
+    #[tokio::test]
+    async fn test_external_wakeup_ends_when_channel_closed() {
+        let mut loop_ = TuiLoop::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        loop_.set_external_wakeup(rx, Box::new(|_: &u8| WakeOutcome::Render));
+        // Send one message to verify the path, then close the sender → stream ends (None)
+        tx.send(9).unwrap();
+        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Render));
+        drop(tx);
+        assert_eq!(loop_.next_wake().await, None, "Wakeup stream ends after channel disconnect");
+    }
+
+    #[tokio::test]
+    async fn test_external_wakeup_unregistered_is_pending_forever() {
+        // Fourth channel unregistered: next_wake is always pending (in-flight; verify with timeout that it doesn't return immediately)
+        let mut loop_ = TuiLoop::new().unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), loop_.next_wake()).await;
+        assert!(result.is_err(), "Should never become ready when unregistered (timeout expires)");
     }
 }

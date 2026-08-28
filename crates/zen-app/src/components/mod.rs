@@ -5,6 +5,7 @@
 pub mod assistant_message;
 pub mod bash_execution;
 pub mod bordered_loader;
+pub mod branch_summary_message;
 pub mod compaction_summary_message;
 pub mod countdown_timer;
 pub mod custom_editor;

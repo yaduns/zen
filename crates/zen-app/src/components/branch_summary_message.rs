@@ -2,7 +2,7 @@
 // Corresponds to original TS: reference/pi-original/packages/coding-agent/src/modes/interactive/components/branch-summary-message.ts.
 // Render with shared FoldRow/paint_fold_rows (customMessageBg box family, unified visuals).
 
-use crate::components::{paint_fold_rows, FoldRow, Component};
+use crate::components::{paint_fold_rows, Component, FoldRow};
 use crate::keybindings::AppAction;
 use crossterm::style::Attribute;
 use zen_tui::highlight::StyledSegment;
@@ -57,7 +57,8 @@ impl<'a> BranchSummaryMessageComponent<'a> {
                 text: format!("{header}{}", self.summary),
             });
         } else {
-            let key = crate::components::keybinding_hints::key_text(self.kb, AppAction::ToolsExpand);
+            let key =
+                crate::components::keybinding_hints::key_text(self.kb, AppAction::ToolsExpand);
             rows.push(FoldRow::Segments {
                 segments: vec![
                     StyledSegment {
@@ -118,7 +119,6 @@ mod tests {
             .filter(|c| !c.is_control())
             .collect()
     }
-
 
     #[test]
     fn collapsed_shows_label_and_expand_hint() {
