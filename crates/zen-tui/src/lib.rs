@@ -9,4 +9,5 @@ pub mod keys;
 pub mod markdown;
 pub mod screen;
 pub mod terminal;
+pub mod theme;
 pub mod wrap;

@@ -10,8 +10,8 @@
 mod common;
 
 use clap::Parser;
-use zen_ai::types::ThinkingLevel;
 use common::*;
+use zen_ai::types::ThinkingLevel;
 
 /// Simulated CLI tool-selection flags (only for this example; does not modify existing code).
 #[derive(Parser)]
@@ -58,15 +58,29 @@ async fn main() -> anyhow::Result<()> {
         // --exclude-tools blacklist filtering
         let all = tool_registry_tools("all");
         all.into_iter()
-            .filter(|t| !args.exclude_tools.iter().any(|name| t.name() == name.as_str()))
+            .filter(|t| {
+                !args
+                    .exclude_tools
+                    .iter()
+                    .any(|name| t.name() == name.as_str())
+            })
             .collect()
     } else {
         tool_registry_tools("all")
     };
 
-    eprintln!("[example] Tool count: {} ({})", tools.len(),
-        if tools.is_empty() { "No tools".into() }
-        else { tools.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ") }
+    eprintln!(
+        "[example] Tool count: {} ({})",
+        tools.len(),
+        if tools.is_empty() {
+            "No tools".into()
+        } else {
+            tools
+                .iter()
+                .map(|t| t.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     );
 
     let mut session = make_session(

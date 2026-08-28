@@ -2,12 +2,12 @@ use crate::harness::agent_hooks::{AgentLoopError, AgentLoopHooks};
 use crate::harness::agent_loop::{run_agent_loop, run_agent_loop_continue};
 use crate::harness::context::create_context;
 use crate::harness::types::AgentLoopConfig;
-use crate::util::now_millis;
 use crate::harness::types::{
     AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentLoopTurnUpdate, AgentState,
     BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
     ShouldStopAfterTurnContext,
 };
+use crate::util::now_millis;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

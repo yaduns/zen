@@ -60,6 +60,14 @@ pub fn get_debug_log_path() -> Result<PathBuf, PathError> {
     Ok(get_agent_dir()?.join(format!("{APP_NAME}-debug.log")))
 }
 
+/// Custom theme directory: `<agentDir>/themes`.
+/// Where users place custom theme JSON files.
+/// # Consumers
+/// T-AP-11-3 (ThemeController scans custom themes)
+pub fn get_custom_themes_dir() -> Result<PathBuf, PathError> {
+    Ok(get_agent_dir()?.join("themes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

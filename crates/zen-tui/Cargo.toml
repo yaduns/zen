@@ -27,6 +27,9 @@ walkdir = { workspace = true }
 pulldown-cmark = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
+# Theme system (T-AP-11-3): JSON theme file deserialization
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }

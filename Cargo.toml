@@ -25,6 +25,7 @@ authors = ["Zen Contributors"]
 zen-ai = { path = "crates/zen-ai" }
 zen-core = { path = "crates/zen-core" }
 zen-app = { path = "crates/zen-app" }
+zen-tui = { path = "crates/zen-tui" }
 
 # ── async runtime ────────────────────────────────────────────────
 tokio = { version = "1", features = [
@@ -116,4 +117,7 @@ unicode-segmentation = "1"
 
 # ── directory traversal (recursive walk for @-attachment autocomplete, T-TU-03-3) ──
 walkdir = "2"
+
+# ── file watching (theme hot-reload, T-AP-11-3) ────────────────
+notify = "7"
 

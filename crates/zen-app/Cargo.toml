@@ -23,7 +23,7 @@ clap = { workspace = true }
 crossterm = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
-zen-tui = { path = "../zen-tui" }
+zen-tui = { workspace = true }
 # File watching (theme hot reload, T-AP-11-3)
 notify = { workspace = true }
 # Word-level diff (T-AP-11-2 diff component; existing workspace declaration, same family as zen-core edit_diff)

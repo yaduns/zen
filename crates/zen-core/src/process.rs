@@ -101,10 +101,7 @@ impl ProcessRegistry {
 
     /// Number of currently tracked pids (for test assertions only).
     pub fn len(&self) -> usize {
-        self.pids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.pids.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 

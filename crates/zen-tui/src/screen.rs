@@ -10,6 +10,35 @@ pub struct Style {
     pub attributes: Vec<crossterm::style::Attribute>, // Text attributes; whether to use a Vec is decided at implementation time; must be Default-able (empty) = no styles
 }
 
+impl Style {
+    /// Foreground color constructor—quickly constructs a Style containing only a foreground color for component/theme systems.
+    pub fn fg(color: crossterm::style::Color) -> Self {
+        Style {
+            fg: Some(color),
+            bg: None,
+            attributes: Vec::new(),
+        }
+    }
+
+    /// Background color constructor—quickly constructs a Style containing only a background color for component/theme systems.
+    pub fn bg(color: crossterm::style::Color) -> Self {
+        Style {
+            fg: None,
+            bg: Some(color),
+            attributes: Vec::new(),
+        }
+    }
+
+    /// Full constructor—constructs a Style containing foreground + background + attributes for the theme system.
+    pub fn new(
+        fg: Option<crossterm::style::Color>,
+        bg: Option<crossterm::style::Color>,
+        attributes: Vec<crossterm::style::Attribute>,
+    ) -> Self {
+        Style { fg, bg, attributes }
+    }
+}
+
 /// A single position cell in the screen grid, carrying the display content and style of that column/row.
 /// Blank cells are expressed with Option (rather than a separate "blank" marker) so differential refresh can determine "this cell needs to be cleared".
 /// kind distinguishes a normal space, a wide-character start cell, and a wide-character continuation cell — continuation cells matter for differential refresh and overwrite rules: a wide character is written once at its start cell, its continuation cells only hold space and are never printed, and cannot be overwritten by single-column writes (width-aware writers won't step past them).
@@ -234,13 +263,25 @@ impl ScreenBuffer {
                 // Skip continuation cells — continuation cells only occupy space, never print; if marked dirty due to orphan propagation, just write blanks over them below
                 // But continuation cells themselves emit no content command (they have no content)
                 if matches!(cell.kind, CellKind::Continuation) {
-                    // Orphan continuation cell: must write spaces on the terminal to cover the residual right half of a wide character
-                    queue!(
-                        out,
-                        crossterm::cursor::MoveTo(col as u16, row as u16),
-                        crossterm::style::Print(' ')
-                    )
-                    .map_err(TerminalError::Io)?;
+                    // Orphan continuation cell: needs to write whitespace to the terminal to overwrite the remaining right half of a wide character.
+                    // Only when the starting cell of the wide character associated with this continuation cell **has no printable content in the current frame** (cleared/replaced with empty or in
+                    // farther right) before overwriting—when the starting cell has just printed a wide character, its right half is already occupied by that wide character,
+                    // printing spaces again will corrupt the display (on a fully dirty first frame, wide characters become “char char char”);
+                    // Skip when the starting cell is this frame's Char (width 2).
+                    let start_painted = col > 0
+                        && matches!(self.cells[row_offset + col - 1].kind, CellKind::Char)
+                        && self.cells[row_offset + col - 1]
+                            .content
+                            .as_ref()
+                            .map_or(false, |c| c.width() == 2);
+                    if !start_painted {
+                        queue!(
+                            out,
+                            crossterm::cursor::MoveTo(col as u16, row as u16),
+                            crossterm::style::Print(' ')
+                        )
+                        .map_err(TerminalError::Io)?;
+                    }
                     continue;
                 }
 

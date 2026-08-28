@@ -820,12 +820,7 @@ mod tests {
         // `sleep 30`; assertion fails as soon as the timeout fires.
         let registry = crate::process::ProcessRegistry::new();
 
-        let env = ExecutionEnv::new(
-            PathBuf::from("/"),
-            None,
-            None,
-            Some(registry.clone()),
-        );
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, Some(registry.clone()));
         let ct = CancellationToken::new();
         let opts = ExecOptions {
             cancellation: Some(ct.clone()),

@@ -32,6 +32,7 @@ pub struct KeybindingConflict<A> {
 ///
 /// Key routing for the editor/selection component (`matches`) and keybinding-hints queries (`get_keys`, etc.) all go through this table;
 /// `rebuild()` rebuilds the `resolved`/`conflicts` caches after `new` and `set_user_bindings`; this is the only mutation point.
+#[derive(Clone)]
 pub struct KeybindingsManager<A> {
     /// Default definition table (indexed by action).
     definitions: HashMap<A, KeybindingDefinition<A>>,
