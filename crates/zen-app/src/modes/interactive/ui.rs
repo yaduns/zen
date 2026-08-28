@@ -541,6 +541,9 @@ impl InteractiveUi {
         let mut used = 0u16;
         for (i, h) in heights.iter().enumerate().rev() {
             if used + *h > area_h {
+                if start == self.chat_rows.len() {
+                    start = i; // Fallback: at least draw the last line (truncated display, not blank)
+                }
                 break;
             }
             used += *h;

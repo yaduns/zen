@@ -234,6 +234,18 @@ pub(crate) async fn stream_assistant_response(
                 timestamp: now(),
             };
             context.messages.push(Message::Assistant(msg.clone()));
+            // Note: failures are also part of the message stream; emit Start/End so the UI can surface the error
+            hooks
+                .on_event(&AgentEvent::MessageStart {
+                    message: Message::Assistant(msg.clone()),
+                })
+                .await;
+            hooks
+                .on_event(&AgentEvent::MessageEnd {
+                    message: Message::Assistant(msg.clone()),
+                })
+                .await;
+
             return msg;
         }
     };
