@@ -44,6 +44,8 @@ impl Terminal {
             self.cursor_hidden = true;
         }
 
+        self.clear_screen()?;
+
         Ok(())
     }
 
