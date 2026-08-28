@@ -30,7 +30,7 @@ impl Model {
             api: provider.api(),
             base_url: provider.base_url(),
             max_tokens: provider_max_tokens(provider.id()),
-            context_window: 65536,
+            context_window: 1_000_000,
             reasoning: true,
             name: None,
             headers: None,
