@@ -112,6 +112,20 @@ impl CustomEditor {
         self.editor.render(buf, x, y, width, height);
     }
 
+    /// Compute the total height required for rendering from current text and wrapping rules (borders 2 + content lines, capped at
+    /// `max(5, terminal_rows*30/100)` — dynamic budget for editor area height at the UI layer
+    /// (T-AP-11-1-fix; width semantics strictly consistent with render, see `Editor::needed_height`).
+    pub fn needed_height(&self, width: u16, terminal_rows: u16) -> u16 {
+        self.editor.needed_height(width, terminal_rows)
+    }
+
+    /// Bracketed paste entry: delegate to Editor for newline normalization / tab expansion / non-printable filtering, then insert the whole block.
+    /// Consumer: T-AP-11-1-fix (`InteractiveUi::handle_paste` forwards; on_event routes
+    /// `Event::Paste`）。
+    pub fn handle_paste(&mut self, text: &str) {
+        self.editor.handle_paste(text);
+    }
+
     /// Hardware cursor positioning (delegates to Editor; used by T-AP-11-1 IME positioning).
     pub fn cursor_position(&self) -> (u16, u16) {
         self.editor.cursor_position()
@@ -275,5 +289,40 @@ mod tests {
         let mut buf = ScreenBuffer::new(40, 5);
         let painted = editor.render(&mut buf, 0, 0, 40, 5);
         assert!(painted >= 3, "editor renders border + text + border");
+    }
+
+    #[test]
+    fn needed_height_delegates_to_editor() {
+        let mut editor = CustomEditor::new(0, kb());
+        // empty -> 3; 3 short lines -> 5; rows=40 gives cap=12, 7 lines of content -> 9
+        assert_eq!(editor.needed_height(40, 24), 3);
+        editor.set_text("a\nb\nc");
+        assert_eq!(editor.needed_height(40, 24), 5);
+        editor.set_text("a\nb\nc\nd\ne\nf\ng");
+        assert_eq!(editor.needed_height(40, 40), 9);
+        // semantics match rendering: after rendering at the returned height, all content lines are visible (no disconnect)
+        let h = editor.needed_height(40, 40);
+        let mut buf = ScreenBuffer::new(40, h);
+        editor.render_editor(&mut buf, 0, 0, 40, h);
+        let filled = (1..h - 1)
+            .filter(|r| !buf.line_segments(*r as u16).is_empty())
+            .count();
+        assert_eq!(filled as u16, h - 2);
+    }
+
+    #[test]
+    fn handle_paste_delegates_to_editor() {
+        let mut editor = CustomEditor::new(0, kb());
+        editor.handle_paste("line1\r\nline2");
+        assert_eq!(editor.text(), "line1\nline2", "Delegates newline normalization semantics to Editor");
+        // tab expansion + non-printable filtering also take effect
+        let mut editor2 = CustomEditor::new(0, kb());
+        editor2.handle_paste("a\tb\x01c");
+        assert_eq!(editor2.text(), "a    bc");
+        // empty paste is a no-op
+        let mut editor3 = CustomEditor::new(0, kb());
+        editor3.set_text("keep");
+        editor3.handle_paste("");
+        assert_eq!(editor3.text(), "keep");
     }
 }

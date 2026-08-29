@@ -268,6 +268,15 @@ impl InteractiveUi {
         }
     }
 
+    /// Bracketed paste entry: hand the pasted text to the editor as a whole for atomic insertion (`Editor::handle_paste`
+    /// handles newline normalization / tab expansion / non-printable filtering internally), and syncs the bash mode indicator (body `!` prefix).
+    /// Repaint triggering is done by the event path's `EventOutcome::Continue` setting the coalescing flag.
+    /// Consumer: T-AP-11-1-fix (interactive `on_event` routes `Event::Paste`).
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        self.editor.handle_paste(text);
+        self.sync_bash_mode();
+    }
+
     /// Localization: ToolsExpand flips the expanded state (`folded` set) of all tool/bash/summary lines at once.
     /// Aligns with pi `toggleToolOutputExpansion` (v1 component expansion differs little under fallback layout; semantic interface preserved).
     fn toggle_rows_expanded(&mut self) {
@@ -578,8 +587,10 @@ impl InteractiveUi {
     /// queue) → status line → editor → footer; each component is **constructed transiently per line** (borrows `&self.theme`, not stored),
     /// the status line is the sole exception — draws a persistent `status_indicator` instance (reused across frames to preserve the animation clock, see `render_status`).
     ///
-    /// Layout budget (fixed bottom-up): footer 2 lines + editor 3 lines + status line 2 lines (busy indicator 1 line +
-    /// idle placeholder to keep the bottom stable); everything else is allocated to the message area (bottom follows scrolling, see render_chat).
+    /// Layout budget (fixed bottom-up): footer 2 lines + status line 2 lines (1 line busy indicator +
+    /// idle placeholder keeps the bottom stable), **editor height grows dynamically with content** (`needed_height`, cap = terminal rows
+    /// 30% with a floor of 5, aligned with pi `maxVisibleLines`; T-AP-11-1-fix replaces the former fixed 3 lines),
+    /// everything else is allocated to the message area (bottom-following scroll, see render_chat).
     ///
     /// **Current assembly note**: after T-TU-01-5, interactive mode init has switched to scrollback mode (`run_scrollback` +
     /// [`Self::render_scrollback`]); this method and its windowed subpaths (render_chat/paint_row) follow the task
@@ -592,9 +603,10 @@ impl InteractiveUi {
             return;
         }
 
-        // Bottom three-section budget (line counts)
+        // Budget for the bottom three regions (line counts): editor height computed dynamically from content (cap = 30% of terminal rows with a floor of 5,
+        // aligned with pi maxVisibleLines; T-AP-11-1-fix).
         let footer_h: u16 = 2;
-        let editor_h: u16 = 3;
+        let editor_h: u16 = self.editor.needed_height(width, buf.size().1);
         let status_h: u16 = 2;
         let editor_y = height.saturating_sub(footer_h + editor_h);
         let status_y = editor_y.saturating_sub(status_h);
@@ -665,8 +677,11 @@ impl InteractiveUi {
         }
 
         // ── 2. Fixed-region tail (status line + editor + footer) drawn into a screen-height buffer → bridged wholesale into the line stream ──
+        // Editor height grows dynamically with content (cap = 30% of terminal rows with a floor of 5, aligned with pi maxVisibleLines;
+        // T-AP-11-1-fix replaces the former fixed 3 lines — multiline input / long wrapped text fully visible; the lines yielded by the message area are
+        // naturally carried by the scrollback line stream).
         let status_h: u16 = 2;
-        let editor_h: u16 = 3;
+        let editor_h: u16 = self.editor.needed_height(width, canvas.height());
         let footer_h: u16 = 2;
         let fixed_h = status_h + editor_h + footer_h;
         let mut fixed = ScreenBuffer::new(width, fixed_h);
@@ -1483,6 +1498,55 @@ mod tests {
         assert!(canvas.content_height() > 0);
         // Working status line + editor + footer are all non-empty line stream tail
         assert!(canvas.content_height() >= 6);
+    }
+
+    // ── render_scrollback: editor height grows dynamically with content (T-AP-11-1-fix) ──
+
+    #[test]
+    fn test_scrollback_editor_grows_with_content() {
+        let mut u = ui();
+        let mut empty = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut empty);
+        let base = empty.content_height();
+        assert!(
+            base >= 6,
+            "empty editor fixed area (status 2 + editor 3 + footer 2) is at least 6 lines"
+        );
+
+        // 3 lines of input → needed_height = 5 (2 borders + 3 content) → fixed region is 2 lines taller than the empty state
+        u.editor.set_text("a\nb\nc");
+        assert_eq!(u.editor.needed_height(80, 24), 5);
+        let mut grown = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut grown);
+        assert_eq!(
+            grown.content_height(),
+            base + 2,
+            "3 lines of input → editor 3→5 lines, fixed area grows by 2 lines"
+        );
+        // cap reached: 7 lines of input (rows=24 → cap=max(5,7)=7), width=80 with no wrapping
+        u.editor.set_text("a\nb\nc\nd\ne\nf\ng");
+        assert_eq!(
+            u.editor.needed_height(80, 24),
+            9,
+            "7 lines of content, rows=24 → cap=7 hits the ceiling at 9"
+        );
+    }
+
+    #[test]
+    fn test_editor_paste_inserts_text_and_syncs_bash() {
+        let mut u = ui();
+        u.handle_paste("line1\r\nline2");
+        assert_eq!(
+            u.editor.text(),
+            "line1\nline2",
+            "after paste newline normalization the whole block goes into the editor"
+        );
+        assert!(!u.is_bash_mode);
+        // pasting a `!` prefix → bash mode indicator sync (on_change → route.bash_mode → border color)
+        let mut u2 = ui();
+        u2.handle_paste("!ls -la");
+        assert_eq!(u2.editor.text(), "!ls -la");
+        assert!(u2.is_bash_mode);
     }
 
     // ── handle_key: routing / localized actions ────────────────────────────

@@ -33,6 +33,9 @@ use zen_ai::types::{ImageContent, Message, ThinkingLevel};
 use zen_core::harness::types::AgentEvent;
 use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop, WakeOutcome};
 use zen_tui::keybindings::KeybindingsManager;
+use zen_tui::keys::{
+    is_apple_terminal_session, native_shift_pressed, normalize_apple_terminal_enter,
+};
 use zen_tui::theme::Theme;
 
 /// Startup configuration carrier for run_interactive_mode (aligned with pi `InteractiveModeOptions` v1 subset),
@@ -316,14 +319,40 @@ impl InteractiveMode {
                     }
                 }),
             );
+            // Apple Terminal session detection: evaluated once outside the closure and cached (env query done once on demand, T-AP-11-1-fix)
+            let is_apple_terminal = is_apple_terminal_session();
             tui.run_scrollback(
                 &cancel,
                 move |event| {
-                    if let crossterm::event::Event::Key(key) = event {
-                        let mut ui = ui_on_event.borrow_mut();
-                        if let Some(cmd) = ui.handle_key(&key) {
-                            let _ = input_tx.send(cmd);
+                    match event {
+                        crossterm::event::Event::Key(key) => {
+                            // Defensive filtering: when the enhanced protocol has not enabled REPORT_EVENT_TYPES, always Press;
+                            // reject any Release leaking in (T-AP-11-1-fix design decision 1 — even if release events are
+                            // produced via other means in the future, they won't cause double-triggering).
+                            if key.kind == crossterm::event::KeyEventKind::Release {
+                                return EventOutcome::Continue;
+                            }
+                            // Apple Terminal fallback: this terminal doesn't send CSI-u, rewrite bare `\r`+Shift to
+                            // Enter+SHIFT (the editor's existing mapping then inserts a newline). Zero overhead pass-through on non-Apple sessions
+                            // (native_shift_pressed is macOS-only and is_apple_terminal is checked first here).
+                            let key = if is_apple_terminal {
+                                normalize_apple_terminal_enter(key, true, native_shift_pressed())
+                            } else {
+                                key
+                            };
+                            let mut ui = ui_on_event.borrow_mut();
+                            if let Some(cmd) = ui.handle_key(&key) {
+                                let _ = input_tx.send(cmd);
+                            }
                         }
+                        // Bracketed paste (Terminal::start already enables EnableBracketedPaste): the whole segment goes into the editor.
+                        // Before the fix, Event::Paste was silently dropped (T-AP-11-1-fix design decision 2).
+                        crossterm::event::Event::Paste(text) => {
+                            let mut ui = ui_on_event.borrow_mut();
+                            ui.handle_paste(&text);
+                        }
+                        // Other events (Resize is handled inside run_loop, Focus etc. are ignored)
+                        _ => {}
                     }
                     EventOutcome::Continue
                 },

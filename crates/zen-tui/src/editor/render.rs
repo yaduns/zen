@@ -8,11 +8,12 @@ impl Editor {
     /// Render the editor into the screen buffer at (x,y), with width width and height height. Design:
     /// Effective padding is clamped by available width (`min(padding_x, (width-1)/2)`, aligned with pi) → layout width
     /// When wrapping at the outer margin with no padding, reserve 1 column for the line-end cursor (aligned with pi layoutWidth calculation, deducted only once) →
-    /// Line layout → scroll clamping (visible_rows = clamp(max(5, 30%·height), 1, height-2), aligned with pi)
-    /// 30% of terminal height; upper bound h-2 prevents text from covering the top/bottom borders) → write to the buffer line by line: top/bottom borders
-    /// (includes `─── ↑N more` / `─── ↓N more` scroll indicators; padding width is calculated from display width), text lines,
+    /// Line layout → scroll clamping (visible rows = **budget height − 2 borders** `(h-2).max(1)`; the budget is provided by the caller
+    /// [`Editor::needed_height`] capped according to terminal row count, aligned with pi `slice(scrollOffset,
+    /// maxVisibleLines)` displays all budgeted rows; content exceeding the budget scrolls naturally, with `↑N more`/`↓N more` indicators
+    /// driven by scroll offset and remaining row count) → write to buffer line by line: top/bottom borders, text rows,
     /// Cursor inverse (`Style.attributes=[Reverse]` block: if the cursor is on a grapheme, that grapheme is inverted; at line end, a space is inverted).
-    /// Consumer: T-AP-11-1 (called once inside the draw callback).
+    /// Consumers: T-AP-11-1 (called once inside the draw callback), T-AP-11-1-fix (the two render paths in ui.rs).
     pub fn render(
         &mut self,
         buf: &mut crate::screen::ScreenBuffer,
@@ -46,8 +47,11 @@ impl Editor {
         let layout = self.layout_text(layout_width);
         let total_lines = layout.len();
 
-        // ── Visible rows: max(5, 30%·height), clamped to [1, h-2] to prevent border overlap (aligned with pi maxVisibleLines)──
-        let visible_rows = std::cmp::max(5, h * 30 / 100).clamp(1, h - 2);
+        // ── Visible rows: budget height − 2 borders (the budget has already been capped by the caller's needed_height according to terminal row count
+        //    constraint; P0-A: no longer truncated to 30% of editor height — old formula max(5, h*30/100).clamp(1,h-2)
+        //    became disconnected from cap when budget > 7 (a 9-row budget drew only 5 rows + incorrectly showed ↓N more), aligned with pi
+        //    slice(scrollOffset, maxVisibleLines) shows full budget-line semantics) ──
+        let visible_rows = (h - 2).max(1);
 
         // ── 2. Scroll clamping: ensure the visual line containing the cursor is in the visible area, then clamp to bottom alignment (aligned with pi maxScrollOffset) ──
         let cursor_vis = layout.iter().position(|l| l.has_cursor).unwrap_or(0);
@@ -157,10 +161,9 @@ impl Editor {
 
         let layout = self.layout_text(self.last_width);
 
-        // Visible rows (same formula as render: max(5, 30%·height) clamped to [1, h-2]),
+        // visible line count (same formula as render: budget height − 2 borders),
         // Fallback clamp for the row coordinate while scroll_offset has not yet been clamped by the next render
-        let visible = std::cmp::max(5, self.last_height * 30 / 100)
-            .clamp(1, self.last_height.saturating_sub(2).max(1));
+        let visible = (self.last_height.saturating_sub(2)).max(1);
 
         // Find the visual row containing the caret
         for (vis_idx, line) in layout.iter().enumerate() {
@@ -176,6 +179,28 @@ impl Editor {
 
         // Fallback (normally unreachable: an empty editor still produces a layout row with a caret; kept defensively)
         (self.last_effective_padding as u16, 1)
+    }
+
+    /// Compute the total height needed for rendering from the current text and wrapping rules (2 border rows + content rows), for the UI layer
+    /// Budget the editor area height. Strictly consistent with [`Editor::render`]: same layout_width
+    /// derivation (padding clamped to `(w-1)/2`, 1 column reserved for the cursor when no padding) → `layout_text`
+    /// line count → `clamp(lines, 1, cap) + 2`, where `cap = max(5, terminal_rows*30/100)`
+    /// (aligned with pi `maxVisibleLines = max(5, floor(rows*0.3))`, 30% with a floor of 5).
+    /// Empty editor (layout is always 1 cursor row) returns 3.
+    /// Constraint: callers must pass the same width as `render` (same frame, same width), otherwise the wrapped line count is off.
+    /// Consumers: T-AP-11-1-fix (both render paths in ui.rs).
+    pub fn needed_height(&self, width: u16, terminal_rows: u16) -> u16 {
+        let w = width as usize;
+        // layout width derivation identical to render (padding clamped + 1 cursor column reserved when no padding)
+        let max_padding = (w.saturating_sub(1)) / 2;
+        let pad = self.padding_x.min(max_padding);
+        let content_width = (w - pad * 2).max(1);
+        let layout_width = (content_width - if pad == 0 { 1 } else { 0 }).max(1);
+
+        let lines = self.layout_text(layout_width).len();
+        // cap: terminal row count formula (aligned with pi maxVisibleLines), floor 5; u32 intermediate math to avoid overflow
+        let cap = std::cmp::max(5u16, ((terminal_rows as u32 * 30 / 100) as u16).max(5));
+        (lines as u16).clamp(1, cap) + 2
     }
 
     // Lay out text into visual rows (including line wrapping and caret attribution, aligned with pi layoutText).
@@ -293,8 +318,9 @@ mod tests {
         // Cursor is on last line
         let mut buf = ScreenBuffer::new(40, 8);
         e.render(&mut buf, 0, 0, 40, 8);
-        // visible_rows = max(5, 8*30/100) = max(5, 2) = 5, clamped to [1, 6]
-        let visible = std::cmp::max(5, 8 * 30 / 100).clamp(1, 8 - 2);
+        // visible_rows = budget height − 2 borders = 6 (post-P0-A formula, no longer truncated to 30% editor height)
+        let visible = (8 - 2).max(1);
+        assert_eq!(visible, 6);
         // Cursor line (19) should be in visible window
         let cursor_vis = e.scroll_offset; // approximate
         assert!(cursor_vis + visible >= 20 || e.scroll_offset > 0);
@@ -409,5 +435,176 @@ mod tests {
         // Cursor should be at (0, 1) for empty line
         assert_eq!(col, 0);
         assert_eq!(row, 1);
+    }
+
+    // ── needed_height ──
+
+    /// Concatenate the text of all spans in a buffer line (helper for reading border/content rows).
+    fn join_row(buf: &ScreenBuffer, row: u16) -> String {
+        buf.line_segments(row)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_needed_height_empty_is_three() {
+        let e = Editor::new(0);
+        // empty editor layout is always 1 cursor row → 2 borders + 1 content = 3
+        assert_eq!(e.needed_height(40, 24), 3);
+        assert_eq!(e.needed_height(40, 10), 3);
+    }
+
+    #[test]
+    fn test_needed_height_three_lines_is_five() {
+        let mut e = Editor::new(0);
+        e.set_text("a\nb\nc");
+        // 3 content rows → 2 borders + 3 = 5 (cap 24*30%=7 not hit)
+        assert_eq!(e.needed_height(40, 24), 5);
+    }
+
+    #[test]
+    fn test_needed_height_counts_wrapped_rows() {
+        let mut e = Editor::new(0);
+        // 26 chars at width=20 (layout_width=19) wrap into 2 visual lines
+        e.insert_text_at_cursor("abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(e.needed_height(20, 24), 4);
+        // same text in a wider buffer doesn't wrap → 1 line → 3
+        assert_eq!(e.needed_height(40, 24), 3);
+    }
+
+    #[test]
+    fn test_needed_height_caps_at_max_5_or_30pct() {
+        let mut e = Editor::new(0);
+        // rows=10 → cap = max(5, 3) = 5: 5 content rows → 7 (capped), 8 content rows still 7
+        let t5 = "a\nb\nc\nd\ne";
+        let t8 = "a\nb\nc\nd\ne\nf\ng\nh";
+        e.set_text(t5);
+        assert_eq!(
+            e.needed_height(40, 10),
+            7,
+            "With rows=10, cap=5; 5 content lines hit the top at 7"
+        );
+        e.set_text(t8);
+        assert_eq!(e.needed_height(40, 10), 7, "8 content lines are still truncated by cap=5 to 7");
+        // rows=40 → cap = max(5, 12) = 12: 7 content rows → 9 (not capped), 20 rows → 14
+        e.set_text(t5);
+        assert_eq!(e.needed_height(40, 40), 7);
+        let t7 = "a\nb\nc\nd\ne\nf\ng";
+        e.set_text(t7);
+        assert_eq!(
+            e.needed_height(40, 40),
+            9,
+            "With rows=40, cap=12; 7 content lines do not hit the top"
+        );
+        let mut t20 = String::new();
+        for i in 0..20 {
+            t20.push_str(&format!("line {i}\n"));
+        }
+        t20.pop();
+        e.set_text(&t20);
+        assert_eq!(e.needed_height(40, 40), 14, "20 content lines are truncated by cap=12 to 14");
+    }
+
+    /// P0-A core regression: rendered visible rows always equal needed_height − 2 (any rows/content combination),
+    /// the "9-row budget only draws 5 rows" disconnect no longer occurs.
+    #[test]
+    fn test_needed_height_matches_render_visible_rows() {
+        for (content_lines, rows, expected_h) in
+            [(0usize, 24u16, 3u16), (3, 24, 5), (7, 40, 9), (12, 40, 14)]
+        {
+            let mut e = Editor::new(0);
+            if content_lines > 0 {
+                let t = (0..content_lines)
+                    .map(|i| format!("row {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                e.set_text(&t);
+            }
+            let h = e.needed_height(40, rows);
+            assert_eq!(h, expected_h, "content={content_lines} rows={rows}");
+
+            let mut buf = ScreenBuffer::new(40, h);
+            e.render(&mut buf, 0, 0, 40, h);
+            // cursor on the last line and content ≤ cap → no scrolling: non-empty rows between the two borders == h-2
+            let filled = (1..h - 1)
+                .filter(|r| !buf.line_segments(*r as u16).is_empty())
+                .count();
+            assert_eq!(
+                filled as u16,
+                h - 2,
+                "content={content_lines} rows={rows}: budget {h} should fill {h}−2 content lines"
+            );
+        }
+    }
+
+    /// P0-A acceptance: 7 content rows + rows=40 → budget 9; after render all 7 rows are visible, no blanks, no ↓ indicator.
+    #[test]
+    fn test_render_shows_all_budgeted_lines() {
+        let mut e = Editor::new(0);
+        e.set_text("a\nb\nc\nd\ne\nf\ng");
+        let h = e.needed_height(40, 40);
+        assert_eq!(h, 9);
+        let mut buf = ScreenBuffer::new(40, h);
+        e.render(&mut buf, 0, 0, 40, h);
+        // content rows 1..=7 each visible (no blanks between border rows 0 and 8); the cursor line ends with a reverse-video space, compare after trim
+        let rows: Vec<String> = (1..=7)
+            .map(|r| join_row(&buf, r).trim_end().to_string())
+            .collect();
+        assert_eq!(rows, vec!["a", "b", "c", "d", "e", "f", "g"]);
+        // bottom border (row 8) has no ↓N more indicator (content within budget)
+        assert!(!join_row(&buf, 8).contains('↓'), "No ↓ indicator should appear when under budget");
+    }
+
+    /// Old fixed-height h=3 path behavior unchanged (regression guard: visible=1, matching the old clamp(5,1,1)).
+    #[test]
+    fn test_render_fixed_height_3_unchanged() {
+        let mut e = Editor::new(0);
+        e.set_text("hello\nworld");
+        let mut buf = ScreenBuffer::new(40, 3);
+        e.render(&mut buf, 0, 0, 40, 3);
+        // only 1 content row: shows the cursor line (last line in world), content above scrolls out → top border shows ↑ indicator
+        let top = join_row(&buf, 0);
+        assert!(
+            top.contains('↑'),
+            "When scroll offset >0, top border should have ↑N more; actual {top:?}"
+        );
+        let content = join_row(&buf, 1);
+        assert_eq!(content.trim_end(), "world", "At height 3, only the line containing the cursor is shown");
+        let bottom = join_row(&buf, 2);
+        assert!(bottom.starts_with('─'), "Bottom border is at line 2; actual {bottom:?}");
+    }
+
+    /// ↓N more appears only when content truly exceeds the budget (no indicator when content ≤ cap; when over cap and there is content above the cursor
+    /// up/down indicators appear per scroll offset).
+    #[test]
+    fn test_render_scroll_indicator_only_when_exceeds_budget() {
+        let mut e = Editor::new(0);
+        let mut t = String::new();
+        for i in 0..15 {
+            t.push_str(&format!("line {i}\n"));
+        }
+        t.pop(); // 15 content rows
+        e.set_text(&t);
+        // move cursor to the first line (clamped before render) so content below exceeds the visible area → ↓N more should appear
+        e.state.cursor_line = 0;
+        e.state.cursor_col = 0;
+
+        let h = e.needed_height(40, 40); // cap=12 → 14
+        assert_eq!(h, 14);
+        let mut buf = ScreenBuffer::new(40, h);
+        e.render(&mut buf, 0, 0, 40, h);
+        let bottom = join_row(&buf, 13);
+        assert!(
+            bottom.contains('↓'),
+            "15 content lines exceed cap=12; ↓N more should appear; actual {bottom:?}"
+        );
+        // within-budget scenario: 7 content rows → no ↓
+        let mut e2 = Editor::new(0);
+        e2.set_text("a\nb\nc\nd\ne\nf\ng");
+        let h2 = e2.needed_height(40, 40);
+        let mut buf2 = ScreenBuffer::new(40, h2);
+        e2.render(&mut buf2, 0, 0, 40, h2);
+        assert!(!join_row(&buf2, h2 - 1).contains('↓'));
     }
 }

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::fmt::Display;
 
 /// Normalized identity of a single keypress — wraps crossterm's KeyCode (base key, including char/function/navigation keys) and KeyModifiers bit flags (modifiers);
@@ -111,6 +111,62 @@ impl KeyId {
             KeyEventKind::Release => None,
         }
     }
+}
+
+/// Apple Terminal normalization filter (aligned with pi `normalizeAppleTerminalInput`):
+///
+/// Only when `is_apple_terminal` and the event is **unmodified Enter** (Press with no Ctrl/Alt/Shift/Super
+/// modifier) and native Shift is held, rewrite the event as `Enter+SHIFT`—the editor's existing mapping
+/// (`Shift+Enter → NewLine`) then inserts a newline; all other events are returned unchanged.
+///
+/// Pure function: `shift_pressed` is injected by the caller (see [`is_apple_terminal_session`] and
+/// [`native_shift_pressed`]), making unit testing easier. Background: Apple Terminal does not send CSI-u enhanced sequences,
+/// Shift+Enter sends only a bare `\r`; this function rewrites the padded-back Shift modifier state into the event, equivalent to pi rewriting
+/// the bare `\r` as `\x1b[13;2u`.
+/// See reference/pi-original/packages/tui/src/terminal.ts `normalizeAppleTerminalInput`.
+pub fn normalize_apple_terminal_enter(
+    key: KeyEvent,
+    is_apple_terminal: bool,
+    shift_pressed: bool,
+) -> KeyEvent {
+    if is_apple_terminal
+        && shift_pressed
+        && key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Enter
+        && key.modifiers.is_empty()
+    {
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::SHIFT,
+            kind: key.kind,
+            state: key.state,
+        }
+    } else {
+        key
+    }
+}
+
+/// Whether this is an Apple Terminal session (aligned with pi `isAppleTerminalSession`):
+/// macOS and `TERM_PROGRAM=Apple_Terminal`. Always false on non-macOS.
+/// Consumer: T-AP-11-1-fix (evaluated once outside the interactive `on_event` closure and cached).
+pub fn is_apple_terminal_session() -> bool {
+    cfg!(target_os = "macos") && std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal")
+}
+
+/// Queries the local Shift modifier pressed state. Only macOS has a real implementation (Carbon FFI, via
+/// [`crate::native_modifiers::native_shift_pressed`] queries `GetCurrentKeyModifiers`,
+/// the maskShift bit covers left/right Shift); always false on non-macOS
+/// (aligned with pi native helper load-failure fallback to false; see native-modifiers.ts).
+/// Consumer: T-AP-11-1-fix (Apple Terminal normalization filter inside interactive `on_event`).
+#[cfg(target_os = "macos")]
+pub fn native_shift_pressed() -> bool {
+    crate::native_modifiers::native_shift_pressed()
+}
+
+/// Non-macOS always-false placeholder (callers need no cfg branch).
+#[cfg(not(target_os = "macos"))]
+pub fn native_shift_pressed() -> bool {
+    false
 }
 
 /// Writes a `KeyId` back into a human-readable binding string (`"ctrl+b"`, `"alt+shift+P"`), for keybinding-hints/footer to show the current key to the user.
@@ -536,7 +592,6 @@ mod tests {
     fn test_display_plain_char() {
         assert_eq!(format!("{}", KeyId::parse("a").unwrap()), "a");
     }
-
     #[test]
     fn test_display_modifier_order_is_ctrl_alt_shift() {
         // SHIFT normalization uppercases the char, displayed as "P"
@@ -561,5 +616,81 @@ mod tests {
     #[test]
     fn test_display_ctrl_combo() {
         assert_eq!(format!("{}", KeyId::parse("ctrl+b").unwrap()), "ctrl+b");
+    }
+
+    // ── normalize_apple_terminal_enter ──
+
+    /// Bare Enter (Press, no modifiers) + Apple session + Shift held → rewrite to Enter+SHIFT
+    #[test]
+    fn test_normalize_apple_terminal_enter_rewrites_bare_enter() {
+        let bare = event(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press);
+        let out = normalize_apple_terminal_enter(bare, true, true);
+        assert_eq!(out.code, KeyCode::Enter);
+        assert_eq!(out.modifiers, KeyModifiers::SHIFT);
+        assert_eq!(out.kind, KeyEventKind::Press);
+    }
+
+    /// Bare Enter but Shift not held → pass through unchanged (preserve submit semantics)
+    #[test]
+    fn test_normalize_apple_terminal_enter_no_shift_passthrough() {
+        let bare = event(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press);
+        let out = normalize_apple_terminal_enter(bare, true, false);
+        assert_eq!(out.modifiers, KeyModifiers::NONE);
+    }
+
+    /// Non-Apple session stays unchanged even if Shift is held (no rewrite; handled by CSI-u or the editing layer)
+    #[test]
+    fn test_normalize_non_apple_passthrough() {
+        let bare = event(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press);
+        let out = normalize_apple_terminal_enter(bare, false, true);
+        assert_eq!(out.modifiers, KeyModifiers::NONE);
+    }
+
+    /// Enter with modifiers (Ctrl/Alt, etc.) is not rewritten—rewriting only compensates for the missing Shift on bare \r
+    #[test]
+    fn test_normalize_ignores_modified_enter() {
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            let k = event(KeyCode::Enter, mods, KeyEventKind::Press);
+            let out = normalize_apple_terminal_enter(k, true, true);
+            assert_eq!(out.modifiers, mods, "Modifiers {mods:?} should be preserved as-is");
+        }
+    }
+
+    /// Non-Enter keys are not rewritten
+    #[test]
+    fn test_normalize_non_enter_passthrough() {
+        let k = event(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Press);
+        let out = normalize_apple_terminal_enter(k, true, true);
+        assert_eq!(out.code, KeyCode::Char('x'));
+        assert_eq!(out.modifiers, KeyModifiers::NONE);
+    }
+
+    /// Release events are not rewritten (defensive: even if they slip in, no SHIFT variant is produced)
+    #[test]
+    fn test_normalize_ignores_release_event() {
+        let k = event(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        let out = normalize_apple_terminal_enter(k, true, true);
+        assert_eq!(out.kind, KeyEventKind::Release);
+        assert_eq!(out.modifiers, KeyModifiers::NONE);
+    }
+
+    // ── is_apple_terminal_session / native_shift_pressed (shape smoke) ──
+
+    #[test]
+    fn test_is_apple_terminal_session_returns_bool() {
+        // Environment-dependent (TERM_PROGRAM): only assert true/false shape, do not lock the value
+        let _v = is_apple_terminal_session();
+    }
+
+    #[test]
+    fn test_native_shift_pressed_returns_bool() {
+        // Always false on non-macOS; macOS queries real key state (CI has no keyboard context, so do not lock the value)
+        let v = native_shift_pressed();
+        assert!(v == true || v == false);
     }
 }

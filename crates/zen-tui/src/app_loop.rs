@@ -70,8 +70,9 @@ impl TuiLoop {
     }
 
     /// Enter raw mode and hide the cursor (Terminal::start), request first-frame render.
-    /// Idempotent; repeated calls have no side effects. Bracketed paste / keyboard protocol enhancements (EnableBracketedPaste / KeyboardEnhancementFlags)
-    /// Whether to enable it in this method: see "Open Issues".
+    /// Idempotent; repeated calls have no side effects. Bracketed paste/keyboard enhancement protocols (EnableBracketedPaste /
+    /// PushKeyboardEnhancementFlags) are already enabled along with raw mode in [`Terminal::start`],
+    /// and symmetrically disabled in [`Terminal::stop`] (T-AP-11-1-fix closed the loop; the former "open issue" is resolved).
     pub fn start(&mut self) -> Result<(), TuiError> {
         if self.started {
             return Ok(());

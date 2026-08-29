@@ -94,6 +94,13 @@ impl ScrollbackCanvas {
         self.width
     }
 
+    /// Canvas row height (terminal rows; `set_size` syncs with the terminal each frame).
+    /// Consumer: T-AP-11-1-fix (`render_scrollback`'s editor cap calculation needs terminal rows,
+    /// previously only had a `width()` accessor).
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
     /// Size sync: returns whether a change occurred. On change, clears the previous frame's diff and viewport state so the next
     /// flush performs a full redraw (aligns with pi's `widthChanged`/`heightChanged → fullRender`).
     pub(crate) fn set_size(&mut self, width: u16, height: u16) -> bool {

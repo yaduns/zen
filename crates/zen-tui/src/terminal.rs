@@ -1,8 +1,19 @@
-/// Thin stateful adapter over crossterm terminal primitives; the screen manager's external output sink. Holds thin state such as "whether raw mode is currently enabled" and "whether the cursor is currently hidden", and provides command methods like start/stop (enter/exit raw mode, hide/show cursor), write, size, cursor movement, and clear screen. Does not handle any input or keyboard protocol processing.
+/// A thin stateful adapter over crossterm terminal primitives, serving as the screen manager's external output sink. Tracks whether raw mode is currently enabled,
+/// whether the cursor is currently hidden, as well as keyboard protocol state (keyboard enhancement flag / bracketed paste), and provides start/stop
+/// (Entering/exiting raw mode, hiding/showing the cursor, enabling/disabling keyboard enhancements and bracketed paste), write, size, cursor movement, clearing the screen, etc.
+/// Command methods.
+///
+/// Protocol enablement location (consumer: T-AP-11-1-fix): crossterm is enabled in `start()` together with raw mode.
+/// Keyboard enhancements (`PushKeyboardEnhancementFlags`, Kitty CSI-u) and bracketed paste (`EnableBracketedPaste`),
+/// `stop()` symmetrically disables them—unsupported terminals ignore enhancement sequences with no side effects (blind push; no query-first negotiation with pi;
+/// The modifyOtherKeys fallback is not implemented in v1; see tasks/T-AP-11-1-fix-implemented.md.
 pub(crate) struct Terminal {
     out: std::io::Stdout,  // target for writing crossterm commands (tail of queue!/execute!)
-    raw_mode_active: bool, // Record raw mode state between start/stop so stop can restore idempotently; whether a field is needed is decided at implementation time
+    raw_mode_active: bool, // Record raw mode state across start/stop for idempotent restoration by stop
     cursor_hidden: bool,   // record cursor visibility state to avoid sending Hide/Show repeatedly
+    // Keyboard protocol pairing flag (idempotent: do not resend commands when already enabled/disabled; mirrors raw_mode_active)
+    keyboard_enhancement_active: bool,
+    bracketed_paste_active: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -26,10 +37,19 @@ impl Terminal {
             out: std::io::stdout(), // Get the standard output handle
             raw_mode_active: false,
             cursor_hidden: false,
+            keyboard_enhancement_active: false,
+            bracketed_paste_active: false,
         })
     }
 
-    /// Enter raw mode and hide the cursor to prepare for TUI drawing. Idempotent (succeeds directly if already enabled).
+    /// Enter raw mode and hide the cursor, while enabling keyboard enhancements and bracketed paste (to support Shift+Enter's CSI-u
+    /// events and allow `Event::Paste` to arrive), preparing for TUI rendering. Idempotent (succeeds immediately if already enabled).
+    ///
+    /// Keyboard enhancement flags = DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS (**do not enable
+    /// REPORT_EVENT_TYPES to avoid double-triggering Release events—zen's event chain has no kind filtering layer,
+    /// See design decision 1 in tasks/T-AP-11-1-fix-implemented.md).
+    /// See [`Terminal::stop`] for paired deactivation; start/stop round trips (e.g., external editor suspend/resume in T-AP-11-4)
+    /// Naturally reentrant: protocol commands are resent via start() during restoration.
     pub fn start(&mut self) -> Result<(), TerminalError> {
         if !self.raw_mode_active {
             crossterm::terminal::enable_raw_mode().map_err(|e| TerminalError::RawMode {
@@ -44,16 +64,51 @@ impl Terminal {
             self.cursor_hidden = true;
         }
 
+        // Keyboard enhancement (Kitty CSI-u: Shift+Enter/modifier-modified function keys are distinguishable). Idempotent pairing.
+        if !self.keyboard_enhancement_active {
+            use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+            crossterm::execute!(
+                self.out,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                )
+            )
+            .map_err(TerminalError::Io)?;
+            self.keyboard_enhancement_active = true;
+        }
+
+        // Bracketed paste: the terminal wraps pasted content in \x1b[200~…\x1b[201~, which crossterm parses as Event::Paste.
+        if !self.bracketed_paste_active {
+            crossterm::execute!(self.out, crossterm::event::EnableBracketedPaste)
+                .map_err(TerminalError::Io)?;
+            self.bracketed_paste_active = true;
+        }
+
         self.clear_screen()?;
 
         Ok(())
     }
 
     /// Exit raw mode, restore the cursor, and flush to restore terminal state. Idempotent.
+    /// Disable order: restore cursor → disable bracketed paste → disable keyboard enhancement → raw mode (escape sequences are ANSI output,
+    /// Sent before disable_raw_mode to ensure the terminal receives them; after exit, no flag/paste residue leaks to the shell).
     pub fn stop(&mut self) -> Result<(), TerminalError> {
         if self.cursor_hidden {
             crossterm::execute!(self.out, crossterm::cursor::Show).map_err(TerminalError::Io)?;
             self.cursor_hidden = false;
+        }
+
+        if self.bracketed_paste_active {
+            crossterm::execute!(self.out, crossterm::event::DisableBracketedPaste)
+                .map_err(TerminalError::Io)?;
+            self.bracketed_paste_active = false;
+        }
+
+        if self.keyboard_enhancement_active {
+            crossterm::execute!(self.out, crossterm::event::PopKeyboardEnhancementFlags)
+                .map_err(TerminalError::Io)?;
+            self.keyboard_enhancement_active = false;
         }
 
         if self.raw_mode_active {
@@ -291,6 +346,37 @@ mod tests {
                 // Without tty: enable_raw_mode fails, flag not set
                 assert!(!t.raw_mode_active);
                 assert!(!t.cursor_hidden);
+            }
+            Err(e) => panic!("unexpected error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_start_stop_enables_and_disables_protocols() {
+        // Keyboard enhancement + bracketed paste: start sets flags, stop clears them, with idempotent round trips (mirrors raw mode).
+        // In a non-tty environment, start fails when enabling raw mode, so the protocol flags are not set.
+        let mut t = Terminal::new().unwrap();
+        match t.start() {
+            Ok(()) => {
+                assert!(t.keyboard_enhancement_active);
+                assert!(t.bracketed_paste_active);
+                // Idempotent: calling start again does not resend protocol commands (flags remain set)
+                t.start().unwrap();
+                assert!(t.keyboard_enhancement_active);
+                assert!(t.bracketed_paste_active);
+                // stop symmetrically disables the features and clears the flags
+                t.stop().unwrap();
+                assert!(!t.keyboard_enhancement_active);
+                assert!(!t.bracketed_paste_active);
+                // Idempotent: calling stop again has no side effects
+                t.stop().unwrap();
+                assert!(!t.keyboard_enhancement_active);
+            }
+            Err(TerminalError::RawMode {
+                action: "enter", ..
+            }) => {
+                assert!(!t.keyboard_enhancement_active);
+                assert!(!t.bracketed_paste_active);
             }
             Err(e) => panic!("unexpected error: {:?}", e),
         }
