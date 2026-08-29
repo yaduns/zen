@@ -725,6 +725,7 @@ fn map_finish_reason(reason: &str) -> StopReason {
 /// Difference from `AssistantMessageEvent`:
 /// - `StreamEvent` is the accumulator's input, with fine granularity (content/json/thinking per block increment)
 /// - `AssistantMessageEvent` is the output for external callers, containing the `partial` snapshot
+#[derive(Clone)]
 enum StreamEvent {
     /// A new content block begins. `block_type` is `"text"` / `"tool_use"` / `"thinking"`.
     ContentBlockStart {
@@ -755,25 +756,32 @@ enum StreamEvent {
 /// Modeled after cersei's `StreamAccumulator` design (`crates/cersei-provider/src/stream.rs`).
 ///
 /// Core principles:
-/// - `content_blocks` stores only finalized blocks (written at `ContentBlockStop`)
-/// - The `partial_*` maps store only incomplete data, indexed by content index
-/// - `process_event()` is a pure accumulation operation and returns no event
-/// - `into_response()` consumes self and returns the final `AssistantMessage`
+/// - `content_blocks` stores only finalized complete blocks (written in ascending internal index order on `ContentBlockStop`)
+/// - `partial_*` maps store only incomplete data, indexed by **internal block index** (unified allocator, eliminating the text/tool index 0 conflict)
+/// - `process_event()` is a pure accumulating operation and returns no events; boundary event pushes are handled by `handle_events`
 #[derive(Default)]
 struct StreamAccumulator {
-    /// Final output content blocks (only blocks after finalize are here)
+    /// Final output content blocks (only finalized blocks are here). finalize appends in ascending internal index order, preserving array order
     content_blocks: Vec<ContentBlock>,
-    /// Incomplete text indexed by content index
+    /// Next available internal block index (monotonically increasing; the internal index is the content array position)
+    next_block_seq: usize,
+    /// Internal index of the text block (API `content` stream), lazily allocated on the first text delta
+    content_seq: Option<usize>,
+    /// Internal index of thinking block (API `reasoning_content` stream), lazily assigned on first thinking delta
+    thinking_seq: Option<usize>,
+    /// API tool index → internal index (each multi-tool call gets its own independent seq, not conflicting with text/thinking)
+    tool_seqs: HashMap<usize, usize>,
+    /// Incomplete text indexed by internal index
     partial_text: HashMap<usize, String>,
-    /// Incomplete thinking content indexed by content index
+    /// Incomplete thinking content indexed by internal index
     partial_thinking: HashMap<usize, String>,
-    /// Incomplete tool call argument JSON fragments indexed by content index
+    /// Incomplete tool call argument JSON fragments indexed by internal index
     partial_json: HashMap<usize, String>,
-    /// Block type (text/thinking/tool_use) indexed by content index
+    /// Block type (text/thinking/tool_use) indexed by internal index
     block_types: HashMap<usize, String>,
-    /// Tool call IDs indexed by content index
+    /// Tool call IDs indexed by internal index
     tool_use_ids: HashMap<usize, String>,
-    /// Tool names indexed by content index
+    /// Tool names indexed by internal index
     tool_use_names: HashMap<usize, String>,
     /// Stop reason (set by `MessageDelta` events)
     stop_reason: Option<StopReason>,
@@ -784,8 +792,58 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// Allocate the next internal block index.
+    fn alloc_seq(&mut self) -> usize {
+        let seq = self.next_block_seq;
+        self.next_block_seq += 1;
+        seq
+    }
+
+    /// Resolve the internal index for the text stream (lazily allocated).
+    fn resolve_content(&mut self) -> usize {
+        if let Some(seq) = self.content_seq {
+            seq
+        } else {
+            let seq = self.alloc_seq();
+            self.content_seq = Some(seq);
+            seq
+        }
+    }
+
+    /// Resolve the internal index of the thinking stream (allocated lazily).
+    fn resolve_thinking(&mut self) -> usize {
+        if let Some(seq) = self.thinking_seq {
+            seq
+        } else {
+            let seq = self.alloc_seq();
+            self.thinking_seq = Some(seq);
+            seq
+        }
+    }
+
+    /// Map an API tool index to an internal index (allocated on first appearance).
+    fn resolve_tool(&mut self, api_index: usize) -> usize {
+        if let Some(seq) = self.tool_seqs.get(&api_index) {
+            *seq
+        } else {
+            let seq = self.alloc_seq();
+            self.tool_seqs.insert(api_index, seq);
+            seq
+        }
+    }
+
+    /// Internal index of the text block (None when no text delta occurred).
+    fn content_seq_value(&self) -> Option<usize> {
+        self.content_seq
+    }
+
+    /// Internal index of the thinking block (None when no thinking delta occurred).
+    fn thinking_seq_value(&self) -> Option<usize> {
+        self.thinking_seq
+    }
+
     /// Consumes a `StreamEvent` and updates the accumulator's internal state.
-    /// Returns no events — event pushing is handled by `send()` in `sse_event_loop`.
+    /// Emits no events — event delivery is handled by `send()` in `sse_event_loop` / `handle_events`.
     fn process_event(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::ContentBlockStart {
@@ -794,36 +852,48 @@ impl StreamAccumulator {
                 id,
                 name,
             } => {
-                self.block_types.insert(index, block_type);
+                // Tool blocks register their seq at start; text/thinking start events are not sent in the real stream
+                // (blocks are built lazily); this branch is only for tests that construct events directly.
+                let seq = match block_type.as_str() {
+                    "tool_use" => self.resolve_tool(index),
+                    "text" => self.resolve_content(),
+                    "thinking" => self.resolve_thinking(),
+                    _ => self.alloc_seq(), // unknown: discard at finalize time if the type is unrecognized
+                };
+                self.block_types.insert(seq, block_type);
                 // Only update id/name if non-empty. Some providers (e.g. DeepSeek)
                 // send subsequent chunks with id="" and name="" which would
                 // overwrite the correct values from the first chunk.
                 if let Some(id) = id {
                     if !id.is_empty() {
-                        self.tool_use_ids.insert(index, id);
+                        self.tool_use_ids.insert(seq, id);
                     }
                 }
                 if let Some(name) = name {
                     if !name.is_empty() {
-                        self.tool_use_names.insert(index, name);
+                        self.tool_use_names.insert(seq, name);
                     }
                 }
             }
 
-            StreamEvent::TextDelta { index, text } => {
+            StreamEvent::TextDelta { index: _, text } => {
+                let seq = self.resolve_content();
                 // Lazily create a text block if not already started at this index.
                 // This matches Pi's ensureTextBlock() pattern: text blocks are created
                 // when text content actually arrives, not when role: "assistant" is seen.
-                // This avoids creating empty text blocks for tool-call-only responses.
                 self.block_types
-                    .entry(index)
+                    .entry(seq)
                     .or_insert_with(|| "text".to_string());
-                self.partial_text.entry(index).or_default().push_str(&text);
+                self.partial_text.entry(seq).or_default().push_str(&text);
             }
 
-            StreamEvent::ThinkingDelta { index, thinking } => {
+            StreamEvent::ThinkingDelta { index: _, thinking } => {
+                let seq = self.resolve_thinking();
+                self.block_types
+                    .entry(seq)
+                    .or_insert_with(|| "thinking".to_string());
                 self.partial_thinking
-                    .entry(index)
+                    .entry(seq)
                     .or_default()
                     .push_str(&thinking);
             }
@@ -832,45 +902,18 @@ impl StreamAccumulator {
                 index,
                 partial_json,
             } => {
+                let seq = self.resolve_tool(index);
                 self.partial_json
-                    .entry(index)
+                    .entry(seq)
                     .or_default()
                     .push_str(&partial_json);
             }
 
-            StreamEvent::ContentBlockStop { index } => {
-                let block = match self.block_types.remove(&index).as_deref() {
-                    Some("text") => {
-                        let text = self.partial_text.remove(&index).unwrap_or_default();
-                        ContentBlock::Text(TextContent {
-                            text,
-                            text_signature: None,
-                        })
-                    }
-                    Some("thinking") => {
-                        let thinking = self.partial_thinking.remove(&index).unwrap_or_default();
-                        ContentBlock::Thinking(ThinkingContent {
-                            thinking,
-                            thinking_signature: None,
-                            redacted: None,
-                        })
-                    }
-                    Some("tool_use") => {
-                        let id = self.tool_use_ids.remove(&index).unwrap_or_default();
-                        let name = self.tool_use_names.remove(&index).unwrap_or_default();
-                        let json = self.partial_json.remove(&index).unwrap_or_default();
-                        let arguments = serde_json::from_str(&json)
-                            .unwrap_or(serde_json::Value::Object(Default::default()));
-                        ContentBlock::ToolCall(ToolCall {
-                            id,
-                            name,
-                            arguments,
-                            thought_signature: None,
-                        })
-                    }
-                    _ => return,
-                };
-                self.content_blocks.push(block);
+            StreamEvent::ContentBlockStop { index: _ } => {
+                // Semantics change (T-AI-02-1-fix): current `parse_chunk` emits this event only once at finish_reason, semantics =
+                // finalize **all** active blocks (fixes the bug where multi-tool calls only finalized index 0).
+                // If mid-stream single-block completion semantics are introduced later, per-index block finalization must be restored.
+                self.finalize_all();
             }
 
             StreamEvent::MessageDelta { stop_reason, usage } => {
@@ -881,6 +924,242 @@ impl StreamAccumulator {
                 if let Some(u) = usage {
                     self.usage = u;
                 }
+            }
+        }
+    }
+
+    /// Terminal finalization: finalize all still-active blocks into `content_blocks` in ascending internal index order,
+    /// returning a list of `(internal index, complete block)` for pushing the End event. Ascending internal index equals content array order.
+    fn finalize_all(&mut self) -> Vec<(usize, ContentBlock)> {
+        let mut seqs: Vec<usize> = self.block_types.keys().copied().collect();
+        seqs.sort_unstable();
+        let mut out = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            let block_type = self.block_types.remove(&seq).unwrap_or_default();
+            let block = match block_type.as_str() {
+                "text" => {
+                    let text = self.partial_text.remove(&seq).unwrap_or_default();
+                    ContentBlock::Text(TextContent {
+                        text,
+                        text_signature: None,
+                    })
+                }
+                "thinking" => {
+                    let thinking = self.partial_thinking.remove(&seq).unwrap_or_default();
+                    ContentBlock::Thinking(ThinkingContent {
+                        thinking,
+                        thinking_signature: None,
+                        redacted: None,
+                    })
+                }
+                "tool_use" => {
+                    let id = self.tool_use_ids.remove(&seq).unwrap_or_default();
+                    let name = self.tool_use_names.remove(&seq).unwrap_or_default();
+                    let json = self.partial_json.remove(&seq).unwrap_or_default();
+                    let arguments = serde_json::from_str(&json)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    ContentBlock::ToolCall(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        thought_signature: None,
+                    })
+                }
+                _ => continue,
+            };
+            self.content_blocks.push(block.clone());
+            out.push((seq, block));
+        }
+        out
+    }
+
+    /// Build the current partial `AssistantMessage` snapshot (borrowed clone; does not consume the accumulator).
+    /// content = finalized blocks (in order) + active blocks in ascending internal index order.
+    /// Partial field used for incremental events (Text/Thinking/Toolcall Start/Delta/End).
+    fn partial_snapshot(&self, model: &Model, response_id: Option<String>) -> AssistantMessage {
+        let mut seqs: Vec<usize> = self.block_types.keys().copied().collect();
+        seqs.sort_unstable();
+        let mut content = self.content_blocks.clone();
+        for seq in seqs {
+            let block = match self.block_types.get(&seq).map(|t| t.as_str()) {
+                Some("text") => ContentBlock::Text(TextContent {
+                    text: self.partial_text.get(&seq).cloned().unwrap_or_default(),
+                    text_signature: None,
+                }),
+                Some("thinking") => ContentBlock::Thinking(ThinkingContent {
+                    thinking: self.partial_thinking.get(&seq).cloned().unwrap_or_default(),
+                    thinking_signature: None,
+                    redacted: None,
+                }),
+                Some("tool_use") => ContentBlock::ToolCall(ToolCall {
+                    id: self.tool_use_ids.get(&seq).cloned().unwrap_or_default(),
+                    name: self.tool_use_names.get(&seq).cloned().unwrap_or_default(),
+                    arguments: serde_json::from_str(
+                        self.partial_json
+                            .get(&seq)
+                            .map(|s| s.as_str())
+                            .unwrap_or("{}"),
+                    )
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                    thought_signature: None,
+                }),
+                _ => continue,
+            };
+            content.push(block);
+        }
+        AssistantMessage {
+            content,
+            api: model.api.to_string(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            response_model: None,
+            response_id,
+            usage: self.usage.clone(),
+            stop_reason: self.stop_reason.clone().unwrap_or(StopReason::Stop),
+            error_message: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+/// Process a batch of `StreamEvent`s (results of `parse_chunk` from a single SSE chunk):
+/// Push incremental `AssistantMessageEvent`s at block boundaries (lazy Start / per-block Delta / batched End),
+/// and accumulate into `accumulator`. Called per chunk by the Phase 3 loop of `sse_event_loop`.
+///
+/// Ordering convention between pushing and accumulating (aligned with pi's `stream.push` model, openai-completions.ts:228/251/282/294):
+/// - Lazily emit `TextStart`/`ThinkingStart` before the first text/thinking delta (partial includes empty block, aligned with `ensureTextBlock`);
+/// - Emit `ToolcallStart` after the tool block's `ContentBlockStart` (partial includes empty tool block);
+/// - After accumulating each Delta, emit the corresponding Delta event (partial includes the post-accumulation snapshot);
+/// - On the finish batch (`ContentBlockStop`), finalize all active blocks and emit End for each (partial includes the complete blocks).
+fn handle_events(
+    events: &[StreamEvent],
+    accumulator: &mut StreamAccumulator,
+    sender: &tokio::sync::mpsc::UnboundedSender<AssistantMessageEvent>,
+    model: &Model,
+    response_id: &Option<String>,
+) {
+    for ev in events {
+        // Lazy start: first delta of a text/thinking stream (internal index not yet assigned = block's first appearance)
+        match ev {
+            StreamEvent::TextDelta { .. } if accumulator.content_seq_value().is_none() => {
+                let seq = accumulator.resolve_content();
+                accumulator
+                    .block_types
+                    .entry(seq)
+                    .or_insert_with(|| "text".to_string());
+                let partial = accumulator.partial_snapshot(model, response_id.clone());
+                let _ = sender.send(AssistantMessageEvent::TextStart {
+                    content_index: seq as u32,
+                    partial,
+                });
+            }
+            StreamEvent::ThinkingDelta { .. } if accumulator.thinking_seq_value().is_none() => {
+                let seq = accumulator.resolve_thinking();
+                accumulator
+                    .block_types
+                    .entry(seq)
+                    .or_insert_with(|| "thinking".to_string());
+                let partial = accumulator.partial_snapshot(model, response_id.clone());
+                let _ = sender.send(AssistantMessageEvent::ThinkingStart {
+                    content_index: seq as u32,
+                    partial,
+                });
+            }
+            _ => {}
+        }
+
+        match ev {
+            StreamEvent::ContentBlockStart { index, .. } => {
+                // Only tool blocks have real start events; text/thinking start events are not emitted on the real stream (lazy),
+                // defensively avoid constructing events directly in tests without pushing ToolcallStart.
+                accumulator.process_event(ev.clone());
+                if let StreamEvent::ContentBlockStart { block_type, .. } = ev {
+                    if block_type == "tool_use" {
+                        let seq = accumulator.resolve_tool(*index);
+                        let partial = accumulator.partial_snapshot(model, response_id.clone());
+                        let _ = sender.send(AssistantMessageEvent::ToolcallStart {
+                            content_index: seq as u32,
+                            partial,
+                        });
+                    }
+                }
+            }
+            StreamEvent::TextDelta { text, .. } => {
+                accumulator.process_event(ev.clone());
+                let seq = accumulator.resolve_content();
+                let partial = accumulator.partial_snapshot(model, response_id.clone());
+                let _ = sender.send(AssistantMessageEvent::TextDelta {
+                    content_index: seq as u32,
+                    delta: text.clone(),
+                    partial,
+                });
+            }
+            StreamEvent::ThinkingDelta { thinking, .. } => {
+                accumulator.process_event(ev.clone());
+                let seq = accumulator.resolve_thinking();
+                let partial = accumulator.partial_snapshot(model, response_id.clone());
+                let _ = sender.send(AssistantMessageEvent::ThinkingDelta {
+                    content_index: seq as u32,
+                    delta: thinking.clone(),
+                    partial,
+                });
+            }
+            StreamEvent::InputJsonDelta {
+                index,
+                partial_json,
+            } => {
+                accumulator.process_event(ev.clone());
+                let seq = accumulator.resolve_tool(*index);
+                let partial = accumulator.partial_snapshot(model, response_id.clone());
+                let _ = sender.send(AssistantMessageEvent::ToolcallDelta {
+                    content_index: seq as u32,
+                    delta: partial_json.clone(),
+                    partial,
+                });
+            }
+            StreamEvent::ContentBlockStop { .. } => {
+                // Finish batch: finalize all active blocks and emit End for each (partial includes the complete blocks),
+                // Event order = ascending internal index = content array order.
+                let finalized = accumulator.finalize_all();
+                for (seq, block) in finalized {
+                    let partial = accumulator.partial_snapshot(model, response_id.clone());
+                    match block {
+                        ContentBlock::Text(t) => {
+                            let _ = sender.send(AssistantMessageEvent::TextEnd {
+                                content_index: seq as u32,
+                                content: t.text,
+                                partial,
+                            });
+                        }
+                        ContentBlock::Thinking(t) => {
+                            let _ = sender.send(AssistantMessageEvent::ThinkingEnd {
+                                content_index: seq as u32,
+                                content: t.thinking,
+                                partial,
+                            });
+                        }
+                        ContentBlock::ToolCall(tc) => {
+                            let _ = sender.send(AssistantMessageEvent::ToolcallEnd {
+                                content_index: seq as u32,
+                                tool_call: tc,
+                                partial,
+                            });
+                        }
+                        ContentBlock::Image(_) => {
+                            // No image streaming in v1, defensively ignored
+                        }
+                    }
+                }
+            }
+            StreamEvent::MessageDelta { stop_reason, usage } => {
+                // Sync metadata into the snapshot (delivered uniformly on Done), do not emit events
+                if let Some(sr) = stop_reason {
+                    accumulator.stop_reason = Some(sr.clone());
+                }
+                if let Some(u) = usage {
+                    accumulator.usage = u.clone();
+                }
+                accumulator.process_event(ev.clone());
             }
         }
     }
@@ -969,20 +1248,10 @@ async fn sse_event_loop(
                             response_id = json["id"].as_str().map(String::from);
                         }
 
-                                        // 3f. Parse chunk into StreamEvent, accumulate each one
+                        // 3f. Parse chunk into StreamEvents and push incremental events at block boundaries (Start/Delta/End)
+                        //     and accumulate into accumulator (T-AI-02-1-fix: source push for streaming typewriter effect)
                         let events = parse_chunk(&json);
-                        for ev in events {
-                            // stop_reason and usage from MessageDelta are written directly into the accumulator
-                            if let StreamEvent::MessageDelta { ref stop_reason, ref usage } = ev {
-                                if let Some(sr) = stop_reason {
-                                    accumulator.stop_reason = Some(sr.clone());
-                                }
-                                if let Some(u) = usage {
-                                    accumulator.usage = u.clone();
-                                }
-                            }
-                            accumulator.process_event(ev);
-                        }
+                        handle_events(&events, &mut accumulator, &sender, model, &response_id);
                     }
                     // 3g. SSE transport-layer error → record and exit
                     Some(Err(e)) => {
@@ -1840,5 +2109,346 @@ mod tests {
         });
         acc.process_event(StreamEvent::ContentBlockStop { index: 0 });
         assert!(acc.content_blocks.is_empty());
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  handle_events: incremental event push (T-AI-02-1-fix, chunk-level integration)
+    // ═════════════════════════════════════════════════════════════
+
+    /// Run a set of JSON chunks through `parse_chunk` + `handle_events`; return the collected incremental events and the accumulator's final state.
+    /// Enter from real chunk JSON (no manually constructed StreamEvents), covering `parse_chunk`'s path.
+    fn run_chunks(chunks: &[serde_json::Value]) -> (Vec<AssistantMessageEvent>, StreamAccumulator) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AssistantMessageEvent>();
+        let mut acc = StreamAccumulator::default();
+        let model = sample_model();
+        let mut rid: Option<String> = None;
+        for c in chunks {
+            let events = parse_chunk(c);
+            handle_events(&events, &mut acc, &tx, &model, &rid);
+        }
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            got.push(ev);
+        }
+        (got, acc)
+    }
+
+    fn chunk_content(text: &str) -> serde_json::Value {
+        serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]})
+    }
+
+    fn chunk_thinking(text: &str) -> serde_json::Value {
+        serde_json::json!({"choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]})
+    }
+
+    fn chunk_finish() -> serde_json::Value {
+        serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    }
+
+    fn chunk_tool_start(index: u64, id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": null}]})
+    }
+
+    fn chunk_tool_args(index: u64, args: &str) -> serde_json::Value {
+        serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "function": {"arguments": args}}]}, "finish_reason": null}]})
+    }
+
+    #[test]
+    fn test_stream_text_incremental_and_consistent() {
+        // Plain text stream: lazy TextStart → TextDelta* → TextEnd at finish; final state matches manual calculation
+        let (evs, acc) = run_chunks(&[
+            chunk_content("Hello"),
+            chunk_content(" world"),
+            chunk_finish(),
+        ]);
+        assert_eq!(evs.len(), 4, "TextStart + 2×delta + TextEnd");
+        assert!(matches!(
+            evs[0],
+            AssistantMessageEvent::TextStart {
+                content_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &evs[1],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "Hello"
+        ));
+        assert!(matches!(
+            &evs[2],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == " world"
+        ));
+        match &evs[3] {
+            AssistantMessageEvent::TextEnd {
+                content_index: 0,
+                content,
+                ..
+            } => {
+                assert_eq!(content, "Hello world");
+            }
+            _ => panic!("expected TextEnd"),
+        }
+        // Final state: 1 text block, complete content, stop_reason settled
+        assert_eq!(acc.content_blocks.len(), 1);
+        match &acc.content_blocks[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Hello world"),
+            _ => panic!("expected Text block"),
+        }
+        assert_eq!(acc.stop_reason, Some(StopReason::Stop));
+        assert!(acc.has_finish_reason);
+    }
+
+    #[test]
+    fn test_stream_thinking_then_text_order() {
+        // Mixed thinking + text: block order = first-appearance order (thinking first), final state has both blocks in the correct order
+        let (evs, acc) = run_chunks(&[
+            chunk_thinking("step 1"),
+            chunk_thinking(" step 2"),
+            chunk_content("Answer"),
+            chunk_finish(),
+        ]);
+        // Event sequence: ThinkingStart, ThinkingDelta, ThinkingDelta, TextStart, TextDelta, ThinkingEnd, TextEnd
+        assert!(matches!(
+            evs[0],
+            AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &evs[1],
+            AssistantMessageEvent::ThinkingDelta { delta, .. } if delta == "step 1"
+        ));
+        assert!(matches!(
+            evs[3],
+            AssistantMessageEvent::TextStart {
+                content_index: 1,
+                ..
+            }
+        ));
+        // End events in ascending internal index order: thinking(0) before text(1)
+        assert!(matches!(
+            evs[5],
+            AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            evs[6],
+            AssistantMessageEvent::TextEnd {
+                content_index: 1,
+                ..
+            }
+        ));
+        // Final state: two blocks, thinking first
+        assert_eq!(acc.content_blocks.len(), 2);
+        match (&acc.content_blocks[0], &acc.content_blocks[1]) {
+            (ContentBlock::Thinking(t), ContentBlock::Text(x)) => {
+                assert_eq!(t.thinking, "step 1 step 2");
+                assert_eq!(x.text, "Answer");
+            }
+            _ => panic!("expected [Thinking, Text]"),
+        }
+    }
+
+    #[test]
+    fn test_stream_multi_tool_all_finalized() {
+        // Multi-tool call index 0/1/2: all finalize, three ToolcallEnd, final state contains 3 complete ToolCalls
+        let (evs, acc) = run_chunks(&[
+            chunk_tool_start(0, "call_1", "bash"),
+            chunk_tool_start(1, "call_2", "read"),
+            chunk_tool_start(2, "call_3", "write"),
+            chunk_tool_args(0, "{\"command\": "),
+            chunk_tool_args(0, "\"ls\"}"),
+            chunk_tool_args(1, "{\"path\": "),
+            chunk_tool_args(1, "\"/a\"}"),
+            chunk_tool_args(2, "{\"path\": \"/b\", "),
+            chunk_tool_args(2, "\"content\": \"x\"}"),
+            chunk_finish(),
+        ]);
+        let starts = evs
+            .iter()
+            .filter(|e| matches!(e, AssistantMessageEvent::ToolcallStart { .. }))
+            .count();
+        let deltas = evs
+            .iter()
+            .filter(|e| matches!(e, AssistantMessageEvent::ToolcallDelta { .. }))
+            .count();
+        let ends = evs
+            .iter()
+            .filter(|e| matches!(e, AssistantMessageEvent::ToolcallEnd { .. }))
+            .count();
+        assert_eq!(starts, 3, "One ToolcallStart for each of the three tools");
+        assert_eq!(deltas, 6, "One ToolcallDelta for each of 6 argument increments");
+        assert_eq!(ends, 3, "All three tools ToolcallEnd (defect 6 regression)");
+        assert_eq!(
+            acc.content_blocks.len(),
+            3,
+            "All multi-tool final states settled (defect 6 regression)"
+        );
+        let ids: Vec<&str> = acc
+            .content_blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::ToolCall(tc) => tc.id.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(ids, vec!["call_1", "call_2", "call_3"]);
+        // Full parameters for each tool
+        let tc2 = match &acc.content_blocks[1] {
+            ContentBlock::ToolCall(tc) => tc,
+            _ => panic!(),
+        };
+        assert_eq!(tc2.name, "read");
+        assert_eq!(tc2.arguments, serde_json::json!({"path": "/a"}));
+        let tc3 = match &acc.content_blocks[2] {
+            ContentBlock::ToolCall(tc) => tc,
+            _ => panic!(),
+        };
+        assert_eq!(
+            tc3.arguments,
+            serde_json::json!({"path": "/b", "content": "x"})
+        );
+    }
+
+    #[test]
+    fn test_stream_text_tool_mixed_keeps_text() {
+        // text and tool_use mixed in the same stream: text not lost, two blocks in correct order (defect 5 regression: index 0 conflict)
+        let (evs, acc) = run_chunks(&[
+            chunk_content("Here "),
+            chunk_tool_start(0, "call_1", "bash"),
+            chunk_tool_args(0, "{\"a\": "),
+            chunk_content("is result"),
+            chunk_tool_args(0, "1}"),
+            chunk_finish(),
+        ]);
+        // Event sequence: TextStart, TextDelta, ToolcallStart, ToolcallDelta, TextDelta, ToolcallDelta, TextEnd, ToolcallEnd
+        assert!(matches!(
+            evs[0],
+            AssistantMessageEvent::TextStart {
+                content_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &evs[1],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "Here "
+        ));
+        assert!(matches!(
+            evs[2],
+            AssistantMessageEvent::ToolcallStart {
+                content_index: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &evs[4],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "is result"
+        ));
+        assert!(matches!(
+            evs[6],
+            AssistantMessageEvent::TextEnd {
+                content_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            evs[7],
+            AssistantMessageEvent::ToolcallEnd {
+                content_index: 1,
+                ..
+            }
+        ));
+        // Final state: text not lost, Text first, ToolCall after (internal indices 0/1)
+        assert_eq!(
+            acc.content_blocks.len(),
+            2,
+            "One block each for text and tool (defect 5 regression)"
+        );
+        match (&acc.content_blocks[0], &acc.content_blocks[1]) {
+            (ContentBlock::Text(t), ContentBlock::ToolCall(tc)) => {
+                assert_eq!(t.text, "Here is result");
+                assert_eq!(tc.id, "call_1");
+                assert_eq!(tc.arguments, serde_json::json!({"a": 1}));
+            }
+            _ => panic!("expected [Text, ToolCall]"),
+        }
+    }
+
+    #[test]
+    fn test_stream_delta_count_matches() {
+        // Event count ≈ number of deltas in chunk (regression guard against silently swallowed events)
+        let (evs, _acc) = run_chunks(&[
+            chunk_thinking("t1"),
+            chunk_content("c1"),
+            chunk_tool_start(0, "call_1", "bash"),
+            chunk_tool_args(0, "{}"),
+            chunk_finish(),
+        ]);
+        let delta_events = evs
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AssistantMessageEvent::TextDelta { .. }
+                        | AssistantMessageEvent::ThinkingDelta { .. }
+                        | AssistantMessageEvent::ToolcallDelta { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            delta_events, 3,
+            "1 thinking + 1 text + 1 tool args = 3 deltas"
+        );
+        assert_eq!(evs.len(), 9, "Start×3 + Delta×3 + End×3");
+    }
+
+    #[test]
+    fn test_stream_partial_text_monotonic() {
+        // Each Delta's partial text accumulates monotonically with no rollback
+        let (evs, _acc) = run_chunks(&[chunk_content("a"), chunk_content("b"), chunk_content("c")]);
+        let texts: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                AssistantMessageEvent::TextDelta { partial, .. } => Some(partial_text(partial)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["a", "ab", "abc"]);
+    }
+
+    #[test]
+    fn test_stream_abort_keeps_pushed_partial() {
+        // Stream not finalized (simulated abort): already-pushed events and partial remain visible, no End, no Done
+        let (evs, acc) = run_chunks(&[chunk_content("Hello"), chunk_content(" world")]);
+        assert_eq!(evs.len(), 3, "TextStart + 2×delta, no End/Done");
+        assert!(!evs
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::TextEnd { .. })));
+        // Accumulator still holds active blocks; a partial snapshot can be built at any time (partial already seen in the UI before abort is preserved)
+        assert!(
+            acc.content_blocks.is_empty(),
+            "Not finalized; content_blocks empty"
+        );
+        let model = sample_model();
+        let snap = acc.partial_snapshot(&model, None);
+        assert_eq!(snap.content.len(), 1);
+        match &snap.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Hello world"),
+            _ => panic!("expected Text block in partial"),
+        }
+    }
+
+    /// Extract the text block content from the partial message (test helper).
+    fn partial_text(msg: &AssistantMessage) -> String {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 }
