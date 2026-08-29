@@ -817,7 +817,9 @@ fn default_settings() -> SettingsConfig {
         quiet_startup: false,
         double_escape_action: DoubleEscapeAction::Fork,
         tree_filter_mode: FilterMode::Default,
-        thinking_level: ThinkingLevel::Medium,
+        // thinking defaults to Off repo-wide (aligned with pi session default; settings only holds the panel's current value,
+        // runtime authority is in AgentState—see T-AP-02-3 notes).
+        thinking_level: ThinkingLevel::Off,
         available_thinking_levels: vec![
             ThinkingLevel::Off,
             ThinkingLevel::Low,

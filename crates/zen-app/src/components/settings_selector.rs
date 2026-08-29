@@ -649,7 +649,7 @@ mod tests {
             quiet_startup: false,
             double_escape_action: DoubleEscapeAction::Fork,
             tree_filter_mode: FilterMode::Default,
-            thinking_level: ThinkingLevel::Medium,
+            thinking_level: ThinkingLevel::Off,
             available_thinking_levels: vec![
                 ThinkingLevel::Off,
                 ThinkingLevel::Low,
@@ -775,9 +775,9 @@ mod tests {
         }
         let enter = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter);
         assert!(comp.handle_key(&enter));
-        // Submenu open: current Medium (last item) → Up to Low (index 1), then Enter
+        // submenu open: currently Off (first item) → Down to Low (index 1) then Enter
         assert!(comp.handle_key(&crossterm::event::KeyEvent::from(
-            crossterm::event::KeyCode::Up
+            crossterm::event::KeyCode::Down
         )));
         assert!(comp.handle_key(&enter));
         assert_eq!(*level.borrow(), Some(ThinkingLevel::Low));
