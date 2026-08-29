@@ -1,3 +1,4 @@
+use crate::provider::{thinking_format_for_provider, ThinkingFormat};
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, StreamFn, TextContent,
@@ -81,6 +82,17 @@ struct Request {
     /// DeepSeek thinking mode strength (API string value, converted from ThinkingLevel)
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning_effort")]
     reasoning_effort: Option<String>,
+    /// DeepSeek-family endpoint thinking toggle (`thinking: {type: "enabled"/"disabled"}`), per provider thinking
+    /// Format-family extra (aligns with pi compat.thinkingFormat "deepseek" branch, openai-completions.ts:664-673);
+    /// Not sent in openai format (opencode-go).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingParam>,
+}
+
+/// Internal structure of the `thinking` toggle parameter (DeepSeek-family endpoints): `{type: "enabled"}` or `{type: "disabled"}`.
+#[derive(Debug, Clone, Serialize)]
+struct ThinkingParam {
+    r#type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,6 +243,12 @@ struct ChunkDelta {
     /// DeepSeek reasoning delta content (the `reasoning_content` field).
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Fallback thinking field (opencode-go endpoints actually return `reasoning`, a non-standard name).
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// Fallback reasoning field (some compatible endpoints return `reasoning_text`).
+    #[serde(default)]
+    reasoning_text: Option<String>,
     /// List of tool call deltas.
     #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCallDelta>>,
@@ -479,6 +497,21 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
         }
     });
 
+    let reasoning_effort = cfg.reasoning_effort.and_then(thinking_level_to_api_value);
+    // Append thinking toggle per provider thinking format family: DeepSeek-family (huoshan)
+    // On → {type:"enabled"}, Off → {type:"disabled"} (avoids "can't turn Off a session that was enabled",
+    // aligns with the pi deepseek branch; openai-format providers like opencode-go don't send it).
+    let thinking = match thinking_format_for_provider(&model.provider) {
+        ThinkingFormat::DeepSeek => Some(ThinkingParam {
+            r#type: if reasoning_effort.is_some() {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            },
+        }),
+        ThinkingFormat::OpenAi => None,
+    };
+
     let req = Request {
         model: model.id.clone(),
         messages,
@@ -492,7 +525,8 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
         temperature: cfg.temperature,
         top_p: None,
         stop: None,
-        reasoning_effort: cfg.reasoning_effort.and_then(thinking_level_to_api_value),
+        reasoning_effort,
+        thinking,
     };
 
     req
@@ -596,15 +630,17 @@ fn convert_content_block(block: &crate::types::ContentBlock) -> Option<ContentPa
     }
 }
 
-// Parse a single SSE chunk's JSON into a `StreamEvent` domain event.
+/// Parse a single SSE chunk's JSON and convert it to a `StreamEvent` domain event.
 ///
-/// Convert OpenAI's chunk format (`choices[0].delta.{content,reasoning_content,tool_calls}`)
+/// Convert OpenAI's chunk format (`choices[0].delta.{content,reasoning_content,reasoning,reasoning_text,tool_calls}`)
 /// Mapped into the `StreamEvent` enum for `StreamAccumulator` to consume.
+/// `provider` is passed in for thinking signature normalization special-casing (opencode-go maps `reasoning` hit to the canonical name
+/// `reasoning_content`, aligned with pi openai-completions.ts:412-416).
 ///
 /// Handles:
 /// - First chunk (`choices[0].delta.role === "assistant"`) → `ContentBlockStart { block_type: "text" }`
 /// - Regular chunk (`delta.content` non-empty) → `TextDelta`
-/// - DeepSeek thinking chunk (`delta.reasoning_content` non-empty) → `ThinkingDelta`
+/// - thinking chunk (first non-empty of `delta.reasoning_content` / `reasoning` / `reasoning_text`) → `ThinkingDelta`
 /// - First tool call chunk (`delta.tool_calls[0].id` non-empty) → `ContentBlockStart { block_type: "tool_use" }` + `InputJsonDelta`
 /// - Tool call incremental chunk (`delta.tool_calls[0].function.arguments` non-empty) → `InputJsonDelta`
 /// - Final chunk (`choices[0].finish_reason` non-empty) → `ContentBlockStop` + `MessageDelta`
@@ -614,7 +650,7 @@ fn convert_content_block(block: &crate::types::ContentBlock) -> Option<ContentPa
 ///
 /// Combined with Pi's internal functions such as `ensureTextBlock` / `ensureThinkingBlock` / `finishBlock`
 /// chunk parsing logic.
-fn parse_chunk(chunk: &serde_json::Value) -> Vec<StreamEvent> {
+fn parse_chunk(chunk: &serde_json::Value, provider: &str) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
     // usage → message metadata (final chunk only, may exist independently of choices)
@@ -651,14 +687,27 @@ fn parse_chunk(chunk: &serde_json::Value) -> Vec<StreamEvent> {
         });
     }
 
-    // Thinking delta (DeepSeek)
-    if let Some(t) = delta["reasoning_content"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-    {
+    // Thinking delta: try reasoning_content / reasoning / reasoning_text in order, take the first non-empty field
+    // (aligned with pi openai-completions.ts:394-407; opencode-go endpoints actually return delta.reasoning,
+    // not reading it silently drops thinking deltas — defect A of T-thinking-invisible-fix).
+    const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
+    let thinking_field = REASONING_FIELDS
+        .iter()
+        .copied()
+        .find(|f| delta[*f].as_str().is_some_and(|s| !s.is_empty()));
+    if let Some(field) = thinking_field {
+        let thinking = delta[field].as_str().unwrap_or_default().to_string();
+        // Same signature normalization as pi: opencode-go maps reasoning hit to canonical name reasoning_content
+        // (openai-completions.ts:412-416; when writing back to history at the end, the endpoint expects the canonical name, lines 1009-1013).
+        let signature = if provider == "opencode-go" && field == "reasoning" {
+            "reasoning_content".to_string()
+        } else {
+            field.to_string()
+        };
         events.push(StreamEvent::ThinkingDelta {
             index: idx,
-            thinking: t.into(),
+            thinking,
+            signature,
         });
     }
 
@@ -736,8 +785,13 @@ enum StreamEvent {
     },
     /// Text delta.
     TextDelta { index: usize, text: String },
-    /// Thinking/reasoning content delta.
-    ThinkingDelta { index: usize, thinking: String },
+    // Thinking/reasoning content delta. `signature` is the response field name that was hit (canonical name after the opencode-go special case)
+    /// `reasoning_content`）。
+    ThinkingDelta {
+        index: usize,
+        thinking: String,
+        signature: String,
+    },
     /// Tool call argument JSON delta.
     InputJsonDelta { index: usize, partial_json: String },
     /// Content block ended.
@@ -767,8 +821,11 @@ struct StreamAccumulator {
     next_block_seq: usize,
     /// Internal index of the text block (API `content` stream), lazily allocated on the first text delta
     content_seq: Option<usize>,
-    /// Internal index of thinking block (API `reasoning_content` stream), lazily assigned on first thinking delta
+    /// Internal index of the thinking block (API `reasoning_content`/`reasoning`/`reasoning_text` stream), lazily allocated on the first thinking delta
     thinking_seq: Option<usize>,
+    /// Thinking block signature (field name of the first ThinkingDelta; opencode-go normalized to reasoning_content).
+    /// Effective on first delta, later deltas do not override (aligned with pi ensureThinkingBlock binding the first signature).
+    thinking_signature: Option<String>,
     /// API tool index → internal index (each multi-tool call gets its own independent seq, not conflicting with text/thinking)
     tool_seqs: HashMap<usize, usize>,
     /// Incomplete text indexed by internal index
@@ -887,11 +944,18 @@ impl StreamAccumulator {
                 self.partial_text.entry(seq).or_default().push_str(&text);
             }
 
-            StreamEvent::ThinkingDelta { index: _, thinking } => {
+            StreamEvent::ThinkingDelta {
+                index: _,
+                thinking,
+                signature,
+            } => {
                 let seq = self.resolve_thinking();
                 self.block_types
                     .entry(seq)
                     .or_insert_with(|| "thinking".to_string());
+                if self.thinking_signature.is_none() {
+                    self.thinking_signature = Some(signature);
+                }
                 self.partial_thinking
                     .entry(seq)
                     .or_default()
@@ -948,7 +1012,7 @@ impl StreamAccumulator {
                     let thinking = self.partial_thinking.remove(&seq).unwrap_or_default();
                     ContentBlock::Thinking(ThinkingContent {
                         thinking,
-                        thinking_signature: None,
+                        thinking_signature: self.thinking_signature.clone(),
                         redacted: None,
                     })
                 }
@@ -988,7 +1052,7 @@ impl StreamAccumulator {
                 }),
                 Some("thinking") => ContentBlock::Thinking(ThinkingContent {
                     thinking: self.partial_thinking.get(&seq).cloned().unwrap_or_default(),
-                    thinking_signature: None,
+                    thinking_signature: self.thinking_signature.clone(),
                     redacted: None,
                 }),
                 Some("tool_use") => ContentBlock::ToolCall(ToolCall {
@@ -1249,8 +1313,9 @@ async fn sse_event_loop(
                         }
 
                         // 3f. Parse chunk into StreamEvents and push incremental events at block boundaries (Start/Delta/End)
-                        //     and accumulate into accumulator (T-AI-02-1-fix: source push for streaming typewriter effect)
-                        let events = parse_chunk(&json);
+                        //     and accumulate into the accumulator (T-AI-02-1-fix: source push for the streaming typewriter effect;
+                        //     provider used for thinking signature normalization special-casing, T-thinking-invisible-fix)
+                        let events = parse_chunk(&json, &model.provider);
                         handle_events(&events, &mut accumulator, &sender, model, &response_id);
                     }
                     // 3g. SSE transport-layer error → record and exit
@@ -1810,13 +1875,81 @@ mod tests {
         assert_eq!(req.messages.len(), 0);
     }
 
+    // ── thinking toggle (T-thinking-invisible-fix defect B: appended per provider format family) ──
+
+    #[test]
+    fn test_build_request_body_thinking_medium_huoshan() {
+        // huoshan (DeepSeek format) Medium → thinking:{type:"enabled"} + reasoning_effort:"medium"
+        let model = Model {
+            provider: "huoshan".into(),
+            ..sample_model()
+        };
+        let ctx = sample_context();
+        let cfg = StreamConfig {
+            reasoning_effort: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let req = build_request_body(&model, &ctx, &cfg);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
+        let t = req
+            .thinking
+            .as_ref()
+            .expect("huoshan Medium should include the thinking switch");
+        assert_eq!(t.r#type, "enabled");
+        // Serialized form: {"thinking":{"type":"enabled"},"reasoning_effort":"medium"}
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_off_huoshan() {
+        // huoshan Off → thinking:{type:"disabled"}, don't send reasoning_effort
+        // (avoids "sessions that had thinking enabled can't be turned off after switching to Off", aligns with pi deepseek branch thinkingLevelMap.off)
+        let model = Model {
+            provider: "huoshan".into(),
+            ..sample_model()
+        };
+        let ctx = sample_context();
+        let req = build_request_body(&model, &ctx, &StreamConfig::default());
+        assert!(req.reasoning_effort.is_none());
+        let t = req
+            .thinking
+            .as_ref()
+            .expect("huoshan Off should include the thinking switch");
+        assert_eq!(t.r#type, "disabled");
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["thinking"]["type"], "disabled");
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_opencode_go_no_switch() {
+        // opencode-go (OpenAI format) Medium → reasoning_effort only, don't send the thinking toggle (aligns with pi)
+        let model = Model {
+            provider: "opencode-go".into(),
+            ..sample_model()
+        };
+        let ctx = sample_context();
+        let cfg = StreamConfig {
+            reasoning_effort: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let req = build_request_body(&model, &ctx, &cfg);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
+        assert!(req.thinking.is_none(), "opencode-go does not send the thinking switch");
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("thinking").is_none());
+        assert_eq!(json["reasoning_effort"], "medium");
+    }
+
     // ═════════════════════════════════════════════════════════════
     //  parse_chunk
     // ═════════════════════════════════════════════════════════════
 
     #[test]
     fn test_parse_chunk_empty() {
-        let events = parse_chunk(&serde_json::json!({}));
+        let events = parse_chunk(&serde_json::json!({}), "opencode-go");
         assert!(events.is_empty());
     }
 
@@ -1831,7 +1964,7 @@ mod tests {
                 "finish_reason": null
             }]
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         assert_eq!(events.len(), 0, "role alone should not emit events");
     }
 
@@ -1844,7 +1977,7 @@ mod tests {
                 "finish_reason": null
             }]
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
@@ -1856,6 +1989,7 @@ mod tests {
 
     #[test]
     fn test_parse_chunk_thinking_delta() {
+        // DeepSeek-style form (huoshan): reasoning_content → ThinkingDelta, signature = field name
         let chunk = serde_json::json!({
             "choices": [{
                 "index": 0,
@@ -1863,13 +1997,109 @@ mod tests {
                 "finish_reason": null
             }]
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "huoshan");
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             StreamEvent::ThinkingDelta {
-                thinking: ref t, ..
-            } if t == "thinking..."
+                thinking: ref t,
+                signature: ref s,
+                ..
+            } if t == "thinking..." && s == "reasoning_content"
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunk_thinking_reasoning_field() {
+        // opencode-go endpoint returns delta.reasoning (non-standard name): readable + signature normalized to canonical name
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning": "thinking..." },
+                "finish_reason": null
+            }]
+        });
+        let events = parse_chunk(&chunk, "opencode-go");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ThinkingDelta {
+                thinking: ref t,
+                signature: ref s,
+                ..
+            } if t == "thinking..." && s == "reasoning_content"
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunk_thinking_reasoning_text() {
+        // Third fallback field reasoning_text: signature = field name (not normalized)
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_text": "thinking..." },
+                "finish_reason": null
+            }]
+        });
+        let events = parse_chunk(&chunk, "opencode-go");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ThinkingDelta {
+                thinking: ref t,
+                signature: ref s,
+                ..
+            } if t == "thinking..." && s == "reasoning_text"
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunk_thinking_field_priority() {
+        // Three fields co-occur (e.g. chutes.ai returns both reasoning_content and reasoning): take the first non-null to avoid duplication
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning_content": "A",
+                    "reasoning": "B",
+                    "reasoning_text": "C"
+                },
+                "finish_reason": null
+            }]
+        });
+        let events = parse_chunk(&chunk, "opencode-go");
+        assert_eq!(events.len(), 1);
+        if let StreamEvent::ThinkingDelta {
+            thinking,
+            signature,
+            ..
+        } = &events[0]
+        {
+            assert_eq!(thinking, "A");
+            assert_eq!(signature, "reasoning_content");
+        } else {
+            panic!("expected ThinkingDelta");
+        }
+    }
+
+    #[test]
+    fn test_parse_chunk_thinking_reasoning_field_non_opencode_provider_not_normalized() {
+        // Non-opencode-go provider hit reasoning: keep raw field name as signature
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning": "thinking..." },
+                "finish_reason": null
+            }]
+        });
+        let events = parse_chunk(&chunk, "huoshan");
+        assert!(matches!(
+            events[0],
+            StreamEvent::ThinkingDelta {
+                thinking: ref t,
+                signature: ref s,
+                ..
+            } if t == "thinking..." && s == "reasoning"
         ));
     }
 
@@ -1889,7 +2119,7 @@ mod tests {
                 "finish_reason": null
             }]
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         assert_eq!(events.len(), 1); // ContentBlockStart only; arguments="" is filtered out
         assert!(matches!(
             events[0],
@@ -1911,7 +2141,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         assert_eq!(events.len(), 2); // ContentBlockStop + MessageDelta
         assert!(matches!(events[0], StreamEvent::ContentBlockStop { .. }));
         assert!(matches!(
@@ -1937,7 +2167,7 @@ mod tests {
                 "total_tokens": 30
             }
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         // MessageDelta(usage) + ContentBlockStop + MessageDelta(stop_reason)
         // usage is now processed before choices, so the index is 0
         assert_eq!(events.len(), 3);
@@ -1962,7 +2192,7 @@ mod tests {
                 "total_tokens": 40
             }
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         assert_eq!(events.len(), 1, "should only emit usage MessageDelta");
         assert!(matches!(
             events[0],
@@ -1982,7 +2212,7 @@ mod tests {
                 "delta": {"content": "hello"}
             }]
         });
-        let events = parse_chunk(&chunk);
+        let events = parse_chunk(&chunk, "opencode-go");
         // Only TextDelta, no MessageDelta
         assert!(events
             .iter()
@@ -2059,11 +2289,37 @@ mod tests {
         acc.process_event(StreamEvent::ThinkingDelta {
             index: 0,
             thinking: "step 1...".into(),
+            signature: "reasoning_content".into(),
         });
         acc.process_event(StreamEvent::ContentBlockStop { index: 0 });
         assert_eq!(acc.content_blocks.len(), 1);
         if let ContentBlock::Thinking(t) = &acc.content_blocks[0] {
             assert_eq!(t.thinking, "step 1...");
+            assert_eq!(t.thinking_signature.as_deref(), Some("reasoning_content"));
+        } else {
+            panic!("expected Thinking block");
+        }
+    }
+
+    #[test]
+    fn test_accumulator_thinking_signature_first_wins() {
+        // First ThinkingDelta's signature takes effect; later ones do not override (aligned with pi ensureThinkingBlock binding the first signature)
+        let mut acc = StreamAccumulator::default();
+        acc.process_event(StreamEvent::ThinkingDelta {
+            index: 0,
+            thinking: "a".into(),
+            signature: "reasoning".into(),
+        });
+        acc.process_event(StreamEvent::ThinkingDelta {
+            index: 0,
+            thinking: "b".into(),
+            signature: "reasoning_text".into(),
+        });
+        acc.process_event(StreamEvent::ContentBlockStop { index: 0 });
+        assert_eq!(acc.content_blocks.len(), 1);
+        if let ContentBlock::Thinking(t) = &acc.content_blocks[0] {
+            assert_eq!(t.thinking, "ab");
+            assert_eq!(t.thinking_signature.as_deref(), Some("reasoning"));
         } else {
             panic!("expected Thinking block");
         }
@@ -2121,9 +2377,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AssistantMessageEvent>();
         let mut acc = StreamAccumulator::default();
         let model = sample_model();
-        let mut rid: Option<String> = None;
+        let rid: Option<String> = None;
         for c in chunks {
-            let events = parse_chunk(c);
+            let events = parse_chunk(c, &model.provider);
             handle_events(&events, &mut acc, &tx, &model, &rid);
         }
         let mut got = Vec::new();
@@ -2240,11 +2496,12 @@ mod tests {
                 ..
             }
         ));
-        // Final state: two blocks, thinking first
+        // Final state: two blocks, thinking first; thinking_signature backfilled (chunk comes from reasoning_content → field name)
         assert_eq!(acc.content_blocks.len(), 2);
         match (&acc.content_blocks[0], &acc.content_blocks[1]) {
             (ContentBlock::Thinking(t), ContentBlock::Text(x)) => {
                 assert_eq!(t.thinking, "step 1 step 2");
+                assert_eq!(t.thinking_signature.as_deref(), Some("reasoning_content"));
                 assert_eq!(x.text, "Answer");
             }
             _ => panic!("expected [Thinking, Text]"),

@@ -38,6 +38,30 @@ impl std::fmt::Display for Api {
     }
 }
 
+/// Thinking toggle format family. Aligns with the value semantics of pi `compat.thinkingFormat` (openai-completions.ts:639-700):
+/// Decides whether the request body carries the provider-specific thinking toggle when enabling/disabling thinking.
+///
+/// - `OpenAi` (aligned with pi `"openai"`): only sends `reasoning_effort`; no thinking toggle.
+/// - `DeepSeek` (aligned with pi `"deepseek"`): attaches `thinking: {type: "enabled"/"disabled"}` + `reasoning_effort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingFormat {
+    /// Aligned with pi compat.thinkingFormat "openai": only reasoning_effort, no thinking toggle
+    OpenAi,
+    /// Aligned with pi compat.thinkingFormat "deepseek": thinking:{type:enabled/disabled} + reasoning_effort
+    DeepSeek,
+}
+
+/// Called by `build_request_body` before each turn in interactive mode: resolves the thinking-toggle format family based on the provider name,
+/// Determines whether to append the `thinking:{type:...}` parameter to the request body (DeepSeek-family endpoints require an explicit toggle to enable/disable thinking).
+/// Unknown providers always fall back to `OpenAi` (reasoning_effort only, matching pi detectCompat's default branch,
+/// opencode-completions.ts:1304——opencode-go classifies a baseUrl starting with opencode.ai as openai format).
+pub fn thinking_format_for_provider(provider_name: &str) -> ThinkingFormat {
+    match provider_name {
+        "huoshan" => ThinkingFormat::DeepSeek,
+        _ => ThinkingFormat::OpenAi,
+    }
+}
+
 /// Multi-provider extension interface. Aligns with pi's `Provider<TApi>` (models.ts:67).
 ///
 /// Association with `Model`: `Provider::id()` string-equals `Model.provider` (`String`)
@@ -152,5 +176,33 @@ mod tests {
         // Default when ZEN_PROVIDER is unset (test processes usually don't set it; if CI sets it, use that value to override the assertion)
         let name = default_provider_name();
         assert!(!name.is_empty());
+    }
+
+    // ── thinking_format_for_provider ──
+
+    #[test]
+    fn test_thinking_format_huoshan_is_deepseek() {
+        // Volcano Engine Ark DeepSeek-family endpoints require an explicit thinking:{type} toggle
+        assert_eq!(
+            thinking_format_for_provider("huoshan"),
+            ThinkingFormat::DeepSeek
+        );
+    }
+
+    #[test]
+    fn test_thinking_format_opencode_go_is_openai() {
+        // opencode-go matches pi detectCompat: openai format, reasoning_effort only
+        assert_eq!(
+            thinking_format_for_provider("opencode-go"),
+            ThinkingFormat::OpenAi
+        );
+    }
+
+    #[test]
+    fn test_thinking_format_unknown_falls_back_openai() {
+        assert_eq!(
+            thinking_format_for_provider("nonexistent"),
+            ThinkingFormat::OpenAi
+        );
     }
 }
