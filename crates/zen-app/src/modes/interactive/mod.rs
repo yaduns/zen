@@ -901,7 +901,7 @@ fn bridge_agent_event(
     match event {
         AgentEvent::AgentStart => {
             let _ = tx.send(UiEvent::Status(StatusSpec::Working {
-                message: "Thinking...".into(),
+                message: "Working...".into(),
             }));
             let _ = tx.send(UiEvent::SetAnimation(true));
         }
