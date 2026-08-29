@@ -65,7 +65,7 @@ impl Component for UserMessageComponent {
         // background fills the entire drawn area (including padding lines)
         buf.fill(x, y, width, painted, &self.bg);
 
-        // Content line: starts at y+1, left side starts at output_pad
+        // Content lines: start at y+1, start from output_pad on the left (text cells merge into box background userMsgBg)
         let content_rows = painted.saturating_sub(2) as usize;
         for (i, row) in rows.iter().take(content_rows).enumerate() {
             write_segment_row(
@@ -74,6 +74,7 @@ impl Component for UserMessageComponent {
                 y + 1 + i as u16,
                 width - self.output_pad,
                 row,
+                self.bg.bg,
             );
         }
 
@@ -150,5 +151,24 @@ mod tests {
         let painted = comp.render(&mut buf, 0, 0, 30, 10);
         assert!(painted >= 1);
         assert!(flush_text(&mut buf).contains("new"));
+    }
+
+    #[test]
+    fn text_cells_carry_user_message_bg() {
+        // Box background merge: glyph cell bg = userMsgBg (no longer shows default background through), consistent with the containing block
+        let mut comp = UserMessageComponent::new("hello box".into(), theme(), 1);
+        let mut buf = ScreenBuffer::new(30, 10);
+        comp.render(&mut buf, 0, 0, 30, 10);
+        let expected = theme().bg(BgToken::UserMessageBg);
+        let row = buf.line_segments(1); // Content lines (line 0 = top padding)
+        let text_seg = row
+            .iter()
+            .find(|s| s.text.contains("hello box"))
+            .expect("text segment");
+        assert_eq!(
+            text_seg.style.bg,
+            Some(expected),
+            "user message glyphs should land on userMsgBg"
+        );
     }
 }

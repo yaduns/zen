@@ -156,10 +156,15 @@ impl Component for ToolExecutionComponent<'_> {
             return 0;
         }
 
-        // Background + content line (1-column indent; title uses toolTitle+bold, rest uses toolOutput)
+        // Background + content line (1-column indent; title uses toolTitle+bold, the rest use toolOutput;
+        // text style carries box background bg_token — glyphs match the panel background, fixing glyphs showing the default backdrop color)
         buf.fill(x, y, width, painted, &bg);
-        let title_style = theme.style(ColorToken::ToolTitle, None, &[Attribute::Bold]);
-        let output_style = Style::fg(theme.fg(ColorToken::ToolOutput));
+        let title_style =
+            self.theme
+                .style(ColorToken::ToolTitle, Some(bg_token), &[Attribute::Bold]);
+        let output_style = self
+            .theme
+            .style(ColorToken::ToolOutput, Some(bg_token), &[]);
         for (i, row_text) in rows.iter().take(painted as usize).enumerate() {
             let style = if i == 0 { &title_style } else { &output_style };
             buf.write(x + 1, y + i as u16, style, row_text);
@@ -265,5 +270,29 @@ mod tests {
         let mut comp = ToolExecutionComponent::new("bash".into(), "c1".into(), json!({}), theme());
         let a = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('a'));
         assert!(!comp.handle_key(&a));
+    }
+
+    #[test]
+    fn tool_text_cells_carry_phase_bg() {
+        // Box background merge: tool panel glyph cell bg = stage background (success=ToolSuccessBg dark green), no longer showing the default backdrop color
+        let mut comp = ToolExecutionComponent::new("bash".into(), "c1".into(), json!({}), theme());
+        comp.update_result(
+            ToolExecutionResult {
+                text: Some("ok".into()),
+                is_error: false,
+            },
+            false,
+        );
+        assert!(matches!(comp.phase(), ToolPhase::Success));
+        let expected = theme().bg(BgToken::ToolSuccessBg);
+        let mut buf = ScreenBuffer::new(60, 10);
+        comp.render(&mut buf, 0, 0, 60, 10);
+        let title_row = buf.line_segments(0);
+        assert!(
+            title_row
+                .iter()
+                .any(|s| s.text.contains("bash") && s.style.bg == Some(expected)),
+            "Tool panel title glyphs should land on the stage background color"
+        );
     }
 }

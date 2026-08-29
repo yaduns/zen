@@ -39,7 +39,8 @@ pub struct MarkdownTheme {
     pub link_url: Style,
     /// Inline code `` `code` ``
     pub code: Style,
-    /// Code block body (syntax highlighting goes through `highlight.rs`; this style provides fallback foreground and whole-block background)
+    /// Code block body (syntax coloring handled by `highlight.rs`; this style provides the fallback foreground;
+    /// `bg` is a schema-reserved field not applied by the renderer — code block background = surrounding environment background, aligned with pi)
     pub code_block: Style,
     /// `` ``` `` fence line (including the language tag)
     pub code_block_border: Style,
@@ -870,14 +871,13 @@ impl<'a, 'b> MarkdownRenderer<'a, 'b> {
 
     // ── Code block ──
 
-    /// Code line style: segments already colored by syntect keep their foreground; when foreground is missing, fall back to `code_block`,
-    /// Apply `code_block` background to the whole block (uniform dark-background appearance; align with highlight.rs bg design decision).
+    /// Code line style: spans already colored by syntect keep their foreground; when the foreground is missing, `code_block` is the fallback.
+    /// **Background is no longer applied by this function** (T-TU-02-1-fix aligns with pi: code block background = surrounding environment background —
+    /// assistant area = terminal default, inside a box = box background merged via render.rs box merge); `code_block.bg`
+    /// is kept in the theme schema for future theming panels; the renderer does not consume it currently.
     fn code_line_style(&self, mut style: Style) -> Style {
         if style.fg.is_none() && self.theme.code_block.fg.is_some() {
             style.fg = self.theme.code_block.fg;
-        }
-        if style.bg.is_none() {
-            style.bg = self.theme.code_block.bg;
         }
         style
     }
@@ -1322,6 +1322,11 @@ mod tests {
         assert!(
             lines[1].iter().any(|s| s.style.fg.is_some()),
             "Rust code line should have colored segments"
+        );
+        // T-TU-02-1-fix: code block background is no longer applied by the renderer (aligned with pi environment background) — all code line span bg are None
+        assert!(
+            lines[1].iter().all(|s| s.style.bg.is_none()),
+            "Code line should not have a panel background (background = environment)"
         );
     }
 

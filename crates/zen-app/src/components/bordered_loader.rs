@@ -92,7 +92,14 @@ impl Component for BorderedLoader {
         }
         if self.show_cancel_hint && painted < height && remaining >= 1 {
             buf.fill(x, row, width, 1, &Style::default());
-            write_segment_row(buf, x + 1, row, width.saturating_sub(2), &self.cancel_hint);
+            write_segment_row(
+                buf,
+                x + 1,
+                row,
+                width.saturating_sub(2),
+                &self.cancel_hint,
+                None,
+            );
             painted += 1;
             row += 1;
             remaining -= 1;

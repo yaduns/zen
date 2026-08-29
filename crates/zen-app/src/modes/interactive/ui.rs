@@ -1071,6 +1071,43 @@ mod tests {
         InteractiveUi::new(theme().clone(), kb(), "/work".into())
     }
 
+    #[test]
+    fn dbg_temp_bg_probe() {
+        // Temporary diagnostics: per-line fg/bg of user messages + thinking messages
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message(
+            "What files are in the current directory?",
+        ))));
+        let m = assistant(
+            vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "secret **bold**".into(),
+                    thinking_signature: None,
+                    redacted: None,
+                }),
+                text_block("# Head\nbody\n\n```rust\nfn main() {}\n```"),
+            ],
+            StopReason::Stop,
+        );
+        u.apply(UiEvent::MessageStart(Message::Assistant(m)));
+        let mut scratch = ScreenBuffer::new(100, 300);
+        for (i, row) in u.chat_rows.iter().enumerate() {
+            let used = u.measure_row(row, i, &mut scratch, 100);
+            for r in 0..used {
+                let segs = scratch.line_segments(r);
+                if !segs.is_empty() {
+                    let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+                    let fgs: Vec<String> =
+                        segs.iter().map(|s| format!("{:?}", s.style.fg)).collect();
+                    let bgs: Vec<String> =
+                        segs.iter().map(|s| format!("{:?}", s.style.bg)).collect();
+                    eprintln!("row {r}: {text:?}\n   fg={fgs:?} bg={bgs:?}");
+                }
+            }
+            scratch.clear();
+        }
+    }
+
     // ── extract_user_text / convert_tool_result (pure functions) ──────────
 
     #[test]
