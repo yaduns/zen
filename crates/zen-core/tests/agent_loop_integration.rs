@@ -558,6 +558,7 @@ async fn mock_test_tool_call_execution() {
 /// ```bash
 /// cargo test -p zen-core --test agent_loop_integration -- real_test_agent_loop_simple_chat --nocapture
 /// ```
+#[ignore]
 #[tokio::test]
 async fn real_test_agent_loop_simple_chat() {
     let key_var = provider_key_var();

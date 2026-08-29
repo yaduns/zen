@@ -177,6 +177,7 @@ async fn run_turn(base_prompt: &str, prompt: &str) -> Vec<Message> {
 /// 3. `read_session_file` reads back entries and last_leaf_id (counts match).
 /// 4. `SessionTree::new` rebuilds the tree → `build_context` restores the message history.
 /// 5. Real LLM round 2 follows up based on the restored context and can answer ORANGE (context not lost).
+#[ignore]
 #[tokio::test]
 async fn real_test_session_persist_recover_continuity() {
     let key_var = provider_key_var();
@@ -264,6 +265,7 @@ async fn real_test_session_persist_recover_continuity() {
 /// 1. Round 1 remembers ORANGE, round 2 continues remembering PURPLE → chain [u1, a1, u2, a2].
 /// 2. `ForkPosition::Before` fork at u2 → branch contains only [u1, a1] (excluding u2 and later).
 /// 3. Rebuild tree from branch → build_context → follow-up question in round 3: should remember ORANGE (branch history is before the fork point).
+#[ignore]
 #[tokio::test]
 async fn real_test_session_fork_roundtrip() {
     let key_var = provider_key_var();

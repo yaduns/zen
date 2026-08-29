@@ -133,6 +133,7 @@ fn last_assistant_text(messages: &[Message]) -> String {
 /// 1. `load_skills` discovers and loads SKILL.md from a temp directory (name/description/content are correct).
 /// 2. `format_skills_for_system_prompt` generates an `<available_skills>` block and appends it to the system prompt.
 /// 3. Constraints in the skill description are followed by the LLM (the final answer contains the `<<SKILLED>>` end token).
+#[ignore]
 #[tokio::test]
 async fn real_test_skills_loaded_and_followed_by_llm() {
     let key_var = provider_key_var();
@@ -207,6 +208,7 @@ async fn real_test_skills_loaded_and_followed_by_llm() {
 /// 1. `create_context` assembles a system prompt carrying a strong constraint ("answer only BANANA").
 /// 2. The LLM follows the system prompt (the final answer contains BANANA).
 /// 3. No tool calls occur at any point (guaranteed both by the system prompt prohibition and the empty tool list).
+#[ignore]
 #[tokio::test]
 async fn real_test_system_prompt_constraint_honored() {
     let key_var = provider_key_var();

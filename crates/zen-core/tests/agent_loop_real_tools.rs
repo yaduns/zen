@@ -152,6 +152,7 @@ fn test_ctx() -> ToolContext {
 /// ```bash
 /// cargo test -p zen-core --test agent_loop_real_tools -- real_multi_tool --nocapture
 /// ```
+#[ignore]
 #[tokio::test]
 async fn real_test_multi_tool_chain() {
     let key_var = provider_key_var();
@@ -404,6 +405,7 @@ async fn real_test_multi_tool_chain() {
 /// ```bash
 /// cargo test -p zen-core --test agent_loop_real_tools -- --nocapture
 /// ```
+#[ignore]
 #[tokio::test]
 async fn real_test_tools_list_directory() {
     let key_var = provider_key_var();

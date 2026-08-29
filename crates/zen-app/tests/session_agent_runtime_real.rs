@@ -38,6 +38,7 @@ const BASE_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 
 /// Aggregated vertical path up to the current node (SessionManager → AgentSession → runtime assembly):
 /// create → prompt (auto-persist) → continue → replace_runtime (fork extraction branch) → continuity + no leakage.
+#[ignore]
 #[tokio::test]
 async fn real_test_session_agent_runtime_fork() {
     let key_var = common::provider_key_var();

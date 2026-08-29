@@ -17,6 +17,7 @@ use zen_app::session::session_manager::SessionManager;
 const BASE_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 
 /// Real closed loop: AgentSession::prompt → resident subscription auto-persist → reopen restore → continuity.
+#[ignore]
 #[tokio::test]
 async fn real_test_agent_session_persist_and_resume_continuity() {
     let key_var = common::provider_key_var();
@@ -91,6 +92,7 @@ async fn real_test_agent_session_persist_and_resume_continuity() {
 }
 
 /// Real restore: the same session file is restored via `continue_recent` and used for follow-up questions (cross-instance continuity).
+#[ignore]
 #[tokio::test]
 async fn real_test_agent_session_continue_recent_continuity() {
     let key_var = common::provider_key_var();

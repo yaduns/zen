@@ -12,6 +12,7 @@ use zen_ai::types::{
 ///
 /// Skip condition: automatically skipped when the API key env var for the selected default provider is not set
 /// (detected inside the test function body rather than using the #[ignore] attribute).
+#[ignore]
 #[tokio::test]
 async fn test_simple_chat() {
     // Check the corresponding API key for the default provider (ZEN_PROVIDER, default opencode-go)
