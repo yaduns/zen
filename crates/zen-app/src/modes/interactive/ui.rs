@@ -77,9 +77,9 @@ struct EditorRoute {
     bash_mode: bool,
 }
 
-/// v1 editor left padding (aligned with pi's `getEditorPaddingX` default 2 / SettingsConfig test defaults;
-/// after T-AP-02-3 settings manager lands, this will be injected into InteractiveMode via SettingsConfig).
-const DEFAULT_EDITOR_PADDING_X: usize = 2;
+/// v1 editor left padding (matching pi `getEditorPaddingX` default **0** — settings-manager.ts `?? 0`;
+/// after T-AP-02-3 settings manager lands, it will be injected by InteractiveMode via SettingsConfig; default remains 0).
+const DEFAULT_EDITOR_PADDING_X: usize = 0;
 
 impl InteractiveUi {
     /// Build the UI state from the theme, app keybinding table, and cwd: create `CustomEditor` (with on_action/on_escape/

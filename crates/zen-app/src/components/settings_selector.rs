@@ -640,7 +640,7 @@ mod tests {
             follow_up_mode: DeliveryMode::All,
             enable_skill_commands: true,
             show_hardware_cursor: false,
-            editor_padding_x: 2,
+            editor_padding_x: 0,
             output_pad: 1,
             autocomplete_max_visible: 10,
             clear_on_shrink: false,

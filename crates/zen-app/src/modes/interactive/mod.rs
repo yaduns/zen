@@ -800,7 +800,7 @@ fn classify_submit(text: &str) -> SubmitKind {
     SubmitKind::Message
 }
 
-/// v1 defaults (aligned with settings_selector test defaults; replace with actual loading once T-AP-02-3 lands).
+/// v1 default settings (aligned with pi: editorPaddingX defaults to 0; replace with real loading once T-AP-02-3 lands).
 fn default_settings() -> SettingsConfig {
     SettingsConfig {
         auto_compact: false,
@@ -808,7 +808,7 @@ fn default_settings() -> SettingsConfig {
         follow_up_mode: DeliveryMode::All,
         enable_skill_commands: true,
         show_hardware_cursor: false,
-        editor_padding_x: 2,
+        editor_padding_x: 0,
         output_pad: 1,
         autocomplete_max_visible: 10,
         clear_on_shrink: false,
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn test_default_settings_sane_baseline() {
         let s = default_settings();
-        assert_eq!(s.editor_padding_x, 2);
+        assert_eq!(s.editor_padding_x, 0);
         assert!(!s.auto_compact);
         assert!(!s.available_thinking_levels.is_empty());
     }

@@ -37,6 +37,9 @@ impl KeyId {
         let code = match code_str.to_ascii_lowercase().as_str() {
             "enter" => KeyCode::Enter,
             "esc" => KeyCode::Esc,
+            // Shift+Tab: crossterm normalizes it to a standalone KeyCode::BackTab (not Tab+SHIFT),
+            // parsing "tab" with SHIFT yields BackTab directly, so the event side can match it (T-TU-02-1-fix).
+            "tab" if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
             "tab" => KeyCode::Tab,
             "backspace" => KeyCode::Backspace,
             "delete" => KeyCode::Delete,
@@ -93,10 +96,18 @@ impl KeyId {
     /// Consumers: planned consumers `editor::handle_key` (T-TU-01-3), autocomplete (T-TU-03-3) — both convert events to `KeyId` uniformly via this function.
     pub fn from_key_event(event: crossterm::event::KeyEvent) -> Option<KeyId> {
         match event.kind {
-            KeyEventKind::Press | KeyEventKind::Repeat => Some(KeyId {
-                code: event.code,
-                modifiers: event.modifiers,
-            }),
+            KeyEventKind::Press | KeyEventKind::Repeat => {
+                let mut modifiers = event.modifiers;
+                // Shift+Tab is a standalone KeyCode::BackTab in crossterm; on some terminals/versions the event modifier bit
+                // is missing, so SHIFT is added uniformly to match the "shift+tab" binding (parse produces BackTab+SHIFT).
+                if event.code == KeyCode::BackTab {
+                    modifiers |= KeyModifiers::SHIFT;
+                }
+                Some(KeyId {
+                    code: event.code,
+                    modifiers,
+                })
+            }
             KeyEventKind::Release => None,
         }
     }
@@ -107,6 +118,10 @@ impl KeyId {
 /// Implemented via `std::fmt::Display`, joining modifiers with `+` followed by the base key name.
 impl Display for KeyId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // BackTab is shift+tab: written out in full to avoid duplicating "shift+" in the prefix loop.
+        if self.code == KeyCode::BackTab {
+            return write!(f, "shift+tab");
+        }
         if self.modifiers.contains(KeyModifiers::CONTROL) {
             write!(f, "ctrl+")?;
         }
@@ -334,6 +349,39 @@ mod tests {
                 "case {s:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_shift_tab_is_backtab() {
+        // shift+tab → BackTab+SHIFT (same shape as the crossterm event side, so the binding matches)
+        assert_eq!(
+            KeyId::parse("shift+tab"),
+            Some(KeyId {
+                code: KeyCode::BackTab,
+                modifiers: KeyModifiers::SHIFT
+            })
+        );
+        // plain tab without modifiers is unaffected
+        assert_eq!(
+            KeyId::parse("tab"),
+            Some(KeyId {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE
+            })
+        );
+    }
+
+    #[test]
+    fn test_backtab_display_and_event_match_roundtrip() {
+        // Display write-back
+        let id = KeyId::parse("shift+tab").unwrap();
+        assert_eq!(id.to_string(), "shift+tab");
+        // real event (BackTab, terminal form with the modifier bit missing) → from_key_event normalizes by adding SHIFT → binding matches
+        let ev = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(KeyId::matches(ev, &id), "BackTab event should match the shift+tab binding");
+        // BackTab with the SHIFT modifier also matches
+        let ev2 = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(KeyId::matches(ev2, &id));
     }
 
     #[test]
