@@ -397,6 +397,7 @@ impl Theme {
             hr: self.style(ColorToken::MdHr, None, &[]),
             list_bullet: self.style(ColorToken::MdListBullet, None, &[]),
             code_block_indent: "  ".to_string(),
+            syntax_theme_name: self.syntax_theme_name().to_string(),
         }
     }
 

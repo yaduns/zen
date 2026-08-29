@@ -53,6 +53,11 @@ pub struct MarkdownTheme {
     pub list_bullet: Style,
     /// Prefix indent before each line of a code block (default `"  "`)
     pub code_block_indent: String,
+    /// Name of the built-in syntect theme used for code block syntax highlighting (in the same family as `highlight.rs` `DEFAULT_THEME`).
+    /// The renderer is self-contained: code block coloring resolves by this name and does not depend on a `Theme` reference (T-AP-11-3 via
+    /// `Theme::syntax_theme_name` supplies the dark/light mapping; `markdown_theme()` populates it;
+    /// `Default` provides the dark-mode fallback).
+    pub syntax_theme_name: String,
 }
 
 impl Default for MarkdownTheme {
@@ -111,6 +116,7 @@ impl Default for MarkdownTheme {
             hr: fg(0x65, 0x73, 0x7e),                                    // base03
             list_bullet: fg(0x96, 0xb5, 0xb4),                           // base0C
             code_block_indent: "  ".to_string(),
+            syntax_theme_name: "base16-ocean.dark".to_string(),
         }
     }
 }
@@ -124,8 +130,28 @@ impl Default for MarkdownTheme {
 /// to a `ScreenBuffer` or convert to ANSI for piping. Supports headings/paragraphs/lists (including nesting, task items, ordered start numbers)/
 /// fenced code blocks (syntax highlighted)/blockquotes/tables/inline code/bold/italic/strikethrough/links (with URL annotation)/horizontal rules.
 /// Purely synchronous function; no TUI loop dependency, no cross-frame caching.
-/// Current consumers: none (pub but currently no implementation-state consumer; reserved for T-AP-11-2 message rendering / print-mode message output).
+/// Current consumers: interactive message rendering (T-AP-11-2/assistant_message.rs), write_markdown
+/// (shared by user/custom/skill messages in render.rs), print-mode message output.
+/// For paragraph-level recoloring, use [`render_markdown_with_override`] (this entry point is byte-for-byte identical to its None variant).
 pub fn render_markdown(theme: &MarkdownTheme, text: &str, width: usize) -> Vec<Vec<StyledSegment>> {
+    render_markdown_with_override(theme, text, width, None)
+}
+
+/// Markdown rendering with paragraph-level style post-processing: assistant_message's thinking block calls it before the full paragraph is displayed,
+/// so that text-stream segments within thinking (paragraph/heading/bold/italic/strikethrough/link text/table cell text) are all styled as
+/// 「gray + italic」—reproduces pi's text-stream recoloring with `DefaultTextStyle { color, italic }`; when `None`, it is byte-for-byte identical to
+/// [`render_markdown`] behavior (the original entry point delegates to this function with None).
+/// Parameter: `style_override` paragraph-level style transform (changes only styling, not text/layout/line wrapping), applied to text-stream segments
+/// (push_text/push_cell_text: the two plain-text entry points); **does not** apply to code-block syntax-highlighted segments, inline code,
+/// fence borders, list markers, blockquote borders, table borders, and other structural elements (aligned with pi: the default style does not recolor code syntax highlighting,
+/// Code blocks in thinking retain syntax colors; see the adjudicated decision in T-TU-02-1-fix).
+/// Consumer: zen-app `assistant_message.rs` (thinking section, T-TU-02-1-fix).
+pub fn render_markdown_with_override(
+    theme: &MarkdownTheme,
+    text: &str,
+    width: usize,
+    style_override: Option<&dyn Fn(Style) -> Style>,
+) -> Vec<Vec<StyledSegment>> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     if normalized.is_empty() || width == 0 {
         return Vec::new();
@@ -135,19 +161,23 @@ pub fn render_markdown(theme: &MarkdownTheme, text: &str, width: usize) -> Vec<V
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(&normalized, options);
 
-    let mut renderer = MarkdownRenderer::new(theme, width);
+    let mut renderer = MarkdownRenderer::new(theme, width, style_override);
     for event in parser {
         renderer.process_event(event);
     }
     renderer.finish()
 }
 
-/// State machine for a single `render_markdown` call; not exposed externally.
+/// State machine for a single `render_markdown(_with_override)` call; not publicly exposed.
 /// One mainline plus three buffers: `current_line` (styled segments of the current physical line, flushed via `wrap_segments`
 /// into `output` at block end), `code_buf` (accumulates fenced code blocks, highlighted in one pass at end),
 /// `table` (accumulates table cells, laid out in one pass at end).
-struct MarkdownRenderer<'a> {
+struct MarkdownRenderer<'a, 'b> {
     theme: &'a MarkdownTheme,
+    /// Segment-level style post-processing (thinking recoloring closure): applies only to text-stream segments
+    /// (push_text/push_cell_text); structural elements/code-block highlighted segments are exempt—see
+    /// [`render_markdown_with_override`] documentation.
+    style_override: Option<&'b dyn Fn(Style) -> Style>,
     width: usize,
 
     /// Completed output lines (final result)
@@ -207,10 +237,15 @@ struct TableState {
     in_header: bool,
 }
 
-impl<'a> MarkdownRenderer<'a> {
-    fn new(theme: &'a MarkdownTheme, width: usize) -> Self {
+impl<'a, 'b> MarkdownRenderer<'a, 'b> {
+    fn new(
+        theme: &'a MarkdownTheme,
+        width: usize,
+        style_override: Option<&'b dyn Fn(Style) -> Style>,
+    ) -> Self {
         Self {
             theme,
+            style_override,
             width,
             output: Vec::new(),
             current_line: Vec::new(),
@@ -420,7 +455,8 @@ impl<'a> MarkdownRenderer<'a> {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
                 let lang_ref = self.code_lang.as_deref();
-                let highlighted = highlight::highlight(&self.code_buf, lang_ref);
+                let highlighted =
+                    highlight::highlight(&self.code_buf, lang_ref, &self.theme.syntax_theme_name);
                 let indent = self.theme.code_block_indent.clone();
 
                 for row in highlighted {
@@ -541,8 +577,9 @@ impl<'a> MarkdownRenderer<'a> {
     }
 
     /// Emit a piece of text as a single style segment with the current inline styles; break lines at `\n`.
+    /// The segment-level override is applied here (one of the text-stream entry points; see `apply_style_override`).
     fn push_text(&mut self, text: &str) {
-        let style = self.current_inline_style();
+        let style = self.apply_style_override(self.current_inline_style());
         for (i, part) in text.split('\n').enumerate() {
             if i > 0 {
                 self.flush_line();
@@ -557,14 +594,25 @@ impl<'a> MarkdownRenderer<'a> {
     }
 
     /// Text inside a table cell: collapse newlines to spaces, emit paragraphs into the current cell buffer.
+    /// The segment-level override is applied here (the second text-stream entry point; as a result, cell content is grayed out along with thinking,
+    /// Table borders/separators do not pass through here; preserve structural colors).
     fn push_cell_text(&mut self, text: &str) {
-        let style = self.current_inline_style();
+        let style = self.apply_style_override(self.current_inline_style());
         let cleaned = text.replace('\n', " ");
         if !cleaned.is_empty() {
             self.emit_segment(StyledSegment {
                 style,
                 text: cleaned,
             });
+        }
+    }
+
+    /// Apply paragraph-level style post-processing when `style_override` is not None (recolor thinking);
+    /// Return unchanged when None (byte-for-byte identical to `render_markdown`).
+    fn apply_style_override(&self, style: Style) -> Style {
+        match self.style_override {
+            Some(f) => f(style),
+            None => style,
         }
     }
 
@@ -1451,5 +1499,95 @@ mod tests {
         let seg = find_seg(&lines, "x").expect("Nested inline text");
         assert!(seg.style.attributes.contains(&Attribute::Bold));
         assert!(seg.style.attributes.contains(&Attribute::Italic));
+    }
+
+    // ── render_markdown_with_override (T-TU-02-1-fix paragraph-level recoloring) ──
+
+    /// Override closure test double: fixed magenta foreground + forced italics (aligned with thinking recoloring semantics).
+    fn override_magenta() -> impl Fn(Style) -> Style {
+        |mut s: Style| {
+            s.fg = Some(Color::Magenta);
+            push_attr(&mut s, Attribute::Italic);
+            s
+        }
+    }
+
+    #[test]
+    fn test_override_none_equals_render_markdown() {
+        // The None case is byte-for-byte identical to render_markdown (a prerequisite for the original entry point to delegate to this function)
+        let text = "# T\n\n**b** *i* `c`\n\n- a\n- b\n\n```rust\nfn main() {}\n```\n\n> q\n";
+        let theme = MarkdownTheme::default();
+        let plain = render_markdown(&theme, text, 60);
+        let via_override = render_markdown_with_override(&theme, text, 60, None);
+        assert_eq!(plain, via_override, "None form should be byte-for-byte identical");
+    }
+
+    #[test]
+    fn test_override_applies_to_text_flow_not_code() {
+        let text = "para **bold** `inline`\n\n```rust\nfn main() {}\n```";
+        let theme = MarkdownTheme::default();
+        let rows = render_markdown_with_override(&theme, text, 80, Some(&override_magenta()));
+        // Paragraph text: foreground overridden to magenta + italics
+        let para = find_seg(&rows, "para").expect("Paragraph text");
+        assert_eq!(para.style.fg, Some(Color::Magenta));
+        assert!(para.style.attributes.contains(&Attribute::Italic));
+        // Bold text: foreground is also overridden (text stream); bold attribute preserved
+        let bold = find_seg(&rows, "bold").expect("Bold text");
+        assert_eq!(bold.style.fg, Some(Color::Magenta));
+        assert!(bold.style.attributes.contains(&Attribute::Bold));
+        // Inline code: preserve theme.code color (structural elements are exempt, matching pi codespan semantics)
+        let inline = find_seg(&rows, "inline").expect("Inline code");
+        assert_eq!(inline.style.fg, theme.code.fg);
+        assert!(!inline.style.attributes.contains(&Attribute::Italic));
+        // Code block: preserve syntax highlighting (at least one segment has fg that is neither magenta nor None, with no override italics)
+        let code_line = rows
+            .iter()
+            .find(|l| concat_segs(l).contains("fn main"))
+            .expect("Code line");
+        assert!(
+            code_line.iter().any(|s| s.style.fg.is_some()
+                && s.style.fg != Some(Color::Magenta)
+                && !s.style.attributes.contains(&Attribute::Italic)),
+            "thinking code block should preserve syntax highlighting"
+        );
+        // fence border: preserve the code_block_border color (structural element exemption)
+        let fence = find_seg(&rows, "```rust").expect("fence line");
+        assert_eq!(fence.style.fg, theme.code_block_border.fg);
+    }
+
+    #[test]
+    fn test_override_applies_to_heading_text() {
+        let theme = MarkdownTheme::default();
+        let rows =
+            render_markdown_with_override(&theme, "# Title\n\ntext", 60, Some(&override_magenta()));
+        let seg = find_seg(&rows, "Title").expect("Heading text");
+        assert_eq!(seg.style.fg, Some(Color::Magenta));
+        assert!(seg.style.attributes.contains(&Attribute::Bold));
+        assert!(seg.style.attributes.contains(&Attribute::Italic));
+    }
+
+    #[test]
+    fn test_override_applies_to_table_cells_not_borders() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let theme = MarkdownTheme::default();
+        let rows = render_markdown_with_override(&theme, text, 40, Some(&override_magenta()));
+        let joined = join(&rows);
+        assert!(joined.contains('┌'), "Table border exists");
+        // Data cell content: text stream → overwritten
+        assert_eq!(find_seg(&rows, "1").unwrap().style.fg, Some(Color::Magenta));
+        assert_eq!(find_seg(&rows, "2").unwrap().style.fg, Some(Color::Magenta));
+        // Header cell: build_row_line uses theme.bold for foreground emphasis (matching pi's bold header wrapping),
+        // The override color is replaced by the header emphasis color—structural semantics, not the text stream
+        assert_eq!(
+            find_seg(&rows, "a").unwrap().style.fg,
+            Some(theme.bold.fg.unwrap())
+        );
+        // Border segment: constructed directly with Style::default, bypassing the text stream → not overridden (fg None)
+        let border = rows
+            .iter()
+            .flatten()
+            .find(|s| s.text.contains('┌'))
+            .expect("Border segment");
+        assert_eq!(border.style.fg, None);
     }
 }

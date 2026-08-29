@@ -62,7 +62,7 @@ const REQUIRED_LANGUAGES: [&str; 7] = [
 static SYNTAX_SET: std::sync::OnceLock<SyntaxSet> = std::sync::OnceLock::new();
 
 /// Theme set singleton: built-in themes batch-loaded lazily (feature `default-themes`),
-/// Highlighting retrieves the DEFAULT_THEME entry via active_theme() and emits colored output.
+/// Highlighting obtains the entry by name via `resolve_syntect_theme()` and outputs coloring.
 static THEME_SET: std::sync::OnceLock<ThemeSet> = std::sync::OnceLock::new();
 
 /// Fallback theme: used when both DEFAULT_THEME and the built-in theme set are missing (unreachable on the normal path;
@@ -77,18 +77,21 @@ fn syntax_set() -> &'static SyntaxSet {
 }
 
 /// Theme set accessor: initialized via `ThemeSet::load_defaults()` on first call, afterwards returns a 'static reference,
-/// Used by active_theme() to retrieve the theme entry.
+/// Used by resolve_syntect_theme() to get a theme entry.
 fn theme_set() -> &'static ThemeSet {
     THEME_SET.get_or_init(ThemeSet::load_defaults)
 }
 
-/// Active theme: look up the built-in theme named DEFAULT_THEME in theme_set() (fall back to
-/// the first built-in theme; if still missing, use the static fallback theme, ensuring highlighting always has a theme available). After T-AP-11-3 integration,
-/// This function is the replaceable seam between the zen theme and syntect Theme (see "Dependencies").
-fn active_theme() -> &'static Theme {
+/// Resolves a syntect built-in theme by name: `highlight` fetches the theme before coloring each code block, letting the 'zen theme name
+/// (dark → base16-ocean.dark, provided by `Theme::syntax_theme_name`)' map to deterministic coloring;
+/// On miss, falls back to `DEFAULT_THEME`, then to the first built-in theme, and then to a static fallback theme—a theme is always available.
+/// Returns a `'static` reference (`ThemeSet` is already a OnceLock singleton, so no extra cache is needed).
+/// Module-private—consumed only by `highlight` and its tests.
+fn resolve_syntect_theme(name: &str) -> &'static Theme {
     let ts = theme_set();
     ts.themes
-        .get(DEFAULT_THEME)
+        .get(name)
+        .or_else(|| ts.themes.get(DEFAULT_THEME))
         .or_else(|| ts.themes.values().next())
         .unwrap_or_else(|| FALLBACK_THEME.get_or_init(Theme::default))
 }
@@ -149,12 +152,13 @@ fn syntect_style_to_screen(style: &syntect::highlighting::Style) -> Style {
 /// Language resolution chain: Some(lang) → `find_syntax_by_token` (case-insensitive, matched by extension/syntax name) →
 /// `find_syntax_by_extension`; None → `find_syntax_by_first_line` (shebang); unrecognized always yields
 /// default style (no coloring) segments, no error.
-/// Theme: the module embeds `DEFAULT_THEME = "base16-ocean.dark"` (a `OnceLock<ThemeSet>` singleton,
-/// lazily initialized on first call); the T-AP-11-3 theme system integration introduces an extension seam (see "Dependencies").
+/// Theme: `theme_name` specifies the syntect built-in theme name (`MarkdownTheme.syntax_theme_name`, supplied by
+/// `Theme::syntax_theme_name`), and `resolve_syntect_theme` falls back to `DEFAULT_THEME` on miss—
+/// Code blocks switch with the zen theme (dark/light) instead of always using dark (T-TU-02-1-fix closes the T-AP-10-1 integration gap).
 /// Boundary: split lines by `\n` (per `str::lines` semantics); output line count is 1:1 with input (empty lines yield an empty Vec,
 /// ensuring line-by-line alignment in the rendering layer); empty input returns an empty Vec; CRLF/CR is normalized first by the caller (REQ-TUI-02 markdown
 /// already commits to normalizing line endings, this function does not handle `\r`); TABs are kept as-is, width expansion is the rendering layer's responsibility.
-pub fn highlight(code: &str, language: Option<&str>) -> Vec<Vec<StyledSegment>> {
+pub fn highlight(code: &str, language: Option<&str>, theme_name: &str) -> Vec<Vec<StyledSegment>> {
     let Some(syntax) = resolve_syntax(language, code) else {
         // Unrecognized language / no shebang: plain-text passthrough (one default-style segment per line), does not enter syntect
         return code
@@ -168,7 +172,7 @@ pub fn highlight(code: &str, language: Option<&str>) -> Vec<Vec<StyledSegment>> 
             .collect();
     };
 
-    let mut hl = HighlightLines::new(syntax, active_theme());
+    let mut hl = HighlightLines::new(syntax, resolve_syntect_theme(theme_name));
     code.lines()
         .map(|line| {
             hl.highlight_line(line, syntax_set())
@@ -219,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_highlight_known_language_colors_keyword() {
-        let rows = highlight("fn main() {}", Some("rust"));
+        let rows = highlight("fn main() {}", Some("rust"), DEFAULT_THEME);
         assert_eq!(rows.len(), 1);
         // Keyword is colored: at least one segment has an explicit foreground color (plain degradation yields all fg=None)
         assert!(any_fg_set(&rows[0]), "Rust highlighting should produce styled spans");
@@ -228,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_highlight_unknown_language_plain() {
-        let rows = highlight("let x = 1;", Some("no-such-language-xyz"));
+        let rows = highlight("let x = 1;", Some("no-such-language-xyz"), DEFAULT_THEME);
         assert_eq!(rows.len(), 1);
         // Unrecognized language: plain-text passthrough, all default style (no explicit foreground color)
         assert!(!any_fg_set(&rows[0]));
@@ -237,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_highlight_no_language_shebang_detects_python() {
-        let rows = highlight("#!/usr/bin/env python\nprint(1)", None);
+        let rows = highlight("#!/usr/bin/env python\nprint(1)", None, DEFAULT_THEME);
         assert_eq!(rows.len(), 2);
         // Shebang triggers syntax recognition → second line (the print call) should be colored
         assert!(any_fg_set(&rows[1]), "shebang should trigger Python syntax detection");
@@ -246,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_highlight_no_language_without_shebang_plain() {
-        let rows = highlight("just some text", None);
+        let rows = highlight("just some text", None, DEFAULT_THEME);
         assert_eq!(rows.len(), 1);
         assert!(!any_fg_set(&rows[0]), "Without a shebang, it should be treated as plain text");
     }
@@ -255,13 +259,13 @@ mod tests {
 
     #[test]
     fn test_highlight_empty_input() {
-        assert!(highlight("", Some("rust")).is_empty());
-        assert!(highlight("", None).is_empty());
+        assert!(highlight("", Some("rust"), DEFAULT_THEME).is_empty());
+        assert!(highlight("", None, DEFAULT_THEME).is_empty());
     }
 
     #[test]
     fn test_highlight_blank_line_preserved() {
-        let rows = highlight("a\n\nb", Some("rust"));
+        let rows = highlight("a\n\nb", Some("rust"), DEFAULT_THEME);
         assert_eq!(rows.len(), 3, "Line count should be 1:1 with input");
         assert!(rows[1].is_empty(), "Blank lines produce a blank-line Vec");
         assert_eq!(row_text(&rows[0]), "a");
@@ -271,7 +275,7 @@ mod tests {
     #[test]
     fn test_highlight_line_integrity_multiline() {
         let code = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
-        let rows = highlight(code, Some("rust"));
+        let rows = highlight(code, Some("rust"), DEFAULT_THEME);
         let joined: String = rows
             .iter()
             .map(|r| row_text(r))
@@ -288,7 +292,7 @@ mod tests {
     fn test_highlight_stateful_across_lines() {
         let ss = syntax_set();
         let syntax = ss.find_syntax_by_token("rust").expect("Built-in Rust syntax");
-        let theme = active_theme();
+        let theme = resolve_syntect_theme(DEFAULT_THEME);
 
         // Context: first line opens a block comment → second line is still inside the comment scope
         let mut hl_ctx = HighlightLines::new(syntax, theme);
@@ -387,8 +391,46 @@ mod tests {
 
         for lang in REQUIRED_LANGUAGES {
             assert!(supports_language(lang), "{lang} should be in the supported list");
-            let rows = highlight(snippets[lang], Some(lang));
+            let rows = highlight(snippets[lang], Some(lang), DEFAULT_THEME);
             assert!(!rows.is_empty(), "Highlighting {lang} should produce at least one line");
         }
+    }
+
+    // ── theme name resolution ──
+
+    #[test]
+    fn test_resolve_syntect_theme_known_and_fallback() {
+        // A known theme name resolves to the same entry by name (pointer comparison); an unknown name falls back to DEFAULT_THEME.
+        // syntect Theme.name is a display name (not a lookup key), so assert pointer identity.
+        let ts = theme_set();
+        let dark = resolve_syntect_theme("base16-ocean.dark");
+        assert!(std::ptr::eq(
+            dark,
+            ts.themes.get("base16-ocean.dark").unwrap()
+        ));
+        let light = resolve_syntect_theme("base16-ocean.light");
+        assert!(std::ptr::eq(
+            light,
+            ts.themes.get("base16-ocean.light").unwrap()
+        ));
+        let fallback = resolve_syntect_theme("no-such-theme");
+        assert!(std::ptr::eq(
+            fallback,
+            ts.themes.get(DEFAULT_THEME).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_highlight_theme_switches_colors() {
+        // Same code under dark/light themes: text lines are identical, but at least one token segment has a different foreground color
+        // (base16 dark/light only swap base00-07 lightness; keywords and similar have the same color; punctuation/whitespace segments differ by theme).
+        let dark = highlight("fn main() {}", Some("rust"), "base16-ocean.dark");
+        let light = highlight("fn main() {}", Some("rust"), "base16-ocean.light");
+        assert!(any_fg_set(&dark[0]));
+        assert!(any_fg_set(&light[0]));
+        assert_eq!(row_text(&dark[0]), row_text(&light[0]));
+        let d_fgs: Vec<_> = dark[0].iter().map(|s| s.style.fg).collect();
+        let l_fgs: Vec<_> = light[0].iter().map(|s| s.style.fg).collect();
+        assert_ne!(d_fgs, l_fgs, "At least one token span should be colored differently between dark/light themes");
     }
 }

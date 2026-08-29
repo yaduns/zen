@@ -40,8 +40,9 @@ pub(crate) fn write_segment_row(
 ///
 /// - `padding_x` is the left padding; each line starts with padding_x spaces, then writes segments; content width =
 ///   `width - padding_x*2` (clamped to at least 1 column, matching zen-tui Text component semantics).
-/// - `theme` is the already-resolved MarkdownTheme (the thinking block uses a derived copy of `Theme::markdown_theme()`,
-///   overriding foreground and italic).
+/// - `theme` is the color-resolved MarkdownTheme. Paragraph-level recoloring of thinking segments (thinkingText gray + italic)
+///   is attributed to assistant_message (via `render_markdown_with_override`, T-TU-02-1-fix);
+///   this entry only renders the plain text flow (shared by text blocks/user/custom/skill messages).
 #[allow(clippy::too_many_arguments)]
 pub fn write_markdown(
     buf: &mut ScreenBuffer,

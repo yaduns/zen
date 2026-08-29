@@ -4,10 +4,11 @@
 // Message snapshot owned (aligned with pi lastMessage); streaming updates are replaced wholesale via update_content.
 // OSC133 terminal chunk markers v1 are not emitted (ScreenBuffer diff model has no start-of-line control sequence injection, see open issue 1).
 
+use crossterm::style::{Attribute, Color};
 use zen_ai::types::{AssistantMessage, ContentBlock, StopReason};
 use zen_tui::components::Component;
 use zen_tui::highlight::StyledSegment;
-use zen_tui::markdown::{render_markdown, MarkdownTheme};
+use zen_tui::markdown::{render_markdown, render_markdown_with_override, MarkdownTheme};
 use zen_tui::screen::{ScreenBuffer, Style};
 use zen_tui::theme::{ColorToken, Theme};
 
@@ -18,8 +19,11 @@ enum Planned {
     Gap,
     /// Single-line label (thinking collapse label / stop-reason error line).
     Label { text: String, style: Style },
-    /// markdown segment (text block / thinking expanded block, each with independent theme).
+    /// markdown segment (text block, base theme).
     Markdown { text: String, theme: MarkdownTheme },
+    /// thinking expansion segment: carries the base theme (including syntax_theme_name, code blocks inside thinking still get syntax highlighting),
+    /// paint_plan renders the text stream with segment-level overrides (thinkingText gray + italic) (T-TU-02-1-fix).
+    ThinkingMarkdown { text: String, theme: MarkdownTheme },
 }
 
 /// Full assistant message rendering component: arranges text / thinking blocks and the stop-reason error line in order—
@@ -27,8 +31,8 @@ enum Planned {
 ///
 /// Behavior (aligned with pi):
 /// - leading empty line when there is visible content; for each consecutive thinking run when thinking is collapsed (hide_thinking_block)
-///   Show only one line `hidden_thinking_label` (thinkingText + italic); when expanded, render with derived theme
-///   (thinkingText foreground + italic baseline);
+///   Show only one line of `hidden_thinking_label` (thinkingText + italic); use paragraph-level override when expanded
+///   render (text-stream gray + italic; code blocks/structural elements keep original color, aligning with pi default style semantics — T-TU-02-1-fix);
 /// - consecutive thinking blocks merged into one markdown segment; append an empty line after the segment if further visible content follows;
 /// - always append an error line when stop_reason = Length; append an error line for Aborted/Error when there is no toolCall;
 /// - toolCall blocks are excluded from the body (rendered separately by ToolExecutionComponent).
@@ -38,7 +42,9 @@ pub struct AssistantMessageComponent<'a> {
     hidden_thinking_label: String,
     output_pad: u16,
     base_md: MarkdownTheme,
-    thinking_md: MarkdownTheme,
+    /// Recolor thinking foreground (single color ColorToken::ThinkingText, reuse via override closure;
+    /// the collapsed label style is also constructed from this, see plan_blocks).
+    thinking_fg: Color,
     theme: &'a Theme,
 }
 
@@ -52,19 +58,14 @@ impl<'a> AssistantMessageComponent<'a> {
         output_pad: u16,
     ) -> Self {
         let base_md = theme.markdown_theme();
-        let mut thinking_md = base_md.clone();
-        thinking_md.text = theme.style(
-            ColorToken::ThinkingText,
-            None,
-            &[crossterm::style::Attribute::Italic],
-        );
+        let thinking_fg = theme.fg(ColorToken::ThinkingText);
         AssistantMessageComponent {
             message,
             hide_thinking_block,
             hidden_thinking_label: hidden_thinking_label.into(),
             output_pad,
             base_md,
-            thinking_md,
+            thinking_fg,
             theme,
         }
     }
@@ -176,19 +177,19 @@ impl<'a> AssistantMessageComponent<'a> {
                     }
                     let has_after = content[i..].iter().any(Self::block_visible);
                     if self.hide_thinking_block {
-                        let style = self.theme.style(
-                            ColorToken::ThinkingText,
-                            None,
-                            &[crossterm::style::Attribute::Italic],
-                        );
+                        let style = Style {
+                            fg: Some(self.thinking_fg),
+                            bg: None,
+                            attributes: vec![Attribute::Italic],
+                        };
                         plan.push(Planned::Label {
                             text: self.hidden_thinking_label.clone(),
                             style,
                         });
                     } else {
-                        plan.push(Planned::Markdown {
+                        plan.push(Planned::ThinkingMarkdown {
                             text: run.join("\n\n"),
-                            theme: self.thinking_md.clone(),
+                            theme: self.base_md.clone(),
                         });
                     }
                     if has_after {
@@ -245,9 +246,16 @@ impl<'a> AssistantMessageComponent<'a> {
                     row += 1;
                     remaining -= 1;
                 }
-                Planned::Markdown { text, theme } => {
+                Planned::Markdown { text, theme } | Planned::ThinkingMarkdown { text, theme } => {
                     let content_width = width.saturating_sub(self.output_pad * 2).max(1) as usize;
-                    let rows = render_markdown(theme, text, content_width);
+                    let rows = if matches!(block, Planned::ThinkingMarkdown { .. }) {
+                        // thinking: paragraph-level override (text-stream gray + italic; code blocks/structural elements keep original color,
+                        // see the render_markdown_with_override docs).
+                        let ov = thinking_override(self.thinking_fg);
+                        render_markdown_with_override(theme, text, content_width, Some(&ov))
+                    } else {
+                        render_markdown(theme, text, content_width)
+                    };
                     if rows.is_empty() {
                         continue;
                     }
@@ -262,6 +270,19 @@ impl<'a> AssistantMessageComponent<'a> {
             }
         }
         painted
+    }
+}
+
+/// Thinking paragraph-level recolor closure: foreground fixed to `thinking_fg` (single color thinkingText) and forces italic,
+/// other attributes (bold/underline etc.) are preserved — aligns with pi `defaultTextStyle { color, italic }` semantics.
+/// Idempotent (reapplying to the same paragraph yields the same result); consumer: `paint_plan` thinking branch.
+fn thinking_override(thinking_fg: Color) -> impl Fn(Style) -> Style {
+    move |mut s: Style| {
+        s.fg = Some(thinking_fg);
+        if !s.attributes.contains(&Attribute::Italic) {
+            s.attributes.push(Attribute::Italic);
+        }
+        s
     }
 }
 
@@ -522,5 +543,105 @@ mod tests {
         // Height budget 2 → draw only the first 2 lines (gap + 1 md line)
         let painted = comp.render(&mut buf, 0, 0, 40, 2);
         assert_eq!(painted, 2);
+    }
+
+    // ── Thinking paragraph-level override (T-TU-02-1-fix) ──
+
+    /// Get the first segment of row row in the buffer (skip space-placeholder segments).
+    fn first_seg(buf: &ScreenBuffer, row: u16) -> zen_tui::highlight::StyledSegment {
+        buf.line_segments(row)
+            .into_iter()
+            .find(|s| !s.text.trim().is_empty())
+            .expect("Line should contain a non-empty segment")
+    }
+
+    #[test]
+    fn thinking_plan_uses_thinkingmarkdown_with_base_theme() {
+        let comp = AssistantMessageComponent::new(
+            msg(vec![thinking_block("secret")], StopReason::Stop, None),
+            theme(),
+            false,
+            "Thinking...",
+            0,
+        );
+        let plan = comp.plan_blocks();
+        let thinking = plan
+            .iter()
+            .find_map(|p| match p {
+                Planned::ThinkingMarkdown { theme, .. } => Some(theme),
+                _ => None,
+            })
+            .expect("Expanding thinking should produce a ThinkingMarkdown segment");
+        // Carries the base theme (including syntax_theme_name → code blocks inside thinking are still syntax-colored per theme)
+        assert_eq!(thinking.syntax_theme_name, comp.base_md.syntax_theme_name);
+    }
+
+    #[test]
+    fn thinking_text_flow_gray_italic() {
+        let mut comp = AssistantMessageComponent::new(
+            msg(
+                vec![thinking_block("plain **bold**")],
+                StopReason::Stop,
+                None,
+            ),
+            theme(),
+            false,
+            "Thinking...",
+            0,
+        );
+        let mut buf = ScreenBuffer::new(80, 10);
+        comp.render(&mut buf, 0, 0, 80, 10);
+        let tt = theme().fg(ColorToken::ThinkingText);
+        // Row 1 = thinking text stream (row 0 = Gap)
+        let plain = first_seg(&buf, 1);
+        assert_eq!(
+            plain.style.fg,
+            Some(tt),
+            "thinking text foreground should be ThinkingText"
+        );
+        assert!(
+            plain.style.attributes.contains(&Attribute::Italic),
+            "thinking text should be forced italic"
+        );
+        let bold = buf
+            .line_segments(1)
+            .into_iter()
+            .find(|s| s.text.contains("bold"))
+            .expect("Bold segment");
+        assert_eq!(bold.style.fg, Some(tt));
+        assert!(bold.style.attributes.contains(&Attribute::Bold));
+        assert!(bold.style.attributes.contains(&Attribute::Italic));
+    }
+
+    #[test]
+    fn thinking_code_block_keeps_syntax_colors() {
+        let mut comp = AssistantMessageComponent::new(
+            msg(
+                vec![thinking_block("```rust\nfn main() {}\n```")],
+                StopReason::Stop,
+                None,
+            ),
+            theme(),
+            false,
+            "Thinking...",
+            0,
+        );
+        let mut buf = ScreenBuffer::new(80, 10);
+        comp.render(&mut buf, 0, 0, 80, 10);
+        let tt = theme().fg(ColorToken::ThinkingText);
+        // Rows 1/2/3 = ```rust / code lines / ``` (row 0 = Gap)
+        let code_row = buf.line_segments(2);
+        assert!(
+            code_row
+                .iter()
+                .any(|s| s.style.fg.is_some() && s.style.fg != Some(tt)),
+            "thinking code block should retain syntax coloring (foreground not ThinkingText)"
+        );
+        assert!(
+            !code_row
+                .iter()
+                .any(|s| s.style.attributes.contains(&Attribute::Italic)),
+            "thinking code block should not have italic overridden"
+        );
     }
 }
