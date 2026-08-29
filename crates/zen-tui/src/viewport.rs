@@ -302,13 +302,15 @@ fn write_segments<W: Write>(
         if used >= width {
             break;
         }
+        // Order-sensitive: first Reset to clear residual attributes/colors, then SetColors to set colors, and finally Set for each attribute—
+        // A Reset (ESC[0m) after SetColors also clears the newly set colors (colors are lost, attributes survive).
         queue!(
             out,
+            crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
             crossterm::style::SetColors(crossterm::style::Colors {
                 foreground: seg.style.fg,
                 background: seg.style.bg,
             }),
-            crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
         )?;
         for attr in &seg.style.attributes {
             queue!(out, crossterm::style::SetAttribute(*attr))?;
@@ -536,5 +538,23 @@ mod tests {
         );
         assert!(out.windows(1).any(|w| w == b"R"));
         assert!(out.windows(1).any(|w| w == b"x"));
+    }
+
+    #[test]
+    fn test_flush_reset_precedes_colors() {
+        // Ordering contract: Reset (ESC[0m) must precede SetColors; otherwise, the reset clears the newly set colors
+        // (Attributes survive, colors are lost—guards against reproducing the historical defect T-TU-02-1-fix).
+        let mut c = ScrollbackCanvas::new(10, 3);
+        c.push_line(vec![red("R")]);
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let reset = text.find("\x1b[0m").expect("Should contain Reset sequence");
+        let color = text
+            .find("\x1b[38;5;9m")
+            .or_else(|| text.find("\x1b[91m"))
+            .or_else(|| text.find("\x1b[31m"))
+            .expect("Should contain foreground color sequence");
+        assert!(reset < color, "Reset must precede color command: {text:?}");
     }
 }

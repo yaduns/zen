@@ -367,8 +367,20 @@ impl ScreenBuffer {
                     continue;
                 }
 
-                // Style change detection: only emit SetColors + SetAttribute commands when the style changes
+                // Style change detection: emit SetColors + SetAttribute commands only when style changes.
+                // Order-sensitive: Reset first, then SetColors, then Set one by one (Reset is ESC[0m, which clears previous
+                // set colors; SetColors must come after Reset for colors to survive).
                 if cell.style != prev_style || style_dirty {
+                    // Attribute switching: Reset first to clear residue, then SetColors to set colors, finally Set one by one (Vec<Attribute>
+                    // Cannot do incremental diff; emits Reset+attributes only on attribute change/first cell).
+                    if style_dirty || cell.style.attributes != prev_style.attributes {
+                        queue!(
+                            out,
+                            crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
+                        )
+                        .map_err(TerminalError::Io)?;
+                    }
+
                     queue!(
                         out,
                         crossterm::style::SetColors(crossterm::style::Colors {
@@ -378,13 +390,7 @@ impl ScreenBuffer {
                     )
                     .map_err(TerminalError::Io)?;
 
-                    // Attribute switching: Reset first, then Set one by one (Vec<Attribute> cannot do an incremental diff)
                     if style_dirty || cell.style.attributes != prev_style.attributes {
-                        queue!(
-                            out,
-                            crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
-                        )
-                        .map_err(TerminalError::Io)?;
                         for attr in &cell.style.attributes {
                             queue!(out, crossterm::style::SetAttribute(*attr))
                                 .map_err(TerminalError::Io)?;
@@ -709,6 +715,24 @@ mod tests {
 
         // previous has been synced to the current frame
         assert_eq!(buf.previous, buf.cells);
+    }
+
+    #[test]
+    fn test_flush_reset_precedes_colors() {
+        // Order contract: Reset (ESC[0m) must precede SetColors, otherwise colors are cleared by reset (regression protection for historical defect:
+        // previous SetColors→Reset order caused TUI full color to fail, only attributes survived — T-TU-02-1-fix).
+        let mut buf = ScreenBuffer::new(3, 1);
+        buf.write(0, 0, &color_style(), "A");
+        let mut out = Vec::new();
+        buf.flush(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let reset = text.find("\x1b[0m").expect("Should contain Reset sequence");
+        let color = text
+            .find("\x1b[38;5;9m")
+            .or_else(|| text.find("\x1b[91m"))
+            .or_else(|| text.find("\x1b[31m"))
+            .expect("Should contain foreground color sequence");
+        assert!(reset < color, "Reset must precede color command: {text:?}");
     }
 
     #[test]
