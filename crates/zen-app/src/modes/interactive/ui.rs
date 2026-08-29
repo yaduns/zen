@@ -14,7 +14,9 @@ use crate::components::custom_entry::CustomEntryComponent;
 use crate::components::custom_message::CustomMessageComponent;
 use crate::components::footer::{FooterComponent, FooterData, UsageTotals};
 use crate::components::skill_invocation_message::SkillInvocationMessageComponent;
-use crate::components::status_indicator::{IdleStatus, StatusIndicator};
+use crate::components::status_indicator::{
+    CompactionStatusReason, IdleStatus, StatusIndicator, StatusIndicatorKind,
+};
 use crate::components::tool_execution::{ToolExecutionComponent, ToolExecutionResult};
 use crate::components::user_message::UserMessageComponent;
 use crate::modes::interactive::{AppAction, InputCommand, StatusSpec, UiEvent};
@@ -37,7 +39,8 @@ use zen_tui::viewport::ScrollbackCanvas;
 const MEASURE_HEIGHT_CAP: u16 = 300;
 
 /// Shared rendering/interaction state on the UI task side (`Rc<RefCell<InteractiveUi>>` shared by the on_event/on_wake/draw closures);
-/// Holds an owned Theme and the editor; renders data snapshots line by line (components are constructed transiently and are not placed in the 'static container).
+/// Holds owned Theme and editor; data snapshot rendered line by line (components are constructed transiently, not stored in 'static containers;
+/// the status line is the exception — its `status_indicator` persistent instance is reused across frames, see apply_status).
 ///
 /// **Send note**: this type contains `Rc<RefCell<EditorRoute>>` and `CustomEditor` (which holds !Send callbacks),
 /// so it is inherently non-Send—the UI task does not cross threads and the main task never holds this type (it only communicates via channels), so `Rc` is safe.
@@ -51,6 +54,10 @@ pub struct InteractiveUi {
     tool_indices: HashMap<String, usize>, // tool_call_id → chat line index
     footer_data: Option<FooterData>, // Per-frame state snapshot (the footer is supplied by the main task each frame via UiEvent::Footer)
     status: Option<StatusSpec>, // Per-frame state snapshot
+    // Persistent status line instance: reused across frames to preserve the Loader animation clock (Working→Working only updates the message, no rebuild).
+    // Lifecycle maintained by apply (apply_status / ClearStatus / ThemeChanged); the render side only draws, never constructs —
+    // fixes the animation defect where per-frame transient construction → started_at re-anchored every frame → spinner stuck on the first frame.
+    status_indicator: Option<StatusIndicator>,
     folded: HashSet<usize>, // Collapsed row set (tree/branch/compaction/skill collapse; ToolsExpand flips locally)
     is_bash_mode: bool,     // Editor border indicator (! prefix)
     hide_thinking_block: bool, // Collapsed thinking in assistant row rendering (v1 default false; T-AP-02-3 wires in the real setting)
@@ -180,6 +187,7 @@ impl InteractiveUi {
             tool_indices: HashMap::new(),
             footer_data,
             status: None,
+            status_indicator: None,
             folded: HashSet::new(),
             is_bash_mode: false,
             hide_thinking_block: false,
@@ -285,8 +293,11 @@ impl InteractiveUi {
     /// animation flags, theme replacement) and set the internal redraw request (effective in the render layer via WakeOutcome).
     pub(crate) fn apply(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::Status(spec) => self.status = Some(spec),
-            UiEvent::ClearStatus => self.status = None,
+            UiEvent::Status(spec) => self.apply_status(spec),
+            UiEvent::ClearStatus => {
+                self.status = None;
+                self.status_indicator = None;
+            }
             UiEvent::MessageStart(msg) => self.apply_message_start(msg),
             UiEvent::MessageUpdate(msg) => self.apply_message_update(msg),
             UiEvent::MessageEnd {
@@ -329,6 +340,9 @@ impl InteractiveUi {
                 };
                 self.editor
                     .set_border_style(Style::fg(self.theme.fg(token)));
+                // Status line style is based on theme tokens: persistent instances are rebuilt from the current state snapshot
+                // (very low-frequency events, clock re-anchoring is acceptable, see rebuild_status_indicator).
+                self.rebuild_status_indicator();
             }
             UiEvent::TerminalTitle(title) => {
                 // Write OSC terminal title escape directly (same thread as ScreenBuffer differential output, executed sequentially, no interleaving risk).
@@ -340,6 +354,124 @@ impl InteractiveUi {
             UiEvent::EditorSetText(text) => {
                 self.editor.set_text(&text);
                 self.sync_bash_mode();
+            }
+        }
+    }
+
+    /// Apply the status line spec: update the snapshot and maintain the persistent `status_indicator` instance.
+    /// Working→Working only calls [`StatusIndicator::set_message`] without rebuilding (preserves the Loader clock anchor,
+    /// which is required for animation frames to advance across frames); construct a new instance only on category switch or first appearance; Error/Warning semantic colors are drawn directly
+    /// (no persistent instance).
+    fn apply_status(&mut self, spec: StatusSpec) {
+        self.status = Some(spec.clone());
+        match spec {
+            StatusSpec::Working { message } => {
+                let reuse = self
+                    .status_indicator
+                    .as_ref()
+                    .is_some_and(|i| matches!(i.kind(), StatusIndicatorKind::Working));
+                if reuse {
+                    // Existing Working instance: only update the message, clock anchor continues (no rebuild).
+                    if let Some(i) = self.status_indicator.as_mut() {
+                        i.set_message(message);
+                    }
+                } else {
+                    self.status_indicator = Some(StatusIndicator::working(message, &self.theme));
+                }
+            }
+            StatusSpec::Retry {
+                attempt,
+                max_attempts,
+                delay_ms,
+            } => {
+                self.status_indicator = Some(StatusIndicator::retry(
+                    attempt,
+                    max_attempts,
+                    delay_ms,
+                    &self.kb,
+                    &self.theme,
+                ));
+            }
+            StatusSpec::Compaction => {
+                self.status_indicator = Some(StatusIndicator::compaction(
+                    CompactionStatusReason::Manual,
+                    &self.kb,
+                    &self.theme,
+                ));
+            }
+            StatusSpec::BranchSummary => {
+                self.status_indicator =
+                    Some(StatusIndicator::branch_summary(&self.kb, &self.theme));
+            }
+            StatusSpec::Error(_) | StatusSpec::Warning(_) => {
+                // Semantic colors drawn directly; no persistent instances.
+                self.status_indicator = None;
+            }
+        }
+    }
+
+    /// After a theme replacement, rebuild the persistent status line from the current state snapshot (style is based on theme tokens, rebuild required;
+    /// clock re-anchoring is acceptable for very low-frequency theme events). Clear the instance when the snapshot is None/Error/Warning.
+    fn rebuild_status_indicator(&mut self) {
+        self.status_indicator = match &self.status {
+            Some(StatusSpec::Working { message }) => {
+                Some(StatusIndicator::working(message.clone(), &self.theme))
+            }
+            Some(StatusSpec::Retry {
+                attempt,
+                max_attempts,
+                delay_ms,
+            }) => Some(StatusIndicator::retry(
+                *attempt,
+                *max_attempts,
+                *delay_ms,
+                &self.kb,
+                &self.theme,
+            )),
+            Some(StatusSpec::Compaction) => Some(StatusIndicator::compaction(
+                CompactionStatusReason::Manual,
+                &self.kb,
+                &self.theme,
+            )),
+            Some(StatusSpec::BranchSummary) => {
+                Some(StatusIndicator::branch_summary(&self.kb, &self.theme))
+            }
+            Some(StatusSpec::Error(_)) | Some(StatusSpec::Warning(_)) | None => None,
+        };
+    }
+
+    /// Status line rendering: animation categories (Working/Retry/Compaction/BranchSummary) draw the persistent instance
+    /// (reused across frames to preserve the clock); Error/Warning drawn directly in semantic color; idle → IdleStatus placeholder.
+    /// Paired with `apply_status`: the render side only draws, never constructs.
+    fn render_status(&mut self, buf: &mut ScreenBuffer, y: u16, height: u16) {
+        let width = buf.size().0;
+        if matches!(
+            self.status,
+            Some(
+                StatusSpec::Working { .. }
+                    | StatusSpec::Retry { .. }
+                    | StatusSpec::Compaction
+                    | StatusSpec::BranchSummary
+            )
+        ) {
+            if let Some(comp) = self.status_indicator.as_mut() {
+                let _ = comp.render(buf, 0, y, width, height);
+            }
+            return;
+        }
+        let theme = &self.theme;
+        match &self.status {
+            Some(StatusSpec::Error(msg)) => {
+                let style = Style::fg(theme.fg(ColorToken::Error));
+                buf.write(0, y, &style, msg);
+            }
+            Some(StatusSpec::Warning(msg)) => {
+                let style = Style::fg(theme.fg(ColorToken::Warning));
+                buf.write(0, y, &style, msg);
+            }
+            _ => {
+                let mut idle = IdleStatus;
+                let _ = idle.render(buf, 0, y, width, height);
             }
         }
     }
@@ -443,7 +575,8 @@ impl InteractiveUi {
     }
 
     /// Per-frame composited rendering (**cell-level diff mode**): top-down cursor advance — message area (chat_rows scrolling window + pending
-    /// queue) → status line → editor → footer; each line **instantiates** components on the fly (borrowing `&self.theme`, not storing them).
+    /// queue) → status line → editor → footer; each component is **constructed transiently per line** (borrows `&self.theme`, not stored),
+    /// the status line is the sole exception — draws a persistent `status_indicator` instance (reused across frames to preserve the animation clock, see `render_status`).
     ///
     /// Layout budget (fixed bottom-up): footer 2 lines + editor 3 lines + status line 2 lines (busy indicator 1 line +
     /// idle placeholder to keep the bottom stable); everything else is allocated to the message area (bottom follows scrolling, see render_chat).
@@ -458,7 +591,6 @@ impl InteractiveUi {
         if height == 0 {
             return;
         }
-        let theme = &self.theme;
 
         // Bottom three-section budget (line counts)
         let footer_h: u16 = 2;
@@ -472,52 +604,15 @@ impl InteractiveUi {
         if message_area_h > 0 {
             self.render_chat(buf, message_area_h);
         }
-        //    Error/Warning → text rendered directly in semantic colors; idle → IdleStatus (a 2-line placeholder keeps the bottom stable).
-        match &self.status {
-            Some(StatusSpec::Working { message }) => {
-                let mut comp = StatusIndicator::working(message.clone(), theme);
-                let _ = comp.render(buf, 0, status_y, width, 1);
-            }
-            Some(StatusSpec::Retry {
-                attempt,
-                max_attempts,
-                delay_ms,
-            }) => {
-                let mut comp =
-                    StatusIndicator::retry(*attempt, *max_attempts, *delay_ms, &self.kb, theme);
-                let _ = comp.render(buf, 0, status_y, width, 1);
-            }
-            Some(StatusSpec::Compaction) => {
-                let mut comp = StatusIndicator::compaction(
-                    crate::components::status_indicator::CompactionStatusReason::Manual,
-                    &self.kb,
-                    theme,
-                );
-                let _ = comp.render(buf, 0, status_y, width, 1);
-            }
-            Some(StatusSpec::BranchSummary) => {
-                let mut comp = StatusIndicator::branch_summary(&self.kb, theme);
-                let _ = comp.render(buf, 0, status_y, width, 1);
-            }
-            Some(StatusSpec::Error(msg)) => {
-                let style = Style::fg(theme.fg(ColorToken::Error));
-                buf.write(0, status_y, &style, msg);
-            }
-            Some(StatusSpec::Warning(msg)) => {
-                let style = Style::fg(theme.fg(ColorToken::Warning));
-                buf.write(0, status_y, &style, msg);
-            }
-            None => {
-                let mut idle = IdleStatus;
-                let _ = idle.render(buf, 0, status_y, width, status_h);
-            }
-        }
+        //    Error/Warning → text drawn directly in semantic color; idle → IdleStatus (2-line placeholder keeps the bottom stable);
+        //    Animated categories draw persistent instances (reused across frames to preserve the clock, see apply_status/render_status).
+        self.render_status(buf, status_y, status_h);
 
         // 3. Editor (fixed 3 lines at the bottom)
         self.editor.render_editor(buf, 0, editor_y, width, editor_h);
 
         // 4. Footer (fixed 2 lines at the bottom)
-        let mut footer = FooterComponent::new(theme);
+        let mut footer = FooterComponent::new(&self.theme);
         if let Some(data) = &self.footer_data {
             footer.set_data(data.clone());
         }
@@ -576,50 +671,14 @@ impl InteractiveUi {
         let fixed_h = status_h + editor_h + footer_h;
         let mut fixed = ScreenBuffer::new(width, fixed_h);
 
-        match &self.status {
-            Some(StatusSpec::Working { message }) => {
-                let mut comp = StatusIndicator::working(message.clone(), theme);
-                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
-            }
-            Some(StatusSpec::Retry {
-                attempt,
-                max_attempts,
-                delay_ms,
-            }) => {
-                let mut comp =
-                    StatusIndicator::retry(*attempt, *max_attempts, *delay_ms, &self.kb, theme);
-                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
-            }
-            Some(StatusSpec::Compaction) => {
-                let mut comp = StatusIndicator::compaction(
-                    crate::components::status_indicator::CompactionStatusReason::Manual,
-                    &self.kb,
-                    theme,
-                );
-                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
-            }
-            Some(StatusSpec::BranchSummary) => {
-                let mut comp = StatusIndicator::branch_summary(&self.kb, theme);
-                let _ = comp.render(&mut fixed, 0, 0, width, status_h);
-            }
-            Some(StatusSpec::Error(msg)) => {
-                let style = Style::fg(theme.fg(ColorToken::Error));
-                fixed.write(0, 0, &style, msg);
-            }
-            Some(StatusSpec::Warning(msg)) => {
-                let style = Style::fg(theme.fg(ColorToken::Warning));
-                fixed.write(0, 0, &style, msg);
-            }
-            None => {
-                let mut idle = IdleStatus;
-                let _ = idle.render(&mut fixed, 0, 0, width, status_h);
-            }
-        }
+        // Status line: animated categories draw persistent instances (reused across frames to preserve the clock), Error/Warning drawn directly in semantic color,
+        // idle → IdleStatus (see apply_status/render_status).
+        self.render_status(&mut fixed, 0, status_h);
         // Editor (fixed 3 rows)
         self.editor
             .render_editor(&mut fixed, 0, status_h, width, editor_h);
         // Footer (fixed 2 rows)
-        let mut footer = FooterComponent::new(theme);
+        let mut footer = FooterComponent::new(&self.theme);
         if let Some(data) = &self.footer_data {
             footer.set_data(data.clone());
         }
@@ -1194,6 +1253,61 @@ mod tests {
         assert!(u.status.is_none());
         u.apply(UiEvent::PendingChanged(vec!["follow-up".into()]));
         assert_eq!(u.pending_rows, vec!["follow-up".to_string()]);
+    }
+
+    #[test]
+    fn test_status_indicator_lifecycle_via_apply() {
+        let mut u = ui();
+        // Working → persistent instance already constructed (clock anchored at construction time)
+        u.apply(UiEvent::Status(StatusSpec::Working {
+            message: "Thinking...".into(),
+        }));
+        assert!(u.status_indicator.is_some());
+        // Working→Working: reuse the instance without rebuilding (preserves the clock anchor, the precondition for cross-frame animation progression)
+        u.apply(UiEvent::Status(StatusSpec::Working {
+            message: "Thinking...".into(),
+        }));
+        assert!(u
+            .status_indicator
+            .as_ref()
+            .is_some_and(|i| matches!(i.kind(), StatusIndicatorKind::Working)));
+        // Category switch: Compaction → rebuild as a Compaction category
+        u.apply(UiEvent::Status(StatusSpec::Compaction));
+        assert!(u
+            .status_indicator
+            .as_ref()
+            .is_some_and(|i| matches!(i.kind(), StatusIndicatorKind::Compaction)));
+        // Error → drawn directly in semantic color, no persistent instance
+        u.apply(UiEvent::Status(StatusSpec::Error("boom".into())));
+        assert!(u.status_indicator.is_none());
+        // ClearStatus → clear the snapshot and the instance
+        u.apply(UiEvent::Status(StatusSpec::Working {
+            message: "again".into(),
+        }));
+        assert!(u.status_indicator.is_some());
+        u.apply(UiEvent::ClearStatus);
+        assert!(u.status.is_none());
+        assert!(u.status_indicator.is_none());
+    }
+
+    #[test]
+    fn test_rebuild_status_indicator_on_theme_changed() {
+        let mut u = ui();
+        u.apply(UiEvent::Status(StatusSpec::Working {
+            message: "Thinking...".into(),
+        }));
+        assert!(u.status_indicator.is_some());
+        let light = zen_tui::theme::builtin_light_theme().clone();
+        u.apply(UiEvent::ThemeChanged(light.clone()));
+        // Rebuild from the snapshot after a theme swap: instance persists, category unchanged (styling already uses the new tokens)
+        assert!(u
+            .status_indicator
+            .as_ref()
+            .is_some_and(|i| matches!(i.kind(), StatusIndicatorKind::Working)));
+        // Theme swap under an idle snapshot → instance cleared
+        u.apply(UiEvent::ClearStatus);
+        u.apply(UiEvent::ThemeChanged(light.clone()));
+        assert!(u.status_indicator.is_none());
     }
 
     #[test]

@@ -293,4 +293,25 @@ mod tests {
         let s = StatusIndicator::working("x", theme());
         assert!(matches!(s.kind(), StatusIndicatorKind::Working));
     }
+
+    #[test]
+    fn spinner_advances_on_long_lived_instance() {
+        // Contract: animation frames are derived from the clock crossing frames — a second render of the same instance (reused across frames) must move off the first frame.
+        // If the caller rebuilds the instance every frame (started_at re-anchored each frame → elapsed≈0), this test fails.
+        let mut status = StatusIndicator::working("Working on it", theme());
+        // Just constructed: elapsed≈0 → first frame ⠋
+        let mut buf1 = ScreenBuffer::new(40, 3);
+        status.render(&mut buf1, 0, 0, 40, 3);
+        let first = flush_text(&mut buf1);
+        assert!(first.contains('⠋'), "first frame should be ⠋, got {first}");
+        // Long-lived: 250ms > 80ms/frame → (250/80)%10 = 3 → not the first frame (a slow machine only pushes it later; always non-zero)
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let mut buf2 = ScreenBuffer::new(40, 3);
+        status.render(&mut buf2, 0, 0, 40, 3);
+        let second = flush_text(&mut buf2);
+        assert!(
+            !second.contains('⠋'),
+            "spinner stuck on first frame (clock not advancing): {second}"
+        );
+    }
 }

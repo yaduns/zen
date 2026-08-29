@@ -104,8 +104,8 @@ pub(crate) enum UiEvent {
     EditorSetText(String),
 }
 
-/// Status line spec: `InteractiveUi::render` constructs `StatusIndicator` on the fly from this
-/// (Corresponds to `StatusIndicatorKind` Working/Retry/Compaction/BranchSummary forms + message).
+/// status line spec: `InteractiveUi::apply` (`apply_status`) maintains a persistent `StatusIndicator`
+/// instance (reused across frames, preserving the Loader clock anchor; animation frames advance across frames); the rendering side only draws, never creates.
 /// Errors/warnings are expressed directly via `Status(StatusSpec::Error/Warning)` (render-side semantic colors drawn directly).
 #[derive(Debug, Clone)]
 pub(crate) enum StatusSpec {
