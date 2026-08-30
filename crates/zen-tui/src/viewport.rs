@@ -44,6 +44,10 @@ pub struct ScrollbackCanvas {
     prev_height: u16,
     /// Content row index of the hardware cursor after the previous frame's render (used to compute physical displacement for the diff; aligns with pi's `hardwareCursorRow`).
     hardware_cursor_row: usize,
+    /// This frame's "IME cursor anchor": (content line number, absolute column). Set every frame by draw side (editor rendering location),
+    /// flush finalization positions the (hidden) hardware cursor here for system IME spelling string/candidate window anchoring
+    /// (aligned with pi CURSOR_MARKER → positionHardwareCursor semantics); None when no focus/no editor.
+    cursor_hint: Option<(usize, usize)>,
 }
 
 impl ScrollbackCanvas {
@@ -59,13 +63,16 @@ impl ScrollbackCanvas {
             height,
             prev_height: height,
             hardware_cursor_row: 0,
+            cursor_hint: None,
         }
     }
 
     /// Clear this frame's line stream; call before each draw (aligns with `render_frame`'s `buffer.clear()` contract);
     /// `prev_lines`/`prev_viewport_top` are kept as the previous frame's diff baseline.
+    /// IME cursor anchor is also reset (re-set every frame by draw side, terminal-ime-anchor-fix).
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.cursor_hint = None;
     }
 
     /// Append a screen line to the end of the line stream (shared entry point for consecutive message-area lines and fixed-area tail lines).
@@ -87,6 +94,24 @@ impl ScrollbackCanvas {
     /// Total content rows this frame (= `lines.len()`); used by TuiLoop to decide whether to trigger scroll advance.
     pub fn content_height(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Set this frame's IME cursor anchor (editor caret's content line number + absolute column; pass None when no focus).
+    /// flush finalization positions the (hidden) hardware cursor at this anchor, so system IME spelling string/candidate window
+    /// draw in place (aligned with pi CURSOR_MARKER → positionHardwareCursor, see terminal-ime-anchor-fix).
+    pub fn set_cursor_hint(&mut self, pos: Option<(usize, usize)>) {
+        self.cursor_hint = pos;
+    }
+
+    /// Current number of content lines already pushed (`lines.len()`; when called before push, this is the content line number of the next line).
+    /// Consumer: the draw side records the content line number corresponding to a given line at the push boundary (for IME cursor anchor row calculation).
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Current IME cursor anchor (read by tests and future consumers).
+    pub fn cursor_hint(&self) -> Option<(usize, usize)> {
+        self.cursor_hint
     }
 
     /// Canvas column width (per-line truncation / single-line measured width); lets the app side build component render buffers per screen width.
@@ -112,6 +137,7 @@ impl ScrollbackCanvas {
             self.prev_viewport_top = 0;
             self.viewport_top = 0;
             self.hardware_cursor_row = 0;
+            self.cursor_hint = None;
         }
         changed
     }
@@ -231,6 +257,29 @@ impl ScrollbackCanvas {
         self.viewport_top = self.prev_viewport_top;
         self.prev_lines = self.lines.clone();
         self.prev_height = height as u16;
+        // IME cursor anchor: after content and state finalization, position the (hidden) hardware cursor at the editor caret (line diff
+        // finalization is on the last line; the anchor row may move up/down; overrides final_cursor_row for the next frame's diff).
+        self.position_cursor_hint(out)?;
+        Ok(())
+    }
+
+    /// Position the (hidden) hardware cursor at this frame's cursor anchor (editor caret): relative row movement (`\x1b[nA/B`)
+    /// + absolute column (`\x1b[nG`). Positioning only; no Show is sent (the cursor stays hidden, and the system IME still anchors at its position
+    /// for the composition string/candidate window). After positioning, sync `hardware_cursor_row` for the next frame's line diff.
+    /// Align with pi `positionHardwareCursor` (reference/pi-original/packages/tui/src/tui.ts).
+    fn position_cursor_hint<W: Write>(&mut self, out: &mut W) -> Result<(), TerminalError> {
+        let Some((row, col)) = self.cursor_hint else {
+            return Ok(());
+        };
+        let delta = row as isize - self.hardware_cursor_row as isize;
+        if delta > 0 {
+            out.write_all(format!("\x1b[{delta}B").as_bytes())?;
+        } else if delta < 0 {
+            out.write_all(format!("\x1b[{}A", -delta).as_bytes())?;
+        }
+        out.write_all(format!("\x1b[{}G", col + 1).as_bytes())?;
+        out.flush().map_err(TerminalError::Io)?;
+        self.hardware_cursor_row = row;
         Ok(())
     }
 
@@ -261,6 +310,8 @@ impl ScrollbackCanvas {
         self.viewport_top = self.prev_viewport_top;
         self.prev_lines = self.lines.clone();
         self.prev_height = height as u16;
+        // IME cursor anchor: the full redraw path also positions after finalization (terminal-ime-anchor-fix).
+        self.position_cursor_hint(out)?;
         Ok(())
     }
 }
@@ -545,6 +596,119 @@ mod tests {
         );
         assert!(out.windows(1).any(|w| w == b"R"));
         assert!(out.windows(1).any(|w| w == b"x"));
+    }
+
+    // ── IME cursor anchor (terminal-ime-anchor-fix) ──
+
+    #[test]
+    fn test_cursor_hint_set_and_clear_and_line_count() {
+        let mut c = ScrollbackCanvas::new(10, 5);
+        assert_eq!(c.cursor_hint(), None);
+        c.push_line(vec![plain("a")]);
+        assert_eq!(c.line_count(), 1, "line_count reflects the number of pushed lines");
+        c.set_cursor_hint(Some((1, 2)));
+        assert_eq!(c.cursor_hint(), Some((1, 2)));
+        // clear() resets the anchor (re-set by draw each frame)
+        c.clear();
+        assert_eq!(c.cursor_hint(), None);
+        assert_eq!(c.line_count(), 0, "clear clears the line stream");
+    }
+
+    #[test]
+    fn test_cursor_hint_reset_by_set_size() {
+        let mut c = ScrollbackCanvas::new(10, 5);
+        c.set_cursor_hint(Some((1, 2)));
+        assert!(c.set_size(12, 5));
+        assert_eq!(c.cursor_hint(), None, "Resize clears anchors");
+    }
+
+    #[test]
+    fn test_flush_no_hint_writes_no_cursor_moves() {
+        // With no anchor, flush emits no cursor positioning sequence (CSI parameters: 1-3 digits + A/B/G terminator)
+        let mut c = ScrollbackCanvas::new(10, 4);
+        c.push_line(vec![plain("a")]);
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        let has_position = |t: &str| {
+            let b = t.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == 0x1b && b.get(i + 1) == Some(&b'[') {
+                    let mut j = i + 2;
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if matches!(b.get(j), Some(b'A' | b'B' | b'G')) {
+                        return true;
+                    }
+                }
+                i += 1;
+            }
+            false
+        };
+        let text = String::from_utf8_lossy(&out);
+        assert!(!has_position(&text), "Without an anchor, no positioning sequence should be output: {text:?}");
+    }
+
+    #[test]
+    fn test_flush_with_hint_moves_row_and_column() {
+        // Content has 3 lines, height=3: after full redraw, hardware_cursor_row=2; anchor (1, 2) → \x1b[1A + \x1b[3G
+        let mut c = ScrollbackCanvas::new(10, 3);
+        c.push_line(vec![plain("r0")]);
+        c.push_line(vec![plain("r1")]);
+        c.push_line(vec![plain("r2")]);
+        c.set_cursor_hint(Some((1, 2)));
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[1A"), "Should move up 1 line: {text:?}");
+        assert!(
+            text.contains("\x1b[3G"),
+            "Should move to absolute column 3 (0-based 2+1): {text:?}"
+        );
+        assert_eq!(c.hardware_cursor_row, 1, "Anchor line synchronized as diff baseline");
+    }
+
+    #[test]
+    fn test_flush_with_hint_same_row_only_column_move() {
+        // Anchor row equals final_cursor_row: only column positioning is emitted (no A/B)
+        let mut c = ScrollbackCanvas::new(10, 3);
+        c.push_line(vec![plain("a")]);
+        c.push_line(vec![plain("b")]);
+        c.push_line(vec![plain("c")]);
+        let mut first = Vec::new();
+        c.flush(&mut first).unwrap(); // Previous frame: full redraw, cursor row 2
+        c.clear();
+        for i in 0..3 {
+            c.push_line(vec![plain(&format!("r{i}"))]);
+        }
+        // Changed rows = 0..2 (final_cursor_row = 2), anchor row 2: only column positioning is needed
+        c.set_cursor_hint(Some((2, 5)));
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[6G"), "Should contain column positioning: {text:?}");
+        assert!(
+            !text.contains("\x1b[1A") && !text.contains("\x1b[1B"),
+            "Same anchor line should not cause line movement: {text:?}"
+        );
+        assert_eq!(c.hardware_cursor_row, 2);
+    }
+
+    #[test]
+    fn test_full_render_path_also_positions_cursor_hint() {
+        // First frame (full redraw) with anchor: finalization positioning takes effect
+        let mut c = ScrollbackCanvas::new(10, 3);
+        c.push_line(vec![plain("r0")]);
+        c.push_line(vec![plain("r1")]);
+        c.set_cursor_hint(Some((0, 0)));
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        // After full redraw, hardware_cursor_row=1, anchor row 0 → move up 1 row + column 1
+        assert!(text.contains("\x1b[1A"));
+        assert!(text.contains("\x1b[1G"));
+        assert_eq!(c.hardware_cursor_row, 0);
     }
 
     #[test]

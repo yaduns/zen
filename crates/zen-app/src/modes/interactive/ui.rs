@@ -700,12 +700,24 @@ impl InteractiveUi {
         let _ = footer.render(&mut fixed, 0, status_h + editor_h, width, footer_h);
 
         // Bridge the fixed region as the line stream tail (only non-empty rows are pushed, to avoid blank rows appearing in scrollback).
+        // IME cursor anchor (terminal-ime-anchor-fix): line of the editor caret within fixed =
+        // status_h + cursor_position().1 (already includes the +1 top border offset); its corresponding content line number (=
+        // number of lines already pushed) is recorded before push — the fixed region skips empty lines, so the line number cannot be derived directly from the fixed line number.
+        // flush uses this to place the (hidden) hardware cursor at the caret, anchoring the system IME composition string/candidate window in place.
+        let caret_pos = self.editor.cursor_position();
+        let caret_fixed_row = status_h as usize + caret_pos.1 as usize;
+        let caret_col = caret_pos.0 as usize;
+        let mut caret_canvas_row: Option<usize> = None;
         for r in 0..fixed_h {
             let segs = fixed.line_segments(r);
             if !segs.is_empty() {
+                if r as usize == caret_fixed_row {
+                    caret_canvas_row = Some(canvas.line_count());
+                }
                 canvas.push_line(segs);
             }
         }
+        canvas.set_cursor_hint(caret_canvas_row.map(|row| (row, caret_col)));
     }
 
     /// Message area rendering: measure each row's actual height → bottom-following scroll window → draw sequentially.
@@ -1446,6 +1458,27 @@ mod tests {
             "fixed area should have at least 6-7 non-empty lines, actual {} lines",
             canvas.content_height()
         );
+    }
+
+    #[test]
+    fn test_render_scrollback_sets_ime_cursor_hint() {
+        // IME cursor anchor (terminal-ime-anchor-fix): editor caret line (status lines 2 + top border +1)
+        // Content present must be pushed → anchor is Some; anchor line falls within the fixed region
+        let mut u = ui();
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let hint = canvas.cursor_hint();
+        assert!(hint.is_some(), "IME cursor anchor should be set every frame while the editor is focused");
+        let (row, _col) = hint.unwrap();
+        assert!(
+            row < canvas.content_height(),
+            "anchor row should be within the pushed content rows: row={row} < {}",
+            canvas.content_height()
+        );
+        // Empty editor caret column = effective left padding (DEFAULT_EDITOR_PADDING_X=0), within the line width
+        if let Some((_row, col)) = hint {
+            assert!(col < 80, "anchor column should be within the line width: {col}");
+        }
     }
 
     #[test]
