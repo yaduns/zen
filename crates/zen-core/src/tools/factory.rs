@@ -2,6 +2,7 @@ use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
 use crate::tools::read::ReadTool;
 use crate::tools::write::WriteTool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use zen_ai::tool::{Tool, ToolContext, ToolRegistry};
 
@@ -63,20 +64,71 @@ pub struct ToolFactory {
     tool_context: ToolContext,
 }
 
+/// Tool selection parameters (aligned with pi's `CreateAgentSessionOptions.tools/excludeTools/noTools`,
+/// mapped from the CLI flags `--tools/--exclude-tools/--no-tools/--no-builtin-tools`; see
+/// cli-tools-flags-fix). v1 has no extension/custom tools: `no_tools` and `no_builtin_tools`
+/// both collapse to "no built-in tools"; the semantic distinction is preserved (custom tools will only be
+/// (turned off by `no_tools`).
+#[derive(Debug, Clone, Default)]
+pub struct ToolSelection {
+    /// Allow-list (`--tools`); when non-empty, only tools in the list are created (unknown names silently skipped, aligned with pi).
+    pub tools: Vec<String>,
+    /// Deny-list (`--exclude-tools`), applied after the allow-list (aligned with pi's "Applies after tools").
+    pub exclude_tools: Vec<String>,
+    /// Disable all tools (`--no-tools`; when given together with `--tools`, the allow-list takes precedence, aligned with pi).
+    pub no_tools: bool,
+    /// Disable builtin tool groups (`--no-builtin-tools`; v1 has no extension tools, same effect as `no_tools`).
+    pub no_builtin_tools: bool,
+}
+
 impl ToolFactory {
     /// Constructs a factory from the session environment.
     pub fn new(tool_context: ToolContext) -> Self {
         Self { tool_context }
     }
     /// Create all built-in tools (full `ToolName` set), injecting the environment into each instance.
+    /// Equivalent to `create_with_selection(&ToolSelection::default())` (default builtin groups:
+    /// read/bash/edit/write, aligned with pi's `defaultActiveToolNames`).
     pub fn create_all(&self) -> ToolRegistry {
+        self.create_with_selection(&ToolSelection::default())
+    }
+
+    /// Create a tool set from selection parameters. Aligned with pi's `createAgentSession`:
+    /// `initialActiveToolNames =
+    ///   (tools ? tools : noTools ? [] : defaultActiveToolNames).filter(!excluded)`：
+    /// - `tools` non-empty → only tools in the list; unknown names via `ToolName::from_str` silently skipped (pi only filters among
+    ///   already-registered tools; not found → not enabled, no error);
+    /// - `tools` empty and `no_tools`/`no_builtin_tools` → empty set;
+    /// - otherwise → default builtin groups [read, bash, edit, write] (aligned with pi's `defaultActiveToolNames`);
+    /// - `exclude_tools` is set-subtracted from the candidates (applied after `--exclude-tools`).
+    /// Unimplemented tools (grep/find/ls; v1 `create` returns None) naturally produce no entries in the list.
+    pub fn create_with_selection(&self, selection: &ToolSelection) -> ToolRegistry {
+        let excluded: HashSet<ToolName> = selection
+            .exclude_tools
+            .iter()
+            .filter_map(|s| ToolName::from_str(s))
+            .collect();
+        let candidate: Vec<ToolName> = if !selection.tools.is_empty() {
+            selection
+                .tools
+                .iter()
+                .filter_map(|s| ToolName::from_str(s))
+                .collect()
+        } else if selection.no_tools || selection.no_builtin_tools {
+            Vec::new()
+        } else {
+            vec![
+                ToolName::Read,
+                ToolName::Bash,
+                ToolName::Edit,
+                ToolName::Write,
+            ]
+        };
         let mut registry = ToolRegistry::new();
-        for name in [
-            ToolName::Read,
-            ToolName::Bash,
-            ToolName::Edit,
-            ToolName::Write,
-        ] {
+        for name in candidate {
+            if excluded.contains(&name) {
+                continue;
+            }
             if let Some(tool) = self.create(name) {
                 registry.register(tool);
             }
@@ -238,5 +290,149 @@ mod tests {
     fn factory_create_all_currently_registers_coding_group() {
         let registry = test_factory().create_all();
         assert_eq!(registry.names(), vec!["read", "bash", "edit", "write"]);
+    }
+
+    // ── create_with_selection（cli-tools-flags-fix：--tools/--exclude-tools/--no-tools/--no-builtin-tools）──
+
+    #[test]
+    fn selection_default_equals_create_all() {
+        let factory = test_factory();
+        assert_eq!(
+            factory
+                .create_with_selection(&ToolSelection::default())
+                .names(),
+            factory.create_all().names()
+        );
+        assert_eq!(
+            factory
+                .create_with_selection(&ToolSelection::default())
+                .names(),
+            vec!["read", "bash", "edit", "write"]
+        );
+    }
+
+    #[test]
+    fn selection_allowlist_limits_to_named_tools() {
+        let factory = test_factory();
+        let sel = ToolSelection {
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            factory.create_with_selection(&sel).names(),
+            vec!["read"],
+            "--tools read → read-only session (user motivation scenario)"
+        );
+    }
+
+    #[test]
+    fn selection_allowlist_skips_unknown_names_silently() {
+        let factory = test_factory();
+        let sel = ToolSelection {
+            tools: vec!["read".into(), "does-not-exist".into()],
+            ..Default::default()
+        };
+        // Aligned with pi: unknown names not in registered tools are silently skipped without error
+        assert_eq!(factory.create_with_selection(&sel).names(), vec!["read"]);
+        // All unknown → empty set
+        let all_unknown = ToolSelection {
+            tools: vec!["nope".into()],
+            ..Default::default()
+        };
+        assert!(factory
+            .create_with_selection(&all_unknown)
+            .names()
+            .is_empty());
+    }
+
+    #[test]
+    fn selection_unimplemented_tools_in_allowlist_produce_nothing() {
+        // grep/find/ls not implemented in v1 (create returns None): silently produce nothing when listed
+        let factory = test_factory();
+        let sel = ToolSelection {
+            tools: vec!["grep".into()],
+            ..Default::default()
+        };
+        assert!(factory.create_with_selection(&sel).names().is_empty());
+    }
+
+    #[test]
+    fn selection_exclude_removes_from_default_set() {
+        let factory = test_factory();
+        let sel = ToolSelection {
+            exclude_tools: vec!["bash".into(), "write".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            factory.create_with_selection(&sel).names(),
+            vec!["read", "edit"],
+            "--exclude-tools bash,write → set difference from default group"
+        );
+    }
+
+    #[test]
+    fn selection_exclude_applied_after_allowlist() {
+        let factory = test_factory();
+        let sel = ToolSelection {
+            tools: vec!["read".into(), "bash".into(), "edit".into()],
+            exclude_tools: vec!["bash".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            factory.create_with_selection(&sel).names(),
+            vec!["read", "edit"],
+            "--tools a,b,c --exclude-tools b → set difference after allowlist (aligned with pi)"
+        );
+    }
+
+    #[test]
+    fn selection_unknown_exclude_is_noop() {
+        let factory = test_factory();
+        let sel = ToolSelection {
+            exclude_tools: vec!["not-a-tool".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            factory.create_with_selection(&sel).names(),
+            vec!["read", "bash", "edit", "write"]
+        );
+    }
+
+    #[test]
+    fn selection_no_tools_and_no_builtin_tools_yield_empty() {
+        let factory = test_factory();
+        let no_tools = ToolSelection {
+            no_tools: true,
+            ..Default::default()
+        };
+        let no_builtin = ToolSelection {
+            no_builtin_tools: true,
+            ..Default::default()
+        };
+        // v1 has no extension/custom tools: both converge to an empty set
+        assert!(factory.create_with_selection(&no_tools).names().is_empty());
+        assert!(factory
+            .create_with_selection(&no_builtin)
+            .names()
+            .is_empty());
+        // No harm in excluding both
+        let both = ToolSelection {
+            no_tools: true,
+            exclude_tools: vec!["read".into()],
+            ..Default::default()
+        };
+        assert!(factory.create_with_selection(&both).names().is_empty());
+    }
+
+    #[test]
+    fn selection_allowlist_wins_over_no_tools() {
+        // Aligned with pi: `options.tools ? [...] : ...` — allow-list takes precedence over no_tools
+        let factory = test_factory();
+        let sel = ToolSelection {
+            tools: vec!["read".into()],
+            no_tools: true,
+            ..Default::default()
+        };
+        assert_eq!(factory.create_with_selection(&sel).names(), vec!["read"]);
     }
 }

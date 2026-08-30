@@ -37,7 +37,7 @@ use zen_core::harness::system_prompt::{
 };
 use zen_core::harness::types::AgentState;
 use zen_core::session::tree::{SessionContext, SessionModel};
-use zen_core::tools::factory::ToolFactory;
+use zen_core::tools::factory::{ToolFactory, ToolSelection};
 
 /// Phase 1 default empty hook implementation: all hook methods use `AgentLoopHooks` trait defaults
 /// (no filtering, no transformation, no key injection, no tool-call interception, no event handling).
@@ -153,10 +153,19 @@ pub fn create_initial_runtime_from_cli(
     let cwd_str = cwd.to_string_lossy().into_owned();
     let session_id = session_manager.session_id();
 
-    // 4. Tool factory: bind cwd + session_id
+    // 4. Tool factory: binds cwd + session_id; selection by CLI flags (--tools/--exclude-tools/
+    //    --no-tools/--no-builtin-tools, cli-tools-flags-fix — tool selection not landed in T-AP-08-3
+    //    injection; pi's `createAgentSession` counterparts for tools/excludeTools/noTools.
+    //    Default builtin group is [read, bash, edit, write]; `--tools read` yields a read-only session.
     let tool_context = ToolContext::new(cwd.clone(), Some(session_id.clone()), None);
     let factory = ToolFactory::new(tool_context);
-    let tools = factory.create_all().tools;
+    let selection = ToolSelection {
+        tools: args.tools.clone(),
+        exclude_tools: args.exclude_tools.clone(),
+        no_tools: args.no_tools,
+        no_builtin_tools: args.no_builtin_tools,
+    };
+    let tools = factory.create_with_selection(&selection).tools;
 
     // 5. System prompt: AGENTS.md context + CLI override
     let tool_refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
@@ -393,6 +402,71 @@ mod tests {
         // Model has a default value (env or provider default chain); session is accessible
         assert_eq!(runtime.services.cwd, cwd);
         assert_eq!(runtime.session.session_id().len() >= 36, true);
+    }
+
+    // ── Tool selection flags (cli-tools-flags-fix: --tools/--exclude-tools/--no-tools/--no-builtin-tools) ──
+
+    /// Assemble a runtime with the specified CLI flags and return the list of active tool names for the session.
+    fn runtime_tools(args: &[&str]) -> Vec<String> {
+        let parsed = parse(args);
+        let cwd = std::env::temp_dir();
+        let manager = SessionManager::in_memory(&cwd.to_string_lossy());
+        let runtime = create_initial_runtime_from_cli(&parsed, cwd, manager).expect("Assemble runtime");
+        runtime
+            .session
+            .active_tool_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn cli_no_flags_creates_default_builtin_tools() {
+        assert_eq!(
+            runtime_tools(&[]),
+            vec!["read", "bash", "edit", "write"],
+            "No flags → default built-in group (aligned with pi defaultActiveToolNames)"
+        );
+    }
+
+    #[test]
+    fn cli_no_tools_disables_all_tools() {
+        assert!(runtime_tools(&["--no-tools"]).is_empty());
+    }
+
+    #[test]
+    fn cli_no_builtin_tools_disables_builtin_set() {
+        assert!(
+            runtime_tools(&["--no-builtin-tools"]).is_empty(),
+            "v1 has no extension tools: same effect as --no-tools"
+        );
+    }
+
+    #[test]
+    fn cli_tools_allowlist_gives_read_only_session() {
+        assert_eq!(
+            runtime_tools(&["--tools", "read"]),
+            vec!["read"],
+            "--tools read → read-only tool session (user motivation scenario)"
+        );
+    }
+
+    #[test]
+    fn cli_exclude_tools_removes_from_default() {
+        assert_eq!(
+            runtime_tools(&["--exclude-tools", "bash,write"]),
+            vec!["read", "edit"],
+            "--exclude-tools bash,write → set difference (comma-separated + trim handled in args.rs)"
+        );
+    }
+
+    #[test]
+    fn cli_tools_wins_over_no_tools() {
+        // Aligned with pi: allow-list takes precedence over no_tools
+        assert_eq!(
+            runtime_tools(&["--no-tools", "--tools", "read"]),
+            vec!["read"]
+        );
     }
 
     // ── apply_session_restore ──────────────────────────────────
