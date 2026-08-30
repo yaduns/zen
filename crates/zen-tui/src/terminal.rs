@@ -197,6 +197,19 @@ impl Terminal {
         .map_err(TerminalError::Io)
     }
 
+    /// Hand the terminal back to the shell (the handover step of `TuiLoop::stop`, aligned with pi `Tui.stop()`'s
+    /// 「Move cursor to the end of the content to prevent overwriting/artifacts on exit」）：
+    /// clear the cursor's current line (editor input box residue) → clear from below the cursor to end of screen (footer/status line residue) →
+    /// `\r\n` lands on a new line at column 0. Chat content above the cursor stays on screen (reviewable via scrollback),
+    /// and the shell takes over from a clean new line — avoiding misaligned layout when the prompt/subsequent output after exit starts at a leftover cursor column
+    /// （terminal-exit-handover-fix）。
+    /// Should be called before [`Terminal::stop`] (restoring raw mode); it only writes to the terminal and does not touch raw/cursor/protocol flags.
+    pub fn handover_to_shell(&mut self) -> Result<(), TerminalError> {
+        self.clear_line()?;
+        self.clear_from_cursor()?;
+        self.write("\r\n")
+    }
+
     /// Clear the entire screen and move the cursor back to the top-left corner (0,0).
     pub fn clear_screen(&mut self) -> Result<(), TerminalError> {
         crossterm::execute!(
@@ -298,6 +311,17 @@ mod tests {
         let mut t = Terminal::new().unwrap();
         assert!(t.write("").is_ok());
         assert!(t.write("hello\n").is_ok());
+    }
+
+    #[test]
+    fn test_handover_to_shell_ok_and_does_not_touch_flags() {
+        // Handover only writes terminal sequences (clear line / clear below / new line), without changing raw/cursor/protocol flags
+        let mut t = Terminal::new().unwrap();
+        assert!(t.handover_to_shell().is_ok());
+        assert!(!t.raw_mode_active);
+        assert!(!t.cursor_hidden);
+        assert!(!t.keyboard_enhancement_active);
+        assert!(!t.bracketed_paste_active);
     }
 
     #[test]

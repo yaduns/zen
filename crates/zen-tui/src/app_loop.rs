@@ -83,14 +83,20 @@ impl TuiLoop {
         Ok(())
     }
 
-    /// Exits raw mode and restores the cursor (Terminal::stop), restoring terminal state. Idempotent.
+    /// Exits interaction and hands the terminal back to the shell: clear residue + restore raw mode/cursor/protocol (Terminal::stop). Idempotent.
     /// Also for apps temporarily exiting raw mode while running (e.g. suspending the TUI during T-AP-11-4 external editor integration, after `stop()`
     /// launch the editor, then `start()` to restore).
+    /// Handover step (terminal-exit-handover-fix): first clear the cursor line via [`Terminal::handover_to_shell`]
+    /// (input box) and fixed area below the cursor (footer/status line), move the cursor to a new line at column 0, then restore raw mode
+    /// — align with pi `Tui.stop()`'s "last content line + \r\n" (reference/pi-original/packages/tui/src/tui.ts).
+    /// Without this step, the shell takes over from the leftover cursor column; the prompt and later output are misaligned (stretched lines/extra spaces).
     /// Consumer: T-AP-11-1.
     pub fn stop(&mut self) -> Result<(), TuiError> {
         if self.stopped {
             return Ok(());
         }
+        // Handover write failure (e.g. terminal dead EIO) does not block restoration — align with pi exit path ignoring write errors.
+        let _ = self.terminal.handover_to_shell();
         self.terminal.stop()?;
         self.started = false;
         self.stopped = true;

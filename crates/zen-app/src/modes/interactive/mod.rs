@@ -321,58 +321,72 @@ impl InteractiveMode {
             );
             // Apple Terminal session detection: evaluated once outside the closure and cached (env query done once on demand, T-AP-11-1-fix)
             let is_apple_terminal = is_apple_terminal_session();
-            tui.run_scrollback(
-                &cancel,
-                move |event| {
-                    match event {
-                        crossterm::event::Event::Key(key) => {
-                            // Defensive filtering: when the enhanced protocol has not enabled REPORT_EVENT_TYPES, always Press;
-                            // reject any Release leaking in (T-AP-11-1-fix design decision 1 — even if release events are
-                            // produced via other means in the future, they won't cause double-triggering).
-                            if key.kind == crossterm::event::KeyEventKind::Release {
-                                return EventOutcome::Continue;
+            // Terminal restore (terminal-exit-handover-fix): after run_scrollback exits via cancel, it must explicitly
+            // call stop(); otherwise raw mode/hidden cursor/bracketed paste/keyboard protocol residues remain and the cursor is left at an arbitrary column of the TUI's last frame,
+            // causing prompt/output misalignment after the shell takes over. The shutdown comment already stated that "terminal restore happens inside the UI task via
+            // tui.stop()」, previously this line call was missing; stop() includes handover (clear residue + \r\n) then restore.
+            let run_result = tui
+                .run_scrollback(
+                    &cancel,
+                    move |event| {
+                        match event {
+                            crossterm::event::Event::Key(key) => {
+                                // Defensive filtering: when the enhanced protocol has not enabled REPORT_EVENT_TYPES, always Press;
+                                // reject any Release leaking in (T-AP-11-1-fix design decision 1 — even if release events are
+                                // produced via other means in the future, they won't cause double-triggering).
+                                if key.kind == crossterm::event::KeyEventKind::Release {
+                                    return EventOutcome::Continue;
+                                }
+                                // Apple Terminal fallback: this terminal doesn't send CSI-u, rewrite bare `\r`+Shift to
+                                // Enter+SHIFT (the editor's existing mapping then inserts a newline). Zero overhead pass-through on non-Apple sessions
+                                // (native_shift_pressed is macOS-only and is_apple_terminal is checked first here).
+                                let key = if is_apple_terminal {
+                                    normalize_apple_terminal_enter(
+                                        key,
+                                        true,
+                                        native_shift_pressed(),
+                                    )
+                                } else {
+                                    key
+                                };
+                                let mut ui = ui_on_event.borrow_mut();
+                                if let Some(cmd) = ui.handle_key(&key) {
+                                    let _ = input_tx.send(cmd);
+                                }
                             }
-                            // Apple Terminal fallback: this terminal doesn't send CSI-u, rewrite bare `\r`+Shift to
-                            // Enter+SHIFT (the editor's existing mapping then inserts a newline). Zero overhead pass-through on non-Apple sessions
-                            // (native_shift_pressed is macOS-only and is_apple_terminal is checked first here).
-                            let key = if is_apple_terminal {
-                                normalize_apple_terminal_enter(key, true, native_shift_pressed())
-                            } else {
-                                key
-                            };
-                            let mut ui = ui_on_event.borrow_mut();
-                            if let Some(cmd) = ui.handle_key(&key) {
-                                let _ = input_tx.send(cmd);
+                            // Bracketed paste (Terminal::start already enables EnableBracketedPaste): the whole segment goes into the editor.
+                            // Before the fix, Event::Paste was silently dropped (T-AP-11-1-fix design decision 2).
+                            crossterm::event::Event::Paste(text) => {
+                                let mut ui = ui_on_event.borrow_mut();
+                                ui.handle_paste(&text);
+                            }
+                            // Other events (Resize is handled inside run_loop, Focus etc. are ignored)
+                            _ => {}
+                        }
+                        EventOutcome::Continue
+                    },
+                    move |canvas| {
+                        // first consume pending events, then render the current frame (content line stream + fixed bottom area; scrollback holds off-screen history)
+                        let mut ui = ui_draw.borrow_mut();
+                        loop {
+                            let ev = pending_draw
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .pop_front();
+                            match ev {
+                                Some(ev) => ui.apply(ev),
+                                None => break,
                             }
                         }
-                        // Bracketed paste (Terminal::start already enables EnableBracketedPaste): the whole segment goes into the editor.
-                        // Before the fix, Event::Paste was silently dropped (T-AP-11-1-fix design decision 2).
-                        crossterm::event::Event::Paste(text) => {
-                            let mut ui = ui_on_event.borrow_mut();
-                            ui.handle_paste(&text);
-                        }
-                        // Other events (Resize is handled inside run_loop, Focus etc. are ignored)
-                        _ => {}
-                    }
-                    EventOutcome::Continue
-                },
-                move |canvas| {
-                    // first consume pending events, then render the current frame (content line stream + fixed bottom area; scrollback holds off-screen history)
-                    let mut ui = ui_draw.borrow_mut();
-                    loop {
-                        let ev = pending_draw
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .pop_front();
-                        match ev {
-                            Some(ev) => ui.apply(ev),
-                            None => break,
-                        }
-                    }
-                    ui.render_scrollback(canvas);
-                },
-            )
-            .await
+                        ui.render_scrollback(canvas);
+                    },
+                )
+                .await;
+            // Both run and stop are executed (even if run errors, the terminal is restored before propagating the error).
+            let stop_result = tui.stop();
+            run_result?;
+            stop_result?;
+            Ok(())
         }));
 
         // 4. Signal registration + agent subscription (start the UI first, then attach listeners, so events have a view ready to receive them).
