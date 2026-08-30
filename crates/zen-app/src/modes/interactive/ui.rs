@@ -843,6 +843,7 @@ impl InteractiveUi {
                     tool_call_id.clone(),
                     args.clone(),
                     theme,
+                    kb,
                 );
                 comp.set_expanded(*expanded || folded_expanded);
                 if let Some(r) = result {
