@@ -7,5 +7,6 @@ pub mod agent_hooks;
 pub mod agent_loop;
 pub mod context;
 pub mod engine;
+pub mod message_filter;
 pub mod system_prompt;
 pub mod types;

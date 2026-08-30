@@ -37,6 +37,8 @@ pub trait AgentLoopHooks: Send + Sync {
     ///
     /// Default implementation: keep everything.
     /// The application layer may override this to skip verbose tool output, etc.
+    /// Pipeline orchestration (filter first, transform consumes its output) see
+    /// `message_filter.rs::filter_and_transform_messages`。
     async fn filter_messages(&self, messages: Vec<Message>) -> Vec<Message> {
         messages
     }
@@ -45,6 +47,8 @@ pub trait AgentLoopHooks: Send + Sync {
     ///
     /// Used for context window management (truncating old messages) or injecting external context.
     /// The default implementation returns the original messages unchanged.
+    /// Pipeline orchestration (filter first, transform consumes its output) see
+    /// `message_filter.rs::filter_and_transform_messages`。
     async fn transform_context(
         &self,
         messages: Vec<Message>,

@@ -3,6 +3,7 @@ use crate::harness::agent_hooks::{
     finalize_executed_tool_call, prepare_tool_call, AgentLoopError, AgentLoopHooks,
     FinalizedToolCallOutcome, PreparedToolCall,
 };
+use crate::harness::message_filter::filter_and_transform_messages;
 use crate::harness::types::{
     AgentEvent, AgentLoopConfig, PrepareNextTurnContext, ShouldStopAfterTurnContext,
 };
@@ -179,8 +180,6 @@ pub async fn run_agent_loop_continue(
 ///
 /// # Edge Cases
 /// - If `stream_fn` returns an error, stop_reason is "error" or "aborted".
-/// - Calls `hooks.transform_context()` and `hooks.filter_messages()` for message transformation.
-/// - If `filter_messages` returns an empty list, behavior is up to the LLM provider (usually an error).
 pub(crate) async fn stream_assistant_response(
     context: &mut Context,
     config: &AgentLoopConfig,
@@ -191,8 +190,7 @@ pub(crate) async fn stream_assistant_response(
     let now = || now_millis();
 
     // 1. Filter and transform messages via hooks
-    let filtered = hooks.filter_messages(context.messages.clone()).await;
-    let transformed = hooks.transform_context(filtered, cancel).await;
+    let transformed = filter_and_transform_messages(context.messages.clone(), hooks, cancel).await;
 
     // 2. Build a new context for the LLM call (keep system_prompt and tools from original)
     let stream_ctx = Context {
