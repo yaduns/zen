@@ -38,6 +38,10 @@ use zen_tui::keys::{
 };
 use zen_tui::theme::Theme;
 
+/// User bash output block callback (T-AP-04-2-fix): the `on_chunk` parameter of `AgentSession::execute_bash`.
+/// Interactive mode pushes each sanitized text chunk to the UI for streaming append via `UiEvent::BashUpdate`.
+type BashChunkCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Startup configuration carrier for run_interactive_mode (aligned with pi `InteractiveModeOptions` v1 subset),
 /// consumed once; no special serialization constraints.
 pub struct InteractiveModeOptions {
@@ -90,6 +94,21 @@ pub(crate) enum UiEvent {
     },
     /// Queued message snapshot change (follow-up queue).
     PendingChanged(Vec<String>),
+    /// User `!` bash execution start: lays down a `ChatRow::Bash` line (empty output, awaiting streaming chunks).
+    /// T-AP-04-2-fix producer: `handle_bash_command`.
+    BashStart {
+        command: String,
+        exclude_from_context: bool,
+    },
+    /// User bash output delta chunk (the `on_chunk` callback of `execute_bash` pushes chunk by chunk, appending to the tail line).
+    BashUpdate { output: String },
+    /// User bash execution complete: backfills exit code / cancellation / truncation / full output path, closes the streaming line.
+    BashEnd {
+        exit_code: Option<i32>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+    },
     /// Per-frame footer data snapshot (assembled by the main task from AgentSession state).
     Footer(FooterData),
     #[allow(dead_code)] // v1 seam: bash session-state switch (sent explicitly by the main task once T-AP-04-2 lands);
@@ -747,16 +766,56 @@ impl InteractiveMode {
         }
     }
 
-    /// `!`/`!!` bash mode: spawn a bash session and render `bash_execution` rows.
-    /// **Top open item**: bash execution engine (T-AP-04-2) not yet landed — this function currently falls back to an "unimplemented" notice,
-    /// wire in here once T-AP-04-2 is done (output capture/truncation/cancellation/exit code backfill into `ChatRow::Bash`).
+    /// `!`/`!!` bash mode: executes the command and renders the `bash_execution` line (T-AP-04-2-fix wiring).
+    ///
+    /// Aligns with pi `handleBashCommand`: lay down empty line (`BashStart`) → output appended in streamed chunks
+    /// (`execute_bash`'s `on_chunk` → `BashUpdate`) → completion backfill (`BashEnd`:
+    /// exit code / cancel / truncation / full output path). `!!` (`exclude_from_context`) is
+    /// registered for exclusion by `AgentSession::execute_bash`, not entering the LLM context. Execution failure falls back to
+    /// an error status line + empty result line (no panic, no session interruption).
     async fn handle_bash_command(
         &mut self,
         command: String,
         exclude_from_context: bool,
     ) -> Result<(), InteractiveModeError> {
-        let _ = exclude_from_context; // Flag to be used for exclude_from_context when T-AP-04-2 lands
-        self.show_warning(format!("Bash execution pending (T-AP-04-2): {command}"));
+        let _ = self.ui_event_tx.send(UiEvent::BashStart {
+            command: command.clone(),
+            exclude_from_context,
+        });
+        self.show_status(format!("Running: {command}"));
+
+        let tx = self.ui_event_tx.clone();
+        let on_chunk: Option<BashChunkCallback> = Some(Arc::new(move |chunk| {
+            let _ = tx.send(UiEvent::BashUpdate {
+                output: chunk.to_string(),
+            });
+        }));
+
+        match self
+            .runtime
+            .session
+            .execute_bash(&command, exclude_from_context, on_chunk)
+            .await
+        {
+            Ok(outcome) => {
+                let _ = self.ui_event_tx.send(UiEvent::BashEnd {
+                    exit_code: outcome.exit_code,
+                    cancelled: outcome.cancelled,
+                    truncated: outcome.truncated,
+                    full_output_path: outcome.full_output_path,
+                });
+                let _ = self.ui_event_tx.send(UiEvent::ClearStatus);
+            }
+            Err(err) => {
+                let _ = self.ui_event_tx.send(UiEvent::BashEnd {
+                    exit_code: None,
+                    cancelled: true,
+                    truncated: false,
+                    full_output_path: None,
+                });
+                self.show_error(format!("Bash failed: {err}"));
+            }
+        }
         Ok(())
     }
 

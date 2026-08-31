@@ -51,6 +51,7 @@ pub struct InteractiveUi {
     chat_rows: Vec<ChatRow>, // Message/tool/bash/summary line data snapshot
     pending_rows: Vec<String>, // Snapshot of queued follow-up message texts (strictly aligned with UiEvent::PendingChanged(Vec<String>))
     streaming_index: Option<usize>, // Index of the current streaming assistant line (wholesale replacement of the snapshot on update)
+    bash_index: Option<usize>, // Current streaming user bash row index (T-AP-04-2-fix: located via BashUpdate/BashEnd)
     tool_indices: HashMap<String, usize>, // tool_call_id → chat line index
     footer_data: Option<FooterData>, // Per-frame state snapshot (the footer is supplied by the main task each frame via UiEvent::Footer)
     status: Option<StatusSpec>, // Per-frame state snapshot
@@ -184,6 +185,7 @@ impl InteractiveUi {
             chat_rows: Vec::new(),
             pending_rows: Vec::new(),
             streaming_index: None,
+            bash_index: None,
             tool_indices: HashMap::new(),
             footer_data,
             status: None,
@@ -321,6 +323,17 @@ impl InteractiveUi {
                 is_error,
             } => self.apply_tool_end(id, result, is_error),
             UiEvent::PendingChanged(rows) => self.pending_rows = rows,
+            UiEvent::BashStart {
+                command,
+                exclude_from_context,
+            } => self.apply_bash_start(command, exclude_from_context),
+            UiEvent::BashUpdate { output } => self.apply_bash_update(output),
+            UiEvent::BashEnd {
+                exit_code,
+                cancelled,
+                truncated,
+                full_output_path,
+            } => self.apply_bash_end(exit_code, cancelled, truncated, full_output_path),
             UiEvent::Footer(data) => self.footer_data = Some(data),
             UiEvent::BashMode(b) => {
                 // Main-task explicit indication (v1 editor body `!` is already locally driven by on_change; this event is reserved for future
@@ -537,6 +550,55 @@ impl InteractiveUi {
             }
             Message::User(_) | Message::ToolResult(_) => {}
         }
+    }
+
+    /// User `!` bash start (T-AP-04-2-fix): lay down an empty `ChatRow::Bash` row and record
+    /// `bash_index`; subsequent `BashUpdate`/`BashEnd` locate it and backfill.
+    fn apply_bash_start(&mut self, command: String, exclude_from_context: bool) {
+        self.chat_rows.push(ChatRow::Bash {
+            command,
+            exclude_from_context,
+            output: String::new(),
+            exit_code: None,
+            cancelled: false,
+            truncation: None,
+            full_output_path: None,
+            expanded: false,
+        });
+        self.bash_index = Some(self.chat_rows.len() - 1);
+    }
+
+    /// User bash output incremental chunk (pushed block by block via `on_chunk`): append to the `bash_index` row's output.
+    fn apply_bash_update(&mut self, output: String) {
+        if let Some(ChatRow::Bash { output: o, .. }) =
+            self.bash_index.and_then(|idx| self.chat_rows.get_mut(idx))
+        {
+            o.push_str(&output);
+        }
+    }
+
+    /// User bash completion (T-AP-04-2-fix): backfill exit code/cancel/truncation/full output path, close the streaming row.
+    fn apply_bash_end(
+        &mut self,
+        exit_code: Option<i32>,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+    ) {
+        if let Some(ChatRow::Bash {
+            exit_code: ec,
+            cancelled: c,
+            truncation,
+            full_output_path: f,
+            ..
+        }) = self.bash_index.and_then(|idx| self.chat_rows.get_mut(idx))
+        {
+            *ec = exit_code;
+            *c = cancelled;
+            *truncation = Some(TruncationInfo { truncated });
+            *f = full_output_path;
+        }
+        self.bash_index = None;
     }
 
     /// Tool start: register `tool_indices` and lay out pending rows.
@@ -993,8 +1055,8 @@ pub(crate) enum ChatRow {
         is_partial: bool,
         expanded: bool,
     },
-    /// Bash execution line (no producer before the T-AP-04-2 seam; render path retained).
-    #[allow(dead_code)] // Constructed by handle_bash_command once T-AP-04-2 lands
+    /// Bash execution row (T-AP-04-2-fix producer: `handle_bash_command` driven via
+    /// `UiEvent::BashStart/Update/End`, command snapshot attached per row).
     Bash {
         command: String,
         exclude_from_context: bool,
@@ -1657,5 +1719,90 @@ mod tests {
             .handle_key(&press(KeyCode::Esc))
             .expect("Esc is forwarded when not in bash mode");
         assert!(matches!(cmd, InputCommand::Escape));
+    }
+
+    // ── Bash execution flow (T-AP-04-2-fix: BashStart/Update/End) ──
+
+    #[test]
+    fn test_apply_bash_start_appends_empty_row_and_indexes() {
+        let mut u = ui();
+        u.apply(UiEvent::BashStart {
+            command: "ls -la".into(),
+            exclude_from_context: false,
+        });
+
+        assert!(matches!(u.bash_index, Some(0)));
+        match &u.chat_rows[0] {
+            ChatRow::Bash {
+                command,
+                exclude_from_context,
+                output,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(command, "ls -la");
+                assert!(!exclude_from_context);
+                assert!(output.is_empty());
+                assert!(exit_code.is_none(), "not finished, exit code is empty");
+            }
+            _other => panic!("expected Bash row"),
+        }
+    }
+
+    #[test]
+    fn test_apply_bash_update_appends_chunks_to_indexed_row() {
+        let mut u = ui();
+        u.apply(UiEvent::BashStart {
+            command: "ls".into(),
+            exclude_from_context: true,
+        });
+        u.apply(UiEvent::BashUpdate {
+            output: "file1\n".into(),
+        });
+        u.apply(UiEvent::BashUpdate {
+            output: "file2".into(),
+        });
+
+        match &u.chat_rows[0] {
+            ChatRow::Bash { output, .. } => assert_eq!(output, "file1\nfile2"),
+            _other => panic!("expected Bash row"),
+        }
+    }
+
+    #[test]
+    fn test_apply_bash_end_fills_completion_and_clears_index() {
+        let mut u = ui();
+        u.apply(UiEvent::BashStart {
+            command: "make".into(),
+            exclude_from_context: false,
+        });
+        u.apply(UiEvent::BashUpdate {
+            output: "error".into(),
+        });
+        u.apply(UiEvent::BashEnd {
+            exit_code: Some(2),
+            cancelled: false,
+            truncated: true,
+            full_output_path: Some("/tmp/bash-x.log".into()),
+        });
+
+        assert!(u.bash_index.is_none(), "close the streaming line after completion");
+        match &u.chat_rows[0] {
+            ChatRow::Bash {
+                output,
+                exit_code,
+                cancelled,
+                truncation,
+                full_output_path,
+                ..
+            } => {
+                assert_eq!(output, "error");
+                assert_eq!(*exit_code, Some(2));
+                assert!(!cancelled);
+                assert_eq!(truncation.as_ref().map(|t| t.truncated), Some(true));
+                assert_eq!(full_output_path.as_deref(), Some("/tmp/bash-x.log"));
+            }
+            _other => panic!("expected Bash row"),
+        }
     }
 }

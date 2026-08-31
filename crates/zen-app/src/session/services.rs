@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::cli::{parse_thinking_level, CliArgs};
 use crate::config::get_agent_dir;
@@ -29,13 +29,18 @@ use tokio_util::sync::CancellationToken;
 use zen_ai::api::stream_for;
 use zen_ai::provider::resolve_provider;
 use zen_ai::tool::{Tool, ToolContext, ToolExecutionMode};
-use zen_ai::types::{ImageContent, Model, ThinkingLevel};
+use zen_ai::types::{ImageContent, Message, Model, ThinkingLevel};
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::engine::Agent;
+use zen_core::harness::message_filter::filter_excluded;
 use zen_core::harness::system_prompt::{
     build_system_prompt, collect_tool_prompt_metadata, BuildSystemPromptOptions,
 };
-use zen_core::harness::types::AgentState;
+use zen_core::harness::types::{
+    AfterToolCallContext, AfterToolCallResult, AgentEvent, AgentLoopTurnUpdate, AgentState,
+    BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
+    ShouldStopAfterTurnContext,
+};
 use zen_core::session::tree::{SessionContext, SessionModel};
 use zen_core::tools::factory::{ToolFactory, ToolSelection};
 
@@ -48,6 +53,81 @@ use zen_core::tools::factory::{ToolFactory, ToolSelection};
 pub struct NoopHooks;
 
 impl AgentLoopHooks for NoopHooks {}
+
+/// Wrapping hooks used for real assembly (T-AP-04-2-fix): merge the caller's hooks with the `excludeFromContext`
+/// exclusion set stream.
+///
+/// `filter_messages` = first run the caller's hooks (NoopHooks = pass-through; print/TUI may pass custom ones)
+/// then remove messages hit by the `!!` bash exclusion identity via `zen_core::harness::message_filter::filter_excluded`
+/// (registered by `AgentSession::execute_bash`) — policy lives in the hooks layer, no markers added at the data layer
+/// (per the ruling in `type-duplication-refactoring-plan.md`). All other methods delegate to `inner`.
+///
+/// `excluded` shares the same Arc with `AgentSession` (created inside `create_agent_session`).
+pub struct SessionHooks {
+    inner: Arc<dyn AgentLoopHooks>,
+    excluded: Arc<Mutex<HashSet<String>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentLoopHooks for SessionHooks {
+    /// After caller filtering, drop the `!!` bash messages per the exclusion set (T-AP-04-2-fix wiring).
+    async fn filter_messages(&self, messages: Vec<Message>) -> Vec<Message> {
+        let inner_filtered = self.inner.filter_messages(messages).await;
+        let excluded = self.excluded.lock().unwrap();
+        filter_excluded(inner_filtered, &excluded)
+    }
+
+    async fn transform_context(
+        &self,
+        messages: Vec<Message>,
+        cancel: &CancellationToken,
+    ) -> Vec<Message> {
+        self.inner.transform_context(messages, cancel).await
+    }
+
+    async fn get_api_key(&self, provider: &str) -> Option<String> {
+        self.inner.get_api_key(provider).await
+    }
+
+    async fn should_stop_after_turn(&self, context: &ShouldStopAfterTurnContext) -> bool {
+        self.inner.should_stop_after_turn(context).await
+    }
+
+    async fn prepare_next_turn(
+        &self,
+        context: &PrepareNextTurnContext,
+    ) -> Option<AgentLoopTurnUpdate> {
+        self.inner.prepare_next_turn(context).await
+    }
+
+    async fn get_steering_messages(&self) -> Vec<Message> {
+        self.inner.get_steering_messages().await
+    }
+
+    async fn get_follow_up_messages(&self) -> Vec<Message> {
+        self.inner.get_follow_up_messages().await
+    }
+
+    async fn before_tool_call(
+        &self,
+        context: &BeforeToolCallContext,
+        cancel: &CancellationToken,
+    ) -> Result<Option<BeforeToolCallResult>, String> {
+        self.inner.before_tool_call(context, cancel).await
+    }
+
+    async fn after_tool_call(
+        &self,
+        context: &AfterToolCallContext,
+        cancel: &CancellationToken,
+    ) -> Result<Option<AfterToolCallResult>, String> {
+        self.inner.after_tool_call(context, cancel).await
+    }
+
+    async fn on_event(&self, event: &AgentEvent) {
+        self.inner.on_event(event).await
+    }
+}
 
 /// Generic assembly layer: build a runnable `AgentSession` from the resolved inputs.
 ///
@@ -95,14 +175,21 @@ pub fn create_agent_session(
         error_message: None,
     };
 
+    // T-AP-04-2-fix: shared exclusion set — one goes into SessionHooks (engine filtering), one into AgentSession
+    // (execute_bash registers the `!!` identity); the caller's hooks are wrapped, not replaced (event/transform semantics unchanged).
+    let excluded: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let session_hooks: Arc<dyn AgentLoopHooks> = Arc::new(SessionHooks {
+        inner: hooks,
+        excluded: excluded.clone(),
+    });
     let agent = Agent::new(
         state,
         ToolExecutionMode::Parallel,
-        hooks,
+        session_hooks,
         stream_fn,
         CancellationToken::new(),
     );
-    AgentSession::new(agent, session_store)
+    AgentSession::new_with_exclusions(agent, session_store, excluded)
 }
 
 /// Thin CLI-specific glue: parse `CliArgs` + the already-selected session manager into model/tools/system prompt, and assemble the full runtime.
@@ -325,6 +412,7 @@ fn resolve_model(args: &CliArgs) -> (Model, ThinkingLevel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_ai::types::{ContentBlockList, UserMessage};
 
     /// Test helper: construct CliArgs (aligned with args.rs test conventions).
     fn parse(args: &[&str]) -> CliArgs {
@@ -551,5 +639,77 @@ mod tests {
         // New session: no session model/thinking to restore, keep resolve_model defaults (leave untouched)
         assert!(!model.id.is_empty());
         assert_eq!(thinking, ThinkingLevel::Off);
+    }
+
+    // ── SessionHooks (T-AP-04-2-fix wiring) ──
+
+    /// Recording inner hooks: only records filter_messages input args and applies one marker transform; everything else uses defaults.
+    struct RecordingHooks {
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLoopHooks for RecordingHooks {
+        async fn filter_messages(&self, messages: Vec<Message>) -> Vec<Message> {
+            self.seen.lock().unwrap().push(messages.clone());
+            messages
+        }
+    }
+
+    fn user_msg(text: &str, ts: i64) -> Message {
+        Message::User(UserMessage {
+            content: ContentBlockList::Text(text.to_string()),
+            timestamp: ts,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_session_hooks_filter_delegates_inner_then_excludes() {
+        // inner receives the full set (delegated); exclusion-set hits are removed after `!!` bash User timestamps
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner: Arc<dyn AgentLoopHooks> = Arc::new(RecordingHooks { seen: seen.clone() });
+        let excluded = Arc::new(Mutex::new(HashSet::from(["777".to_string()])));
+        let hooks = SessionHooks { inner, excluded };
+
+        let msgs = vec![user_msg("secret", 777), user_msg("keep", 1)];
+        let result = hooks.filter_messages(msgs.clone()).await;
+
+        assert_eq!(seen.lock().unwrap()[0], msgs, "inner delegation receives full set");
+        assert_eq!(result, vec![user_msg("keep", 1)]);
+    }
+
+    #[tokio::test]
+    async fn test_session_hooks_filter_no_match_keeps_all() {
+        let inner: Arc<dyn AgentLoopHooks> = Arc::new(RecordingHooks {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let excluded = Arc::new(Mutex::new(HashSet::from(["888".to_string()])));
+        let hooks = SessionHooks { inner, excluded };
+
+        let msgs = vec![user_msg("a", 1), user_msg("b", 2)];
+        assert_eq!(hooks.filter_messages(msgs.clone()).await, msgs);
+    }
+
+    #[tokio::test]
+    async fn test_session_hooks_empty_exclusion_passthrough() {
+        let inner: Arc<dyn AgentLoopHooks> = Arc::new(RecordingHooks {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let excluded = Arc::new(Mutex::new(HashSet::new()));
+        let hooks = SessionHooks { inner, excluded };
+
+        let tool_result_msg = Message::ToolResult(zen_ai::types::ToolResultMessage {
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            content: vec![],
+            details: None,
+            usage: None,
+            is_error: false,
+            added_tool_names: None,
+            timestamp: 0,
+        });
+        let msgs = vec![tool_result_msg.clone()];
+        // empty exclusion set always passes through (filter_excluded guarantee)
+        assert_eq!(hooks.filter_messages(msgs.clone()).await, msgs);
     }
 }

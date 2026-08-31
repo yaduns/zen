@@ -19,6 +19,7 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }
 zen-core = { workspace = true }

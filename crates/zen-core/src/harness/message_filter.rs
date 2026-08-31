@@ -38,16 +38,21 @@ pub(crate) async fn filter_and_transform_messages(
 }
 
 /// When `filter_excluded` determines whether a history message is excluded from the LLM context, it takes the message's
-/// Stable identity key — currently only `Message::ToolResult` has a cross-transcript unique identity (`tool_call_id`,
-/// corresponding one-to-one with tool_call in assistant messages); User/Assistant messages have no identity key,
-/// return `None` (never matched by exclusion set).
+/// Stable identity key:
+/// - `Message::ToolResult` → `Some(tool_call_id)` (unique across the transcript, one-to-one with the
+///   tool_call in assistant messages);
+/// - `Message::User` → `Some(timestamp)` (stringified millisecond timestamp) — user bash record
+///   (T-AP-04-2-fix: `!`/`!!` user commands rendered as user messages) uses the construction time as the exclusion identity;
+/// - `Message::Assistant` → `None` (currently no producer; never hit by the exclusion set).
 ///
 /// # Return Value
-/// `Some(tool_call_id)` (ToolResult messages) / `None` (other messages).
+/// `Some(identity key)` / `None` (messages of this type do not participate in exclusion).
+/// The key semantics are the contract surface when T-AP-04-2-fix records the `!!` bash exclusion identity (see the plan seam note).
 fn exclusion_key(message: &Message) -> Option<String> {
     match message {
         Message::ToolResult(result) => Some(result.tool_call_id.clone()),
-        Message::User(_) | Message::Assistant(_) => None,
+        Message::User(user) => Some(user.timestamp.to_string()),
+        Message::Assistant(_) => None,
     }
 }
 
@@ -60,15 +65,16 @@ fn exclusion_key(message: &Message) -> Option<String> {
 ///
 /// # Parameters
 /// - `messages`: Message list to filter (usually from `build_context` / engine state).
-/// - `excluded`: exclusion set, keys are values of `exclusion_key` (currently i.e.
-///   `!!` bash results' `tool_call_id`). Application layer (T-AP-04-2 recording side) is responsible for populating it.
+/// - `excluded`: exclusion set; keys are the values of `exclusion_key` (the `!!` bash ToolResult
+///   `tool_call_id` / the UserMessage timestamp of user bash). The application layer
+///   (`AgentSession::execute_bash` + `SessionHooks`, T-AP-04-2-fix) is responsible for injecting and consuming them.
 ///
 /// # Return Value
 /// List of retained messages (all messages not matching the exclusion set are retained; empty exclusion set = always pass-through).
 ///
-/// # pub annotation notes
-/// Currently no consumers (application layer `NoopHooks` not yet wired); reserved for T-AP-04-2 — avoid
-/// that task reimplementing filtering from scratch. During implementation, keep the "reserved" note at the plan seam.
+/// # Consumers
+/// `SessionHooks::filter_messages` (zen-app `session/services.rs`, wired in T-AP-04-2-fix) is reused cross-
+/// crate to implement the hooks-layer excludeFromContext semantics.
 pub fn filter_excluded(messages: Vec<Message>, excluded: &HashSet<String>) -> Vec<Message> {
     // Empty exclusion set always passes through, avoiding unnecessary allocation (doc comment already promises this behavior)
     if excluded.is_empty() {
@@ -100,9 +106,13 @@ mod tests {
     // ── Construction helpers ─────────────────────────────────────────────
 
     fn user_msg(text: &str) -> Message {
+        user_msg_at(text, 0)
+    }
+
+    fn user_msg_at(text: &str, timestamp: i64) -> Message {
         Message::User(UserMessage {
             content: ContentBlockList::Text(text.to_string()),
-            timestamp: 0,
+            timestamp,
         })
     }
 
@@ -245,8 +255,10 @@ mod tests {
     }
 
     #[test]
-    fn test_exclusion_key_user_is_none() {
-        assert_eq!(exclusion_key(&user_msg("hi")), None);
+    fn test_exclusion_key_user_returns_timestamp() {
+        // User bash records (T-AP-04-2-fix) use construction-time milliseconds as the exclusion identity
+        let msg = user_msg_at("hi", 12345);
+        assert_eq!(exclusion_key(&msg), Some("12345".to_string()));
     }
 
     #[test]
@@ -287,5 +299,21 @@ mod tests {
 
         // The exclusion set matches no message identity keys; all are retained
         assert_eq!(filter_excluded(msgs.clone(), &excluded), msgs);
+    }
+
+    #[test]
+    fn test_filter_excluded_drops_user_by_timestamp() {
+        // T-AP-04-2-fix: `!!` user bash uses the UserMessage timestamp as the exclusion identity
+        let extra = user_msg("other");
+        let msgs = vec![
+            user_msg_at("secret", 777),
+            tool_result_msg("tc1"),
+            extra.clone(),
+        ];
+        let excluded: HashSet<String> = ["777".to_string()].into_iter().collect();
+
+        let result = filter_excluded(msgs, &excluded);
+
+        assert_eq!(result, vec![tool_result_msg("tc1"), extra]);
     }
 }

@@ -11,29 +11,29 @@ use tokio_util::sync::CancellationToken;
 
 pub struct ShellCaptureOptions {
     // Working directory of the command, passed through as ExecOptions.cwd
-    cwd: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
     // Additional environment variable overrides, passed through as ExecOptions.env
-    env: Option<HashMap<String, String>>,
+    pub env: Option<HashMap<String, String>>,
     // Timeout, passed through as ExecOptions.timeout (
-    timeout: Option<Duration>,
+    pub timeout: Option<Duration>,
     // Cancellation token, passed through as ExecOptions.cancellation
-    cancellation: Option<CancellationToken>,
+    pub cancellation: Option<CancellationToken>,
     // Streaming callback for each chunk of sanitized text (\r removed); infallible contract (panic unwinds directly, aligning with ExecOptions.on_stdout)
-    on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
+    pub on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 // Complete result of a capture call returned to the caller
 pub struct ShellCaptureResult {
     // Content after tail truncation (truncateTail semantics: keep last 2000 lines / 50KB)
-    output: String,
+    pub output: String,
     // Process exit code; None when cancelled, Some(code) on normal exit
-    exit_code: Option<i32>,
+    pub exit_code: Option<i32>,
     // Whether it was cancelled (exec returned Err(Aborted), or a race where the token was cancelled after execution)
-    cancelled: bool,
+    pub cancelled: bool,
     // Whether tail truncation occurred
-    truncated: bool,
+    pub truncated: bool,
     // Full-output temp file path (prefix `bash-`, suffix `.log`); exists only on overflow/truncation
-    full_output_path: Option<PathBuf>,
+    pub full_output_path: Option<PathBuf>,
 }
 
 // Return of the private truncate_tail helper
