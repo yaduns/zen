@@ -970,10 +970,9 @@ impl FooterCtx {
             None
         };
 
-        // Cache hit rate should also apply to current turn
-        let prompt_tokens = usage.last_input; // Excludes cache_write
-        let cache_hit_rate = if prompt_tokens > 0 {
-            Some(usage.cache_read as f64 / prompt_tokens as f64 * 100.0)
+        // Cache hit rate computed from cumulative values
+        let cache_hit_rate = if usage.input > 0 {
+            Some(usage.cache_read as f64 / usage.input as f64 * 100.0)
         } else {
             None
         };
@@ -1252,7 +1251,7 @@ mod tests {
     #[test]
     fn test_footer_ctx_computes_percent_and_cache_hit() {
         let usage = UsageTotals {
-            input: 100, // Cumulative values (for footer statistics display; not used for percentages)
+            input: 1000, // Cumulative values (for footer statistics display; not used for percentages)
             output: 50,
             cache_read: 900,
             cache_write: 0,
