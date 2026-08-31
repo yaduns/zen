@@ -240,7 +240,12 @@ async fn read_file_content(
 
     let truncated_by_bytes = result.len() > MAX_BYTES;
     if truncated_by_bytes {
-        result.truncate(MAX_BYTES);
+        // Find the last character boundary before MAX_BYTES (avoid cutting multi-byte UTF-8 characters)
+        let mut end = MAX_BYTES;
+        while end > 0 && !result.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.truncate(end);
         if let Some(pos) = result.rfind('\n') {
             result.truncate(pos);
         }

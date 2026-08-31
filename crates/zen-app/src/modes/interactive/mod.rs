@@ -963,17 +963,21 @@ impl FooterCtx {
     /// Assemble `FooterData`: context ratio = prompt tokens (input+cache_read+cache_write) / window;
     /// cache hit rate = cache_read / prompt tokens.
     fn footer(&self, usage: &UsageTotals) -> FooterData {
-        let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
+        // context_percent uses the current turn's input tokens
         let context_percent = if self.context_window > 0 {
-            Some((prompt_tokens as f64 / self.context_window as f64) * 100.0)
+            Some((usage.last_input as f64 / self.context_window as f64) * 100.0)
         } else {
             None
         };
+
+        // Cache hit rate should also apply to current turn
+        let prompt_tokens = usage.last_input; // Excludes cache_write
         let cache_hit_rate = if prompt_tokens > 0 {
             Some(usage.cache_read as f64 / prompt_tokens as f64 * 100.0)
         } else {
             None
         };
+
         FooterData {
             pwd: self.pwd.clone(),
             git_branch: None,   // After T-AP-06-3 lands, hook up git branch
@@ -1027,6 +1031,7 @@ fn bridge_agent_event(
                 Message::Assistant(a) => {
                     if let Ok(mut u) = usage.lock() {
                         add_usage_to_totals(&mut u, &a.usage);
+                        u.last_input = a.usage.input; // ← overwritten each turn
                     }
                 }
                 Message::ToolResult(t) => {
@@ -1247,11 +1252,12 @@ mod tests {
     #[test]
     fn test_footer_ctx_computes_percent_and_cache_hit() {
         let usage = UsageTotals {
-            input: 100,
+            input: 100, // Cumulative values (for footer statistics display; not used for percentages)
             output: 50,
             cache_read: 900,
             cache_write: 0,
             cost: 0.0,
+            last_input: 1000, // ← Most recent full request (including cache-hit portion)
         };
         let ctx = FooterCtx {
             pwd: "/work".into(),

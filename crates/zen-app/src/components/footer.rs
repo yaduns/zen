@@ -23,6 +23,7 @@ pub struct UsageTotals {
     pub cache_write: u64,
     /// Cumulative cost (usage.cost.total semantics).
     pub cost: f64,
+    pub last_input: u64, // ← new: input tokens of the latest turn
 }
 
 /// Accumulate a single usage into totals.
@@ -367,6 +368,7 @@ mod tests {
                 cache_read: 800,
                 cache_write: 100,
                 cost: 0.0,
+                last_input: 0,
             },
             context_percent: Some(42.0),
             context_window: 128_000,
