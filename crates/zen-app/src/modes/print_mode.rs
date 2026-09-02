@@ -41,7 +41,7 @@ use zen_core::process::ProcessRegistry;
 /// # Consumers
 /// `crates/zen-app/src/main.rs` (node 5 mode dispatch)
 pub async fn run_print_mode(
-    mut runtime: AgentSessionRuntime,
+    runtime: AgentSessionRuntime,
     output_mode: Mode,
     messages: Vec<String>,
     initial_message: Option<String>,

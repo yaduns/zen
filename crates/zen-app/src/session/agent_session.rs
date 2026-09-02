@@ -111,17 +111,18 @@ impl AgentSession {
     /// Send a prompt to the agent and wait for completion.
     ///
     /// # Behavior
-    /// 1. Call `self.agent.prompt(text)`
+    /// 1. Calls `self.agent.prompt(text)` (the engine renews the run token internally; pi's surface takes no args; D2/D4)
     /// 2. A resident persistence subscription writes to disk in real time during runtime (message_end → append_message); the consumer
     ///    Events subscribed via `subscribe` are delivered synchronously
     /// 3. Returns all messages added in this round
     ///
     /// # Errors
-    /// - `AgentSessionError::Agent`: agent loop error (underlying `AgentLoopError`)
+    /// - `AgentSessionError::Agent`: agent loop error (underlying `AgentLoopError`; the `prompt` path is always Ok — legacy quirk, out of scope here)
     ///
     /// # Edge Cases
-    /// - `&mut self`: exclusive borrow while running; no concurrent prompt possible from outside (guaranteed at compile time by Rust)
-    pub async fn prompt(&mut self, text: &str) -> Result<Vec<Message>, AgentSessionError> {
+    /// - `&self`: this struct is a lock-free Facade (store/excluded are already Arc-shared), callable concurrently by the run task and the main task
+    ///   (&self after the engine is shared; see interactive cancellation fix plan D)
+    pub async fn prompt(&self, text: &str) -> Result<Vec<Message>, AgentSessionError> {
         Ok(self.agent.prompt(text).await)
     }
     // Consumers: T-AP-07-1 (print mode prompt), T-AP-11-1 (interactive mode prompt)
@@ -222,38 +223,38 @@ impl AgentSession {
         self.agent.subscribe(listener)
     }
 
-    // ── State accessors (all delegate to self.agent.state(); nothing stored) ─────────────
+    // ── State accessors (all delegate to agent snapshot accessors, nothing stored) ─────────────
 
-    /// Current model (delegated read via `agent.state().model`).
-    pub fn model(&self) -> &Model {
-        &self.agent.state().model
+    /// Current model snapshot (delegated via `agent.model()`, owned clone).
+    pub fn model(&self) -> Model {
+        self.agent.model()
     }
     // Consumers: T-AP-07-1 (print mode footer), T-AP-11-1 (interactive mode footer)
 
-    /// Current thinking level (delegated read via `agent.state().thinking_level`).
+    /// Current thinking level (delegated via `agent.thinking_level()`).
     pub fn thinking_level(&self) -> ThinkingLevel {
-        self.agent.state().thinking_level
+        self.agent.thinking_level()
     }
 
-    /// List of currently active tool names (delegated read via `agent.state().tools`).
-    pub fn active_tool_names(&self) -> Vec<&str> {
+    /// List of currently active tool names (delegated via the `agent.tools()` snapshot; returns an owned `Vec<String>`;
+    /// references cannot be borrowed while the lock is held).
+    pub fn active_tool_names(&self) -> Vec<String> {
         self.agent
-            .state()
-            .tools
+            .tools()
             .iter()
-            .map(|tool| tool.name())
+            .map(|tool| tool.name().to_string())
             .collect()
     }
 
-    /// Whether a run is in progress (delegated read via `agent.state().is_run`).
+    /// Whether a run is currently in progress (delegated via `agent.is_run()`).
     /// Semantics: not "whether the protocol is streaming", but whether the agent is currently executing a run (busy state).
     pub fn is_run(&self) -> bool {
-        self.agent.state().is_run
+        self.agent.is_run()
     }
 
     /// Whether idle (= not running).
     pub fn is_idle(&self) -> bool {
-        !self.agent.state().is_run
+        !self.agent.is_run()
     }
 
     /// Session ID (read via delegation to `session_store.session_id()`).
@@ -278,7 +279,8 @@ impl AgentSession {
     ///
     /// # Edge Cases
     /// - Must not be called during streaming (caller should ensure idle)
-    pub fn set_model(&mut self, model: Model) {
+    /// - `&self`: lock-free Facade; state is mutated through the engine lock, callable from any thread
+    pub fn set_model(&self, model: Model) {
         let provider = model.provider.clone();
         let model_id = model.id.clone();
         self.agent.set_model(model);
@@ -293,7 +295,8 @@ impl AgentSession {
     ///
     /// # Edge Cases
     /// - Must not be called during streaming (caller should ensure idle)
-    pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
+    /// - `&self`: lock-free Facade (same as set_model)
+    pub fn set_thinking_level(&self, level: ThinkingLevel) {
         self.agent.set_thinking_level(level);
         self.session_store
             .append_thinking_level_change(&level.to_string())
@@ -305,8 +308,8 @@ impl AgentSession {
     /// to seed the history of `SessionManager::build_context()`; pass an empty value for a new session to get empty history.
     ///
     /// # Consumers
-    /// `create_initial_runtime_from_cli` (session/fork/resume assembly)
-    pub fn set_messages(&mut self, messages: Vec<Message>) {
+    /// `create_initial_runtime_from_cli` (session/fork/resume assembly); `&self` (lock-free Facade).
+    pub fn set_messages(&self, messages: Vec<Message>) {
         self.agent.set_messages(messages);
     }
 
@@ -525,7 +528,6 @@ mod tests {
             ToolExecutionMode::Sequential,
             std::sync::Arc::new(MockHooks),
             mock_stream_fn(),
-            tokio_util::sync::CancellationToken::new(),
         )
     }
 
@@ -540,7 +542,7 @@ mod tests {
         let m = test_model();
         let store = Arc::new(MockStore::default());
         let session = test_session(store);
-        assert_eq!(session.model(), &m);
+        assert_eq!(session.model(), m);
     }
 
     #[test]
@@ -572,7 +574,7 @@ mod tests {
     #[test]
     fn test_set_model_persists_and_updates_state() {
         let store = Arc::new(MockStore::default());
-        let mut session = test_session(store.clone());
+        let session = test_session(store.clone());
 
         let mut m2 = test_model();
         m2.id = "other-model".into();
@@ -585,13 +587,13 @@ mod tests {
             vec![("huoshan".to_string(), "other-model".to_string())]
         );
         // Single-source update: model() reads the new model
-        assert_eq!(session.model(), &m2);
+        assert_eq!(session.model(), m2);
     }
 
     #[test]
     fn test_set_thinking_level_persists_and_updates_state() {
         let store = Arc::new(MockStore::default());
-        let mut session = test_session(store.clone());
+        let session = test_session(store.clone());
 
         session.set_thinking_level(ThinkingLevel::High);
 
@@ -604,7 +606,7 @@ mod tests {
     fn test_set_messages_restores_history_on_delegate() {
         // set_messages delegates to the engine and only mutates state.messages, without triggering any persistence
         let store = Arc::new(MockStore::default());
-        let mut session = test_session(store.clone());
+        let session = test_session(store.clone());
 
         let msg = Message::User(zen_ai::types::UserMessage {
             content: zen_ai::types::ContentBlockList::Text("History messages".into()),
@@ -645,7 +647,8 @@ mod tests {
     // - The persistent subscription in `new` (message_end → append_message) **is implemented** (see `new`), but triggering it
     //   requires agent.on_event or a prompt event stream; the agent field is private and unreachable. Recommendation: add an integration test
     // - `prompt`: depends on a full mock StreamFn event stream (AgentStart/MessageUpdate/Done...); recommended to add an integration test
-    // - `abort`: the cancel token is a private agent field, so unit tests cannot assert is_cancelled
+    // - `abort`: the cancel token is a private agent field (Mutex<CancellationToken>), so unit tests cannot assert is_cancelled;
+    //   the semantics (bumping the current run token, no-op when idle, not polluting the next round) are covered by abort/per-run regression tests in engine.rs
     // - Event reception in `subscribe`: likewise requires triggering agent.on_event, but agent is private and unreachable; the pass-through behavior itself is already
     //   covered by the subscribe unit tests in engine.rs
 

@@ -31,9 +31,12 @@ pub struct AgentSessionServices {
 
 /// Runtime wrapper holding `AgentSession` + `AgentSessionServices`.
 /// Consumers: T-AP-07-1 (print mode), T-AP-11-1 (interactive mode)
+///
+/// Plan D: `session` is an `Arc<AgentSession>` (lock-free facade, shareable between the run task and the main task),
+/// all `runtime.session.xxx()` calls pass through via Deref, with zero changes for callers.
 pub struct AgentSessionRuntime {
-    /// Currently active session
-    pub session: AgentSession,
+    /// Currently active session (Arc-shared for concurrent access by interactive-mode run tasks, D3)
+    pub session: Arc<AgentSession>,
     /// Runtime service collection
     pub services: AgentSessionServices,
     /// Reason for this runtime creation (for diagnostics/logging)
@@ -56,13 +59,15 @@ pub struct AgentSessionRuntime {
 ///
 /// # Return Value
 /// Runtime wrapper usable directly in print-mode / interactive-mode.
+/// `session` is wrapped in an `Arc` here (assembly-phase `set_messages` etc. must be completed on the owned session before this call;
+/// after wrapping, all access goes through read-only/&self Deref calls).
 pub fn create_initial_runtime(
     session: AgentSession,
     services: AgentSessionServices,
     start_reason: SessionStartReason,
 ) -> AgentSessionRuntime {
     AgentSessionRuntime {
-        session,
+        session: Arc::new(session),
         services,
         start_reason,
     }
@@ -92,9 +97,9 @@ where
     let AgentSessionRuntime { services, .. } = current;
     // 2) Closure: construct new session + services + start_reason from the old services (ownership transfer)
     let (session, services, start_reason) = create_runtime_fn(services)?;
-    // 3) Construct new runtime
+    // 3) Construct new runtime (session wrapped in Arc, D3)
     Ok(AgentSessionRuntime {
-        session,
+        session: Arc::new(session),
         services,
         start_reason,
     })
@@ -187,7 +192,6 @@ mod tests {
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             mock_stream_fn(),
-            tokio_util::sync::CancellationToken::new(),
         )
     }
 

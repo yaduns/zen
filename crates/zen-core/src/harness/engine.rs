@@ -21,16 +21,26 @@ use zen_ai::types::{ContentBlock, ContentBlockList, Message, Model, ThinkingLeve
 /// internally implements AgentLoopHooks (queue draining + everything else delegated to the user hooks).
 /// Each prompt/continue_turn builds a fresh Context (with tools) and AgentLoopConfig from state (model derived from state.model + scattered settings),
 ///  syncing newly added messages back into state.messages when done.
+///
+/// **Interactive cancellation fix (Plan D1-D12)**:
+/// - D3: `state: Mutex<AgentState>` (single lock point, short-lived std Mutex; shared surface provided by outer `Arc<AgentSession>`),
+///   all methods take `&self`, supporting concurrent access from the run task and the main task (aligned with pi MutableAgentState).
+/// - D4: `cancel: Mutex<CancellationToken>` replaced on every run = pi `activeRun.abortController`; `abort()` targets the "current" run,
+///   when idle it targets the old token (no-op, doesn't pollute the next run).
+/// - D7: `start_run` is wired into the `run_with_lifecycle` entry; `finish_run` is backed by `RunGuard` RAII on Drop
+///   (unified across normal/panic paths, prevents a panic skipping finish_run → is_run stuck true → session dead).
+/// - D11: the three transient fields `streaming_message`/`pending_tool_calls`/`error_message` are registered as v1 gaps
+///   (no production readers, `on_event` not wired to `apply_event`; fields kept to align with pi).
 pub struct Agent {
-    /// system_prompt (a fully assembled string produced at the app layer), model, thinking_level, tools (single source, created per-session by the application layer via ToolFactory and bound to the environment), messages (accumulated across turns); transient fields (is_run/streaming_message/pending_tool_calls/error_message) are maintained by AgentState's start_run/finish_run/apply_event (aligned with pi's MutableAgentState transient fields, plan A)
-    state: AgentState,
+    /// system_prompt (fully assembled string from the app layer), model, thinking_level, tools (single source, created per session by the application layer via ToolFactory, bound to environment), messages (accumulated across turns); is_run maintained by start_run/run_with_lifecycle
+    state: Mutex<AgentState>,
     tool_execution: ToolExecutionMode,
     /// User-behavior hooks; delegation target for Agent's non-queue methods
     hooks: Arc<dyn AgentLoopHooks>,
     /// Each prompt passes self.stream_fn.clone() to the lower layer
     stream_fn: StreamFn,
-    /// abort() = cancel.cancel()
-    cancel: CancellationToken,
+    /// D4: cancellation token for the current run (replaced on every run); abort() targets it (idle = old token no-op).
+    cancel: Mutex<CancellationToken>,
     /// Consumed by the Agent's own impl AgentLoopHooks
     steer_queue: Arc<Mutex<VecDeque<Message>>>,
     /// Consumed by the Agent's own impl AgentLoopHooks
@@ -43,6 +53,28 @@ pub struct Agent {
 struct EventListenerList {
     next_id: u64,
     entries: Vec<(u64, Arc<dyn Fn(&AgentEvent) + Send + Sync>)>,
+}
+
+/// In run_with_lifecycle, attach RunGuard after Agent's start_run succeeds; both normal return and panic unwind paths reset is_run on Drop.
+/// RunGuard carries AgentState data because Drop needs its finish_run function; otherwise any variable inside run_with_lifecycle could serve as the carrier.
+/// Prevents run_agent_loop panicking past finish_run → is_run stuck true → all subsequent runs rejected by the start_run guard
+/// (session permanently dead); `unwrap_or_else(into_inner)` guards against lock poisoning (P1-2).
+/// 'a cannot outlive the actual lifetime of the borrowed Mutex (otherwise dangling reference, compile error); the guard instance cannot outlive 'a, ensuring finish_run is called on the guard before the Mutex is dropped
+struct RunGuard<'a>(&'a Mutex<AgentState>);
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_run();
+    }
+}
+
+/// Run entry distinction (prompt appends input / continue does not).
+enum RunBody {
+    Prompt(Vec<Message>),
+    Continue,
 }
 
 #[async_trait]
@@ -123,28 +155,27 @@ impl Agent {
     /// # Parameters
     /// - `state`: route A single-source-of-truth state (`system_prompt` is a finished string assembled by the app layer,
     ///   `tools` is the current tool set, `messages` is the restored history). After construction `state.tools`/`state.model`
-    ///   i.e. the sole source.
-    /// - `tool_execution`: tool execution mode (aligned with pi's `toolExecution`, the engine's only scattered setting).
+    ///   i.e. the single source. Wrapped as `Mutex<AgentState>` (single lock point, D3).
+    /// - `tool_execution`: tool execution mode (aligned with pi `toolExecution`, the engine's only scattered setting, Copy, read inside the lock).
     /// - `hooks`: user-behavior hooks (delegation target for non-queue methods)
     /// - `stream_fn`: LLM streaming call function
-    /// - `cancel`: cancellation token
     ///
     /// # Edge Cases
     /// - Both queues are created inside `new` and retained as engine fields.
     /// - `Agent` is the `AgentLoopHooks` implementation: no separate hooks wrapper needed.
+    /// - **Does not take a `cancel` argument** (D5): the token is built at each run entry (D4), so a constructor argument is meaningless.
     pub fn new(
         state: AgentState,
         tool_execution: ToolExecutionMode,
         hooks: Arc<dyn AgentLoopHooks>,
         stream_fn: StreamFn,
-        cancel: CancellationToken,
     ) -> Self {
         Self {
-            state,
+            state: Mutex::new(state),
             tool_execution,
             hooks,
             stream_fn,
-            cancel,
+            cancel: Mutex::new(CancellationToken::new()), // placeholder; replaced on the first run (D4)
             // Both queues are created in new and kept as engine fields (aligns with the comment's edge cases).
             steer_queue: Arc::new(Mutex::new(VecDeque::new())),
             follow_up_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -157,42 +188,102 @@ impl Agent {
 
     /// Builds this turn's runtime `AgentLoopConfig` (model/reasoning derived from the single source of truth, `state`).
     ///
-    /// Rebuilt on the fly from state + scattered settings on every low-level call.
-    /// `reasoning` is derived from `state.thinking_level`: `Off` → `None`, otherwise `Some(level)`
-    /// Fields: `model`/`reasoning` ← state, `tool_execution` ← engine field, `api_key` fixed to `None`
-    /// (low-level goes through `hooks.get_api_key`).
-    fn make_config(&self) -> AgentLoopConfig {
+    /// **Pure function: no locking, no touching `self`** (avoids re-entering the lock while holding the state guard; std Mutex is not reentrant).
+    /// `state` is held by the caller under the lock; `tool_execution` is Copy, so the caller reads fields directly under the lock
+    /// (field-level shared borrow, no conflict with the state lock).
+    /// `reasoning` is derived from `state.thinking_level`: `Off` → `None`, otherwise `Some(level)`.
+    fn make_config(state: &AgentState, tool_execution: ToolExecutionMode) -> AgentLoopConfig {
         AgentLoopConfig {
-            model: self.state.model.clone(),     // ← single source of truth: state
-            api_key: None,                       // Low level goes through hooks.get_api_key
-            tool_execution: self.tool_execution, // ← engine field (Copy)
-            reasoning: match self.state.thinking_level {
+            model: state.model.clone(), // ← single source of truth: state
+            api_key: None,              // Low level goes through hooks.get_api_key
+            tool_execution,             // Passed in as parameters instead of reading from `self` (avoids re-entering the lock while holding the state guard)
+            reasoning: match state.thinking_level {
                 ThinkingLevel::Off => None, // Off → don't send reasoning_effort
                 level => Some(level),       // Pass other levels through unchanged
             },
         }
     }
 
+    /// Unified run lifecycle: under lock "guard + token refresh + snapshot" → release lock, run loop → under lock "write-back".
+    /// `is_run` is finalized by `RunGuard`'s Drop (unified normal/panic paths, P1-2).
+    ///
+    /// # Lock Discipline (documented in comments)
+    /// 1. Never await or call the loop under a lock; only do snapshot clones / pure logic.
+    /// 2. Enforce the three-stage pattern: "snapshot under lock → release lock → await loop → write back under lock".
+    /// 3. `make_config` is a pure function + Copy prefetched, eliminating lock re-entry while holding the state guard.
+    /// 4. If the `start_run` guard rejects → warn + empty Vec (defensive net; a real prompt run always has at least a user message, so an empty Vec distinguishes it).
+    /// 5. Poisoning handled with `unwrap_or_else(|e| e.into_inner())`.
+    /// 6. Lock ordering: state→cancel nesting exists; always state→cancel, never the reverse.
+    async fn run_with_lifecycle(&self, body: RunBody) -> Vec<Message> {
+        let token = CancellationToken::new(); // D4：= pi new AbortController
+        let (mut ctx, run_config, _guard) = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.start_run().is_err() {
+                // D7 guard (defensive net, unreachable in the normal flow): dispatch_loop single-spawns + sticky guard, at most one run at any instant
+                tracing::warn!("run rejected: agent already running");
+                return Vec::new();
+            }
+            *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = token.clone(); // D4: refresh
+            let tool_execution = self.tool_execution; // Copy-read fields under lock (not reentrant, harmless), consumed in place (not added to the tuple)
+            let ctx = create_context(s.system_prompt.clone(), s.messages.clone(), &s.tools);
+            let cfg = Self::make_config(&s, tool_execution); // Pure function, no re-entry
+            let _guard = RunGuard(&self.state); // Attach RAII after start_run succeeds (P1-2)
+            (ctx, cfg, _guard)
+        }; // Release lock (guard drop); _guard borrows &self.state (shared) and outlives the function
+        let new_messages = match body {
+            RunBody::Prompt(input) => {
+                run_agent_loop(
+                    input,
+                    &mut ctx,
+                    &run_config,
+                    self,
+                    &token,
+                    self.stream_fn.clone(),
+                )
+                .await
+            }
+            RunBody::Continue => match run_agent_loop_continue(
+                &mut ctx,
+                &run_config,
+                self,
+                &token,
+                self.stream_fn.clone(),
+            )
+            .await
+            {
+                Ok(msgs) => msgs,
+                // Fallback: continue_turn already pre-validates (see below), so Err is theoretically unreachable.
+                // Note: run_agent_loop_continue **also performs** EmptyContext/InvalidLastRole validation internally,
+                // If someone changes the internal validation in the future without syncing the up-front check, this Err branch catches it — **not dead code, do not delete** (dual-validation redundancy).
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "continue validation failed (continue_turn pre-validates, so theoretically unreachable)"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.messages = ctx.messages; // Changing the material voids the entire batch
+            s.system_prompt = ctx.system_prompt.unwrap_or_default();
+            s.tools = ctx.tools.unwrap_or_default();
+            // Explicit finish_run is no longer needed: _guard Drop (unified across normal/panic paths) provides an idempotent fallback (P1-2)
+        }
+        new_messages
+    }
+
     /// Appends a user prompt and runs one turn (= Pi low-level `Agent::prompt()`).
     ///
     /// # Behavior
-    /// 1. Build a fresh `Context` from `self.state`: `create_context(state.system_prompt.clone(),
-    ///    state.messages.clone(), &state.tools)` (aligns with Route A's per-turn `AgentContext` snapshot);
-    /// 2. Build a fresh `AgentLoopConfig` (`self.make_config()`, model derived from `state.model`);
-    /// 3. Call `run_agent_loop(vec![user_msg], &mut ctx, &run_config, self, &self.cancel,
-    ///    self.stream_fn.clone())` — pass `&*self` as the hooks argument (`Agent` implements `AgentLoopHooks`).
-    ///    `&*self` is a **shared borrow** that lives across `.await`; `ctx`/`config`/`cancel`/`stream_fn` are all owned locals
-    ///    cloned from `self` before the call, so they don't conflict with the `&mut self` receiver; the shared borrow ends
-    ///    after the await returns, then flow back into `state` (the low-level signature drops `tool_ctx` per the "tool alignment" plan);
-    /// 4. Sync back to `self.state`: by default `extend` the returned new messages back into `state.messages`;
-    ///    if the low-level replaced `ctx` wholesale mid-run (`prepare_next_turn` returned a `Context` with swapped material, see edge case below),
-    ///    take the replaced `ctx` back in full and overwrite `state` with it.
+    /// Go through `run_with_lifecycle` (token refresh + start_run + snapshot → release lock to run loop → reacquire lock to flush back + RunGuard reset).
     ///
     /// # Return Value
-    /// All messages added this turn (including the user prompt, assistant, and tool results).
+    /// All messages added in this round (including user prompt, assistant, tool results). Returns an empty `Vec` when rejected by the guard (defensive net).
     ///
     /// # Edge Cases
-    /// - `&mut self`: the engine is exclusively borrowed during the run, so external code cannot call `prompt` concurrently (guaranteed by the Rust compiler).
+    /// - `&self`: after plan D, the engine supports concurrent prompt/steer (single lock point AgentState, std Mutex short lock).
     /// - `state.messages` is the authoritative accumulator; `ctx`/`run_config` are per-turn snapshots, not held across turns.
     /// - **Swapping materials must be written back in full**: between turns the low-level loop asks the app layer "swap in a new set of materials for the next turn?" (`prepare_next_turn`
     ///   hook). If the app layer returns a full replacement `Context` (typical case: Phase 2 compaction—when the conversation gets long, compress history into a summary,
@@ -200,37 +291,13 @@ impl Agent {
     ///   `state`**—it must write the replacement `ctx` (messages / system_prompt / tools) back over `state` in full**,
     ///   otherwise the "rewrite the whole session" operation is silently dropped, and the canonical copy diverges from what the model actually saw.
     ///   v1 has no compaction and this hook usually returns `None`, but the write-back convention must be agreed upon from the start.
-    pub async fn prompt(&mut self, text: &str) -> Vec<Message> {
-        // 1) Build this turn's snapshot (Route A: derive Context from state each turn)
-        let mut ctx = create_context(
-            self.state.system_prompt.clone(),
-            self.state.messages.clone(),
-            &self.state.tools,
-        );
-        // 2) Build config on the fly (single source for model/reasoning)
-        let run_config = self.make_config();
-        // 3) User prompt message
+    pub async fn prompt(&self, text: &str) -> Vec<Message> {
         let user_msg = Message::User(UserMessage {
             content: ContentBlockList::Text(text.to_string()),
             timestamp: now_millis(),
         });
-        // 4) Run the low-level loop: pass &*self as hooks (Agent implements AgentLoopHooks);
-        //    ctx/run_config/cancel/stream_fn are owned locals cloned before the call, no borrow conflict with &mut self
-        let new_messages = run_agent_loop(
-            vec![user_msg],
-            &mut ctx,
-            &run_config,
-            &*self,
-            &self.cancel,
-            self.stream_fn.clone(),
-        )
-        .await;
-        // 5) Take ctx back in full → state (messages are the authoritative accumulation; if prepare_next_turn swapped the material,
-        //    system_prompt/tools are also recalled, to avoid divergence between the canonical copy and what the model sees)
-        self.state.messages = ctx.messages;
-        self.state.system_prompt = ctx.system_prompt.unwrap_or_default();
-        self.state.tools = ctx.tools.unwrap_or_default();
-        new_messages
+        self.run_with_lifecycle(RunBody::Prompt(vec![user_msg]))
+            .await
     }
 
     /// Runs one more turn from the current transcript (= Pi low-level `Agent::continue()`, `agent.ts:350`).
@@ -245,31 +312,18 @@ impl Agent {
     /// (requires `state.messages` to be non-empty and the last message to be non-assistant).
     ///
     /// # Errors
-    /// - Empty context / last message is assistant → `Err(AgentLoopError)` (returned by the lower layer).
-    pub async fn continue_turn(&mut self) -> Result<Vec<Message>, AgentLoopError> {
-        // 1) Build a snapshot for this round on the fly (same construction flow as prompt)
-        let mut ctx = create_context(
-            self.state.system_prompt.clone(),
-            self.state.messages.clone(),
-            &self.state.tools,
-        );
-        // 2) Build config on the fly (single source for model/reasoning)
-        let run_config = self.make_config();
-        // 3) Call the lower-level continue: do not append a user prompt;
-        //    Empty context / last message is assistant → Err(AgentLoopError) returned by the lower layer, propagated via ?
-        let new_messages = run_agent_loop_continue(
-            &mut ctx,
-            &run_config,
-            &*self,
-            &self.cancel,
-            self.stream_fn.clone(),
-        )
-        .await?;
-        // 4) Return the whole ctx → state (same return-flow convention as prompt)
-        self.state.messages = ctx.messages;
-        self.state.system_prompt = ctx.system_prompt.unwrap_or_default();
-        self.state.tools = ctx.tools.unwrap_or_default();
-        Ok(new_messages)
+    /// - Empty context / last message is assistant → `Err(AgentLoopError)` (up-front entry validation, single snapshot).
+    ///   **The up-front check and the internal check in run_agent_loop_continue must stay in sync** (see the Err fallback comment on the Continue arm of run_with_lifecycle; don't let the two drift apart).
+    pub async fn continue_turn(&self) -> Result<Vec<Message>, AgentLoopError> {
+        // Entry validation runs before the helper (produces Result; a single snapshot avoids two full clones)
+        let msgs = self.messages();
+        if msgs.is_empty() {
+            return Err(AgentLoopError::EmptyContext);
+        }
+        if matches!(msgs.last(), Some(Message::Assistant(_))) {
+            return Err(AgentLoopError::InvalidLastRole);
+        }
+        Ok(self.run_with_lifecycle(RunBody::Continue).await)
     }
 
     /// Queue a user message to be injected before the LLM responds (= route A `steer()`).
@@ -313,16 +367,16 @@ impl Agent {
     ///
     /// **Only modifies `state.model` (single source of truth)**. `AgentLoopConfig.model` is derived from `state` on the next `prompt`/`continue_turn`
     /// — no persistent dual ownership. Session persistence (appendModelChange) will be wired in when SessionManager lands in Phase 2.
-    pub fn set_model(&mut self, model: Model) {
-        self.state.model = model;
+    pub fn set_model(&self, model: Model) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).model = model;
     }
 
     /// Replace the tool set (= route A `setTools()`).
     ///
     /// Only updates `self.state.tools` (single source of truth). `Context.tools` is derived from `state` on the next `prompt`,
     /// with no persistent dual ownership.
-    pub fn set_tools(&mut self, tools: Vec<Arc<dyn Tool>>) {
-        self.state.tools = tools;
+    pub fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).tools = tools;
     }
 
     /// Restore session history after construction (mirrors pi's `agent.state.messages = buildSessionContext().messages`).
@@ -330,15 +384,22 @@ impl Agent {
     /// Symmetric to `set_model`/`set_tools`: only modifies `state.messages` (single source of truth). Used by the assembly phase (T-AP-08-3
     /// `create_initial_runtime_from_cli`) to load back a persisted/forked session's history; the next `prompt`'s
     /// Context is derived from `state`. For a new session, pass an empty `Vec` for empty history (no forking needed).
-    pub fn set_messages(&mut self, messages: Vec<Message>) {
-        self.state.messages = messages;
+    pub fn set_messages(&self, messages: Vec<Message>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages = messages;
     }
 
-    /// Cancel the current/subsequent run (= route A `abort()`).
+    /// Cancel the current/subsequent run (= route A `abort()`, plan D4 revision).
     ///
-    /// Calls `self.cancel.cancel()` internally. The lower-level loop exits at a safe point after receiving the cancellation signal.
+    /// Strike the "current" run token (`cancel: Mutex<CancellationToken>`, refreshed on every run);
+    /// When idle, strike the old token (no-op, doesn't pollute the next round).
     pub fn abort(&self) {
-        self.cancel.cancel();
+        self.cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
     }
 
     /// Wait until the engine is idle (API aligned with route A `waitForIdle()`).
@@ -351,9 +412,12 @@ impl Agent {
     /// Clear `state.messages` and transient runtime fields (via `AgentState::reset`,
     /// (including `is_run`/`streaming_message`/`pending_tool_calls`/`error_message`) + the steer/follow_up queues.
     /// config in AgentState (system_prompt/model/thinking_level/tools) is preserved — after reset the same instance can continue `prompt()`.
-    pub fn reset(&mut self) {
-        self.state.reset();
-        self.state.messages = vec![];
+    pub fn reset(&self) {
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.reset();
+            s.messages = vec![];
+        }
         if let Ok(mut queue) = self.steer_queue.lock() {
             queue.clear();
         }
@@ -393,12 +457,62 @@ impl Agent {
 
     // Consumer: T-AP-01-1 (persistent subscription via AgentSession::new + pass-through in AgentSession::subscribe)
 
-    pub fn state(&self) -> &AgentState {
-        &self.state
+    // ── State snapshot accessors (cannot return references while holding the lock, so all return owned snapshots; replaces the original state(), III.3/III.4) ──
+
+    /// Whether a run is in progress (`state.is_run`, maintained by start_run/run_with_lifecycle/RunGuard).
+    pub fn is_run(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).is_run
     }
 
-    pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
-        self.state.thinking_level = level;
+    /// Current thinking level snapshot (`state.thinking_level`).
+    pub fn thinking_level(&self) -> ThinkingLevel {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .thinking_level
+    }
+
+    /// Current model snapshot (`state.model`, owned clone).
+    pub fn model(&self) -> Model {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .model
+            .clone()
+    }
+
+    /// Finalized message history snapshot (`state.messages`, owned clone).
+    pub fn messages(&self) -> Vec<Message> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages
+            .clone()
+    }
+
+    /// Current toolset snapshot (`state.tools`, owned clone; shallow `Arc` copy).
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tools
+            .clone()
+    }
+
+    /// Snapshot of the error message from the most recent failed/interrupted assistant turn (`state.error_message`, a vestigial field from D11, currently no writer).
+    pub fn error_message(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error_message
+            .clone()
+    }
+
+    pub fn set_thinking_level(&self, level: ThinkingLevel) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .thinking_level = level;
     }
 
     /// Read-only snapshot of the steer queue (for displaying pending steer message text in the UI).
@@ -442,8 +556,8 @@ fn queue_texts(queue: &Arc<Mutex<VecDeque<Message>>>) -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use zen_ai::types::{AssistantMessageEvent, Context, TextContent};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use zen_ai::types::{AssistantMessage, AssistantMessageEvent, Context, TextContent};
 
     // ── Test helper construction ──
 
@@ -471,7 +585,7 @@ mod tests {
         }
     }
 
-    /// Returns a mock StreamFn of an empty stream (tests in this file don't invoke the prompt; this is only a placeholder).
+    /// Returns a mock StreamFn that emits an empty stream (most tests in this file don't call prompt, they only construct a placeholder).
     fn mock_stream_fn() -> StreamFn {
         Arc::new(
             |_model: &Model,
@@ -483,6 +597,72 @@ mod tests {
                         tokio::sync::mpsc::UnboundedSender<AssistantMessageEvent>,
                         tokio::sync::mpsc::UnboundedReceiver<AssistantMessageEvent>,
                     ) = tokio::sync::mpsc::unbounded_channel();
+                    Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
+                })
+            },
+        )
+    }
+
+    /// Returns a "blockable/completable" mock StreamFn: on receiving a call it first emits Start (run immediately enters the running state),
+    /// if `block` is true it waits — until the cancellation token is cancelled (→ emits `Error{Aborted}`) or `block` becomes false
+    /// (→ emits TextDelta + Done and completes normally). Used for abort/per-run token regression and is_run transient wiring tests:
+    /// the main task has a chance to observe the running state before deciding how to finish up.
+    fn controllable_stream_fn(block: Arc<AtomicBool>) -> StreamFn {
+        Arc::new(
+            move |_model: &Model,
+                  _ctx: &Context,
+                  _cfg: Option<zen_ai::api::openai_stream::StreamConfig>,
+                  cancel: Option<CancellationToken>| {
+                let block = Arc::clone(&block);
+                Box::pin(async move {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AssistantMessageEvent>();
+                    let cancel = cancel.unwrap_or_default();
+                    let partial = AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent {
+                            text: "ok".into(),
+                            text_signature: None,
+                        })],
+                        api: "openai-completions".into(),
+                        provider: "opencode-go".into(),
+                        model: "deepseek-v4-flash".into(),
+                        response_model: None,
+                        response_id: None,
+                        usage: zen_ai::types::Usage::default(),
+                        stop_reason: zen_ai::types::StopReason::Stop,
+                        error_message: None,
+                        timestamp: 0,
+                    };
+                    let _ = tx.send(AssistantMessageEvent::Start {
+                        partial: partial.clone(),
+                    });
+                    if block.load(Ordering::SeqCst) {
+                        // wait for cancellation (→ Error{Aborted}) or unblocking (→ Done)
+                        tokio::select! {
+                            _ = cancel.cancelled() => {}
+                            _ = async {
+                                while block.load(Ordering::SeqCst) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                                }
+                            } => {}
+                        }
+                    }
+                    if cancel.is_cancelled() {
+                        let _ = tx.send(AssistantMessageEvent::Error {
+                            reason: zen_ai::types::ErrorStopReason::Aborted,
+                            error: partial,
+                        });
+                    } else {
+                        let _ = tx.send(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "ok".into(),
+                            partial: partial.clone(),
+                        });
+                        let _ = tx.send(AssistantMessageEvent::Done {
+                            reason: zen_ai::types::NonErrorStopReason::Stop,
+                            message: partial,
+                        });
+                    }
+                    drop(tx);
                     Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
                 })
             },
@@ -503,18 +683,23 @@ mod tests {
         }
     }
 
-    fn test_agent_with_cancel(cancel: CancellationToken) -> Agent {
+    fn test_agent() -> Agent {
         Agent::new(
             agent_state(),
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             mock_stream_fn(),
-            cancel,
         )
     }
 
-    fn test_agent() -> Agent {
-        test_agent_with_cancel(CancellationToken::new())
+    /// Builds an engine with a "blockable/completable" StreamFn (for abort/per-run token regression / transient wiring tests).
+    fn test_controllable_agent(block: Arc<AtomicBool>) -> Agent {
+        Agent::new(
+            agent_state(),
+            ToolExecutionMode::Sequential,
+            Arc::new(MockHooks),
+            controllable_stream_fn(block),
+        )
     }
 
     // ── subscribe / on_event ──
@@ -649,59 +834,63 @@ mod tests {
         assert_eq!(queue_texts(&queue), vec!["first\nsecond".to_string()]);
     }
 
-    // ── set_model / set_thinking_level / set_tools / state ──
+    // ── set_model / set_thinking_level / set_tools / state snapshot accessors ──
 
     #[test]
     fn test_set_model_updates_single_source() {
-        let mut agent = test_agent();
+        let agent = test_agent();
         let m = test_model();
         agent.set_model(m.clone());
-        assert_eq!(agent.state().model, m);
+        assert_eq!(agent.model(), m);
     }
 
     #[test]
     fn test_set_thinking_level_updates_state() {
-        let mut agent = test_agent();
+        let agent = test_agent();
         agent.set_thinking_level(ThinkingLevel::High);
-        assert_eq!(agent.state().thinking_level, ThinkingLevel::High);
+        assert_eq!(agent.thinking_level(), ThinkingLevel::High);
     }
 
     #[test]
     fn test_set_tools_replaces_state() {
-        let mut agent = test_agent();
+        let agent = test_agent();
         agent.set_tools(vec![]);
-        assert!(agent.state().tools.is_empty());
+        assert!(agent.tools().is_empty());
     }
 
     #[test]
     fn test_set_messages_restores_history() {
-        let mut agent = test_agent();
+        let agent = test_agent();
         // Initially empty history
-        assert!(agent.state().messages.is_empty());
+        assert!(agent.messages().is_empty());
         // Reload persisted session history (align with pi `agent.state.messages = buildContext().messages`)
         let msg = Message::User(UserMessage {
             content: ContentBlockList::Text("History messages".into()),
             timestamp: 0,
         });
         agent.set_messages(vec![msg.clone()]);
-        assert_eq!(agent.state().messages, vec![msg]);
+        assert_eq!(agent.messages(), vec![msg]);
         // Empty Vec restores empty history (new session)
         agent.set_messages(vec![]);
-        assert!(agent.state().messages.is_empty());
+        assert!(agent.messages().is_empty());
     }
 
     #[test]
-    fn test_state_returns_latest_state() {
+    fn test_accessors_snapshot_latest_state() {
         let agent = test_agent();
-        assert_eq!(agent.state().system_prompt, "test");
-        assert_eq!(agent.state().is_run, false);
+        assert_eq!(agent.model().id, "deepseek-v4-flash");
+        assert_eq!(agent.thinking_level(), ThinkingLevel::Off);
+        assert!(!agent.is_run(), "Initially not running");
+        assert!(agent.error_message().is_none());
+        assert!(agent.messages().is_empty());
+        assert!(agent.tools().is_empty());
     }
 
     // ── reset ──
 
     #[tokio::test]
     async fn test_reset_clears_queue_but_preserves_config() {
-        let mut agent = test_agent();
+        let agent = test_agent();
         agent.steer("queued");
         let m = test_model();
         agent.set_model(m.clone());
@@ -709,48 +898,107 @@ mod tests {
         agent.reset();
 
         // Configuration is preserved (model is not cleared)
-        assert_eq!(agent.state().model, m);
+        assert_eq!(agent.model(), m);
         // Queue is emptied
         assert!(agent.steering_messages().is_empty());
         assert!(agent.follow_up_messages().is_empty());
         // messages is empty
-        assert!(agent.state().messages.is_empty());
+        assert!(agent.messages().is_empty());
     }
 
-    // ── abort ──
+    // ── abort (scheme D4: invalidate the current run token, no-op when idle) ──
 
     #[test]
-    fn test_abort_cancels_token() {
-        let cancel = CancellationToken::new();
-        let agent = test_agent_with_cancel(cancel.clone());
-        assert!(!cancel.is_cancelled());
+    fn test_abort_idle_is_noop() {
+        let agent = test_agent();
+        // abort is a no-op when idle (no panic, doesn't pollute subsequent run tokens)
         agent.abort();
-        assert!(cancel.is_cancelled());
+        assert!(!agent.is_run());
     }
 
-    // ── make_config (private, testable within this module) ──
+    /// abort/per-run token regression: abort cancels the current run; then prompting again with a fresh run token (the engine swaps in a new one on each run)
+    /// should complete normally (no longer polluted by "one abort cancels forever", D4).
+    #[tokio::test]
+    async fn test_abort_cancels_active_run_and_next_run_completes() {
+        let block = Arc::new(AtomicBool::new(true));
+        let agent = Arc::new(test_controllable_agent(Arc::clone(&block)));
+        // First round: abort mid-run → this round is cancelled (controllable_stream_fn emits Error{Aborted} for a cancelled token)
+        let task_agent = Arc::clone(&agent);
+        let spawn1 = tokio::spawn(async move {
+            let _ = task_agent.prompt("first").await;
+        });
+        // Abort after the first round enters running (is_run set, run hangs because block=true)
+        let mut entered = false;
+        for _ in 0..200 {
+            if agent.is_run() {
+                entered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered, "is_run should be true during prompt run (D7 wiring)");
+        agent.abort();
+        spawn1.await.expect("first round task should not panic");
+        assert!(!agent.is_run(), "is_run resets after run ends (RunGuard Drop)");
+
+        // Second round: unblock + engine's fresh internal token (not cancelled) → should complete normally (returns an assistant message)
+        block.store(false, Ordering::SeqCst);
+        let msgs = agent.prompt("second").await;
+        assert!(!msgs.is_empty(), "second round should produce message (normal completion)");
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|m| matches!(m, Message::Assistant(_))));
+        assert!(!agent.is_run(), "is_run resets after second round");
+    }
+
+    /// Transient wiring: `is_run()` is true during prompt, false after it finishes.
+    #[tokio::test]
+    async fn test_is_run_toggles_during_prompt() {
+        let block = Arc::new(AtomicBool::new(true));
+        let agent = Arc::new(test_controllable_agent(Arc::clone(&block)));
+        assert!(!agent.is_run());
+        let task_agent = Arc::clone(&agent);
+        let spawned = tokio::spawn(async move {
+            let _ = task_agent.prompt("hi").await;
+        });
+        let mut saw_run = false;
+        for _ in 0..200 {
+            if agent.is_run() {
+                saw_run = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(saw_run, "is_run=true should be observed during prompt run");
+        // Unblock → run completes normally → is_run resets
+        block.store(false, Ordering::SeqCst);
+        spawned.await.expect("prompt task should not panic");
+        assert!(!agent.is_run(), "is_run=false after prompt ends");
+    }
+
+    // ── make_config (private pure function, testable within the same module) ──
 
     #[test]
     fn test_make_config_reasoning_off_is_none() {
-        let agent = test_agent(); // thinking_level = Off
-        let cfg = agent.make_config();
+        let cfg = Agent::make_config(&agent_state(), ToolExecutionMode::Sequential);
         assert_eq!(cfg.reasoning, None, "Off → do not send reasoning_effort");
         assert_eq!(cfg.api_key, None, "api_key fixed to None, uses hooks.get_api_key");
     }
 
     #[test]
     fn test_make_config_reasoning_level_passthrough() {
-        let mut agent = test_agent();
-        agent.set_thinking_level(ThinkingLevel::Low);
-        let cfg = agent.make_config();
+        let mut st = agent_state();
+        st.thinking_level = ThinkingLevel::Low;
+        let cfg = Agent::make_config(&st, ToolExecutionMode::Sequential);
         assert_eq!(cfg.reasoning, Some(ThinkingLevel::Low));
     }
 
     #[test]
     fn test_make_config_derives_model_and_tool_execution() {
-        let agent = test_agent();
-        let cfg = agent.make_config();
-        assert_eq!(cfg.model, agent.state().model);
-        assert_eq!(cfg.tool_execution, ToolExecutionMode::Sequential);
+        let st = agent_state();
+        let cfg = Agent::make_config(&st, ToolExecutionMode::Parallel);
+        assert_eq!(cfg.model, st.model);
+        assert_eq!(cfg.tool_execution, ToolExecutionMode::Parallel);
     }
 }

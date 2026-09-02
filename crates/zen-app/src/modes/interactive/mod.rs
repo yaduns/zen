@@ -200,9 +200,11 @@ pub enum InteractiveModeError {
 /// Interactive session driver (main-task side): holds AgentSessionRuntime, registers agent subscriptions and signal handling,
 /// consumes user input via input_rx, pushes UI changes via ui_event_tx; run() is the "initial message + input dispatch" main loop.
 ///
-/// **v1 known limitation**: while `handle_submit`'s prompt inline await is in flight, the main task does not consume input (queued);
-/// input is dispatched in order after the turn ends — "steering while streaming" requires the Agent to support concurrent prompt/steer,
-/// so this version falls back to idle dispatch (`is_run()` branch retained); see tasks/T-AP-11-1-implemented.md "Open Issues".
+/// **Cancellation/concurrency (Plan D)**: Message submission is driven via `spawn_local` to `session.prompt` (run task, D1),
+/// dispatch_loop: single loop, three-way select (input / RunDone pre-guard / root token), resident; Esc/CtrlD (during run) hit directly
+/// `session.abort()` (run-level cancellation, root token untouched), single-exit shutdown bridge (session.abort + explicit join of run_task).
+/// Initial message also goes through spawn (Esc can cancel during init; if the initial message fails it degrades to a UI status line, see "Known Deviations" #3).
+/// Remaining boundary: `!`/`!!` bash and `/` commands use sequential awaits in v1 (bash tasking lands in phase 2).
 pub struct InteractiveMode {
     /// Sole source of session/agent/service.
     runtime: AgentSessionRuntime,
@@ -236,6 +238,9 @@ pub struct InteractiveMode {
     last_ctrl_c_at: Option<Instant>,
     /// Exit request (CtrlD idle / CtrlC double-press / /quit → break the dispatch loop).
     exit_requested: bool,
+    /// Current run task handle (plan D): set synchronously at spawn time (sticky guard, at most one run in flight at any instant);
+    /// The RunDone branch / shutdown own the reset point.
+    run_task: Option<tokio::task::JoinHandle<()>>,
     /// Footer usage accumulators (mutable within subscription callbacks; std Mutex guarantees callback thread safety).
     usage_totals: Arc<Mutex<UsageTotals>>,
     /// SIGTERM/SIGHUP listener task (register/unregister lifecycle pair).
@@ -267,6 +272,7 @@ impl InteractiveMode {
             last_escape_at: None,
             last_ctrl_c_at: None,
             exit_requested: false,
+            run_task: None,
             usage_totals: Arc::new(Mutex::new(UsageTotals::default())),
             signal_task: None,
             signal_exit_code: Arc::new(AtomicI32::new(0)),
@@ -477,33 +483,41 @@ impl InteractiveMode {
         Ok(())
     }
 
-    /// Input dispatch loop: two-way select on `input_rx.recv()` / `cancel.cancelled()`.
-    /// CtrlD (idle), CtrlC double-tap, /quit, cancel signal → break (then shutdown cleanup).
+    /// Input dispatch loop (plan D): single loop, three-way select + RunDone pre-guard, resident and non-blocking.
+    ///
+    /// - **input branch**: Submit → idle spawn / steer during run; Esc/CtrlD (during run) → `session.abort()`;
+    ///   CtrlD (idle), double CtrlC, /quit, root token → break (shutdown wraps up afterwards).
+    /// - **RunDone branch**: teardown of the `run_task` JoinHandle (normal / post-Esc-abort teardown / panic all reset via this point).
+    ///   **The pre-guard is load-bearing**: tokio evaluates `if cond` once when entering select (setting the disabled bit), and only then creates
+    ///   the futures——so the guard's `&self.run_task` and the async block's `&mut self.run_task` don't conflict on borrowing, and
+    ///   when `run_task` is None the whole branch is disabled for the round (no busy-loop). **Do not** move the `is_some()` check inside the async block
+    ///   to self-check on return——that would make the branch always Ready when None, degenerating into a busy-loop.
     async fn dispatch_loop(&mut self) -> Result<(), InteractiveModeError> {
         loop {
             tokio::select! {
                 cmd = self.input_rx.recv() => {
                     match cmd {
                         Some(InputCommand::Submit(text)) => {
-                            // Single-turn prompt error → report error in status line and continue (do not break the interactive session)
                             if let Err(e) = self.handle_submit(text).await {
                                 self.show_error(format!("{e}"));
                             }
                         }
                         Some(InputCommand::FollowUp(text)) => {
-                            if self.runtime.session.is_run() {
+                            if self.runtime.session.is_run() || self.run_task.is_some() {
                                 self.runtime.session.follow_up(&text);
                                 self.push_pending();
                             } else {
                                 // Alt+Enter is equivalent to Enter when idle (aligned with pi handleFollowUp's non-streaming branch)
-                                self.handle_submit(text).await?;
+                                if let Err(e) = self.handle_submit(text).await {
+                                    self.show_error(format!("{e}"));
+                                }
                             }
                         }
                         Some(InputCommand::Action(action)) => self.handle_app_action(action),
                         Some(InputCommand::Escape) => self.handle_escape(),
                         Some(InputCommand::CtrlC) => self.handle_ctrl_c(),
                         Some(InputCommand::CtrlD) => {
-                            if self.runtime.session.is_run() {
+                            if self.runtime.session.is_run() || self.run_task.is_some() {
                                 self.runtime.session.abort();
                                 self.show_status("Aborting...");
                             } else {
@@ -516,7 +530,22 @@ impl InteractiveMode {
                         break;
                     }
                 }
+                _ = async {
+                    if let Some(h) = &mut self.run_task {
+                        if let Err(je) = h.await {
+                            // The run task itself panics: record it to surface it (run internally catches the prompt's Err, but panics must be visible)
+                            tracing::warn!(error = %je, "[interactive] run task panicked");
+                        }
+                    }
+                }, if self.run_task.is_some() => {
+                    // ← the only run_task reset point (normal / post-Esc-abort teardown / panic all go through here)
+                    self.run_task = None;
+                    self.push_footer(); // Refresh the footer after the run finishes (coexists idempotently with the AgentEnd event refresh)
+                }
                 _ = self.cancel.cancelled() => break, // Signal task / shutdown trigger
+            }
+            if self.exit_requested {
+                break;
             }
         }
         Ok(())
@@ -536,10 +565,13 @@ impl InteractiveMode {
     }
 
     /// Graceful exit (pi `shutdown`): `registry.kill_all()` terminates registered detached child process trees
-    /// (T-AP-09-3, same as print_mode), stop UI (cancel + join), unsubscribe; `from_signal` path
-    /// Do not print the resume hint.
+    /// (T-AP-09-3, same as print_mode), stop the current run (session.abort + explicit join), stop the UI (cancel + join), unsubscribe;
+    /// the `from_signal` path does not print the resume hint.
     /// Unlike pi: **does not `process::exit`**; after returning, `run_interactive_mode` converges the exit code,
     /// keeping the library layer testable.
+    ///
+    /// Deterministic teardown sequence (D8/D9 landing points): kill_all → session.abort (single bridge, stops the current run) →
+    /// join run_task (wait for Aborted to be flushed before process exit) → cancel.cancel (stop UI, child exits cascaded) → join ui_task.
     async fn shutdown(&mut self, from_signal: bool) -> Result<(), InteractiveModeError> {
         if self.is_shutting_down {
             return Ok(());
@@ -549,7 +581,13 @@ impl InteractiveMode {
         // 1. Terminate registered detached child processes (idempotent; no-op if the signal task already called kill_all).
         self.runtime.services.registry.kill_all();
 
-        // 2. Stop UI: cancel triggers the TuiLoop cancellation branch to exit → join (terminal restoration happens in the UI task via tui.stop()).
+        // 2. Stop the current run: session.abort (engine marks the current run token, D8 single-exit bridging) → explicit join (wait for Aborted to be flushed).
+        self.runtime.session.abort();
+        if let Some(h) = self.run_task.take() {
+            let _ = h.await; // JoinError already handled by RunDone/itself; just wait for the wrap-up here
+        }
+
+        // 3. Stop the UI: cancel triggers the TuiLoop cancel branch exit → join (terminal restoration happens inside the UI task via tui.stop()).
         self.cancel.cancel();
         self.unregister_signal_handlers();
         if let Some(sub) = self.subscription.take() {
@@ -559,7 +597,7 @@ impl InteractiveMode {
             task.await??;
         }
 
-        // 3. Resume hint (the signal path does not print, aligning with pi shutdown's fromSignal branch; wording aligns with
+        // 4. Resume hint (not printed on the signal path, aligned with pi shutdown's fromSignal branch; wording aligned with
         //    `--resume` semantics — the path for `--session <path>` requires T-AP-08-5's session tree to land before it can be assembled).
         if !from_signal {
             eprintln!("To resume this session, run: zen --resume");
@@ -740,15 +778,21 @@ impl InteractiveMode {
                 Ok(())
             }
             SubmitKind::Message => {
-                if self.runtime.session.is_run() {
-                    // Submissions during streaming go through steer (when the v1 dispatch loop blocks inside prompt, inputs are queued,
-                    // fallback for idle dispatch; this branch takes effect once Agent supports concurrency after)
+                if self.runtime.session.is_run() || self.run_task.is_some() {
+                    // Belt-and-suspenders: run active or already in flight → steer (pi semantics: queue and inject before the next LLM turn; no double spawn)
                     self.runtime.session.steer(&text);
                     Ok(())
                 } else {
+                    // idle → spawn a run task (Approach D): set run_task synchronously (sticky guard prevents a double spawn from overwriting the handle)
                     self.push_footer();
-                    self.runtime.session.prompt(&text).await.map(|_| ())?;
-                    self.push_footer();
+                    let session = Arc::clone(&self.runtime.session);
+                    let tx = self.ui_event_tx.clone(); // can't borrow &self inside async move
+                    self.run_task = Some(tokio::task::spawn_local(async move {
+                        if let Err(e) = session.prompt(&text).await {
+                            // P1-1: errors inside run are degraded to a UI status line (session not interrupted; the initial message is degraded the same way, see known deviation #3)
+                            let _ = tx.send(UiEvent::Status(StatusSpec::Error(e.to_string())));
+                        }
+                    }));
                     Ok(())
                 }
             }
@@ -1187,7 +1231,6 @@ mod tests {
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             mock_stream_fn(),
-            CancellationToken::new(),
         )
     }
 
@@ -1487,5 +1530,140 @@ mod tests {
         ));
         // cancel token initially not canceled
         assert!(!mode.cancel.is_cancelled());
+    }
+
+    // ── dispatch_loop: RunDone reset guard regression (plan D) ──
+
+    /// Recording SessionStore (counts append_message calls for the two-round run assertion).
+    #[derive(Default)]
+    struct CountingStore {
+        messages: StdMutex<Vec<Message>>,
+    }
+
+    impl CountingStore {
+        fn count(&self) -> usize {
+            self.messages.lock().unwrap().len()
+        }
+    }
+
+    impl SessionStore for CountingStore {
+        fn append_message(&self, message: &Message) {
+            self.messages.lock().unwrap().push(message.clone());
+        }
+        fn append_model_change(&self, _provider: &str, _model_id: &str) {}
+        fn append_thinking_level_change(&self, _level: &str) {}
+        fn session_id(&self) -> String {
+            "s1".to_string()
+        }
+        fn cwd(&self) -> &str {
+            "/work"
+        }
+    }
+
+    /// Mock StreamFn that can complete one round immediately (Start + TextDelta + Done, no tool calls).
+    fn completable_stream_fn() -> StreamFn {
+        Arc::new(
+            |_model: &zen_ai::types::Model,
+             _ctx: &zen_ai::types::Context,
+             _cfg: Option<zen_ai::api::openai_stream::StreamConfig>,
+             _cancel: Option<CancellationToken>| {
+                Box::pin(async move {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                        zen_ai::types::AssistantMessageEvent,
+                    >();
+                    let partial = AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent {
+                            text: "ok".into(),
+                            text_signature: None,
+                        })],
+                        api: "openai-completions".into(),
+                        provider: "test".into(),
+                        model: "m".into(),
+                        response_model: None,
+                        response_id: None,
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                        timestamp: 0,
+                    };
+                    let _ = tx.send(zen_ai::types::AssistantMessageEvent::Start {
+                        partial: partial.clone(),
+                    });
+                    let _ = tx.send(zen_ai::types::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "ok".into(),
+                        partial: partial.clone(),
+                    });
+                    let _ = tx.send(zen_ai::types::AssistantMessageEvent::Done {
+                        reason: zen_ai::types::NonErrorStopReason::Stop,
+                        message: partial,
+                    });
+                    drop(tx);
+                    Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
+                })
+            },
+        )
+    }
+
+    /// Wait until `session_store` has accumulated ≥ n messages (polling + timeout).
+    async fn wait_for_count(store: &Arc<CountingStore>, n: usize) {
+        for _ in 0..200 {
+            if store.count() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("wait_for_count({n}) timed out: currently {} entries", store.count());
+    }
+
+    /// RunDone reset guard regression: after one round completes, `run_task` is reset so a second Submit can start the second round.
+    /// Each run round produces two messages, user + assistant (run_agent_loop pushes the prompt into ctx,
+    /// AgentSession's resident subscription flushes MessageEnd to disk) — after two rounds the store accumulates ≥ 4. If RunDone fails to reset
+    /// `run_task`, the second-round Submit hits `run_task.is_some()` → steer (no spawn) → 4 is never reached.
+    #[tokio::test]
+    async fn test_dispatch_loop_run_done_resets_and_allows_second_run() {
+        let store: Arc<CountingStore> = Arc::new(CountingStore::default());
+        let store_dyn: Arc<dyn SessionStore> = store.clone();
+        let session = Arc::new(AgentSession::new(
+            zen_core::harness::engine::Agent::new(
+                agent_state(),
+                ToolExecutionMode::Sequential,
+                Arc::new(MockHooks),
+                completable_stream_fn(),
+            ),
+            Arc::clone(&store_dyn),
+        ));
+        let runtime = AgentSessionRuntime {
+            session,
+            services: crate::session::runtime::AgentSessionServices {
+                cwd: "/work".into(),
+                agent_dir: "/agent".into(),
+                session_store: store_dyn,
+                registry: zen_core::process::ProcessRegistry::new(),
+            },
+            start_reason: crate::session::runtime::SessionStartReason::Startup,
+        };
+        let mut mode = InteractiveMode::new(runtime, options());
+        let tx = mode.input_tx.take().expect("input_tx");
+        let cancel = mode.cancel.clone();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let loop_task = tokio::task::spawn_local(async move {
+                    let _ = mode.dispatch_loop().await;
+                });
+                // First round
+                let _ = tx.send(InputCommand::Submit("first".into()));
+                wait_for_count(&store, 2).await; // user + assistant already flushed
+                                                 // Leave enough margin for the dispatch_loop RunDone branch to process (run_task reset)
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Second round: if run_task is not reset, this Submit goes to steer → count stalls at 2, failing the timeout below
+                let _ = tx.send(InputCommand::Submit("second".into()));
+                wait_for_count(&store, 4).await; // Both rounds completed
+                cancel.cancel(); // root token → dispatch_loop break (normal termination)
+                let _ = loop_task.await;
+            })
+            .await;
     }
 }

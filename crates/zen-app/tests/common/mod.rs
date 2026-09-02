@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionMode;
 use zen_ai::types::StreamFn;
 use zen_ai::types::{ContentBlock, ContentBlockList, Context, Message, Model, ThinkingLevel};
@@ -85,7 +84,6 @@ pub fn new_agent(base_prompt: &str, history: Vec<Message>) -> Agent {
         ToolExecutionMode::Sequential,
         Arc::new(MockHooks::new().with_max_turns(3)),
         real_stream_fn(),
-        CancellationToken::new(),
     )
 }
 

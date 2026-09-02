@@ -182,13 +182,7 @@ pub fn create_agent_session(
         inner: hooks,
         excluded: excluded.clone(),
     });
-    let agent = Agent::new(
-        state,
-        ToolExecutionMode::Parallel,
-        session_hooks,
-        stream_fn,
-        CancellationToken::new(),
-    );
+    let agent = Agent::new(state, ToolExecutionMode::Parallel, session_hooks, stream_fn);
     AgentSession::new_with_exclusions(agent, session_store, excluded)
 }
 
@@ -283,7 +277,7 @@ pub fn create_initial_runtime_from_cli(
     );
 
     let session_store: Arc<dyn SessionStore> = Arc::new(session_manager);
-    let mut session = create_agent_session(
+    let session = create_agent_session(
         model,
         system_prompt,
         tools,
@@ -292,7 +286,7 @@ pub fn create_initial_runtime_from_cli(
         stream_fn,
         session_store.clone(),
     );
-    // Replay session history (aligned with pi; new session ctx.messages is empty)
+    // Replay session history (aligned with pi; new session ctx.messages is empty) — call on owned session before Arc::new
     session.set_messages(ctx.messages);
 
     // 7. Runtime assembly

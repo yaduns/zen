@@ -14,7 +14,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionMode;
 use zen_ai::types::StreamFn;
 use zen_ai::types::{ContentBlock, Context, Message, Model, ThinkingLevel};
@@ -182,12 +181,11 @@ async fn real_test_skills_loaded_and_followed_by_llm() {
     );
 
     // 4) Engine (empty tools, pure skill compliance): the Agent constructs a Context from state internally and drives the low-level loop
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         agent_state(system_prompt),
         ToolExecutionMode::Sequential,
         Arc::new(MockHooks::new().with_max_turns(3)),
         real_stream_fn(),
-        CancellationToken::new(),
     );
     let all_messages = agent.prompt("Hello! What is 2 + 2?").await;
 
@@ -220,14 +218,13 @@ async fn real_test_system_prompt_constraint_honored() {
 
     // Keep an external Arc reference to hooks to inspect events after the run (assert no tool calls)
     let hooks = Arc::new(MockHooks::new().with_max_turns(3));
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         agent_state(
             "Do not use any tools. Answer with exactly the single word: BANANA".to_string(),
         ),
         ToolExecutionMode::Sequential,
         hooks.clone(),
         real_stream_fn(),
-        CancellationToken::new(),
     );
     let all_messages = agent.prompt("Say hello.").await;
 

@@ -15,7 +15,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionMode;
 use zen_ai::types::StreamFn;
 use zen_ai::types::{ContentBlock, Context, Message, Model, ThinkingLevel};
@@ -148,12 +147,11 @@ async fn run_turn_with_history(
     history: Vec<Message>,
     prompt: &str,
 ) -> Vec<Message> {
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         agent_state(base_prompt, history),
         ToolExecutionMode::Sequential,
         Arc::new(MockHooks::new().with_max_turns(3)),
         real_stream_fn(),
-        CancellationToken::new(),
     );
     agent.prompt(prompt).await
 }
