@@ -596,13 +596,14 @@ mod tests {
     fn restore_skipped_when_cli_provides_model() {
         // --model explicit → don't restore session model (but still… restore thinking when not given)
         let args = parse(&["--model", "my-model"]);
+        let baseline = resolve_model(&parse(&[])).0; // Baseline: the provider created by from_env in the same process environment
         let (mut model, mut thinking) = resolve_model(&args);
         let ctx = restored_ctx("huoshan", "ark-restored-model", "high");
 
         apply_session_restore(&args, &ctx, &mut model, &mut thinking);
 
         assert_eq!(model.id, "my-model", "CLI --model takes precedence, not overridden");
-        assert_eq!(model.provider, "opencode-go", "provider not overridden");
+        assert_eq!(model.provider, baseline.provider, "provider not overridden");
         // thinking not explicitly specified (model shorthand has no colon) → restore
         assert_eq!(thinking, ThinkingLevel::High);
     }

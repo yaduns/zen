@@ -1,5 +1,4 @@
-// REQ-AGENT-02 (pi-213): write tool
-
+use crate::tools::file_mutation_queue::with_file_mutation_queue;
 use crate::tools::path_utils::resolve_to_cwd;
 use crate::util::now_millis;
 use async_trait::async_trait;
@@ -103,7 +102,16 @@ impl Tool for WriteTool {
             .map_err(|e| {
                 ToolError::Execution(format!("Failed to resolve path '{file_path}': {e}"))
             })?;
-        let success_msg = write_file(&absolute_path, &content, cancel).await?;
+
+        // let success_msg = write_file(&absolute_path, &content, cancel).await?;
+        // File paths are stored in a static, locked HashMap; when operating on a file, acquire the Mutex lock and clone the Arc reference;
+        // When the file operation ends, by checking the lock against this file's lock and that the Arc reference count is 2 (including the original Arc and the cloned reference),
+        // it is considered that there are no other operations on this file, and the file path is removed from the HashMap.
+        // The above is the serialization scheme for multiple simultaneous modifications to individual files, using a LazyLock static variable and Mutex's exclusive lock
+        let success_msg = with_file_mutation_queue(&absolute_path, || async {
+            write_file(&absolute_path, &content, cancel).await
+        })
+        .await?;
 
         let now = now_millis();
 

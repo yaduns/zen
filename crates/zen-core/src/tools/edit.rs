@@ -11,6 +11,7 @@ use crate::tools::edit_diff::{
     apply_edits_to_normalized_content, detect_line_ending, normalize_to_lf, restore_line_endings,
     strip_bom, Edit, EditError, EditToolDetails,
 };
+use crate::tools::file_mutation_queue::with_file_mutation_queue;
 use crate::tools::path_utils::resolve_to_cwd;
 use crate::util::now_millis;
 use async_trait::async_trait;
@@ -207,9 +208,12 @@ impl Tool for EditTool {
             resolve_to_cwd(&file_path, self.tool_context.working_dir.as_path()).map_err(|e| {
                 ToolError::Execution(format!("Failed to resolve path '{file_path}': {e}"))
             })?;
-        let details = edit_file(&abs, &edits, cancel)
-            .await
-            .map_err(|e| map_edit_error(e, &file_path))?;
+
+        let details =
+            with_file_mutation_queue(&abs, || async { edit_file(&abs, &edits, cancel).await })
+                .await
+                .map_err(|e| map_edit_error(e, &file_path))?;
+
         let now = now_millis();
         let msg = ToolResultMessage {
             tool_call_id: tool_call_id.into(),
