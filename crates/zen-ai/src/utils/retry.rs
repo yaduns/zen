@@ -8,6 +8,7 @@ use crate::types::{AssistantMessage, StopReason};
 /// Retry policy configuration.
 /// Controls retry enable/disable, max retry count, and the base delay for exponential backoff.
 /// When `enabled` is `false`, `retry_assistant_call` returns the first result of `produce()` directly,
+#[derive(Clone, Copy)]
 pub struct RetryPolicy {
     pub enabled: bool,
     pub max_retries: u32,

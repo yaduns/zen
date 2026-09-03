@@ -169,7 +169,10 @@ mod tests {
         let alias = dir.path().join("alias.txt");
         std::fs::write(&target, "x").unwrap();
         symlink(&target, &alias).unwrap();
-        assert_eq!(mutation_key(&alias), std::fs::canonicalize(&target).unwrap());
+        assert_eq!(
+            mutation_key(&alias),
+            std::fs::canonicalize(&target).unwrap()
+        );
     }
 
     #[test]
@@ -428,10 +431,7 @@ mod tests {
         // B has acquired the lock and entered f (still in flight, not yet cleaned up); the entry should still be in the map at this point
         b_entered_rx.await.unwrap();
         let map = queue.inner.lock().await;
-        assert!(
-            map.contains_key(&key),
-            "Entry must not be deleted while tasks are in flight"
-        );
+        assert!(map.contains_key(&key), "Entry must not be deleted while tasks are in flight");
         drop(map);
 
         // Release B: B is the last in-flight task → its cleanup removes the entry (map does not grow unboundedly)

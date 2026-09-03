@@ -15,13 +15,13 @@ pub const ESTIMATED_IMAGE_CHARS: usize = 4800;
 /// 3. How many messages have been added since then, estimated? (trailing_tokens)
 pub struct ContextUsageEstimate {
     /// Estimated total context token count (usage_tokens + trailing_tokens, plus prefix if present)
-    tokens: usize,
+    pub tokens: usize,
     /// Token count reported by the usage field of the most recent available assistant message (calculate_context_tokens result), or 0 if none
-    usage_tokens: usize,
+    pub usage_tokens: usize,
     /// Estimated token count of messages after last_usage_index (equal to tokens if last_usage_index is None),
-    trailing_tokens: usize,
+    pub trailing_tokens: usize,
     /// Index of the assistant message providing the usage within the message list, or None if none
-    last_usage_index: Option<usize>,
+    pub last_usage_index: Option<usize>,
 }
 
 // Compute total token count from the `Usage` struct.

@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod env;
 pub mod harness;
 pub mod paths;

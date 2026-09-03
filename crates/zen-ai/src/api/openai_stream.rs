@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 /// Optional configuration parameters for the stream() function, controlling non-functional behavior of the API call (authentication, timeouts, tool-selection policy, thinking mode, etc.).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct StreamConfig {
     pub api_key: Option<String>,
     // model is a field of AgentLoopConfig (the engine derives it from state.model each turn, see engine.rs);
