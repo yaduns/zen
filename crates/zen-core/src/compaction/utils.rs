@@ -5,7 +5,7 @@ use zen_ai::types::{ContentBlock, Message};
 use zen_ai::utils::text::{content_text, content_text_from_list};
 
 /// Extracts file operations from the assistant message's toolCall blocks (the path argument of the read/write/edit tools) and accumulates them into the buckets.
-/// Consumer: `prepare_compaction` (in crate); pub(crate) for reuse by T-AG-04-3/branch-summary
+/// Consumers: `prepare_compaction` (mod.rs), `prepare_branch_entries` (branch.rs, T-AG-04-2)
 /// (All consumers are inside the zen-core crate; FileOperations is pub(crate), and pub would trigger private_interfaces.)
 pub(crate) fn extract_file_ops_from_message(message: &Message, file_ops: &mut FileOperations) {
     let Message::Assistant(assistant) = message else {
@@ -33,7 +33,8 @@ pub(crate) fn extract_file_ops_from_message(message: &Message, file_ops: &mut Fi
 }
 
 /// Computes the final list from the accumulated buckets: modified = edited ∪ written; read minus modified, then sorted.
-/// Consumer: `compact` (in crate); pub(crate) for reuse by T-AG-04-3 (same visibility rationale as extract).
+/// Consumers: `compact` (mod.rs), `generate_branch_summary` (branch.rs, T-AG-04-2);
+/// pub(crate) (all consumers are within the zen-core crate; same visibility rationale as extract).
 pub(crate) fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
     let modified: HashSet<&String> = file_ops.edited.union(&file_ops.written).collect();
     let mut read_files: Vec<String> = file_ops
@@ -49,7 +50,8 @@ pub(crate) fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec
 }
 
 /// Formats the file list into `<read-files>`/`<modified-files>` appendix sections (empty list returns an empty string).
-/// Consumer: `compact` (in crate); pub(crate) for reuse by T-AG-04-3 (isolated pub discipline: no consumers outside crate).
+/// Consumers: `compact` (mod.rs), `generate_branch_summary` (branch.rs, T-AG-04-2);
+/// pub(crate) (isolated-pub discipline: no consumers outside the crate).
 pub(crate) fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections: Vec<String> = Vec::new();
     if !read_files.is_empty() {

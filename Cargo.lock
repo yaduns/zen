@@ -2454,6 +2454,7 @@ dependencies = [
  "home",
  "ignore",
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "similar",

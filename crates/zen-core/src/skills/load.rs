@@ -1,4 +1,5 @@
 use crate::skills::skill::Skill;
+use crate::util::extract_frontmatter;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -197,25 +198,6 @@ fn parse_frontmatter(content: &str) -> Result<(SkillFrontmatter, String), String
         Some(block) => Ok((parse_frontmatter_fields(block)?, body.to_string())),
         // Returns empty frontmatter and the full text when there is no frontmatter
         None => Ok((SkillFrontmatter::default(), body.to_string())),
-    }
-}
-
-/// Extracts the frontmatter YAML block and body from the content.
-/// After normalizing line endings, if the content starts with `---` and a closing `\n---` is found, returns `(Some(yaml_block), body)`; otherwise, `(None, full text)`.
-fn extract_frontmatter(content: &str) -> (Option<&str>, &str) {
-    if !content.starts_with("---") {
-        return (None, content);
-    }
-    let rest = &content[3..]; // Skip leading ---
-    match rest.find("\n---") {
-        Some(idx) => {
-            // yaml_block: content after the leading --- and before the closing marker (leading newline stripped)
-            let yaml_block = rest[..idx].trim_start_matches('\n');
-            // Body: after the closing delimiter (excluding the immediately following newline)
-            let body = rest[idx + 4..].trim_start_matches('\n');
-            (Some(yaml_block), body)
-        }
-        None => (None, content),
     }
 }
 
