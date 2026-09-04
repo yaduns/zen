@@ -1,33 +1,21 @@
 use crate::tools::path_utils::resolve_read_path_async;
+use crate::truncate::{truncate_head, TruncationOptions};
 use crate::util::now_millis;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
 use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 
-const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 50 * 1024;
-
-struct TruncationInfo {
-    // Truncated content
+/// Return of read_file_content: content and line statistics after offset/limit window and shared truncation kernel.
+struct ReadOutput {
+    // Final content after truncation (complete lines within the window)
     content: String,
-    // Whether truncation occurred
-    truncated: bool,
-    // truncation reason (lines/bytes), None when truncated=false
-    truncated_by: Option<TruncationKind>,
-    // total line count of the original content
+    // Total lines in the entire file (details.totalLines; note: not window line count)
     total_lines: usize,
-    // line count of the truncated output
+    // Number of lines output after truncation (details.readLines)
     output_lines: usize,
-    // whether the first line exceeds the byte limit (making it completely impossible to display)
-    first_line_exceeds_limit: bool,
-}
-
-enum TruncationKind {
-    // content line count exceeds max_lines
-    Lines,
-    // content byte count exceeds max_bytes
-    Bytes,
+    // Byte count of truncated content (details.bytes)
+    content_len: usize,
 }
 
 /// File reading tool that allows the agent to read file contents.
@@ -126,7 +114,7 @@ impl Tool for ReadTool {
             .map_err(|e| {
                 ToolError::Execution(format!("Failed to resolve read path '{file_path}': {e}"))
             })?;
-        let (content, info) = read_file_content(&resolved, offset, limit, cancel).await?;
+        let info = read_file_content(&resolved, offset, limit, cancel).await?;
 
         let now = now_millis();
 
@@ -134,14 +122,14 @@ impl Tool for ReadTool {
             tool_call_id: tool_call_id.to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent {
-                text: content,
+                text: info.content,
                 text_signature: None,
             })],
             details: Some(serde_json::json!({
                 "totalLines": info.total_lines,
                 "readLines": info.output_lines,
                 "offset": offset.unwrap_or(1),
-                "bytes": info.content.len(),
+                "bytes": info.content_len,
             })),
             usage: Some(Usage::default()),
             is_error: false,
@@ -192,7 +180,7 @@ fn parse_read_args(
     Ok((file_path, offset, limit))
 }
 
-/// Read a text file, applying offset/limit and truncation.
+/// Reads a text file, applies offset/limit window and shared truncation kernel (crate::truncate, T-AG-06-3).
 ///
 /// # Parameters
 /// - `absolute_path`: the resolved absolute path.
@@ -201,18 +189,21 @@ fn parse_read_args(
 /// - `cancel`: cancellation token.
 ///
 /// # Return Value
-/// Tuple containing the file content and truncation info.
+/// Window content (finalized by shared `truncate_head`) + file line statistics.
 ///
 /// # Edge Cases
 /// - Returns an error if offset exceeds the total number of lines in the file.
 /// - Binary files return garbled text after reading — this is expected behavior; the LLM may decide to use the bash tool to handle them.
 /// - Returns `ToolError::Execution` if the file does not exist or is not readable.
+/// - Truncation semantics: offset/limit window slicing itself does not count as truncation; if window content exceeds 2000 lines / 50KB
+///   (whichever comes first) it is finalized by shared `truncate_head`, keeping only complete lines
+///   (when the first line alone exceeds the limit, returns empty content; `first_line_exceeds_limit` can be used for later prompts).
 async fn read_file_content(
     absolute_path: &std::path::Path,
     offset: Option<usize>,
     limit: Option<usize>,
     cancel: &CancellationToken,
-) -> Result<(String, TruncationInfo), ToolError> {
+) -> Result<ReadOutput, ToolError> {
     if cancel.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
@@ -227,50 +218,26 @@ async fn read_file_content(
             ))
         })?;
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
+    let total_lines = content.lines().count();
 
+    // offset/limit window slicing (1-indexed → 0-indexed; slicing itself does not count as truncation)
     let start = offset.unwrap_or(1).saturating_sub(1).min(total_lines);
     let available = total_lines - start;
     let requested = limit.unwrap_or(available).min(available);
-    let truncated_lines = requested.min(MAX_LINES);
+    let window: String = content
+        .lines()
+        .skip(start)
+        .take(requested)
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let selected: Vec<&str> = lines[start..start + truncated_lines].to_vec();
-    let mut result = selected.join("\n");
+    // Window content then passes through shared truncation kernel (2000 lines / 50KB, whichever comes first, keeping only complete lines)
+    let result = truncate_head(&window, TruncationOptions::default());
 
-    let truncated_by_bytes = result.len() > MAX_BYTES;
-    if truncated_by_bytes {
-        // Find the last character boundary before MAX_BYTES (avoid cutting multi-byte UTF-8 characters)
-        let mut end = MAX_BYTES;
-        while end > 0 && !result.is_char_boundary(end) {
-            end -= 1;
-        }
-        result.truncate(end);
-        if let Some(pos) = result.rfind('\n') {
-            result.truncate(pos);
-        }
-    }
-
-    let truncated_by_lines = truncated_lines < available;
-    let truncated = truncated_by_lines || truncated_by_bytes;
-
-    let info = TruncationInfo {
-        content: result.clone(),
-        truncated,
-        truncated_by: if truncated {
-            Some(if truncated_by_lines {
-                TruncationKind::Lines
-            } else {
-                TruncationKind::Bytes
-            })
-        } else {
-            None
-        },
+    Ok(ReadOutput {
+        content_len: result.content.len(),
+        content: result.content,
         total_lines,
-        output_lines: result.lines().count(),
-        // Raw content size exceeds 50KB, triggering byte truncation; content is empty after truncation; both conditions together mean: the file's first line alone exceeds 50KB.
-        first_line_exceeds_limit: truncated_by_bytes && result.is_empty(),
-    };
-
-    Ok((result, info))
+        output_lines: result.output_lines,
+    })
 }

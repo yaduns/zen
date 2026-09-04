@@ -6,7 +6,7 @@
 // never across threads; the `Rc` choice aligns with the !Send nature of CustomEditor callbacks, see the assembly comments in mod.rs).
 
 use crate::components::assistant_message::AssistantMessageComponent;
-use crate::components::bash_execution::{BashExecutionComponent, TruncationInfo};
+use crate::components::bash_execution::BashExecutionComponent;
 use crate::components::branch_summary_message::BranchSummaryMessageComponent;
 use crate::components::compaction_summary_message::CompactionSummaryMessageComponent;
 use crate::components::custom_editor::CustomEditor;
@@ -561,7 +561,7 @@ impl InteractiveUi {
             output: String::new(),
             exit_code: None,
             cancelled: false,
-            truncation: None,
+            truncated: None,
             full_output_path: None,
             expanded: false,
         });
@@ -588,14 +588,14 @@ impl InteractiveUi {
         if let Some(ChatRow::Bash {
             exit_code: ec,
             cancelled: c,
-            truncation,
+            truncated: t,
             full_output_path: f,
             ..
         }) = self.bash_index.and_then(|idx| self.chat_rows.get_mut(idx))
         {
             *ec = exit_code;
             *c = cancelled;
-            *truncation = Some(TruncationInfo { truncated });
+            *t = Some(truncated);
             *f = full_output_path;
         }
         self.bash_index = None;
@@ -938,21 +938,14 @@ impl InteractiveUi {
                 output,
                 exit_code,
                 cancelled,
-                truncation,
+                truncated,
                 full_output_path,
                 expanded,
             } => {
                 let mut comp =
                     BashExecutionComponent::new(command.clone(), *exclude_from_context, theme, kb);
                 comp.append_output(output);
-                comp.set_complete(
-                    *exit_code,
-                    *cancelled,
-                    truncation.as_ref().map(|t| TruncationInfo {
-                        truncated: t.truncated,
-                    }),
-                    full_output_path.clone(),
-                );
+                comp.set_complete(*exit_code, *cancelled, *truncated, full_output_path.clone());
                 comp.set_expanded(*expanded || folded_expanded);
                 Box::new(comp)
             }
@@ -1063,7 +1056,8 @@ pub(crate) enum ChatRow {
         output: String,
         exit_code: Option<i32>,
         cancelled: bool,
-        truncation: Option<TruncationInfo>,
+        /// Whether context truncation occurred (None = truncation info not reported)
+        truncated: Option<bool>,
         full_output_path: Option<String>,
         expanded: bool,
     },
@@ -1792,14 +1786,14 @@ mod tests {
                 output,
                 exit_code,
                 cancelled,
-                truncation,
+                truncated,
                 full_output_path,
                 ..
             } => {
                 assert_eq!(output, "error");
                 assert_eq!(*exit_code, Some(2));
                 assert!(!cancelled);
-                assert_eq!(truncation.as_ref().map(|t| t.truncated), Some(true));
+                assert_eq!(*truncated, Some(true));
                 assert_eq!(full_output_path.as_deref(), Some("/tmp/bash-x.log"));
             }
             _other => panic!("expected Bash row"),

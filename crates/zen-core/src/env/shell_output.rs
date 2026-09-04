@@ -1,6 +1,7 @@
 // All optional arguments for a single execute_shell_with_capture call
 
 use crate::env::{ExecOptions, ExecutionEnv, ExecutionError};
+use crate::truncate::{truncate_tail, TruncationOptions, DEFAULT_MAX_BYTES};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -35,18 +36,6 @@ pub struct ShellCaptureResult {
     // Full-output temp file path (prefix `bash-`, suffix `.log`); exists only on overflow/truncation
     pub full_output_path: Option<PathBuf>,
 }
-
-// Return of the private truncate_tail helper
-struct TailTruncationInfo {
-    // Truncated content
-    content: String,
-    // Whether truncation occurred
-    truncated: bool,
-}
-
-// ---- Constants (move when extracting the shared truncate module in T-AG-06-3) ----
-const DEFAULT_MAX_BYTES: usize = 50 * 1024;
-const DEFAULT_MAX_LINES: usize = 2000;
 
 // ---- Serial write coordination (replaces pi's writeChain promise chain) ----
 enum WriteRequest {
@@ -263,7 +252,7 @@ pub async fn execute_shell_with_capture(
         Ok(st) => st.tail.iter().cloned().collect::<Vec<_>>().concat(),
         Err(_) => String::new(),
     };
-    let truncation = truncate_tail(&tail_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let truncation = truncate_tail(&tail_output, TruncationOptions::default());
 
     // Truncation occurred and no complete output file yet → write the full tail buffer into the temp file
     let need_final_write = match full_output_path.lock() {
@@ -323,95 +312,11 @@ pub async fn execute_shell_with_capture(
     })
 }
 
-/// Truncate content from the tail (keep the last `max_lines` lines / `max_bytes` bytes, aligns with pi `truncateTail`).
-///
-/// Two independent limits for line truncation and byte truncation; whichever hits first wins; byte truncation aligns to line start where possible.
-/// Boundary: with non-empty input it **never returns empty content** (if the last line exceeds the byte limit, return the tail of that line
-/// partial content, `truncated: true`).
-///
-/// When T-AG-06-3 extracts the shared truncate module, this private helper together with BashTool's inline
-/// `truncate_tail` will be migrated together; this task ships a private version first to preserve the plan's implementation order (T-AG-06-3 comes later).
-fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TailTruncationInfo {
-    // 1) Split lines on \n; drop the trailing empty line produced by the final newline (aligns with pi's lines.pop())
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    if lines.len() > 1 && lines.last() == Some(&"") {
-        lines.pop();
-    }
-
-    // 2) Line count and byte count both within limits → return as-is (content.len() is the UTF-8 byte count)
-    if lines.len() <= max_lines && content.len() <= max_bytes {
-        return TailTruncationInfo {
-            content: content.to_string(),
-            truncated: false,
-        };
-    }
-
-    // 3) Accumulate lines from the tail forward (aligned with pi's reverse traversal)
-    let mut output_lines: Vec<&str> = Vec::new();
-    let mut output_bytes: usize = 0;
-
-    for &line in lines.iter().rev() {
-        if output_lines.len() >= max_lines {
-            break; // Line limit reached
-        }
-        // Byte cost = line bytes + (newline 1 byte when not the first line)
-        let line_cost = line.len() + usize::from(!output_lines.is_empty());
-        if output_bytes + line_cost > max_bytes {
-            // Byte limit hit: no lines accumulated yet → take partial content from the end of that line (guarantees non-empty)
-            if output_lines.is_empty() {
-                let partial = tail_bytes_utf8(line, max_bytes);
-                return TailTruncationInfo {
-                    content: partial,
-                    truncated: true,
-                };
-            }
-            break;
-        }
-        output_lines.push(line);
-        output_bytes += line_cost;
-    }
-
-    output_lines.reverse(); // Convert the reverse-order push result to forward order
-    TailTruncationInfo {
-        content: output_lines.join("\n"),
-        truncated: true,
-    }
-}
-
-/// Take the trailing partial content of `line` (UTF-8 safe, never splits multi-byte characters).
-/// Collect characters from the tail forward up to `max_bytes`; skip tail characters that don't fit and keep searching earlier.
-/// If not even one character fits (e.g. 4-byte char + 3-byte limit), return the last character
-/// (allowing slight overshoot) to honor the boundary promise of "never return empty content when input is non-empty".
-fn tail_bytes_utf8(line: &str, max_bytes: usize) -> String {
-    if max_bytes == 0 {
-        return String::new();
-    }
-    let mut out: Vec<char> = Vec::new();
-    let mut bytes = 0usize;
-    for c in line.chars().rev() {
-        if bytes + c.len_utf8() <= max_bytes {
-            out.push(c);
-            bytes += c.len_utf8();
-        } else if !out.is_empty() {
-            break; // Existing content and the next one doesn't fit → stop
-        }
-        // out is empty and c doesn't fit: skip it and keep searching earlier for a character that fits
-    }
-    if out.is_empty() {
-        // Fallback: return the last character to guarantee non-empty
-        return line
-            .chars()
-            .next_back()
-            .map(|c| c.to_string())
-            .unwrap_or_default();
-    }
-    out.iter().rev().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::env::{ExecutionEnv, ExecutionError};
+    use crate::truncate::DEFAULT_MAX_LINES;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
@@ -477,91 +382,6 @@ mod tests {
             sanitize_binary_output("a\x01b\t\u{fffa}c\nd\r"),
             "ab\tc\nd\r"
         );
-    }
-
-    // ── truncate_tail ────────────────────────────────────────────
-
-    #[test]
-    fn test_truncate_tail_within_limits_unchanged() {
-        let info = truncate_tail("a\nb\nc\n", 10, 100);
-        assert!(!info.truncated);
-        assert_eq!(info.content, "a\nb\nc\n");
-    }
-
-    #[test]
-    fn test_truncate_tail_keeps_last_lines() {
-        let content = (1..=5)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let info = truncate_tail(&content, 3, 10_000);
-        assert!(info.truncated);
-        assert_eq!(info.content, "line3\nline4\nline5");
-    }
-
-    #[test]
-    fn test_truncate_tail_byte_limit_aligns_to_line_start() {
-        // 4 chars per line + newline = 5 bytes; max_bytes=10 → keep full lines from the tail and align to line start
-        // (When the byte limit is hit, no further over-limit lines are appended; only already-accumulated full lines are kept)
-        let info = truncate_tail("aaaa\nbbbb\ncccc\ndddd\n", 100, 10);
-        assert!(info.truncated);
-        assert_eq!(info.content, "cccc\ndddd");
-    }
-
-    #[test]
-    fn test_truncate_tail_single_line_partial_tail() {
-        // Single line exceeds byte limit → return trailing partial content of that line
-        let info = truncate_tail("abcdefghij", 10, 4);
-        assert!(info.truncated);
-        assert_eq!(info.content, "ghij");
-    }
-
-    #[test]
-    fn test_truncate_tail_never_empty_for_nonempty_input() {
-        // With max_bytes=1 a non-empty tail is still returned (fallback guarantee)
-        let info = truncate_tail("abcdefghij", 10, 1);
-        assert!(info.truncated);
-        assert!(!info.content.is_empty());
-        assert_eq!(info.content, "j");
-    }
-
-    #[test]
-    fn test_truncate_tail_empty_input() {
-        let info = truncate_tail("", 10, 100);
-        assert!(!info.truncated);
-        assert_eq!(info.content, "");
-    }
-
-    #[test]
-    fn test_truncate_tail_trailing_newline_within_limits() {
-        // Strip the trailing blank line produced by the final newline before counting; doesn't affect the "not truncated" determination
-        let info = truncate_tail("a\nb\n", 10, 100);
-        assert!(!info.truncated);
-        assert_eq!(info.content, "a\nb\n");
-    }
-
-    // ── tail_bytes_utf8 ──────────────────────────────────────────
-
-    #[test]
-    fn test_tail_bytes_utf8_multibyte_safe() {
-        // é takes 2 bytes; max_bytes=5 exactly fits "éllo", without splitting a multi-byte character
-        assert_eq!(tail_bytes_utf8("héllo", 5), "éllo");
-    }
-
-    #[test]
-    fn test_tail_bytes_utf8_zero_limit() {
-        assert_eq!(tail_bytes_utf8("abc", 0), "");
-    }
-
-    #[test]
-    fn test_tail_bytes_utf8_single_char_exceeds_limit_fallback() {
-        // 🦀 is 4 bytes, max_bytes=2 doesn't fit → fallback returns the last character (allowing slight overshoot)
-        assert_eq!(tail_bytes_utf8("🦀", 2), "🦀");
-    }
-
-    #[test]
-    fn test_tail_bytes_utf8_empty_line() {
-        assert_eq!(tail_bytes_utf8("", 5), "");
     }
 
     // ── create_and_write / append_text (tempfile isolates resources, deterministically verifiable) ──

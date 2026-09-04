@@ -1,7 +1,7 @@
 // REQ-APP-11 (pi-358): bash-execution — bash command execution display block.
 // Corresponds to the original TS: reference/pi-original/packages/coding-agent/src/modes/interactive/components/bash-execution.ts.
-// Output finalization: context truncation (2000 lines/50KB, equivalent to zen-core bash.rs private truncate_tail, T-AP-04-8
-// use its shared module after landing) + preview 20 visual lines (visual-truncate). ANSI stripping is a submodule-private implementation
+// Output finalization: context truncation (2000 lines/50KB, shared module zen_core::truncate, T-AG-06-3)
+// + preview 20 visual lines (visual-truncate). ANSI stripping is a private submodule implementation
 // (Use its module once T-AP-09-8 lands.)
 
 use crate::components::dynamic_border::DynamicBorder;
@@ -9,6 +9,7 @@ use crate::components::keybinding_hints::key_text;
 use crate::components::visual_truncate::truncate_to_visual_lines;
 use crate::keybindings::AppAction;
 use crossterm::style::Attribute;
+use zen_core::truncate::{truncate_tail, TruncationOptions};
 use zen_tui::components::loader::Loader;
 use zen_tui::components::Component;
 use zen_tui::highlight::StyledSegment;
@@ -18,16 +19,6 @@ use zen_tui::theme::{ColorToken, Theme};
 
 /// Preview line limit (collapsed state; aligns with pi PREVIEW_LINES).
 const PREVIEW_LINES: usize = 20;
-/// Context truncation max lines (aligning with pi DEFAULT_MAX_LINES / bash tool).
-const MAX_LINES: usize = 2000;
-/// Context truncation max bytes (aligning with pi DEFAULT_MAX_BYTES).
-const MAX_BYTES: usize = 50 * 1024;
-
-/// Output tail truncation result (for bash-execution display; local fallback shape for T-AP-04-8 shared module).
-pub struct TruncationInfo {
-    /// Whether truncation occurred.
-    pub truncated: bool,
-}
 
 /// Execution status.
 enum BashStatus {
@@ -35,36 +26,10 @@ enum BashStatus {
     Complete {
         exit_code: Option<i32>,
         cancelled: bool,
-        truncation: Option<TruncationInfo>,
+        /// Whether context truncation occurred (None = truncation info not reported)
+        truncated: Option<bool>,
         full_output_path: Option<String>,
     },
-}
-
-fn truncate_tail(content: &str) -> (String, bool) {
-    let total = content.lines().count();
-    let lines: Vec<&str> = content.lines().collect();
-
-    // 1. Line truncation (keep last MAX_LINES lines)
-    let truncated_by_lines = total > MAX_LINES;
-    let keep_from = if truncated_by_lines {
-        total - MAX_LINES
-    } else {
-        0
-    };
-    let mut result = lines[keep_from..].join("\n");
-
-    // 2. Byte truncation: align from line start when possible
-    let truncated_by_bytes = result.len() > MAX_BYTES;
-    if truncated_by_bytes {
-        let cut = result.len() - MAX_BYTES;
-        let start = result[cut..]
-            .find('\n')
-            .map(|pos| cut + pos + 1)
-            .unwrap_or(cut);
-        result = result[start..].to_string();
-    }
-
-    (result, truncated_by_lines || truncated_by_bytes)
 }
 
 /// Bash command execution display block: $cmd header + streaming output + border + running/finished status — T-AP-11-1 in tool
@@ -146,13 +111,13 @@ impl<'a> BashExecutionComponent<'a> {
         &mut self,
         exit_code: Option<i32>,
         cancelled: bool,
-        truncation: Option<TruncationInfo>,
+        truncated: Option<bool>,
         full_output_path: Option<String>,
     ) {
         self.status = BashStatus::Complete {
             exit_code,
             cancelled,
-            truncation,
+            truncated,
             full_output_path,
         };
         self.loader.stop();
@@ -225,7 +190,7 @@ impl<'a> BashExecutionComponent<'a> {
         let BashStatus::Complete {
             exit_code,
             cancelled,
-            truncation,
+            truncated,
             full_output_path,
         } = &self.status
         else {
@@ -246,7 +211,7 @@ impl<'a> BashExecutionComponent<'a> {
                 });
             }
         }
-        let was_truncated = truncation.as_ref().is_some_and(|t| t.truncated);
+        let was_truncated = truncated.unwrap_or(false);
         if was_truncated {
             if let Some(path) = full_output_path {
                 parts.push(StyledSegment {
@@ -303,9 +268,9 @@ impl Component for BashExecutionComponent<'_> {
                     remaining -= n;
                 }
                 BashStatus::Complete { .. } => {
-                    // Context truncation → usable lines
+                    // Context truncation → available lines (shared module crate::truncate, T-AG-06-3)
                     let full = self.get_output();
-                    let (available_text, _ctx_truncated) = truncate_tail(&full);
+                    let available_text = truncate_tail(&full, TruncationOptions::default()).content;
                     let available_lines: Vec<&str> = if available_text.is_empty() {
                         Vec::new()
                     } else {
@@ -422,6 +387,7 @@ mod tests {
     use super::*;
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
+    use zen_core::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()
@@ -455,24 +421,24 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (out, truncated) = truncate_tail(&text);
-        assert!(truncated);
-        assert_eq!(out.lines().count(), MAX_LINES);
+        let out = truncate_tail(&text, TruncationOptions::default());
+        assert!(out.truncated);
+        assert_eq!(out.output_lines, DEFAULT_MAX_LINES);
     }
 
     #[test]
     fn truncate_tail_limits_bytes() {
         let text = "x".repeat(60 * 1024);
-        let (out, truncated) = truncate_tail(&text);
-        assert!(truncated);
-        assert!(out.len() <= MAX_BYTES);
+        let out = truncate_tail(&text, TruncationOptions::default());
+        assert!(out.truncated);
+        assert!(out.content.len() <= DEFAULT_MAX_BYTES);
     }
 
     #[test]
     fn truncate_tail_no_truncation() {
-        let (out, truncated) = truncate_tail("hello");
-        assert!(!truncated);
-        assert_eq!(out, "hello");
+        let out = truncate_tail("hello", TruncationOptions::default());
+        assert!(!out.truncated);
+        assert_eq!(out.content, "hello");
     }
 
     #[test]
@@ -503,12 +469,7 @@ mod tests {
         for i in 0..30 {
             comp.append_output(&format!("out line {i}\n"));
         }
-        comp.set_complete(
-            Some(1),
-            false,
-            Some(TruncationInfo { truncated: false }),
-            None,
-        );
+        comp.set_complete(Some(1), false, Some(false), None);
         let mut buf = ScreenBuffer::new(100, 40);
         comp.render(&mut buf, 0, 0, 100, 40);
         let text = flush_text(&mut buf);
@@ -533,12 +494,7 @@ mod tests {
         let kb = kb();
         let mut comp = BashExecutionComponent::new("cmd".into(), false, theme(), &kb);
         comp.append_output("x");
-        comp.set_complete(
-            Some(0),
-            false,
-            Some(TruncationInfo { truncated: true }),
-            Some("/tmp/out.txt".into()),
-        );
+        comp.set_complete(Some(0), false, Some(true), Some("/tmp/out.txt".into()));
         let mut buf = ScreenBuffer::new(120, 20);
         comp.render(&mut buf, 0, 0, 120, 20);
         assert!(flush_text(&mut buf).contains("/tmp/out.txt"));

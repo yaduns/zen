@@ -1,3 +1,4 @@
+use crate::truncate::{truncate_tail, TruncationOptions, TruncationResult};
 use crate::util::now_millis;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -189,7 +190,7 @@ async fn execute_command(
     timeout: Option<f64>,
     cancel: &CancellationToken,
     on_update: Option<&ToolUpdateCallback>,
-) -> Result<(String, Option<i32>, TailTruncationInfo), ToolError> {
+) -> Result<(String, Option<i32>, TruncationResult), ToolError> {
     // 1. Start the process
     let mut child = tokio::process::Command::new("sh")
         .arg("-c")
@@ -257,95 +258,11 @@ async fn execute_command(
     }
     let text = String::from_utf8_lossy(&merged).into_owned();
 
-    // 6. Tail truncation
-    let info = truncate_tail(&text, None, None);
+    // 6. Tail truncation (shared module crate::truncate, T-AG-06-3)
+    let info = truncate_tail(&text, TruncationOptions::default());
     let content = info.content.clone();
 
     Ok((content, exit_code, info))
-}
-
-/// Tail truncation result info (inlined in bash.rs, not extracted as a shared type).
-struct TailTruncationInfo {
-    content: String,
-    truncated: bool,
-    truncated_by: Option<TruncationKind>,
-    total_lines: usize,
-    output_lines: usize,
-}
-
-/// Truncation reason.
-#[derive(Debug, Clone, PartialEq)]
-enum TruncationKind {
-    Lines,
-    Bytes,
-}
-
-/// Truncate content from the tail (keep the last N lines/bytes).
-///
-/// Intended for bash output — show the end of a command's execution result (error messages, final result).
-///
-/// # Parameters
-/// - `content`: raw text content.
-/// - `max_lines`: maximum number of lines (default: 2000).
-/// - `max_bytes`: maximum number of bytes (default: 50KB).
-///
-/// # Return Value
-/// Truncated content + truncation info.
-///
-/// # Edge Cases
-/// - Never returns empty content (always keeps at least the last line).
-/// - If the last line exceeds the byte limit, returns a partial portion of that line (consistent with Pi's truncateTail behavior).
-fn truncate_tail(
-    content: &str,
-    max_lines: Option<usize>,
-    max_bytes: Option<usize>,
-) -> TailTruncationInfo {
-    let max_lines = max_lines.unwrap_or(2000);
-    let max_bytes = max_bytes.unwrap_or(50 * 1024);
-    let total_lines = content.lines().count();
-
-    let lines: Vec<&str> = content.lines().collect();
-
-    // 1. Line-count truncation: keep the last max_lines lines
-    let truncated_by_lines = total_lines > max_lines;
-    let keep_from = if truncated_by_lines {
-        total_lines - max_lines
-    } else {
-        0
-    };
-    let mut result = lines[keep_from..].join("\n");
-
-    // 2. Byte truncation: keep the last max_bytes bytes, preferring line-start alignment
-    let truncated_by_bytes = result.len() > max_bytes;
-    if truncated_by_bytes {
-        let cut = result.len() - max_bytes;
-        let start = result[cut..]
-            .find('\n')
-            .map(|pos| cut + pos + 1)
-            .unwrap_or(cut);
-        result = result[start..].to_string();
-    }
-
-    // 3. Guarantee non-empty: keep at least the last line (or the tail-truncated content of that line)
-    if result.is_empty() && !content.is_empty() {
-        let last = content.lines().last().unwrap_or("");
-        let take = last.len().min(max_bytes);
-        result = last[last.len() - take..].to_string();
-    }
-
-    TailTruncationInfo {
-        content: result.clone(),
-        truncated: truncated_by_lines || truncated_by_bytes,
-        truncated_by: if truncated_by_lines {
-            Some(TruncationKind::Lines)
-        } else if truncated_by_bytes {
-            Some(TruncationKind::Bytes)
-        } else {
-            None
-        },
-        total_lines,
-        output_lines: result.lines().count(),
-    }
 }
 
 #[cfg(test)]
@@ -446,102 +363,6 @@ mod tests {
         );
         assert!(params["properties"]["timeout"].is_object());
         assert_eq!(params["required"].as_array().unwrap().len(), 1);
-    }
-
-    // ─── truncate_tail ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_truncate_tail_no_truncation() {
-        let input = "line1\nline2\nline3";
-        let info = truncate_tail(input, Some(10), Some(1024));
-        assert!(!info.truncated);
-        assert_eq!(info.content, input);
-        assert_eq!(info.total_lines, 3);
-        assert_eq!(info.output_lines, 3);
-        assert_eq!(info.truncated_by, None);
-    }
-
-    #[test]
-    fn test_truncate_tail_empty_content() {
-        let info = truncate_tail("", Some(10), Some(1024));
-        assert!(!info.truncated);
-        assert_eq!(info.content, "");
-        assert_eq!(info.total_lines, 0);
-        assert_eq!(info.output_lines, 0);
-    }
-
-    #[test]
-    fn test_truncate_tail_truncated_by_lines() {
-        // 5 lines, max_lines=2, should keep the last 2 lines
-        let input = "a\nb\nc\nd\ne";
-        let info = truncate_tail(input, Some(2), Some(1024));
-        assert!(info.truncated);
-        assert_eq!(info.content, "d\ne");
-        assert_eq!(info.total_lines, 5);
-        assert_eq!(info.output_lines, 2);
-        assert_eq!(info.truncated_by, Some(TruncationKind::Lines));
-    }
-
-    #[test]
-    fn test_truncate_tail_exactly_at_line_limit() {
-        // 2 lines, max_lines=2, no truncation
-        let input = "line1\nline2";
-        let info = truncate_tail(input, Some(2), Some(1024));
-        assert!(!info.truncated);
-        assert_eq!(info.content, "line1\nline2");
-        assert_eq!(info.total_lines, 2);
-    }
-
-    #[test]
-    fn test_truncate_tail_truncated_by_bytes() {
-        // Each line is about 10 bytes, max_bytes=25, should keep about the last 2 lines
-        let input = "aaaaaaaaaa\nbbbbbbbbbb\ncccccccccc\ndddddddddd";
-        let info = truncate_tail(input, Some(100), Some(25));
-        assert!(info.truncated);
-        assert_eq!(info.truncated_by, Some(TruncationKind::Bytes));
-        // The last 2 lines are about 22 bytes (with newlines), should be kept
-        assert_eq!(info.content, "cccccccccc\ndddddddddd");
-        assert_eq!(info.total_lines, 4);
-        assert_eq!(info.output_lines, 2);
-    }
-
-    #[test]
-    fn test_truncate_tail_single_line_within_limit() {
-        let input = "hello world";
-        let info = truncate_tail(input, Some(10), Some(1024));
-        assert!(!info.truncated);
-        assert_eq!(info.content, "hello world");
-        assert_eq!(info.total_lines, 1);
-    }
-
-    #[test]
-    fn test_truncate_tail_lines_and_bytes_both_exceed() {
-        // 10 lines, max_lines=5 triggers line-count truncation first, keep the last 5 lines
-        // The kept content is about 30 bytes, max_bytes=20 then triggers byte truncation
-        // truncated_by prefers Lines (the Lines check comes first in code)
-        let input = (0..10)
-            .map(|i| format!("line{}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let info = truncate_tail(&input, Some(5), Some(20));
-        assert!(info.truncated);
-        assert_eq!(info.truncated_by, Some(TruncationKind::Lines));
-        assert!(info.output_lines <= 5);
-        assert!(info.total_lines == 10);
-    }
-
-    #[test]
-    fn test_truncate_tail_never_empty() {
-        // Very large line, tiny byte limit, but at least part of the last line is kept
-        let input = format!("short\n{}", "x".repeat(10000));
-        let info = truncate_tail(&input, Some(100), Some(100));
-        assert!(info.truncated);
-        assert!(
-            !info.content.is_empty(),
-            "should never return empty for non-empty input"
-        );
-        assert_eq!(info.total_lines, 2);
-        assert_eq!(info.output_lines, 1);
     }
 
     // ─── execute_command (cancellation only) ────────────────────────────────
