@@ -180,7 +180,7 @@ pub(crate) async fn generate_summary(
 /// The event stream already includes accumulated partial results (aligned with agent_loop's existing consumption pattern: only the latest state is tracked per event),
 /// `Done`/`Error` return typed messages directly; if StreamFn fails to establish the stream or the stream ends without a terminal state → construct an Error terminal-state message.
 /// Produces a complete AssistantMessage for `retry_assistant_call` to consume.
-async fn collect_stream_response(
+pub(crate) async fn collect_stream_response(
     stream_fn: &StreamFn,
     model: &Model,
     context: &Context,
@@ -296,7 +296,7 @@ fn summary_max_tokens(reserve_tokens: u64, ratio: f64, model: &Model) -> u64 {
 /// Single-message Context for summarization calls: the system prompt is fixed to SUMMARIZATION_SYSTEM_PROMPT,
 /// The sole user message carries the assembled prompt text (equivalent to a single text block in a pi array ↔ zen `ContentBlockList::Text`),
 /// Carries no tools (pi completeSimple has no tools).
-fn summarization_context(prompt_text: &str) -> Context {
+pub(crate) fn summarization_context(prompt_text: &str) -> Context {
     Context {
         system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
         messages: vec![Message::User(UserMessage {

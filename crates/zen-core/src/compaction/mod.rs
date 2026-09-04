@@ -1,3 +1,4 @@
+pub mod branch;
 pub mod cut;
 pub mod summarize;
 pub mod utils;
@@ -273,7 +274,7 @@ fn entries_to_messages_for_summarization(
 /// details is JSON persisted by zen-app; the key-name contract follows the pi JSONL shape (camelCase
 /// readFiles/modifiedFiles) — the T-AP-04-3 persistence side must write the same shape (seam note);
 /// Silently skip non-string array elements (pi calls add directly and relies on callers to guarantee this; zen is defensively stricter).
-fn seed_file_ops_from_details(details: &Value, file_ops: &mut FileOperations) {
+pub(crate) fn seed_file_ops_from_details(details: &Value, file_ops: &mut FileOperations) {
     if let Some(read_files) = details.get("readFiles").and_then(Value::as_array) {
         for file in read_files.iter().filter_map(Value::as_str) {
             file_ops.read.insert(file.to_string());
