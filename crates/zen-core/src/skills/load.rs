@@ -1,5 +1,5 @@
+use crate::frontmatter;
 use crate::skills::skill::Skill;
-use crate::util::extract_frontmatter;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -186,50 +186,27 @@ async fn load_skill_from_file(file_path: &Path) -> (Option<Skill>, Vec<SkillDiag
     }
 }
 
-/// Parses the frontmatter (minimal YAML subset) and body of SKILL.md.
+/// Parse the frontmatter of SKILL.md (minimal YAML subset, uniformly via the `frontmatter` module) and the body.
 ///
 /// No YAML crate: only supports the single-line `key: value` form; recognizes name (String), description (String),
 /// disable-model-invocation (bool); unknown keys are ignored.
 /// Returns empty frontmatter and the full text when the input does not start with `---` or lacks a closing `---`.
 /// A malformed `key: value` line returns `Err(malformed line / message)` (converted by the caller into a `ParseFailed` diagnostic).
+/// Behavior aligned with pi (T-AP-03-5 convergence): CRLF normalization, comment-line ignoring, and quote stripping are handled by the common layer.
 fn parse_frontmatter(content: &str) -> Result<(SkillFrontmatter, String), String> {
-    let (yaml_block, body) = extract_frontmatter(content);
-    match yaml_block {
-        Some(block) => Ok((parse_frontmatter_fields(block)?, body.to_string())),
-        // Returns empty frontmatter and the full text when there is no frontmatter
-        None => Ok((SkillFrontmatter::default(), body.to_string())),
-    }
-}
+    let parsed = frontmatter::parse_frontmatter(content).map_err(|e| e.to_string())?;
 
-/// Parses `key: value` lines in a frontmatter YAML block and produces a `SkillFrontmatter`.
-/// Recognizes only name/description/disable-model-invocation; skips unknown keys; returns `Err` for malformed lines.
-fn parse_frontmatter_fields(yaml_block: &str) -> Result<SkillFrontmatter, String> {
-    let mut frontmatter = SkillFrontmatter {
-        name: None,
-        description: None,
-        disable_model_invocation: false,
-    };
-
-    for line in yaml_block.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // Split at the first ':' into key: value; the value may contain colons (e.g., description text)
-        let Some((key, value)) = line.split_once(':') else {
-            return Err(format!("malformed frontmatter line: {line:?}"));
-        };
-        match key.trim() {
-            "name" => frontmatter.name = Some(value.trim().to_string()),
-            "description" => frontmatter.description = Some(value.trim().to_string()),
-            "disable-model-invocation" => {
-                frontmatter.disable_model_invocation = value.trim() == "true"
-            }
+    let mut frontmatter = SkillFrontmatter::default();
+    for (key, value) in parsed.frontmatter {
+        match key.as_str() {
+            "name" => frontmatter.name = Some(value),
+            "description" => frontmatter.description = Some(value),
+            "disable-model-invocation" => frontmatter.disable_model_invocation = value == "true",
             _ => {} // Skip unknown keys
         }
     }
 
-    Ok(frontmatter)
+    Ok((frontmatter, parsed.body))
 }
 
 #[cfg(test)]
@@ -256,102 +233,11 @@ mod tests {
         }
     }
 
-    fn expect_fm_err(r: Result<SkillFrontmatter, String>) -> String {
-        match r {
-            Err(e) => e,
-            Ok(_) => panic!("expected Err"),
-        }
-    }
-
     fn expect_parse_fm_err(r: Result<(SkillFrontmatter, String), String>) -> String {
         match r {
             Err(e) => e,
             Ok(_) => panic!("expected Err"),
         }
-    }
-
-    // ─── extract_frontmatter ──────────────────────────────────────
-    #[test]
-    fn test_extract_frontmatter_no_frontmatter() {
-        let content = "just text\nno frontmatter";
-        let (block, body) = extract_frontmatter(content);
-        assert_eq!(block, None);
-        assert_eq!(body, content);
-    }
-
-    #[test]
-    fn test_extract_frontmatter_with_block() {
-        let content = "---\nname: foo\ndescription: bar\n---\nbody text";
-        let (block, body) = extract_frontmatter(content);
-        assert_eq!(block, Some("name: foo\ndescription: bar"));
-        assert_eq!(body, "body text");
-    }
-
-    #[test]
-    fn test_extract_frontmatter_unclosed() {
-        let content = "---\nname: foo\nno closing marker";
-        let (block, body) = extract_frontmatter(content);
-        assert_eq!(block, None);
-        assert_eq!(body, content);
-    }
-
-    #[test]
-    fn test_extract_frontmatter_leading_newline_trimmed() {
-        let content = "---\n\nname: foo\n---\nbody";
-        let (block, body) = extract_frontmatter(content);
-        assert_eq!(block, Some("name: foo"));
-        assert_eq!(body, "body");
-    }
-
-    // ─── parse_frontmatter_fields ─────────────────────────────────
-    #[test]
-    fn test_parse_frontmatter_fields_all_keys() {
-        let fm = parse_frontmatter_fields(
-            "name: foo\ndescription: does foo\ndisable-model-invocation: true",
-        )
-        .unwrap();
-        assert_eq!(fm.name.as_deref(), Some("foo"));
-        assert_eq!(fm.description.as_deref(), Some("does foo"));
-        assert!(fm.disable_model_invocation);
-    }
-
-    #[test]
-    fn test_parse_frontmatter_fields_unknown_keys_ignored() {
-        let fm = parse_frontmatter_fields("name: foo\nrandom: 123\nversion: 1").unwrap();
-        assert_eq!(fm.name.as_deref(), Some("foo"));
-        assert!(fm.description.is_none());
-        assert!(!fm.disable_model_invocation);
-    }
-
-    #[test]
-    fn test_parse_frontmatter_fields_value_with_colon() {
-        let fm = parse_frontmatter_fields("description: uses a: b and c").unwrap();
-        assert_eq!(fm.description.as_deref(), Some("uses a: b and c"));
-    }
-
-    #[test]
-    fn test_parse_frontmatter_fields_trim_values() {
-        let fm = parse_frontmatter_fields("  name:  foo  \n description: bar ").unwrap();
-        assert_eq!(fm.name.as_deref(), Some("foo"));
-        assert_eq!(fm.description.as_deref(), Some("bar"));
-    }
-
-    #[test]
-    fn test_parse_frontmatter_fields_empty_lines_skipped() {
-        let fm = parse_frontmatter_fields("\n\nname: foo\n\n").unwrap();
-        assert_eq!(fm.name.as_deref(), Some("foo"));
-    }
-
-    #[test]
-    fn test_parse_frontmatter_fields_malformed_line_errors() {
-        let err = expect_fm_err(parse_frontmatter_fields("name: foo\nthis has no colon"));
-        assert!(err.contains("malformed"));
-    }
-
-    #[test]
-    fn test_parse_frontmatter_fields_disable_false_and_absent() {
-        let fm = parse_frontmatter_fields("name: foo\ndisable-model-invocation: false").unwrap();
-        assert!(!fm.disable_model_invocation);
     }
 
     // ─── parse_frontmatter ────────────────────────────────────────
@@ -376,6 +262,32 @@ mod tests {
     fn test_parse_frontmatter_malformed_errors() {
         let err = expect_parse_fm_err(parse_frontmatter("---\nno colon here\n---\nbody"));
         assert!(err.contains("malformed"));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_comment_lines_ignored() {
+        // Aligned with pi: comment-only frontmatter does not error and returns empty metadata (the old zen implementation reported malformed for comment lines)
+        let (fm, body) = parse_frontmatter("---\n# just a comment\n---\nBody").unwrap();
+        assert!(fm.name.is_none());
+        assert!(fm.description.is_none());
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_quotes_stripped() {
+        let (fm, _) =
+            parse_frontmatter("---\nname: \"foo\"\ndescription: 'bar'\n---\nBody").unwrap();
+        assert_eq!(fm.name.as_deref(), Some("foo"));
+        assert_eq!(fm.description.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_crlf_normalized() {
+        // Aligned with pi: CRLF normalization (the old implementation did not normalize on the skills side; fixed after convergence)
+        let (fm, body) =
+            parse_frontmatter("---\r\nname: foo\r\n---\r\nLine one\r\nLine two").unwrap();
+        assert_eq!(fm.name.as_deref(), Some("foo"));
+        assert_eq!(body, "Line one\nLine two");
     }
 
     // ─── default_name_from_path ───────────────────────────────────

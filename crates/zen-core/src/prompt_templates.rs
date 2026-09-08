@@ -1,4 +1,4 @@
-use crate::util::extract_frontmatter;
+use crate::frontmatter;
 use regex::{Captures, Regex};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -220,46 +220,29 @@ fn build_prompt_template(
             path: path_str.clone(),
         })?;
 
-    // Entry-point supplement in this function (when T-AP-03-5 ownership is unified, lift into primitive and delete this line)
-    let content = content.replace("\r\n", "\n").replace('\r', "\n");
+    // go through the frontmatter module uniformly (T-AP-03-5 consolidation): CRLF normalization and full body trim are lifted into the primitive
+    let parsed =
+        frontmatter::parse_frontmatter(&content).map_err(|e| PromptTemplateDiagnostic {
+            code: PromptTemplateDiagnosticCode::ParseFailed,
+            message: format!("{path_str}: {e}"),
+            path: path_str.clone(),
+        })?;
 
-    // Shared primitive splitting (same as skills): no frontmatter / unclosed --- → (None, full text), aligning with pi
-    let (yaml_block, raw_body) = extract_frontmatter(&content);
-
-    // Field parsing: key-value line pattern copied from skills parse_frontmatter_fields precedent; key set is template-specific
+    // two-key projection: description / argument-hint (generic key-value pairs, unknown keys ignored)
     let (mut description, mut argument_hint) = (String::new(), None);
-    if let Some(block) = yaml_block {
-        for line in block.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+    for (key, value) in parsed.frontmatter {
+        match key.as_str() {
+            "description" => description = value,
+            // pi `frontmatter["argument-hint"] && {...}` truthiness semantics: empty hint = no hint
+            "argument-hint" => {
+                argument_hint = if value.is_empty() { None } else { Some(value) };
             }
-            // split at the first ':': the value may contain colons (e.g. description text)
-            let Some((key, value)) = line.split_once(':') else {
-                return Err(PromptTemplateDiagnostic {
-                    code: PromptTemplateDiagnosticCode::ParseFailed,
-                    message: format!("{path_str}: malformed frontmatter line: {line:?}"),
-                    path: path_str.clone(),
-                });
-            };
-            match key.trim() {
-                "description" => description = value.trim().to_string(),
-                // pi `frontmatter["argument-hint"] && {...}` truthiness semantics: empty hint = no hint
-                "argument-hint" => {
-                    let hint = value.trim();
-                    argument_hint = if hint.is_empty() {
-                        None
-                    } else {
-                        Some(hint.to_string())
-                    };
-                }
-                _ => {} // Unknown keys are skipped (pi `Record<string,string>` takes only two keys)
-            }
+            _ => {} // Unknown keys are skipped (pi `Record<string,string>` takes only two keys)
         }
     }
 
-    // pi parseFrontmatter trims body (all leading/trailing whitespace) — shared primitive only removes leading newlines; supplemented here
-    let body = raw_body.trim();
+    // body already fully trimmed by the primitive (when frontmatter present; otherwise the whole text)
+    let body = &parsed.body;
 
     // description fallback chain: frontmatter missing/empty → first non-empty body line, truncate to 60 chars + "..." (aligning with pi)
     if description.is_empty() {

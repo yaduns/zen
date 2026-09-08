@@ -1,5 +1,6 @@
 pub mod compaction;
 pub mod env;
+pub mod frontmatter;
 pub mod harness;
 pub mod paths;
 pub mod process;
