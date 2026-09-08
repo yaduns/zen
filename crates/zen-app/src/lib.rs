@@ -5,5 +5,6 @@ pub mod keybindings;
 pub mod modes;
 pub mod output;
 pub mod session;
+pub mod skills;
 pub mod system_prompt;
 pub mod theme;

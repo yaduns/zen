@@ -22,11 +22,11 @@ pub enum SkillDiagnosticCode {
 
 pub struct SkillDiagnostic {
     /// diagnostic code
-    code: SkillDiagnosticCode,
+    pub code: SkillDiagnosticCode,
     /// human-readable message
-    message: String,
+    pub message: String,
     /// associated path
-    path: String,
+    pub path: String,
 }
 
 struct FileInfo {
@@ -175,8 +175,12 @@ fn build_skill(content: String, file_path: &Path) -> Result<Skill, SkillDiagnost
     })
 }
 
-/// Assembly point: IO reading → pure validation, wrapping the Result back into a tuple (keeps the existing boundary signature).
-async fn load_skill_from_file(file_path: &Path) -> (Option<Skill>, Vec<SkillDiagnostic>) {
+/// Load from a single `SKILL.md` file — explicit `.md` skill path (CLI `--skill` pointing to a file, T-AP-03-3 single-file assembly)
+/// Called when loading a single file: read raw text (`tokio::fs`) → parse frontmatter → validate metadata → construct `Skill`.
+/// Shares the same assembly path as `load_skills` (directory traversal); returns when description is missing or metadata validation fails
+/// `(None, diagnostics)`。
+/// Returns tuple `(Option<Skill>, Vec<SkillDiagnostic>)` (single use site; no named type).
+pub async fn load_skill_from_file(file_path: &Path) -> (Option<Skill>, Vec<SkillDiagnostic>) {
     match read_skill_file(file_path)
         .await
         .and_then(|c| build_skill(c, file_path))

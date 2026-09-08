@@ -1,4 +1,5 @@
 /// Describes a loaded SKILL.md skill. Pure data with no loading or execution logic.
+#[derive(Debug)]
 pub struct Skill {
     /// Stable skill name ([a-z0-9-], length ≤64, defaults to the parent directory name)
     pub name: String,
