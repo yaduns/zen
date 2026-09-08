@@ -71,6 +71,15 @@ pub fn get_custom_themes_dir() -> Result<PathBuf, PathError> {
     Ok(get_agent_dir()?.join("themes"))
 }
 
+/// Global prompt template directory: `<agentDir>/prompts`.
+/// Used by loader assembly for the User default directory (T-AP-03-4) and resource loading (T-AP-05-3)
+/// (T-AP-02-1 deferred annotation placeholder, aligning with pi `getPromptsDir`).
+/// # Errors
+/// Depends on `get_agent_dir`; when env overrides are missing and home is unavailable → `PathError::NoHomeDir`.
+pub fn get_prompts_dir() -> Result<PathBuf, PathError> {
+    Ok(get_agent_dir()?.join("prompts"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +210,16 @@ mod tests {
         assert_eq!(
             get_debug_log_path().unwrap(),
             PathBuf::from(format!("/fake/agent/{APP_NAME}-debug.log"))
+        );
+    }
+
+    #[test]
+    fn test_get_prompts_dir_appends_prompts() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::set(ENV_AGENT_DIR, "/fake/agent");
+        assert_eq!(
+            get_prompts_dir().unwrap(),
+            PathBuf::from("/fake/agent/prompts")
         );
     }
 }
