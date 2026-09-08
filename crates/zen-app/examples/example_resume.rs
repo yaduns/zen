@@ -101,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
         stream_fn,
         Arc::new(resumed) as Arc<dyn SessionStore>,
         ShellConfig::default(),
+        Vec::new(),
+        Vec::new(),
     );
     session.set_messages(ctx.messages); // ← history replay
 

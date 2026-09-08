@@ -1,5 +1,7 @@
 /// Describes a loaded SKILL.md skill. Pure data with no loading or execution logic.
-#[derive(Debug)]
+/// `Clone` lets the assembly layer feed both the system prompt (`BuildSystemPromptOptions.skills`) and session expansion resources
+/// (`AgentSession::skills`, two consumption sites in T-AP-03-2).
+#[derive(Debug, Clone)]
 pub struct Skill {
     /// Stable skill name ([a-z0-9-], length ≤64, defaults to the parent directory name)
     pub name: String,

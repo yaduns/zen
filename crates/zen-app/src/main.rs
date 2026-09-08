@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     // Layer 3: assembly factory (refactoring point 3 — assembly logic extracted to services.rs; session chosen by main)
     let cwd = std::env::current_dir()?;
     let session_manager = select_session_manager(&args, &cwd)?;
-    let runtime = create_initial_runtime_from_cli(&args, cwd, session_manager)?;
+    let runtime = create_initial_runtime_from_cli(&args, cwd, session_manager).await?;
     info!(
         session_id = runtime.session.session_id(),
         model_id = %runtime.session.model().id,

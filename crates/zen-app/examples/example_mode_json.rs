@@ -39,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
         stream_fn,
         store.clone(),
         ShellConfig::default(),
+        Vec::new(),
+        Vec::new(),
     );
 
     let services = AgentSessionServices {

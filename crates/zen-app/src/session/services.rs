@@ -20,11 +20,13 @@ use crate::cli::{parse_thinking_level, CliArgs};
 use crate::config::defaults::DEFAULT_THINKING_LEVEL;
 use crate::config::get_agent_dir;
 use crate::config::settings::{SettingsData, SettingsManager};
+use crate::prompt_templates::{load_prompt_templates, LoadPromptTemplatesOptions};
 use crate::session::agent_session::{AgentSession, SessionStore};
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
 };
 use crate::session::session_manager::SessionManager;
+use crate::skills::{load_skills, LoadSkillsOptions};
 use crate::system_prompt::load_project_context_files;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +47,9 @@ use zen_core::harness::types::{
     ShouldStopAfterTurnContext,
 };
 use zen_core::paths::{resolve_path, PathInputOptions};
+use zen_core::prompt_templates::PromptTemplate;
 use zen_core::session::tree::{SessionContext, SessionModel};
+use zen_core::skills::skill::Skill;
 use zen_core::tools::factory::{ToolFactory, ToolSelection};
 
 /// Phase 1 default empty hook implementation: all hook methods use `AgentLoopHooks` trait defaults
@@ -158,7 +162,7 @@ impl AgentLoopHooks for SessionHooks {
 /// # Consumers
 /// - `create_initial_runtime_from_cli` (same file, CLI glue layer)
 /// - T-AP-07-1 (print mode, Phase 2), T-AP-11-1 (interactive mode, Phase 2)
-#[allow(clippy::too_many_arguments)] // Assembly surface parameters are all session assembly inputs (model/prompt/tools/thinking/hooks/stream/storage/shell); grouping would instead reduce readability
+#[allow(clippy::too_many_arguments)] // All assembly-face parameters are inputs to session assembly (model/prompts/tools/thinking/hooks/streaming/storage/shell/skills/templates); grouping them would only hurt readability
 pub fn create_agent_session(
     model: Model,
     system_prompt: String,
@@ -168,6 +172,8 @@ pub fn create_agent_session(
     stream_fn: zen_ai::types::StreamFn,
     session_store: Arc<dyn SessionStore>,
     shell_config: ShellConfig,
+    skills: Vec<Skill>,
+    templates: Vec<PromptTemplate>,
 ) -> AgentSession {
     let state = AgentState {
         system_prompt,
@@ -189,7 +195,14 @@ pub fn create_agent_session(
         excluded: excluded.clone(),
     });
     let agent = Agent::new(state, ToolExecutionMode::Parallel, session_hooks, stream_fn);
-    AgentSession::new_with_exclusions(agent, session_store, excluded, shell_config)
+    AgentSession::new_with_exclusions(
+        agent,
+        session_store,
+        excluded,
+        shell_config,
+        skills,
+        templates,
+    )
 }
 
 /// Thin CLI-specific glue: parse `CliArgs` + the already-selected session manager into model/tools/system prompt, and assemble the full runtime.
@@ -215,13 +228,14 @@ pub fn create_agent_session(
 /// The fully assembled `AgentSessionRuntime` (session + services + session store)
 ///
 /// # Edge Cases
-/// - Phase 1 injects no skills (append here after T-AP-03-3 lands)
+/// - Resource loading (skills/prompt templates, T-AP-03-2 interim) is done **inside this function** — T-AP-05-3
+///   takes over this assembly section once unified loading lands (see seam backfill in tasks/T-AP-03-2-implemented.md)
 /// - `--session` only supports full paths (partial UUID resolution is T-AP-08-5)
 /// - Phase 2's SettingsManager/ResourceLoader append their assembly steps within this function.
 ///
 /// # Consumers
 /// T-AP-08-3 (main's node 4 call point, session selected by main)
-pub fn create_initial_runtime_from_cli(
+pub async fn create_initial_runtime_from_cli(
     args: &CliArgs,
     cwd: PathBuf,
     session_manager: SessionManager,
@@ -245,6 +259,64 @@ pub fn create_initial_runtime_from_cli(
     // Known provider matched → rebuild the model by provider (provider side); default_model only changes the id,
     // default_thinking_level fills in thinking. Extracted as a free function for unit testing (T-AP-02-3 additional fields).
     apply_settings_defaults(args, &ctx, &merged, &mut model, &mut thinking_level);
+
+    // 2.6 Resource loading (T-AP-03-2 interim, taken over by T-AP-05-3 later): skills + prompt templates
+    //     (default dir + CLI `--skill`/`--prompt-template` + merged settings.skills/prompts).
+    //     `--no-prompt-templates` disables template loading (aligns with pi resource-loader branch);
+    //     loading diagnostics are non-fatal (missing/broken files don't abort), log tracing warnings, not surfaced in v1.
+    let skill_paths: Vec<PathBuf> = merged
+        .skills
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(args.skills.iter().cloned())
+        .map(PathBuf::from)
+        .collect();
+    let prompt_paths: Vec<PathBuf> = merged
+        .prompts
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(args.prompt_templates.iter().cloned())
+        .map(PathBuf::from)
+        .collect();
+    let skills: Vec<Skill>;
+    let mut templates: Vec<PromptTemplate> = Vec::new();
+    // Skills are always loaded (`--no-prompt-templates` only governs templates); templates are controlled by that flag (aligns with pi resource-loader branch)
+    let skills_result = load_skills(&LoadSkillsOptions {
+        cwd: cwd.clone(),
+        agent_dir: agent_dir.clone(),
+        skill_paths,
+        include_defaults: true,
+    })
+    .await;
+    skills = skills_result
+        .skills
+        .into_iter()
+        .map(|loaded| loaded.skill)
+        .collect();
+    for d in &skills_result.diagnostics {
+        if let crate::skills::SkillLoadDiagnostic::Warning { message, .. } = d {
+            tracing::warn!(target: "zen::resources", "skill load: {message}");
+        }
+    }
+    if !args.no_prompt_templates {
+        let prompts_result = load_prompt_templates(&LoadPromptTemplatesOptions {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            prompt_paths,
+            include_defaults: true,
+        })
+        .await;
+        templates = prompts_result
+            .prompt_templates
+            .into_iter()
+            .map(|loaded| loaded.template)
+            .collect();
+        for d in &prompts_result.diagnostics {
+            tracing::warn!(target: "zen::resources", "prompt load: {}", d.message);
+        }
+    }
 
     // 3. Session ID (supplied by a manager chosen by the caller; the session_id of the persisted/forked session)
     let cwd_str = cwd.to_string_lossy().into_owned();
@@ -273,7 +345,8 @@ pub fn create_initial_runtime_from_cli(
     };
     let tools = factory.create_with_selection(&selection).tools;
 
-    // 5. System prompt: AGENTS.md context + CLI override
+    // 5. System prompt: AGENTS.md context + CLI overrides + skills (assembled and injected per T-AP-03-2, honoring
+    //    the "Phase 1 does not inject skills (append here once T-AP-03-3 lands)" note)
     let tool_refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
     let meta = collect_tool_prompt_metadata(&tool_refs);
     let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
@@ -287,7 +360,7 @@ pub fn create_initial_runtime_from_cli(
             Some(args.append_system_prompt.join("\n"))
         },
         cwd: cwd_str,
-        skills: vec![],
+        skills: skills.clone(),
         context_files: if args.no_context_files {
             vec![]
         } else {
@@ -311,6 +384,8 @@ pub fn create_initial_runtime_from_cli(
         stream_fn,
         session_store.clone(),
         shell,
+        skills,
+        templates,
     );
     // Replay session history (aligned with pi; new session ctx.messages is empty) — call on owned session before Arc::new
     session.set_messages(ctx.messages);
@@ -655,13 +730,15 @@ mod tests {
     }
 
     /// Smoke test for `create_initial_runtime_from_cli`: no CLI flags (zero config) + fake cwd should assemble a runtime.
-    /// No real LLM call is triggered (print stub does not run the prompt).
-    #[test]
-    fn create_runtime_zero_config_smoke() {
+    /// No real LLM call is triggered (the print stub does not run the prompt); resource loading (T-AP-03-2) scans the real default directories,
+    /// silently skipping missing ones without aborting.
+    #[tokio::test]
+    async fn create_runtime_zero_config_smoke() {
         let args = parse(&[]);
         let cwd = std::env::temp_dir();
         let manager = SessionManager::in_memory(&cwd.to_string_lossy());
         let runtime = create_initial_runtime_from_cli(&args, cwd.clone(), manager)
+            .await
             .expect("Zero config should be able to assemble runtime");
         // Model has a default value (env or provider default chain); session is accessible
         assert_eq!(runtime.services.cwd, cwd);
@@ -671,11 +748,13 @@ mod tests {
     // ── Tool selection flags (cli-tools-flags-fix: --tools/--exclude-tools/--no-tools/--no-builtin-tools) ──
 
     /// Assemble a runtime with the specified CLI flags and return the list of active tool names for the session.
-    fn runtime_tools(args: &[&str]) -> Vec<String> {
+    async fn runtime_tools(args: &[&str]) -> Vec<String> {
         let parsed = parse(args);
         let cwd = std::env::temp_dir();
         let manager = SessionManager::in_memory(&cwd.to_string_lossy());
-        let runtime = create_initial_runtime_from_cli(&parsed, cwd, manager).expect("Assemble runtime");
+        let runtime = create_initial_runtime_from_cli(&parsed, cwd, manager)
+            .await
+            .expect("Assemble runtime");
         runtime
             .session
             .active_tool_names()
@@ -684,51 +763,51 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn cli_no_flags_creates_default_builtin_tools() {
+    #[tokio::test]
+    async fn cli_no_flags_creates_default_builtin_tools() {
         assert_eq!(
-            runtime_tools(&[]),
+            runtime_tools(&[]).await,
             vec!["read", "bash", "edit", "write"],
             "No flags → default built-in group (aligned with pi defaultActiveToolNames)"
         );
     }
 
-    #[test]
-    fn cli_no_tools_disables_all_tools() {
-        assert!(runtime_tools(&["--no-tools"]).is_empty());
+    #[tokio::test]
+    async fn cli_no_tools_disables_all_tools() {
+        assert!(runtime_tools(&["--no-tools"]).await.is_empty());
     }
 
-    #[test]
-    fn cli_no_builtin_tools_disables_builtin_set() {
+    #[tokio::test]
+    async fn cli_no_builtin_tools_disables_builtin_set() {
         assert!(
-            runtime_tools(&["--no-builtin-tools"]).is_empty(),
+            runtime_tools(&["--no-builtin-tools"]).await.is_empty(),
             "v1 has no extension tools: same effect as --no-tools"
         );
     }
 
-    #[test]
-    fn cli_tools_allowlist_gives_read_only_session() {
+    #[tokio::test]
+    async fn cli_tools_allowlist_gives_read_only_session() {
         assert_eq!(
-            runtime_tools(&["--tools", "read"]),
+            runtime_tools(&["--tools", "read"]).await,
             vec!["read"],
             "--tools read → read-only tool session (user motivation scenario)"
         );
     }
 
-    #[test]
-    fn cli_exclude_tools_removes_from_default() {
+    #[tokio::test]
+    async fn cli_exclude_tools_removes_from_default() {
         assert_eq!(
-            runtime_tools(&["--exclude-tools", "bash,write"]),
+            runtime_tools(&["--exclude-tools", "bash,write"]).await,
             vec!["read", "edit"],
             "--exclude-tools bash,write → set difference (comma-separated + trim handled in args.rs)"
         );
     }
 
-    #[test]
-    fn cli_tools_wins_over_no_tools() {
+    #[tokio::test]
+    async fn cli_tools_wins_over_no_tools() {
         // Aligned with pi: allow-list takes precedence over no_tools
         assert_eq!(
-            runtime_tools(&["--no-tools", "--tools", "read"]),
+            runtime_tools(&["--no-tools", "--tools", "read"]).await,
             vec!["read"]
         );
     }

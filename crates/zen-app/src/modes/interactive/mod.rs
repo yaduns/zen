@@ -10,6 +10,7 @@ pub mod ui;
 
 pub(crate) use crate::keybindings::{app_default_bindings, AppAction};
 
+use crate::commands::{parse_slash_command, resolve_builtin, BuiltinSlashCommand};
 use crate::components::footer::{add_usage_to_totals, FooterData, UsageTotals};
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::tree_selector::FilterMode;
@@ -853,39 +854,64 @@ impl InteractiveMode {
                     .await
             }
             SubmitKind::Command(cmd) => {
-                self.handle_inline_command(&cmd).await;
-                Ok(())
-            }
-            SubmitKind::Message => {
-                if self.runtime.session.is_run() || self.run_task.is_some() {
-                    // Belt-and-suspenders: run active or already in flight → steer (pi semantics: queue and inject before the next LLM turn; no double spawn)
-                    self.runtime.session.steer(&text);
-                    Ok(())
-                } else {
-                    // idle → spawn a run task (Approach D): set run_task synchronously (sticky guard prevents a double spawn from overwriting the handle)
-                    self.push_footer();
-                    let session = Arc::clone(&self.runtime.session);
-                    let tx = self.ui_event_tx.clone(); // can't borrow &self inside async move
-                    self.run_task = Some(tokio::task::spawn_local(async move {
-                        if let Err(e) = session.prompt(&text).await {
-                            // P1-1: errors inside run are degraded to a UI status line (session not interrupted; the initial message is degraded the same way, see known deviation #3)
-                            let _ = tx.send(UiEvent::Status(StatusSpec::Error(e.to_string())));
-                        }
-                    }));
-                    Ok(())
+                // T-AP-03-2 command table integration: built-in commands → interactive dispatch; the rest (/template-name, /skill:name,
+                // unknown names) → fall back to the message path (expanded by the session's expand_prompt_input) — fixes
+                // the old "any unknown / command warns" deviation (in pi, template/skill commands are not intercepted; they are left to expansion).
+                match parse_slash_command(&cmd)
+                    .and_then(|p| resolve_builtin(p.name).map(|b| (b, p.args)))
+                {
+                    Some((builtin, args)) => {
+                        self.handle_inline_command(builtin, args).await;
+                        Ok(())
+                    }
+                    None => self.submit_message(cmd).await,
                 }
             }
+            SubmitKind::Message => self.submit_message(text).await,
         }
     }
 
-    /// Inline slash commands (v1 subset: /settings /compact /new /quit; integration seam for the T-AP-03-2 command table).
-    async fn handle_inline_command(&mut self, cmd: &str) {
-        match cmd.trim() {
-            "/settings" => self.open_settings_panel(),
-            "/compact" => self.show_warning("Context compaction pending"),
-            "/new" => self.show_warning("New session pending (T-AP-08-5)"),
-            "/quit" => self.exit_requested = true,
-            _ => self.show_warning(format!("Unknown command: {cmd}")),
+    /// Submit a regular message: if a run is active → steer (queued injection before the next LLM turn); if idle → spawn a run task (Plan D).
+    /// Expansion of `/skill:` and `/template-name` is handled on the session side by `expand_prompt_input` (T-AP-03-2),
+    /// This function does not perform classification.
+    async fn submit_message(&mut self, text: String) -> Result<(), InteractiveModeError> {
+        if self.runtime.session.is_run() || self.run_task.is_some() {
+            self.runtime.session.steer(&text);
+            return Ok(());
+        }
+        self.push_footer();
+        let session = Arc::clone(&self.runtime.session);
+        let tx = self.ui_event_tx.clone(); // can't borrow &self inside async move
+        self.run_task = Some(tokio::task::spawn_local(async move {
+            if let Err(e) = session.prompt(&text).await {
+                // P1-1: errors inside run are degraded to a UI status line (session not interrupted; the initial message is degraded the same way, see known deviation #3)
+                let _ = tx.send(UiEvent::Status(StatusSpec::Error(e.to_string())));
+            }
+        }));
+        Ok(())
+    }
+
+    /// Built-in slash command dispatch (registry-driven in T-AP-03-2): `handle_submit` has already confirmed a match
+    /// in `BUILTIN_SLASH_COMMANDS` before calling in; here mode-specific actions are performed based on the registry `name`
+    /// (open panel / exit / pending hint). Unregistered commands (templates/skills/unknown) do not land here
+    /// (they have fallen back to the `submit_message` expansion path).
+    async fn handle_inline_command(&mut self, command: &BuiltinSlashCommand, _args: &str) {
+        match command.name {
+            "settings" => self.open_settings_panel(),
+            "quit" => self.exit_requested = true,
+            // Registered built-in commands with deferred execution: use pending prompts as a fallback (lifecycle ownership belongs to each domain task; see
+            // tasks/T-AP-03-2-implemented.md ("Data Model · BUILTIN_SLASH_COMMANDS Lifecycle Ownership Table"))
+            "compact" => self.show_warning("Context compaction pending (T-AP-04-3)"),
+            "new" => self.show_warning("New session pending (T-AP-08-5)"),
+            "tree" => self.show_warning("Session tree pending (T-AP-08-5)"),
+            "fork" => self.show_warning("Fork pending (T-AP-08-5)"),
+            "clone" => self.show_warning("Clone pending (T-AP-08-5)"),
+            "resume" => self.show_warning("Resume pending (T-AP-08-5)"),
+            "model" => self.show_warning("Model selection pending (v2); use --model flag"),
+            "name" => self.show_warning("Session name pending"),
+            "session" => self.show_warning("Session info pending"),
+            "hotkeys" => self.show_warning("Hotkeys pending"),
+            _ => self.show_warning(format!("Unknown command: /{}", command.name)), // Unreachable under registry-driven dispatch
         }
     }
 

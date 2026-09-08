@@ -53,6 +53,8 @@ pub fn make_session(
         stream_fn,
         store(),
         ShellConfig::default(),
+        Vec::new(),
+        Vec::new(),
     )
 }
 
@@ -99,6 +101,8 @@ pub async fn run_with_store(
         stream_fn,
         store,
         ShellConfig::default(),
+        Vec::new(),
+        Vec::new(),
     );
     run_and_print(&mut session, prompt).await
 }

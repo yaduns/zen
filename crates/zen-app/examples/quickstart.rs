@@ -47,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
         stream_fn,
         store,
         ShellConfig::default(),
+        Vec::new(),
+        Vec::new(),
     );
 
     // 3. Real LLM call: send one round of prompt, print the assistant's text reply

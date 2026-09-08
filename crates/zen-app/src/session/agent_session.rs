@@ -1,3 +1,4 @@
+use crate::commands::expand_prompt_input;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,8 @@ use zen_core::env::{ExecutionEnv, ExecutionError, ShellConfig};
 use zen_core::harness::agent_hooks::AgentLoopError;
 use zen_core::harness::engine::Agent;
 use zen_core::harness::types::AgentEvent;
+use zen_core::prompt_templates::PromptTemplate;
+use zen_core::skills::skill::Skill;
 use zen_core::util::now_millis;
 
 /// Session persistence interface, defining the persistence operations required by AgentSession.
@@ -39,8 +42,11 @@ pub trait SessionStore: Send + Sync {
 ///
 /// Holds a pre-built Agent engine (with AgentState single source of truth + resident persistence subscription), SessionStore
 /// Persistence delegate. **All session state (model/thinking_level/tools/messages/is_run)
-/// All reads/writes are delegated via `self.agent.state()`; this struct stores no state fields** (aligns with pi
+/// are all read/written via `self.agent.state()` delegation; this struct stores no runtime state fields** (matching pi
 /// `agent.state.*` delegate pattern of `AgentSession`).
+/// `shell_config`/`skills`/`templates` are **config/resource fields injected once at construction time** (not runtime state,
+/// and do not participate in AgentState delegation) — `skills`/`templates` feed the pre-submit `expand_prompt_input` expansion
+/// (T-AP-03-2, routing for /skill: and /template-name).
 ///
 /// # Lifecycle
 /// - Construct (establishes resident persistence subscription) → prompt (may be called multiple times) → drop (subscription cleaned up with the agent)
@@ -55,6 +61,10 @@ pub struct AgentSession {
     excluded: Arc<Mutex<HashSet<String>>>,
     /// Shell override config (shell_path/command_prefix, injected by T-AP-02-3-fix; consumed by `execute_bash`)
     shell_config: ShellConfig,
+    /// Session prompt preprocessing skill set (injected during T-AP-03-2 assembly; /skill: routing in `expand_prompt_input`)
+    skills: Vec<Skill>,
+    /// Session prompt preprocessing template set (T-AP-03-2 assembly injection; /template-name routing in `expand_prompt_input`)
+    templates: Vec<PromptTemplate>,
 }
 
 impl AgentSession {
@@ -85,6 +95,8 @@ impl AgentSession {
             session_store,
             Arc::new(Mutex::new(HashSet::new())),
             ShellConfig::default(),
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -93,11 +105,15 @@ impl AgentSession {
     /// `excluded` must be the **same Arc** as the exclusion set inside the `SessionHooks` injected into the engine (`services.rs::create_agent_session`)
     /// so that identities registered by `execute_bash(!!)` can be read by `filter_messages`
     /// in the loop. `new` uses an empty set (test path, does not participate in filtering).
+    /// `skills`/`templates` (T-AP-03-2) are session prompt preprocessing resources: injected once at construction time,
+    /// Immutable, for expansion by `expand_prompt_input` for `prompt`/`steer`/`follow_up`.
     pub(crate) fn new_with_exclusions(
         agent: Agent,
         session_store: Arc<dyn SessionStore>,
         excluded: Arc<Mutex<HashSet<String>>>,
         shell_config: ShellConfig,
+        skills: Vec<Skill>,
+        templates: Vec<PromptTemplate>,
     ) -> Self {
         // Establish a persistent subscription (option 1, aligned with pi construction as `agent.subscribe(this._handleAgentEvent)`):
         // message_end → session_store.append_message (persist to disk in real time). Subscription closure lives in the engine's listener list,
@@ -114,6 +130,8 @@ impl AgentSession {
             session_store,
             excluded,
             shell_config,
+            skills,
+            templates,
         }
     }
 
@@ -122,13 +140,25 @@ impl AgentSession {
         &self.shell_config
     }
 
+    /// Accessor for the session prompt preprocessing skill set (T-AP-03-2; consumed by interactive completion `build_slash_command_list`).
+    pub fn skills(&self) -> &[Skill] {
+        &self.skills
+    }
+
+    /// Accessor for the session prompt preprocessing template set (T-AP-03-2; consumed by interactive completion `build_slash_command_list`).
+    pub fn templates(&self) -> &[PromptTemplate] {
+        &self.templates
+    }
+
     /// Send a prompt to the agent and wait for completion.
     ///
     /// # Behavior
-    /// 1. Calls `self.agent.prompt(text)` (the engine renews the run token internally; pi's surface takes no args; D2/D4)
-    /// 2. A resident persistence subscription writes to disk in real time during runtime (message_end → append_message); the consumer
+    /// 1. Before submission, expand `/skill:` and `/template_name` via `expand_prompt_input` (T-AP-03-2;
+    ///    aligned with pi agent-session prompt chain's skill → template expansion order)
+    /// 2. Calls `self.agent.prompt(&expanded)` (the engine renews the run token internally; pi's surface takes no args; D2/D4)
+    /// 3. A persistent subscription writes to disk in real time during the run (message_end → append_message); callers
     ///    Events subscribed via `subscribe` are delivered synchronously
-    /// 3. Returns all messages added in this round
+    /// 4. Return all messages newly added this round
     ///
     /// # Errors
     /// - `AgentSessionError::Agent`: agent loop error (underlying `AgentLoopError`; the `prompt` path is always Ok — legacy quirk, out of scope here)
@@ -137,7 +167,8 @@ impl AgentSession {
     /// - `&self`: this struct is a lock-free Facade (store/excluded are already Arc-shared), callable concurrently by the run task and the main task
     ///   (&self after the engine is shared; see interactive cancellation fix plan D)
     pub async fn prompt(&self, text: &str) -> Result<Vec<Message>, AgentSessionError> {
-        Ok(self.agent.prompt(text).await)
+        let expanded = expand_prompt_input(text, &self.skills, &self.templates);
+        Ok(self.agent.prompt(&expanded).await)
     }
     // Consumers: T-AP-07-1 (print mode prompt), T-AP-11-1 (interactive mode prompt)
 
@@ -341,19 +372,23 @@ impl AgentSession {
     // ── Queue operations (agent engine queue + read-only UI snapshot) ──────────────
 
     /// Queue a steer message (injected after tool execution, before the next LLM call).
+    /// Expand before submission via `expand_prompt_input` (T-AP-03-2, aligned with pi steer's expansion chain).
     ///
     /// # Edge Cases
     /// - `&self`: enqueues only via `Agent::steer`, does not block the prompt
     pub fn steer(&self, text: &str) {
-        self.agent.steer(text);
+        let expanded = expand_prompt_input(text, &self.skills, &self.templates);
+        self.agent.steer(&expanded);
     }
 
     /// Queue a follow-up message (injected after the agent goes idle).
+    /// Expanded via `expand_prompt_input` before submission (T-AP-03-2, aligned with the pi followUp expansion chain).
     ///
     /// # Edge Cases
     /// - `&self`: enqueues only via `Agent::follow_up`, does not block the prompt
     pub fn follow_up(&self, text: &str) {
-        self.agent.follow_up(text);
+        let expanded = expand_prompt_input(text, &self.skills, &self.templates);
+        self.agent.follow_up(&expanded);
     }
 
     /// Get a snapshot of the current steer queue (read-only, delegated via engine `steering_messages()`).

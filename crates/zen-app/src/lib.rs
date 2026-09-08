@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod commands;
 pub mod components;
 pub mod config;
 pub mod keybindings;
