@@ -26,6 +26,7 @@ use zen_app::session::agent_session::SessionStore;
 use zen_app::session::jsonl::CreateSessionOptions;
 use zen_app::session::services::{create_agent_session, NoopHooks};
 use zen_app::session::session_manager::SessionManager;
+use zen_core::env::ShellConfig;
 
 #[derive(Parser)]
 #[command(name = "example_fork")]
@@ -108,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NoopHooks),
         stream_fn,
         Arc::new(forked) as Arc<dyn SessionStore>,
+        ShellConfig::default(),
     );
     session.set_messages(ctx.messages); // ← history replay
 

@@ -19,6 +19,7 @@ use zen_app::session::agent_session::SessionStore;
 use zen_app::session::runtime::{create_initial_runtime, AgentSessionServices, SessionStartReason};
 use zen_app::session::services::{create_agent_session, NoopHooks};
 use zen_app::session::session_manager::SessionManager;
+use zen_core::env::ShellConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NoopHooks),
         stream_fn,
         store.clone(),
+        ShellConfig::default(),
     );
 
     let services = AgentSessionServices {

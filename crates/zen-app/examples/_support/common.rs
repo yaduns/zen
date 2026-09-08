@@ -14,6 +14,7 @@ use zen_ai::types::{ContentBlock, Message, Model, ThinkingLevel};
 use zen_app::session::agent_session::{AgentSession, SessionStore};
 use zen_app::session::services::{create_agent_session, NoopHooks};
 use zen_app::session::session_manager::SessionManager;
+use zen_core::env::ShellConfig;
 
 /// Current working directory as a string.
 pub fn cwd_str() -> String {
@@ -51,6 +52,7 @@ pub fn make_session(
         Arc::new(NoopHooks),
         stream_fn,
         store(),
+        ShellConfig::default(),
     )
 }
 
@@ -96,6 +98,7 @@ pub async fn run_with_store(
         Arc::new(NoopHooks),
         stream_fn,
         store,
+        ShellConfig::default(),
     );
     run_and_print(&mut session, prompt).await
 }

@@ -1,3 +1,4 @@
+use crate::env::ShellConfig;
 use crate::truncate::{truncate_tail, TruncationOptions, TruncationResult};
 use crate::util::now_millis;
 use async_trait::async_trait;
@@ -27,13 +28,25 @@ use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 /// - On cancellation, returns `ToolError::Cancelled`.
 #[derive(Debug)]
 pub struct BashTool {
-    tool_context: ToolContext, // New: bind the session environment at construction
+    tool_context: ToolContext, // Bind the session environment at construction time
+    shell: ShellConfig,        // Shell override config (shell_path/command_prefix, T-AP-02-3-fix)
 }
 
 impl BashTool {
-    /// Creates a new BashTool instance.
-    pub fn new(tool_context: ToolContext) -> Self {
-        Self { tool_context }
+    /// Construct the bash tool with shell override config (None fields fall back to the system default shell / no prefix).
+    pub fn new(tool_context: ToolContext, shell: ShellConfig) -> Self {
+        Self {
+            tool_context,
+            shell,
+        }
+    }
+
+    /// Apply the shell command prefix: `{prefix}\n{command}` (aligned with pi `agent-session.ts`).
+    fn resolve_command(&self, command: &str) -> String {
+        match &self.shell.command_prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}\n{command}"),
+            _ => command.to_string(),
+        }
     }
 }
 
@@ -93,9 +106,11 @@ impl Tool for BashTool {
         on_update: ToolUpdateCallback,
     ) -> Result<ToolExecutionResult, ToolError> {
         let (command, timeout) = parse_bash_args(params)?;
+        let resolved = self.resolve_command(&command);
         let (content, exit_code, info) = execute_command(
-            &command,
+            &resolved,
             &self.tool_context.working_dir,
+            self.shell.shell_path.as_deref(),
             timeout,
             cancel,
             Some(&on_update),
@@ -173,6 +188,7 @@ fn parse_bash_args(params: &serde_json::Value) -> Result<(String, Option<f64>), 
 /// # Parameters
 /// - `command`: The command string to execute.
 /// - `working_dir`: working directory.
+/// - `shell_path`: custom shell path (None = system default `sh`).
 /// - `timeout`: Timeout in seconds (None = no timeout).
 /// - `cancel`: cancellation token.
 /// - `on_update`: streaming update callback (optional).
@@ -187,19 +203,21 @@ fn parse_bash_args(params: &serde_json::Value) -> Result<(String, Option<f64>), 
 async fn execute_command(
     command: &str,
     working_dir: &std::path::Path,
+    shell_path: Option<&std::path::Path>,
     timeout: Option<f64>,
     cancel: &CancellationToken,
     on_update: Option<&ToolUpdateCallback>,
 ) -> Result<(String, Option<i32>, TruncationResult), ToolError> {
-    // 1. Start the process
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(working_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| ToolError::Execution(format!("Failed to spawn process: {}", e)))?;
+    // 1. spawn process (shell_path overrides the system default `sh`, matching pi `createLocalBashOperations({shellPath})`)
+    let mut child =
+        tokio::process::Command::new(shell_path.unwrap_or_else(|| std::path::Path::new("sh")))
+            .arg("-c")
+            .arg(command)
+            .current_dir(working_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ToolError::Execution(format!("Failed to spawn process: {}", e)))?;
 
     // 2. Take the stdout/stderr pipes (wait_with_output consumes the child, so read manually instead)
     let stdout_pipe = child.stdout.take();
@@ -274,6 +292,11 @@ mod tests {
     fn test_ctx() -> ToolContext {
         ToolContext::new(std::path::PathBuf::from("/tmp"), None, None)
     }
+
+    /// BashTool with default shell config (all None), reused by metadata tests.
+    fn bash_tool() -> BashTool {
+        BashTool::new(test_ctx(), ShellConfig::default())
+    }
     // ─── parse_bash_args ───────────────────────────────────────────────────
 
     #[test]
@@ -334,26 +357,26 @@ mod tests {
 
     #[test]
     fn test_bash_tool_name() {
-        let tool = BashTool::new(test_ctx());
+        let tool = bash_tool();
         assert_eq!(tool.name(), "bash");
     }
 
     #[test]
     fn test_bash_tool_label() {
-        let tool = BashTool::new(test_ctx());
+        let tool = bash_tool();
         assert_eq!(tool.label(), "bash");
     }
 
     #[test]
     fn test_bash_tool_description_not_empty() {
-        let tool = BashTool::new(test_ctx());
+        let tool = bash_tool();
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("truncated"));
     }
 
     #[test]
     fn test_bash_tool_parameters_schema() {
-        let tool = BashTool::new(test_ctx());
+        let tool = bash_tool();
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["command"].is_object());
@@ -363,6 +386,34 @@ mod tests {
         );
         assert!(params["properties"]["timeout"].is_object());
         assert_eq!(params["required"].as_array().unwrap().len(), 1);
+    }
+
+    // ─── resolve_command (shell prefix, T-AP-02-3-fix) ─────────────────────
+
+    #[test]
+    fn test_resolve_command_prepends_prefix() {
+        let tool = BashTool::new(
+            test_ctx(),
+            ShellConfig {
+                shell_path: None,
+                command_prefix: Some("shopt -s expand_aliases".to_string()),
+            },
+        );
+        // Aligned with pi: `{prefix}\n{command}`
+        assert_eq!(tool.resolve_command("ls"), "shopt -s expand_aliases\nls");
+    }
+
+    #[test]
+    fn test_resolve_command_no_or_empty_prefix_passthrough() {
+        assert_eq!(bash_tool().resolve_command("ls"), "ls");
+        let tool = BashTool::new(
+            test_ctx(),
+            ShellConfig {
+                shell_path: None,
+                command_prefix: Some(String::new()),
+            },
+        );
+        assert_eq!(tool.resolve_command("ls"), "ls");
     }
 
     // ─── execute_command (cancellation only) ────────────────────────────────
@@ -375,6 +426,7 @@ mod tests {
         let result = execute_command(
             "echo hello",
             std::path::Path::new("/tmp"),
+            None,
             None,
             &cancel,
             None,

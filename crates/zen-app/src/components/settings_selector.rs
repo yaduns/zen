@@ -77,6 +77,8 @@ impl DoubleEscapeAction {
 
 /// Input snapshot for the settings selector — "all editable items when entering the settings page"; the component only reads it to generate the list.
 /// Pure data, not serialized (persistence is handled by the T-AP-02-3 settings manager; this type is its display projection).
+/// Debug/Clone: required by UiEvent (OpenSettings payload) (T-AP-02-3-fix).
+#[derive(Debug, Clone)]
 pub struct SettingsConfig {
     /// Auto-compaction switch (footer `(auto)` marker).
     pub auto_compact: bool,

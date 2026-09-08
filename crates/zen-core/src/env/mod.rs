@@ -10,6 +10,19 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
+/// Shell override config for the bash/exec execution path (matches pi `shellPath`/`shellCommandPrefix`).
+/// Pure parameter carrier: `shell_path` overrides the default shell binary; `command_prefix` is prepended to every command
+/// (assembles `{prefix}\n{command}`, matching `resolvedCommand` in pi `agent-session.ts`);
+/// All None = system default (e.g. `sh`).
+/// Consumers: `BashTool` (zen-core tools), `AgentSession::execute_bash` (zen-app).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShellConfig {
+    /// Custom shell path (None = system default); `~` expansion is done at the assembly layer via `paths::resolve_path`
+    pub shell_path: Option<PathBuf>,
+    /// Prefix string prepended to each bash command (None = no prefix)
+    pub command_prefix: Option<String>,
+}
+
 /// Binds one session to a platform-agnostic shell execution environment, holding cwd, an optional custom shell path, and the session's base environment variables;
 /// exec runs commands in the platform self-discovered shell using this environment as context.
 pub struct ExecutionEnv {

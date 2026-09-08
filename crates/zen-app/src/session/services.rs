@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cli::{parse_thinking_level, CliArgs};
 use crate::config::get_agent_dir;
+use crate::config::settings::{SettingsData, SettingsManager};
 use crate::session::agent_session::{AgentSession, SessionStore};
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
@@ -30,6 +31,7 @@ use zen_ai::api::stream_for;
 use zen_ai::provider::resolve_provider;
 use zen_ai::tool::{Tool, ToolContext, ToolExecutionMode};
 use zen_ai::types::{ImageContent, Message, Model, ThinkingLevel};
+use zen_core::env::ShellConfig;
 use zen_core::harness::agent_hooks::AgentLoopHooks;
 use zen_core::harness::engine::Agent;
 use zen_core::harness::message_filter::filter_excluded;
@@ -41,6 +43,7 @@ use zen_core::harness::types::{
     BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
     ShouldStopAfterTurnContext,
 };
+use zen_core::paths::{resolve_path, PathInputOptions};
 use zen_core::session::tree::{SessionContext, SessionModel};
 use zen_core::tools::factory::{ToolFactory, ToolSelection};
 
@@ -154,6 +157,7 @@ impl AgentLoopHooks for SessionHooks {
 /// # Consumers
 /// - `create_initial_runtime_from_cli` (same file, CLI glue layer)
 /// - T-AP-07-1 (print mode, Phase 2), T-AP-11-1 (interactive mode, Phase 2)
+#[allow(clippy::too_many_arguments)] // Assembly surface parameters are all session assembly inputs (model/prompt/tools/thinking/hooks/stream/storage/shell); grouping would instead reduce readability
 pub fn create_agent_session(
     model: Model,
     system_prompt: String,
@@ -162,6 +166,7 @@ pub fn create_agent_session(
     hooks: Arc<dyn AgentLoopHooks>,
     stream_fn: zen_ai::types::StreamFn,
     session_store: Arc<dyn SessionStore>,
+    shell_config: ShellConfig,
 ) -> AgentSession {
     let state = AgentState {
         system_prompt,
@@ -183,7 +188,7 @@ pub fn create_agent_session(
         excluded: excluded.clone(),
     });
     let agent = Agent::new(state, ToolExecutionMode::Parallel, session_hooks, stream_fn);
-    AgentSession::new_with_exclusions(agent, session_store, excluded)
+    AgentSession::new_with_exclusions(agent, session_store, excluded, shell_config)
 }
 
 /// Thin CLI-specific glue: parse `CliArgs` + the already-selected session manager into model/tools/system prompt, and assemble the full runtime.
@@ -230,6 +235,16 @@ pub fn create_initial_runtime_from_cli(
     // 2. Agent config directory (needed for AGENTS.md loading and default paths)
     let agent_dir = get_agent_dir()?;
 
+    // 2.5 Settings assembly (T-AP-02-3 wrap-up): load the two-tier settings, provide default_model/default_thinking_level
+    //     fill-in (priority: CLI > session restore > settings > built-in defaults) and shell override config.
+    //     A corrupt file degrades to empty + is recorded in the manager error queue (not surfaced at this assembly point; the interactive side's drain_errors handles that).
+    let settings = SettingsManager::load(&cwd, &agent_dir);
+    let merged = settings.merged();
+    // settings fill-in (priority: CLI > session restore > settings > env/default): default_provider
+    // Known provider matched → rebuild the model by provider (provider side); default_model only changes the id,
+    // default_thinking_level fills in thinking. Extracted as a free function for unit testing (T-AP-02-3 additional fields).
+    apply_settings_defaults(args, &ctx, &merged, &mut model, &mut thinking_level);
+
     // 3. Session ID (supplied by a manager chosen by the caller; the session_id of the persisted/forked session)
     let cwd_str = cwd.to_string_lossy().into_owned();
     let session_id = session_manager.session_id();
@@ -239,7 +254,16 @@ pub fn create_initial_runtime_from_cli(
     //    injection; pi's `createAgentSession` counterparts for tools/excludeTools/noTools.
     //    Default builtin group is [read, bash, edit, write]; `--tools read` yields a read-only session.
     let tool_context = ToolContext::new(cwd.clone(), Some(session_id.clone()), None);
-    let factory = ToolFactory::new(tool_context);
+    // Shell override config (T-AP-02-3-fix, Seam B): shell_path is normalized via paths (`~` expansion,
+    // relative paths absolutized against cwd; on parse failure falls back to None = system default shell), command_prefix passed through as-is.
+    let shell = ShellConfig {
+        shell_path: merged
+            .shell_path
+            .as_deref()
+            .and_then(|p| resolve_path(p, &cwd, &PathInputOptions::default()).ok()),
+        command_prefix: merged.shell_command_prefix.clone(),
+    };
+    let factory = ToolFactory::with_shell(tool_context, shell.clone());
     let selection = ToolSelection {
         tools: args.tools.clone(),
         exclude_tools: args.exclude_tools.clone(),
@@ -285,6 +309,7 @@ pub fn create_initial_runtime_from_cli(
         Arc::new(NoopHooks),
         stream_fn,
         session_store.clone(),
+        shell,
     );
     // Replay session history (aligned with pi; new session ctx.messages is empty) — call on owned session before Arc::new
     session.set_messages(ctx.messages);
@@ -301,6 +326,43 @@ pub fn create_initial_runtime_from_cli(
         services,
         SessionStartReason::Startup,
     ))
+}
+
+/// Apply the fill-in from settings' default_provider/default_model/default_thinking_level.
+///
+/// # Priority
+/// CLI (--provider/--model/--thinking) > session restore (ctx.model/ctx.thinking_level) >
+/// settings > env (ZEN_PROVIDER)/built-in defaults. Applied only when neither CLI nor session restore specifies:
+/// `default_provider` hits a known provider → rebuild the model by provider (overriding the env-selected
+/// provider), `default_model` only changes the id (consistent with existing T-AP-02-3-fix semantics),
+/// unknown provider names are ignored (fall back to the original model, no error).
+///
+/// # Consumers
+/// Called only internally by `create_initial_runtime_from_cli` (same file).
+fn apply_settings_defaults(
+    args: &CliArgs,
+    ctx: &SessionContext,
+    merged: &SettingsData,
+    model: &mut Model,
+    thinking: &mut ThinkingLevel,
+) {
+    if args.provider.is_none() && args.model.is_none() && ctx.model.is_none() {
+        if let Some(provider_name) = merged.default_provider.as_deref() {
+            if let Some(provider) = resolve_provider(provider_name) {
+                *model = Model::from_provider(provider.as_ref());
+            }
+        }
+        if let Some(default_model) = &merged.default_model {
+            model.id = default_model.clone();
+        }
+    }
+    let has_model_thinking_short = args.model.as_deref().is_some_and(|s| s.contains(':'));
+    if args.thinking.is_none() && !has_model_thinking_short && ctx.thinking_level.trim().is_empty()
+    {
+        if let Some(level) = merged.default_thinking_level {
+            *thinking = level;
+        }
+    }
 }
 
 /// When the CLI does not explicitly override provider/model/thinking, restore them from the session `SessionContext`.
@@ -414,6 +476,121 @@ mod tests {
         full.push("zen");
         full.extend_from_slice(args);
         CliArgs::try_parse_from(full).unwrap()
+    }
+
+    /// Test helper: empty session context (no restore).
+    fn empty_ctx() -> SessionContext {
+        SessionContext {
+            messages: vec![],
+            thinking_level: String::new(),
+            model: None,
+            active_tool_names: None,
+        }
+    }
+
+    // ── apply_settings_defaults (default_provider fallback, additional fields for T-AP-02-3) ─────
+
+    #[test]
+    fn settings_default_thinking_applies_on_fresh_session() {
+        // Regression (fix verified by T-AP-02-3-fix feedback): new session ctx.thinking_level is an empty string (no record),
+        // settings.defaultThinkingLevel must take effect as the fallback — previously build_session_context faked an empty session
+        // as "off", causing this gate to wrongly skip; see fix in zen-core/session/context.rs.
+        let args = parse(&[]);
+        let ctx = empty_ctx(); // thinking_level = ""
+        let merged = SettingsData {
+            default_thinking_level: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let (mut model, mut thinking) = resolve_model(&args);
+        apply_settings_defaults(&args, &ctx, &merged, &mut model, &mut thinking);
+        assert_eq!(thinking, ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn settings_default_provider_rebuilds_model_when_unset() {
+        let args = parse(&[]);
+        let ctx = empty_ctx();
+        let merged = SettingsData {
+            default_provider: Some("huoshan".into()),
+            ..Default::default()
+        };
+        let (mut model, mut thinking) = resolve_model(&args);
+        assert_eq!(model.provider, "opencode-go"); // env default
+        apply_settings_defaults(&args, &ctx, &merged, &mut model, &mut thinking);
+        // settings override the env-selected provider
+        assert_eq!(model.provider, "huoshan");
+        assert_eq!(model.api, zen_ai::provider::Api::OpenAiCompletions);
+    }
+
+    #[test]
+    fn settings_default_provider_ignored_when_cli_provider_set() {
+        let args = parse(&["--provider", "huoshan"]);
+        let ctx = empty_ctx();
+        let merged = SettingsData {
+            default_provider: Some("opencode-go".into()),
+            ..Default::default()
+        };
+        let (mut model, mut thinking) = resolve_model(&args);
+        apply_settings_defaults(&args, &ctx, &merged, &mut model, &mut thinking);
+        // CLI --provider takes precedence; settings do not override
+        assert_eq!(model.provider, "huoshan");
+    }
+
+    #[test]
+    fn settings_default_model_applies_id_within_settings_provider() {
+        let args = parse(&[]);
+        let ctx = empty_ctx();
+        let merged = SettingsData {
+            default_provider: Some("huoshan".into()),
+            default_model: Some("ark-xyz".into()),
+            ..Default::default()
+        };
+        let (mut model, mut thinking) = resolve_model(&args);
+        apply_settings_defaults(&args, &ctx, &merged, &mut model, &mut thinking);
+        assert_eq!(model.provider, "huoshan");
+        assert_eq!(model.id, "ark-xyz");
+    }
+
+    #[test]
+    fn settings_ignored_when_session_restored() {
+        let args = parse(&[]);
+        let ctx = SessionContext {
+            model: Some(SessionModel {
+                provider: "opencode-go".into(),
+                model_id: "deepseek-v4-flash".into(),
+            }),
+            thinking_level: "high".into(),
+            ..empty_ctx()
+        };
+        let merged = SettingsData {
+            default_provider: Some("huoshan".into()),
+            default_model: Some("ark-xyz".into()),
+            default_thinking_level: Some(ThinkingLevel::Low),
+            ..Default::default()
+        };
+        let (mut model, mut thinking) = resolve_model(&args);
+        apply_session_restore(&args, &ctx, &mut model, &mut thinking);
+        apply_settings_defaults(&args, &ctx, &merged, &mut model, &mut thinking);
+        // session restore takes precedence; settings do not override provider/model/thinking
+        assert_eq!(model.provider, "opencode-go");
+        assert_eq!(model.id, "deepseek-v4-flash");
+        assert_eq!(thinking, ThinkingLevel::High);
+    }
+
+    #[test]
+    fn settings_unknown_provider_name_ignored() {
+        let args = parse(&[]);
+        let ctx = empty_ctx();
+        let merged = SettingsData {
+            default_provider: Some("not-a-provider".into()),
+            default_model: Some("m".into()),
+            ..Default::default()
+        };
+        let (mut model, mut thinking) = resolve_model(&args);
+        apply_settings_defaults(&args, &ctx, &merged, &mut model, &mut thinking);
+        // unknown provider ignored (fall back to original model); default_model still only changes the id
+        assert_eq!(model.provider, "opencode-go");
+        assert_eq!(model.id, "m");
     }
 
     // ── resolve_model ────────────────────────────────────────────

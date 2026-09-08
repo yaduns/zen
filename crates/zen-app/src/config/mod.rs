@@ -1,3 +1,5 @@
+pub mod settings;
+
 use std::path::PathBuf;
 use zen_core::paths::{normalize_path, PathError, PathInputOptions};
 

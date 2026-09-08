@@ -1,3 +1,4 @@
+use crate::env::ShellConfig;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
 use crate::tools::read::ReadTool;
@@ -62,6 +63,8 @@ impl ToolName {
 /// After aligning zen: instead of globally registering shared stateless tools, create environment-bound tools per session using this factory.
 pub struct ToolFactory {
     tool_context: ToolContext,
+    /// Shell override config (shell_path/command_prefix, injected per T-AP-02-3-fix; None falls back to defaults)
+    shell: ShellConfig,
 }
 
 /// Tool selection parameters (aligned with pi's `CreateAgentSessionOptions.tools/excludeTools/noTools`,
@@ -82,9 +85,18 @@ pub struct ToolSelection {
 }
 
 impl ToolFactory {
-    /// Constructs a factory from the session environment.
+    /// Build the factory from session env (no shell override; falls back to system default shell / no prefix).
     pub fn new(tool_context: ToolContext) -> Self {
-        Self { tool_context }
+        Self::with_shell(tool_context, ShellConfig::default())
+    }
+
+    /// Build the factory from shell override config (None fields fall back to system default shell / no prefix).
+    /// Main assembly (services.rs) feeds in the merged view from settings; `new()` keeps no-shell-override semantics.
+    pub fn with_shell(tool_context: ToolContext, shell: ShellConfig) -> Self {
+        Self {
+            tool_context,
+            shell,
+        }
     }
     /// Create all built-in tools (full `ToolName` set), injecting the environment into each instance.
     /// Equivalent to `create_with_selection(&ToolSelection::default())` (default builtin groups:
@@ -169,7 +181,9 @@ impl ToolFactory {
     pub fn create(&self, name: ToolName) -> Option<Arc<dyn Tool>> {
         let tool: Arc<dyn Tool> = match name {
             ToolName::Read => Arc::new(ReadTool::new(self.tool_context.clone())),
-            ToolName::Bash => Arc::new(BashTool::new(self.tool_context.clone())),
+            ToolName::Bash => {
+                Arc::new(BashTool::new(self.tool_context.clone(), self.shell.clone()))
+            }
             ToolName::Edit => Arc::new(EditTool::new(self.tool_context.clone())),
             ToolName::Write => Arc::new(WriteTool::new(self.tool_context.clone())),
             // Grep/Find/Ls tool structs are not implemented yet, cannot be created in v1

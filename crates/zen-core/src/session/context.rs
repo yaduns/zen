@@ -138,7 +138,11 @@ pub fn session_entry_to_context_messages(
 ///
 pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContext {
     // 1. Derive state: iterate path_entries and take the most recent value
-    let mut thinking_level = String::from("off");
+    //    empty string = no entry (unset) — must not use "off" as the default: that would conflate "new session has no record" with
+    //    conflated with "explicitly recorded as off", causing services assembly's `apply_settings_defaults`
+    //    gate (`ctx.thinking_level.trim().is_empty()`) to be misjudged as "session already set" and skipped
+    //    settings.defaultThinkingLevel (T-AP-02-3-fix verification feedback fix).
+    let mut thinking_level = String::new();
     let mut model: Option<SessionModel> = None;
     let mut active_tool_names: Option<Vec<String>> = None;
 
@@ -282,7 +286,7 @@ pub fn build_context(tree: &SessionTree, leaf_id: Option<&str>) -> SessionContex
     if path.is_empty() {
         return SessionContext {
             messages: vec![],
-            thinking_level: String::from("off"),
+            thinking_level: String::new(), // Empty string = no entry (unset); see build_session_context comment
             model: None,
             active_tool_names: None,
         };
@@ -654,7 +658,8 @@ mod tests {
     fn test_build_session_context_empty() {
         let ctx = build_session_context(&[]);
         assert!(ctx.messages.is_empty());
-        assert_eq!(ctx.thinking_level, "off");
+        // Empty string = no entry (unset): settings assembly uses this to fall back to defaultThinkingLevel
+        assert_eq!(ctx.thinking_level, "");
         assert!(ctx.model.is_none());
         assert!(ctx.active_tool_names.is_none());
     }

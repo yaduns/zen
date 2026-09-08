@@ -13,18 +13,23 @@ use crate::components::custom_editor::CustomEditor;
 use crate::components::custom_entry::CustomEntryComponent;
 use crate::components::custom_message::CustomMessageComponent;
 use crate::components::footer::{FooterComponent, FooterData, UsageTotals};
+use crate::components::settings_selector::{
+    DoubleEscapeAction, SettingsCallbacks, SettingsConfig, SettingsSelectorComponent,
+};
 use crate::components::skill_invocation_message::SkillInvocationMessageComponent;
 use crate::components::status_indicator::{
     CompactionStatusReason, IdleStatus, StatusIndicator, StatusIndicatorKind,
 };
 use crate::components::tool_execution::{ToolExecutionComponent, ToolExecutionResult};
 use crate::components::user_message::UserMessageComponent;
-use crate::modes::interactive::{AppAction, InputCommand, StatusSpec, UiEvent};
+use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
+use crate::modes::interactive::{AppAction, InputCommand, SettingsApplyKind, StatusSpec, UiEvent};
 use crossterm::event::KeyEvent;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use zen_ai::types::{AssistantMessage, ContentBlock, ContentBlockList, Message, UserMessage};
 use zen_tui::components::Component;
 use zen_tui::editor::EditorAction;
@@ -37,6 +42,20 @@ use zen_tui::viewport::ScrollbackCanvas;
 /// Height cap for single-line metrics of message blocks (the measure stage enlarges the cap and takes the real height; lines exceeding it are truncated by this value for scroll computation;
 /// the vast majority of lines in the chat window are far below this value, and truncating giant lines (e.g. very long bash output) is an acceptable v1 approximation).
 const MEASURE_HEIGHT_CAP: u16 = 300;
+
+/// Initial preference injection carrier at startup (T-AP-02-3-fix): reads once from the merged settings view,
+/// supplying UI field initialization for `InteractiveUi::new`; runtime changes (Ctrl+T etc.) do not go through this struct and do not flow back to settings
+/// (Iron rule: settings is only the source of initial values; runtime authority lives in AgentState/UI state).
+/// Panel changes take effect immediately by writing back same-named fields via the shared `panel_prefs` cell.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct UiPrefs {
+    /// Initial collapsed state of assistant-row thinking (settings.hide_thinking_block, default false)
+    pub hide_thinking_block: bool,
+    /// Left padding for message output (settings.output_pad, default 0)
+    pub output_pad: u16,
+    /// Left padding for the input editor (settings.editor_padding_x, default 0)
+    pub editor_padding_x: usize,
+}
 
 /// Shared rendering/interaction state on the UI task side (`Rc<RefCell<InteractiveUi>>` shared by the on_event/on_wake/draw closures);
 /// Holds owned Theme and editor; data snapshot rendered line by line (components are constructed transiently, not stored in 'static containers;
@@ -61,9 +80,20 @@ pub struct InteractiveUi {
     status_indicator: Option<StatusIndicator>,
     folded: HashSet<usize>, // Collapsed row set (tree/branch/compaction/skill collapse; ToolsExpand flips locally)
     is_bash_mode: bool,     // Editor border indicator (! prefix)
-    hide_thinking_block: bool, // Collapsed thinking in assistant row rendering (v1 default false; T-AP-02-3 wires in the real setting)
-    output_pad: u16,           // Left padding for message output (v1 default 0; T-AP-02-3 wires in the real setting)
+    hide_thinking_block: bool, // Thinking collapse for assistant-row rendering (initial value injected from settings, T-AP-02-3-fix)
+    output_pad: u16,           // Left padding for message output (initial value injected from settings, T-AP-02-3-fix)
     route: Rc<RefCell<EditorRoute>>, // Editor callbacks → routing slot for handle_key (see EditorRoute)
+    /// Settings manager (T-AP-02-3-fix): shared on the panel persistence callback side (callable synchronously from update_global);
+    /// Injected during main-task init (None when agent_dir is unavailable, panel unusable).
+    settings: Option<Arc<SettingsManager>>,
+    /// The mounted settings panel (opened with /settings; closed with Esc).
+    panel: Option<SettingsSelectorComponent>,
+    /// Local preferences produced by panel callbacks take effect immediately (persistence already done in the callback; write back same-named fields on close/after each frame).
+    panel_prefs: Rc<RefCell<UiPrefs>>,
+    /// Runtime changes produced by panel callbacks (theme/thinking_level) → applied by the main task.
+    panel_apply: Rc<RefCell<Vec<InputCommand>>>,
+    /// Panel requests to close (top-level Esc via on_cancel).
+    panel_close: Rc<RefCell<bool>>,
 }
 
 /// Shared routing slot between editor callbacks and handle_key.
@@ -78,17 +108,19 @@ struct EditorRoute {
     bash_mode: bool,
 }
 
-/// v1 editor left padding (matching pi `getEditorPaddingX` default **0** — settings-manager.ts `?? 0`;
-/// after T-AP-02-3 settings manager lands, it will be injected by InteractiveMode via SettingsConfig; default remains 0).
-const DEFAULT_EDITOR_PADDING_X: usize = 0;
-
 impl InteractiveUi {
     /// Build the UI state from the theme, app keybinding table, and cwd: create `CustomEditor` (with on_action/on_escape/
     /// on_exit/on_submit/on_change callbacks), initial footer baseline.
-    pub(crate) fn new(theme: Theme, kb: KeybindingsManager<AppAction>, cwd: String) -> Self {
+    pub(crate) fn new(
+        theme: Theme,
+        kb: KeybindingsManager<AppAction>,
+        cwd: String,
+        prefs: UiPrefs,
+        settings: Option<Arc<SettingsManager>>,
+    ) -> Self {
         // 1. Editor: holds a copy of the app keybinding table (no user overrides in v1, both tables identical; after T-AP-06-2 lands, via
-        //    `kb.clone()` override table injected synchronously) + v1 default left padding.
-        let mut editor = CustomEditor::new(DEFAULT_EDITOR_PADDING_X, kb.clone());
+        //    `kb.clone()` synced override table) + left padding injected from settings (default 0).
+        let mut editor = CustomEditor::new(prefs.editor_padding_x, kb.clone());
 
         // 2. Shared routing slot (implementation of constraint 1).
         let route = Rc::new(RefCell::new(EditorRoute::default()));
@@ -169,6 +201,7 @@ impl InteractiveUi {
             pwd: cwd,
             git_branch: None,
             session_name: None,
+            model_provider: String::new(), // Unknown provider during placeholder phase: render falls back to the bare model name
             model_id: String::new(),
             thinking_level: None,
             usage: UsageTotals::default(),
@@ -192,9 +225,14 @@ impl InteractiveUi {
             status_indicator: None,
             folded: HashSet::new(),
             is_bash_mode: false,
-            hide_thinking_block: false,
-            output_pad: 0,
+            hide_thinking_block: prefs.hide_thinking_block,
+            output_pad: prefs.output_pad,
             route,
+            settings,
+            panel: None,
+            panel_prefs: Rc::new(RefCell::new(prefs)),
+            panel_apply: Rc::new(RefCell::new(Vec::new())),
+            panel_close: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -207,6 +245,11 @@ impl InteractiveUi {
     /// - `ToolsExpand`: invert the entire collapse set (tool/bash/summary row expand toggle, pi `toggleToolOutputExpansion`);
     /// - `Escape` in bash mode (unlike non-bash mode): exit bash mode (clear editor, pi onEscape branch 3).
     pub(crate) fn handle_key(&mut self, key: &KeyEvent) -> Option<InputCommand> {
+        // 0. Settings panel takes priority when open: panel consumes all keys; editor/keymap table do not participate;
+        //    Changes go through panel callbacks (persistence writes directly to disk) → local preferences take effect immediately / runtime changes forwarded to the main task.
+        if self.panel.is_some() {
+            return self.handle_panel_key(key);
+        }
         // 1. Editor first: internal app keybinding match -> trigger registered callbacks (commands write to route; pure editing actions have no command)
         let handled = self.editor.handle_key(key);
         // 2. Bash indicator sync: on_change already wrote route.bash_mode -> persist to self + border color (false→ThinkingOff / true→BashMode)
@@ -233,6 +276,12 @@ impl InteractiveUi {
                 InputCommand::Action(AppAction::ToolsExpand) => {
                     self.toggle_rows_expanded();
                     return None; // Local consumption (expanded state is pure UI, no main task needed)
+                }
+                InputCommand::Action(AppAction::ThinkingToggle) => {
+                    // Ctrl+T toggles thinking collapse at runtime (iron rule: only change UI state, do not flow back to settings;
+                    // initial value injected from settings, T-AP-02-3-fix).
+                    self.hide_thinking_block = !self.hide_thinking_block;
+                    return None;
                 }
                 InputCommand::Escape if self.is_bash_mode => {
                     // Bash mode exit edit state: clear the editor (pi onEscape: isBashMode → setText(""))
@@ -277,6 +326,183 @@ impl InteractiveUi {
     pub(crate) fn handle_paste(&mut self, text: &str) {
         self.editor.handle_paste(text);
         self.sync_bash_mode();
+    }
+
+    // ── Settings panel (T-AP-02-3-fix) ─────────────────────────────────────
+
+    /// Event routing when the panel is open: panel consumes all keys; top-level Esc cancels → panel unmounted (edit state restored).
+    /// Change callbacks: persisted fields go through update_global (synchronous write-to-disk) directly, local preferences via `panel_prefs`
+    /// take effect immediately; runtime changes (theme/thinking) are sent to the main task via `panel_apply`.
+    fn handle_panel_key(&mut self, key: &KeyEvent) -> Option<InputCommand> {
+        // The panel is always present (is_some already checked at handle_key entry); as_mut failure is only a defensive branch
+        let consumed = self.panel.as_mut()?.handle_key(key);
+        // Local preferences take effect immediately (persistence already done inside the callback; here we write back render fields).
+        let prefs = self.panel_prefs.borrow().clone();
+        self.hide_thinking_block = prefs.hide_thinking_block;
+        self.output_pad = prefs.output_pad;
+        self.editor.set_padding_x(prefs.editor_padding_x);
+        // Close request (on_cancel top-level Esc) -> unmount panel, editor resumes.
+        if *self.panel_close.borrow_mut() {
+            *self.panel_close.borrow_mut() = false;
+            self.panel = None;
+        }
+        // Runtime change -> main task (at most one per keypress).
+        let apply_cmd = self.panel_apply.borrow_mut().pop();
+        if let Some(cmd) = apply_cmd {
+            return Some(cmd);
+        }
+        if consumed {
+            return None;
+        }
+        // Keys not consumed by the panel: keep the panel open, swallow them (editor does not participate).
+        None
+    }
+
+    /// Mount settings panel: build the component from the snapshot sent by the main task + callbacks on this task's side (callbacks capture shared cells and
+    /// settings manager, not &mut self, to avoid closure borrow issues). Ignored when settings are unavailable (agent_dir missing).
+    fn open_settings_panel(&mut self, config: SettingsConfig) {
+        if self.settings.is_none() {
+            return;
+        }
+        let callbacks = self.settings_callbacks();
+        let component = SettingsSelectorComponent::new(
+            config,
+            callbacks,
+            &self.theme,
+            self.theme.settings_list_theme(),
+        );
+        self.panel = Some(component);
+    }
+
+    /// Build panel callback set (T-AP-02-3-fix): persisted -> `update_global` synchronous write-to-disk (silent no-op when settings are unavailable);
+    /// local immediate-effect -> `panel_prefs`; runtime -> `panel_apply` (theme/thinking);
+    /// steering/follow_up/skill commands/tree filtering are v1 no-ops (no runtime sink, see fix doc).
+    fn settings_callbacks(&self) -> SettingsCallbacks {
+        // Each closure captures its own Arc clone (Option<Arc> is not Copy; a move closure cannot share outer variables).
+        let settings_handle = self.settings.clone();
+        let prefs = Rc::clone(&self.panel_prefs);
+        let apply = Rc::clone(&self.panel_apply);
+        let close = Rc::clone(&self.panel_close);
+        SettingsCallbacks {
+            on_auto_compact_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| {
+                            s.compaction.get_or_insert_default().enabled = Some(v);
+                        });
+                    }
+                })
+            },
+            on_show_hardware_cursor_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.show_hardware_cursor = Some(v));
+                    }
+                })
+            },
+            on_editor_padding_x_change: {
+                let settings = settings_handle.clone();
+                let prefs = Rc::clone(&prefs);
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.editor_padding_x = Some(v as u32));
+                    }
+                    prefs.borrow_mut().editor_padding_x = v;
+                })
+            },
+            on_output_pad_change: {
+                let settings = settings_handle.clone();
+                let prefs = Rc::clone(&prefs);
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.output_pad = Some(v as u8));
+                    }
+                    prefs.borrow_mut().output_pad = v;
+                })
+            },
+            on_autocomplete_max_visible_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.autocomplete_max_visible = Some(v as u32));
+                    }
+                })
+            },
+            on_clear_on_shrink_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.clear_on_shrink = Some(v));
+                    }
+                })
+            },
+            on_hide_thinking_block_change: {
+                let settings = settings_handle.clone();
+                let prefs = Rc::clone(&prefs);
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.hide_thinking_block = Some(v));
+                    }
+                    prefs.borrow_mut().hide_thinking_block = v;
+                })
+            },
+            on_show_cache_miss_notices_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.show_cache_miss_notices = Some(v));
+                    }
+                })
+            },
+            on_quiet_startup_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        s.update_global(|s| s.quiet_startup = Some(v));
+                    }
+                })
+            },
+            on_double_escape_action_change: {
+                let settings = settings_handle.clone();
+                Box::new(move |v| {
+                    if let Some(s) = &settings {
+                        // Panel UI type -> persisted type conversion (both types share name and semantics, T-AP-02-3-fix)
+                        let persisted = match v {
+                            DoubleEscapeAction::Fork => PersistedDoubleEscape::Fork,
+                            DoubleEscapeAction::Tree => PersistedDoubleEscape::Tree,
+                            DoubleEscapeAction::None => PersistedDoubleEscape::None,
+                        };
+                        s.update_global(|s| s.double_escape_action = Some(persisted));
+                    }
+                })
+            },
+            on_thinking_level_change: {
+                let apply = Rc::clone(&apply);
+                Box::new(move |level| {
+                    apply.borrow_mut().push(InputCommand::SettingsApply(
+                        SettingsApplyKind::Thinking(level),
+                    ));
+                })
+            },
+            on_theme_change: {
+                let apply = Rc::clone(&apply);
+                Box::new(move |name| {
+                    apply
+                        .borrow_mut()
+                        .push(InputCommand::SettingsApply(SettingsApplyKind::Theme(name)));
+                })
+            },
+            // v1 has no runtime sink (steering/follow-up fate belongs to v2, skill commands always on, /tree dropped)
+            on_steering_mode_change: Box::new(|_| {}),
+            on_follow_up_mode_change: Box::new(|_| {}),
+            on_enable_skill_commands_change: Box::new(|_| {}),
+            on_tree_filter_mode_change: Box::new(|_| {}),
+            on_cancel: Box::new(move || {
+                *close.borrow_mut() = true;
+            }),
+        }
     }
 
     /// Localization: ToolsExpand flips the expanded state (`folded` set) of all tool/bash/summary lines at once.
@@ -377,6 +603,7 @@ impl InteractiveUi {
                 self.editor.set_text(&text);
                 self.sync_bash_mode();
             }
+            UiEvent::OpenSettings(config) => self.open_settings_panel(config),
         }
     }
 
@@ -703,6 +930,20 @@ impl InteractiveUi {
     pub(crate) fn render_scrollback(&mut self, canvas: &mut ScrollbackCanvas) {
         let width = canvas.width();
         if width == 0 {
+            return;
+        }
+        // Settings panel open: full-screen overlay render (scrollback line stream only the output panel; message history remains after closing).
+        // Panel component drawn into a temp buffer -> extract styled segments by line and push stream (same bridging path as the message area).
+        if let Some(panel) = self.panel.as_mut() {
+            let height = canvas.height();
+            let mut panel_buf = ScreenBuffer::new(width, height);
+            panel.render(&mut panel_buf, 0, 0, width, height);
+            for r in 0..height {
+                let segs = panel_buf.line_segments(r);
+                if !segs.is_empty() {
+                    canvas.push_line(segs);
+                }
+            }
             return;
         }
         let theme = &self.theme;
@@ -1099,7 +1340,9 @@ mod tests {
     use super::*;
     use crate::keybindings::app_default_bindings;
     use crossterm::event::{KeyCode, KeyModifiers};
-    use zen_ai::types::{StopReason, TextContent, ThinkingContent, ToolResultMessage, Usage};
+    use zen_ai::types::{
+        StopReason, TextContent, ThinkingContent, ThinkingLevel, ToolResultMessage, Usage,
+    };
     use zen_tui::theme::Theme;
 
     fn theme() -> &'static Theme {
@@ -1152,7 +1395,111 @@ mod tests {
     }
 
     fn ui() -> InteractiveUi {
-        InteractiveUi::new(theme().clone(), kb(), "/work".into())
+        InteractiveUi::new(
+            theme().clone(),
+            kb(),
+            "/work".into(),
+            UiPrefs::default(),
+            None,
+        )
+    }
+
+    fn ui_with_settings() -> (tempfile::TempDir, InteractiveUi) {
+        let guard = tempfile::tempdir().unwrap();
+        let manager =
+            SettingsManager::load(&guard.path().join("project"), &guard.path().join("agent"));
+        let u = InteractiveUi::new(
+            theme().clone(),
+            kb(),
+            "/work".into(),
+            UiPrefs::default(),
+            Some(Arc::new(manager)),
+        );
+        (guard, u)
+    }
+
+    fn settings_config() -> SettingsConfig {
+        SettingsConfig {
+            auto_compact: true,
+            steering_mode: crate::components::settings_selector::DeliveryMode::OneAtATime,
+            follow_up_mode: crate::components::settings_selector::DeliveryMode::All,
+            enable_skill_commands: true,
+            show_hardware_cursor: false,
+            editor_padding_x: 0,
+            output_pad: 1,
+            autocomplete_max_visible: 10,
+            clear_on_shrink: false,
+            hide_thinking_block: false,
+            show_cache_miss_notices: true,
+            quiet_startup: false,
+            double_escape_action: DoubleEscapeAction::Fork,
+            tree_filter_mode: crate::components::tree_selector::FilterMode::Default,
+            thinking_level: ThinkingLevel::Off,
+            available_thinking_levels: vec![ThinkingLevel::Off, ThinkingLevel::Medium],
+            current_theme: "dark".into(),
+            available_themes: vec!["dark".into(), "light".into()],
+        }
+    }
+
+    // ── Settings panel (T-AP-02-3-fix) ───────────────────────────────────
+
+    #[test]
+    fn test_panel_mounts_with_settings_and_esc_closes() {
+        // settings unavailable (None) -> mount request ignored (degraded, no panic)
+        let mut u = ui();
+        u.apply(UiEvent::OpenSettings(settings_config()));
+        assert!(u.panel.is_none());
+
+        // settings available -> mount; top-level Esc (on_cancel) -> unmount, editor resumes
+        let (_guard, mut u) = ui_with_settings();
+        u.apply(UiEvent::OpenSettings(settings_config()));
+        assert!(u.panel.is_some());
+        assert!(u.handle_key(&press(KeyCode::Esc)).is_none());
+        assert!(u.panel.is_none());
+    }
+
+    #[test]
+    fn test_panel_open_routes_keys_away_from_editor() {
+        let (_guard, mut u) = ui_with_settings();
+        u.apply(UiEvent::OpenSettings(settings_config()));
+        assert!(u.panel.is_some());
+        // When the panel is open, printable character keys are consumed by the panel; they do not reach the editor or trigger a submit
+        let editor_text_before = u.editor.text();
+        assert!(u.handle_key(&char_key('a')).is_none());
+        assert_eq!(u.editor.text(), editor_text_before);
+    }
+
+    #[test]
+    fn test_thinking_toggle_flips_local_state_without_route_command() {
+        let mut u = ui();
+        assert!(!u.hide_thinking_block);
+        // Triggered via the editor on_action registration path: push the route first, then drive handle_key with a neutral key to pop it
+        u.route
+            .borrow_mut()
+            .commands
+            .push(InputCommand::Action(AppAction::ThinkingToggle));
+        assert!(u.handle_key(&press(KeyCode::Home)).is_none());
+        assert!(u.hide_thinking_block);
+    }
+
+    #[test]
+    fn test_panel_change_applies_prefs_and_persists() {
+        let (_guard, mut u) = ui_with_settings();
+        u.apply(UiEvent::OpenSettings(settings_config()));
+        assert!(u.panel.is_some());
+        // Driven directly via the panel callback: output_pad change → takes effect locally immediately (persistence to disk is done inside the callback)
+        {
+            let mut callbacks = u.settings_callbacks();
+            (callbacks.on_output_pad_change)(2);
+            (callbacks.on_hide_thinking_block_change)(true);
+        }
+        let prefs = u.panel_prefs.borrow().clone();
+        assert_eq!(prefs.output_pad, 2);
+        assert!(prefs.hide_thinking_block);
+        // handle_panel_key path writes back the render fields
+        assert!(u.handle_key(&press(KeyCode::Home)).is_none());
+        assert_eq!(u.output_pad, 2);
+        assert!(u.hide_thinking_block);
     }
 
     #[test]
@@ -1357,6 +1704,7 @@ mod tests {
             pwd: "/work".into(),
             git_branch: None,
             session_name: None,
+            model_provider: "opencode-go".into(),
             model_id: "m".into(),
             thinking_level: None,
             usage: UsageTotals::default(),

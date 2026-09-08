@@ -20,6 +20,7 @@ use zen_ai::types::{ContentBlock, Message, Model, ThinkingLevel};
 use zen_app::session::agent_session::SessionStore;
 use zen_app::session::services::{create_agent_session, NoopHooks};
 use zen_app::session::session_manager::SessionManager;
+use zen_core::env::ShellConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NoopHooks),
         stream_fn,
         store,
+        ShellConfig::default(),
     );
 
     // 3. Real LLM call: send one round of prompt, print the assistant's text reply

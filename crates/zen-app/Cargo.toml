@@ -31,6 +31,8 @@ notify = { workspace = true }
 similar = { workspace = true }
 # Session search regex mode (T-AP-11-2 session-selector-search)
 regex = { workspace = true }
+# settings.json atomic write (temp file + rename, T-AP-02-3)
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }

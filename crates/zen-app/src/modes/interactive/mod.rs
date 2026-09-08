@@ -13,7 +13,11 @@ pub(crate) use crate::keybindings::{app_default_bindings, AppAction};
 use crate::components::footer::{add_usage_to_totals, FooterData, UsageTotals};
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::tree_selector::FilterMode;
-use crate::modes::interactive::ui::InteractiveUi;
+use crate::config;
+use crate::config::settings::{
+    DoubleEscapeAction as PersistedDoubleEscape, SettingsData, SettingsManager,
+};
+use crate::modes::interactive::ui::{InteractiveUi, UiPrefs};
 use crate::modes::print_mode::stop_error_message;
 use crate::session::agent_session::{AgentSession, AgentSessionError};
 use crate::session::runtime::AgentSessionRuntime;
@@ -22,6 +26,7 @@ use crate::theme::{ControllerError, ThemeController};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -120,6 +125,9 @@ pub(crate) enum UiEvent {
     #[allow(dead_code)] // v1 has no file watcher wired up (sent via ThemeController on_change after T-AP-02-3 lands)
     /// Theme hot reload: replace the owned Theme wholesale and rebuild border colors (v1 seam; apply is implemented).
     ThemeChanged(Theme),
+    /// Open the settings panel (T-AP-02-3-fix): payload is the panel snapshot built by the main task
+    /// (persisted fields = merged settings view, runtime fields = current session/theme state).
+    OpenSettings(SettingsConfig),
     /// Terminal title (session name + cwd).
     TerminalTitle(String),
     /// Editor content restore (follow-up queue return / batch restore / clear).
@@ -166,10 +174,22 @@ pub(crate) enum InputCommand {
     /// Esc: context-sensitive handling requires session state (abort stream / abort bash / exit bash mode /
     /// double-Esc selector), so it is decided by the main task rather than the UI side.
     Escape,
+    /// Send runtime settings panel changes (theme/thinking_level) to the main task for application (T-AP-02-3-fix).
+    SettingsApply(SettingsApplyKind),
     /// Ctrl+C: clear editor; double press (500ms window) quits.
     CtrlC,
     /// Ctrl+D: exit when the editor is empty.
     CtrlD,
+}
+
+/// Runtime settings panel change categories (T-AP-02-3-fix): persistence is handled by the UI-side callback,
+/// this is the main task's application side (theme/thinking level have runtime landing points; steering/follow-up etc. are v1 no-ops).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SettingsApplyKind {
+    /// Theme name change: `ThemeController.apply_from_settings` + persist settings.theme.
+    Theme(String),
+    /// Thinking level change: `session.set_thinking_level` (AgentState is authoritative) + persist settings.default_thinking_level.
+    Thinking(ThinkingLevel),
 }
 
 /// Interactive-mode coordinator errors — the aggregation point for all `Result`s on the main-task side.
@@ -228,6 +248,11 @@ pub struct InteractiveMode {
     subscription: Option<Box<dyn FnOnce() + Send>>,
     /// T-AP-11-2 type: v1 uses default values; real settings land after T-AP-02-3.
     settings: SettingsConfig,
+    /// Settings manager (T-AP-02-3-fix): init injects UI preferences, drain_errors display, panel persistence;
+    /// Returns None when agent_dir is unavailable (degraded; startup is not blocked).
+    settings_manager: Option<Arc<SettingsManager>>,
+    /// Empty-editor double-Esc action (settings initial value; None = unset, falls back to pi default tree semantics).
+    double_escape_action: Option<PersistedDoubleEscape>,
     /// Idempotency guard (pre-check in init/run).
     is_initialized: bool,
     /// Idempotency guard (pre-check in shutdown/stop).
@@ -250,11 +275,19 @@ pub struct InteractiveMode {
 }
 
 impl InteractiveMode {
-    /// Constructs the coordinator from the assembled runtime and startup config.
+    /// Construct the coordinator from the assembled runtime and startup config (settings_manager is the settings manager,
+    /// pass None to degrade when agent_dir is unavailable).
     /// Only field initialization and channel creation; no IO/UI actions (idempotency guaranteed by init/run).
-    pub fn new(runtime: AgentSessionRuntime, options: InteractiveModeOptions) -> Self {
+    pub fn new(
+        runtime: AgentSessionRuntime,
+        options: InteractiveModeOptions,
+        settings_manager: Option<Arc<SettingsManager>>,
+    ) -> Self {
         let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let double_escape_action = settings_manager
+            .as_ref()
+            .and_then(|s| s.merged().double_escape_action);
         InteractiveMode {
             runtime,
             options,
@@ -267,6 +300,8 @@ impl InteractiveMode {
             theme_controller: None,
             subscription: None,
             settings: default_settings(),
+            settings_manager,
+            double_escape_action,
             is_initialized: false,
             is_shutting_down: false,
             last_escape_at: None,
@@ -283,8 +318,10 @@ impl InteractiveMode {
     /// Idempotent (guarded by `is_initialized`); repeated calls are no-ops.
     ///
     /// # Behavior
-    /// 1. `ThemeController::new` (T-AP-11-3) gets the current theme; v1 does not enable file watching
-    ///    (themes_dir=None, hot-reload seam = `UiEvent::ThemeChanged`, wired in when T-AP-02-3 lands)
+    /// 1. `ThemeController::new` (T-AP-11-3) picks the current theme: settings.theme preference
+    ///    (T-AP-02-3 closes its settings_theme parameter slot) takes priority; when no preference or settings are unavailable, pick
+    ///    a built-in theme based on terminal background; v1 does not enable file watching (themes_dir=None; custom theme dir
+    ///    assembly is owned by T-AP-11-1's full settings wiring)
     /// 2. Construct `KeybindingsManager::new(app_default_bindings())` (v1 default table only)
     /// 3. Spawn UI task: `TuiLoop` + `Rc<RefCell<InteractiveUi>>`, running a four-way loop—
     ///    - on_event (!Send): key event → handle_key → `InputCommand` sent to the main task via input_tx
@@ -298,10 +335,39 @@ impl InteractiveMode {
             return Ok(());
         }
 
-        // 1. Theme controller: v1 has no custom theme directory or settings (wired after T-AP-02-3 lands); picks a builtin theme based on terminal background.
-        let controller = ThemeController::new(None, None, None)?;
+        // 1. Theme controller: settings.theme preference (T-AP-02-3 closes the T-AP-11-3 parameter slot) takes priority; otherwise pick a built-in theme based on terminal background.
+        //    Unknown theme names fall back to the built-in dark in ThemeController, no failure; path forms containing `/`
+        //    Ignore logic belongs to T-AP-02-4 effective layer.
+        let theme_pref = self
+            .settings_manager
+            .as_ref()
+            .and_then(|s| s.merged().theme);
+        let controller = ThemeController::new(theme_pref.as_deref(), None, None)?;
         let theme = controller.current().clone();
         self.theme_controller = Some(controller);
+
+        // 1.5 Settings assembly (T-AP-02-3-fix): drain_errors warnings (bad files are not silent) +
+        //    refresh self.settings from persisted fields (footer/panel data sources) + inject initial UI preferences.
+        //    Collect all values first (settings borrow scope), then take a mutable borrow of self to apply, avoiding borrow conflicts.
+        let mut settings_warnings: Vec<String> = Vec::new();
+        let mut refreshed_config: Option<SettingsConfig> = None;
+        let mut ui_prefs = UiPrefs::default();
+        if let Some(settings) = &self.settings_manager {
+            settings_warnings.extend(settings.drain_errors().into_iter().map(|e| e.to_string()));
+            let merged = settings.merged();
+            refreshed_config = Some(settings_data_to_config(&merged));
+            ui_prefs = UiPrefs {
+                hide_thinking_block: merged.hide_thinking_block.unwrap_or(false),
+                output_pad: merged.output_pad.map(u16::from).unwrap_or(0),
+                editor_padding_x: merged.editor_padding_x.unwrap_or(0) as usize,
+            };
+        }
+        for warning in settings_warnings {
+            self.show_warning(format!("Settings: {warning}"));
+        }
+        if let Some(config) = refreshed_config {
+            self.settings = config;
+        }
 
         // 2. Keybinding table (v1 default table only).
         let kb = KeybindingsManager::new(app_default_bindings(), HashMap::new());
@@ -318,7 +384,13 @@ impl InteractiveMode {
             .take()
             .expect("init idempotency guard ensures the input sender created by new() is handed off only once");
         let cwd = self.runtime.session.cwd().to_string();
-        let ui_cell = Rc::new(RefCell::new(InteractiveUi::new(theme, kb, cwd)));
+        let ui_cell = Rc::new(RefCell::new(InteractiveUi::new(
+            theme,
+            kb,
+            cwd,
+            ui_prefs,
+            self.settings_manager.clone(),
+        )));
         // Suspend event queue: on_wake (Send closure) enqueues, draw (!Send closure) dequeues — accessed sequentially within the UI task.
         let pending: Arc<Mutex<VecDeque<UiEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let pending_wake = Arc::clone(&pending);
@@ -515,6 +587,7 @@ impl InteractiveMode {
                         }
                         Some(InputCommand::Action(action)) => self.handle_app_action(action),
                         Some(InputCommand::Escape) => self.handle_escape(),
+                        Some(InputCommand::SettingsApply(kind)) => self.apply_settings_change(kind),
                         Some(InputCommand::CtrlC) => self.handle_ctrl_c(),
                         Some(InputCommand::CtrlD) => {
                             if self.runtime.session.is_run() || self.run_task.is_some() {
@@ -723,7 +796,12 @@ impl InteractiveMode {
             self.runtime.session.abort();
             self.show_status("Aborting...");
         } else if is_double {
-            self.show_warning("Double-Esc (tree/fork) is not available in v1");
+            // Double Esc: read settings gate (T-AP-02-3-fix). v1 has no session tree/fork UI;
+            // tree/fork target action existence falls under T-AP-08-5; settings none (unset) defaults to tree per pi.
+            match self.double_escape_action {
+                Some(PersistedDoubleEscape::None) => {}
+                _ => self.show_warning("Double-Esc (tree/fork) is not available in v1"),
+            }
         }
     }
 
@@ -802,7 +880,7 @@ impl InteractiveMode {
     /// Inline slash commands (v1 subset: /settings /compact /new /quit; integration seam for the T-AP-03-2 command table).
     async fn handle_inline_command(&mut self, cmd: &str) {
         match cmd.trim() {
-            "/settings" => self.show_warning("Settings manager pending (T-AP-02-3)"),
+            "/settings" => self.open_settings_panel(),
             "/compact" => self.show_warning("Context compaction pending"),
             "/new" => self.show_warning("New session pending (T-AP-08-5)"),
             "/quit" => self.exit_requested = true,
@@ -884,6 +962,54 @@ impl InteractiveMode {
             .ui_event_tx
             .send(UiEvent::Status(StatusSpec::Warning(message.into())));
     }
+
+    /// Open the settings panel (T-AP-02-3-fix): /settings command triggers in the interactive idle state —
+    /// Build a panel snapshot (persisted fields = merged settings view, runtime fields = current session/theme state)
+    /// delivered via UiEvent to the UI task for mounting; keep the hint when settings are unavailable.
+    fn open_settings_panel(&mut self) {
+        if self.settings_manager.is_none() {
+            self.show_warning("Settings unavailable (agent dir not found)");
+            return;
+        }
+        let config = self.build_settings_config();
+        let _ = self.ui_event_tx.send(UiEvent::OpenSettings(config));
+    }
+
+    /// Build the settings panel snapshot: based on self.settings refreshed by init (persisted fields),
+    /// overwrite runtime fields with current session/theme state (thinking level, current theme).
+    fn build_settings_config(&self) -> SettingsConfig {
+        let mut config = self.settings.clone();
+        config.thinking_level = self.runtime.session.thinking_level();
+        config.current_theme = self
+            .theme_controller
+            .as_ref()
+            .map(|c| c.current().name.clone())
+            .unwrap_or_else(|| config.current_theme.clone());
+        config
+    }
+
+    /// Apply panel runtime changes (T-AP-02-3-fix): theme → ThemeController + theme sent back to UI;
+    /// thinking → session.set_thinking_level (AgentState is authoritative). Persistence is already handled by the UI-side callback.
+    fn apply_settings_change(&mut self, kind: SettingsApplyKind) {
+        match kind {
+            SettingsApplyKind::Theme(name) => {
+                if let Some(controller) = self.theme_controller.as_mut() {
+                    if controller.apply_from_settings(Some(&name)).is_ok() {
+                        let _ = self
+                            .ui_event_tx
+                            .send(UiEvent::ThemeChanged(controller.current().clone()));
+                    }
+                }
+            }
+            SettingsApplyKind::Thinking(level) => {
+                self.runtime.session.set_thinking_level(level);
+                // Footer refresh (aligned with cycle_thinking: push_footer immediately after set_thinking_level,
+                // otherwise the footer keeps the old snapshot until the next Footer event — see T-AP-02-3-fix implementation notes)
+                self.push_footer();
+                self.show_status(format!("Thinking: {level}"));
+            }
+        }
+    }
 }
 
 /// Interactive mode entry: invoked by main.rs when starting with `zen -i` — turns the already-assembled runtime and startup arguments
@@ -907,7 +1033,13 @@ pub async fn run_interactive_mode(
         messages,
         verbose: false,
     };
-    let mut mode = InteractiveMode::new(runtime, options);
+    // Settings manager (T-AP-02-3-fix): degrade to None when agent_dir is unavailable (startup is not blocked,
+    // consistent with the bad-file degradation semantics; file-level errors are shown via init drain_errors).
+    let cwd = runtime.session.cwd().to_string();
+    let settings_manager = config::get_agent_dir()
+        .ok()
+        .map(|agent_dir| Arc::new(SettingsManager::load(Path::new(&cwd), &agent_dir)));
+    let mut mode = InteractiveMode::new(runtime, options, settings_manager);
     mode.run().await?;
     mode.stop()?;
     Ok(mode.signal_exit_code.load(Ordering::Relaxed))
@@ -947,6 +1079,41 @@ fn classify_submit(text: &str) -> SubmitKind {
 }
 
 /// v1 default settings (aligned with pi: editorPaddingX defaults to 0; replace with real loading once T-AP-02-3 lands).
+/// Refresh persisted fields of `SettingsConfig` from settings merged view (T-AP-02-3-fix data source wiring):
+/// Set fields take settings values; unset fields keep the v1 baseline of `default_settings()`; runtime fields
+/// (steering/follow_up/thinking/theme, etc.) are supplemented by `build_settings_config` when the panel opens.
+fn settings_data_to_config(data: &SettingsData) -> SettingsConfig {
+    let mut config = default_settings();
+    config.auto_compact = data
+        .compaction
+        .as_ref()
+        .and_then(|c| c.enabled)
+        .unwrap_or(config.auto_compact);
+    config.show_hardware_cursor = data
+        .show_hardware_cursor
+        .unwrap_or(config.show_hardware_cursor);
+    config.editor_padding_x = data.editor_padding_x.unwrap_or(0) as usize;
+    config.output_pad = data.output_pad.map(u16::from).unwrap_or(0);
+    config.autocomplete_max_visible = data.autocomplete_max_visible.unwrap_or(0) as usize;
+    config.clear_on_shrink = data.clear_on_shrink.unwrap_or(config.clear_on_shrink);
+    config.hide_thinking_block = data
+        .hide_thinking_block
+        .unwrap_or(config.hide_thinking_block);
+    config.show_cache_miss_notices = data
+        .show_cache_miss_notices
+        .unwrap_or(config.show_cache_miss_notices);
+    config.quiet_startup = data.quiet_startup.unwrap_or(config.quiet_startup);
+    config.double_escape_action = data
+        .double_escape_action
+        .map(|a| match a {
+            PersistedDoubleEscape::Fork => DoubleEscapeAction::Fork,
+            PersistedDoubleEscape::Tree => DoubleEscapeAction::Tree,
+            PersistedDoubleEscape::None => DoubleEscapeAction::None,
+        })
+        .unwrap_or(config.double_escape_action);
+    config
+}
+
 fn default_settings() -> SettingsConfig {
     SettingsConfig {
         auto_compact: false,
@@ -965,11 +1132,12 @@ fn default_settings() -> SettingsConfig {
         tree_filter_mode: FilterMode::Default,
         // thinking defaults to Off repo-wide (aligned with pi session default; settings only holds the panel's current value,
         // runtime authority is in AgentState—see T-AP-02-3 notes).
-        thinking_level: ThinkingLevel::Off,
+        thinking_level: ThinkingLevel::High,
         available_thinking_levels: vec![
             ThinkingLevel::Off,
             ThinkingLevel::Low,
             ThinkingLevel::Medium,
+            ThinkingLevel::High,
         ],
         current_theme: "dark".into(),
         available_themes: vec!["dark".into(), "light".into()],
@@ -984,6 +1152,8 @@ struct FooterCtx {
     pwd: String,
     /// Model id.
     model_id: String,
+    /// Provider name (footer `(provider) model` display, aligned with pi; added in T-AP-02-3-fix).
+    model_provider: String,
     /// Thinking level.
     thinking_level: ThinkingLevel,
     /// Context window token count.
@@ -998,6 +1168,7 @@ impl FooterCtx {
         FooterCtx {
             pwd: session.cwd().to_string(),
             model_id: session.model().id.clone(),
+            model_provider: session.model().provider.clone(),
             thinking_level: session.thinking_level(),
             context_window: session.model().context_window,
             auto_compact: settings.auto_compact,
@@ -1025,6 +1196,7 @@ impl FooterCtx {
             pwd: self.pwd.clone(),
             git_branch: None,   // After T-AP-06-3 lands, hook up git branch
             session_name: None, // Hook up session name after T-AP-08-5 lands
+            model_provider: self.model_provider.clone(),
             model_id: self.model_id.clone(),
             thinking_level: Some(self.thinking_level),
             usage: *usage,
@@ -1292,6 +1464,25 @@ mod tests {
     }
 
     #[test]
+    fn test_settings_data_to_config_overlays_persisted_fields() {
+        let data = SettingsData {
+            hide_thinking_block: Some(true),
+            output_pad: Some(1),
+            editor_padding_x: Some(2),
+            double_escape_action: Some(PersistedDoubleEscape::None),
+            ..Default::default()
+        };
+        let config = settings_data_to_config(&data);
+        assert!(config.hide_thinking_block);
+        assert_eq!(config.output_pad, 1);
+        assert_eq!(config.editor_padding_x, 2);
+        assert_eq!(config.double_escape_action, DoubleEscapeAction::None);
+        // Unset fields keep v1 baseline (do not regress to defaults; baseline values change with default_settings(), so assert baseline consistency here rather than hardcoding)
+        assert_eq!(config.thinking_level, default_settings().thinking_level);
+        assert!(config.enable_skill_commands);
+    }
+
+    #[test]
     fn test_footer_ctx_computes_percent_and_cache_hit() {
         let usage = UsageTotals {
             input: 1000, // Cumulative values (for footer statistics display; not used for percentages)
@@ -1304,6 +1495,7 @@ mod tests {
         let ctx = FooterCtx {
             pwd: "/work".into(),
             model_id: "m".into(),
+            model_provider: "opencode-go".into(),
             thinking_level: ThinkingLevel::Off,
             context_window: 2000,
             auto_compact: true,
@@ -1360,6 +1552,7 @@ mod tests {
         FooterCtx {
             pwd: "/work".into(),
             model_id: "m".into(),
+            model_provider: "opencode-go".into(),
             thinking_level: ThinkingLevel::Off,
             context_window: 8192,
             auto_compact: false,
@@ -1511,7 +1704,7 @@ mod tests {
 
     #[test]
     fn test_new_initializes_channels_and_guards() {
-        let mut mode = InteractiveMode::new(test_runtime(), options());
+        let mut mode = InteractiveMode::new(test_runtime(), options(), None);
         assert!(!mode.is_initialized);
         assert!(!mode.is_shutting_down);
         assert!(mode.input_tx.is_some(), "channel sender pending handoff at init");
@@ -1643,7 +1836,7 @@ mod tests {
             },
             start_reason: crate::session::runtime::SessionStartReason::Startup,
         };
-        let mut mode = InteractiveMode::new(runtime, options());
+        let mut mode = InteractiveMode::new(runtime, options(), None);
         let tx = mode.input_tx.take().expect("input_tx");
         let cancel = mode.cancel.clone();
 

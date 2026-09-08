@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use zen_ai::types::{ContentBlockList, Message, Model, ThinkingLevel, UserMessage};
 use zen_core::env::shell_output::{execute_shell_with_capture, ShellCaptureOptions};
-use zen_core::env::{ExecutionEnv, ExecutionError};
+use zen_core::env::{ExecutionEnv, ExecutionError, ShellConfig};
 use zen_core::harness::agent_hooks::AgentLoopError;
 use zen_core::harness::engine::Agent;
 use zen_core::harness::types::AgentEvent;
@@ -53,6 +53,8 @@ pub struct AgentSession {
     /// (services.rs, T-AP-04-2-fix) via the same Arc — the key is the value of `exclusion_key`
     /// (user bash = UserMessage timestamp).
     excluded: Arc<Mutex<HashSet<String>>>,
+    /// Shell override config (shell_path/command_prefix, injected by T-AP-02-3-fix; consumed by `execute_bash`)
+    shell_config: ShellConfig,
 }
 
 impl AgentSession {
@@ -78,7 +80,12 @@ impl AgentSession {
     /// - `new`'s exclusion set is an independent empty set (tests/quick-start path, not participating in loop filtering); real assembly
     ///   goes through `create_agent_session` (services.rs) using `new_with_exclusions`
     pub fn new(agent: Agent, session_store: Arc<dyn SessionStore>) -> Self {
-        Self::new_with_exclusions(agent, session_store, Arc::new(Mutex::new(HashSet::new())))
+        Self::new_with_exclusions(
+            agent,
+            session_store,
+            Arc::new(Mutex::new(HashSet::new())),
+            ShellConfig::default(),
+        )
     }
 
     /// Real assembly constructor (T-AP-04-2-fix): shares the exclusion set with the engine hooks.
@@ -90,6 +97,7 @@ impl AgentSession {
         agent: Agent,
         session_store: Arc<dyn SessionStore>,
         excluded: Arc<Mutex<HashSet<String>>>,
+        shell_config: ShellConfig,
     ) -> Self {
         // Establish a persistent subscription (option 1, aligned with pi construction as `agent.subscribe(this._handleAgentEvent)`):
         // message_end → session_store.append_message (persist to disk in real time). Subscription closure lives in the engine's listener list,
@@ -105,7 +113,13 @@ impl AgentSession {
             agent,
             session_store,
             excluded,
+            shell_config,
         }
+    }
+
+    /// Session-level shell config accessor (consumed by `execute_bash`; injected into the main assembly via `create_agent_session`).
+    pub fn shell_config(&self) -> &ShellConfig {
+        &self.shell_config
     }
 
     /// Send a prompt to the agent and wait for completion.
@@ -156,7 +170,18 @@ impl AgentSession {
         exclude_from_context: bool,
         on_chunk: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     ) -> Result<BashOutcome, AgentSessionError> {
-        let env = ExecutionEnv::new(PathBuf::from(self.cwd()), None, None, None);
+        // Shell override config (T-AP-02-3-fix): shell_path injected into ExecutionEnv; command prefix prepended
+        // (`{prefix}\n{command}`, aligned with pi `agent-session.ts`).
+        let resolved_command = match &self.shell_config.command_prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}\n{command}"),
+            _ => command.to_string(),
+        };
+        let env = ExecutionEnv::new(
+            PathBuf::from(self.cwd()),
+            self.shell_config.shell_path.clone(),
+            None,
+            None,
+        );
         let options = ShellCaptureOptions {
             cwd: None, // default to env.base_dir (= session cwd)
             env: None,
@@ -164,7 +189,7 @@ impl AgentSession {
             cancellation: None,
             on_chunk: on_chunk.unwrap_or_else(|| Arc::new(|_| {})),
         };
-        let captured = execute_shell_with_capture(&env, command, &options).await?;
+        let captured = execute_shell_with_capture(&env, &resolved_command, &options).await?;
 
         let timestamp = now_millis();
         let full_output_text = captured

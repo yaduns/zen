@@ -119,6 +119,8 @@ pub struct FooterData {
     pub git_branch: Option<String>,
     /// Session name (SessionInfo entry).
     pub session_name: Option<String>,
+    /// Current provider name (footer displays `(provider) model_id`, aligned with pi; empty string = placeholder stage).
+    pub model_provider: String,
     /// Current model id.
     pub model_id: String,
     /// Current thinking level (shown when the model supports thinking).
@@ -227,8 +229,12 @@ impl Component for FooterComponent<'_> {
         };
         let stats = parts.join(" ");
 
-        // Right side: model name + thinking level
-        let mut right = data.model_id.clone();
+        // Right side: provider + model name + thinking level (aligned with pi `(provider) model`; during placeholder, empty provider hides the parentheses)
+        let mut right = if data.model_provider.is_empty() {
+            data.model_id.clone()
+        } else {
+            format!("({}) {}", data.model_provider, data.model_id)
+        };
         if let Some(level) = &data.thinking_level {
             let lv = level.to_string().to_ascii_lowercase();
             right = if lv == "off" {
@@ -360,6 +366,7 @@ mod tests {
             pwd: "/tmp/proj".into(),
             git_branch: Some("main".into()),
             session_name: None,
+            model_provider: "opencode-go".into(),
             model_id: "deepseek-v4-flash".into(),
             thinking_level: None,
             usage: UsageTotals {
@@ -384,9 +391,35 @@ mod tests {
         let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("/tmp/proj"));
         assert!(text.contains("main"));
-        assert!(text.contains("deepseek-v4-flash"));
+        assert!(text.contains("(opencode-go) deepseek-v4-flash"));
         assert!(text.contains("↑1.2k"));
         assert!(text.contains("42.0%"));
+    }
+
+    #[test]
+    fn footer_renders_model_without_provider_placeholder() {
+        // Placeholder stage (provider is empty string): do not show empty parentheses, fall back to bare model name
+        let mut comp = FooterComponent::new(theme());
+        comp.set_data(FooterData {
+            pwd: "/tmp/proj".into(),
+            git_branch: None,
+            session_name: None,
+            model_provider: String::new(),
+            model_id: "deepseek-v4-flash".into(),
+            thinking_level: None,
+            usage: UsageTotals::default(),
+            context_percent: None,
+            context_window: 0,
+            cache_hit_rate: None,
+            auto_compact_enabled: false,
+        });
+        let mut buf = ScreenBuffer::new(140, 3);
+        comp.render(&mut buf, 0, 0, 140, 3);
+        let mut out = Vec::new();
+        buf.flush(&mut out).unwrap();
+        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        assert!(text.contains("deepseek-v4-flash"));
+        assert!(!text.contains("()"));
     }
 
     #[test]
