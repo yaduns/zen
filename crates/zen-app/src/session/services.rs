@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::{parse_thinking_level, CliArgs};
+use crate::config::defaults::DEFAULT_THINKING_LEVEL;
 use crate::config::get_agent_dir;
 use crate::config::settings::{SettingsData, SettingsManager};
 use crate::session::agent_session::{AgentSession, SessionStore};
@@ -456,11 +457,11 @@ fn resolve_model(args: &CliArgs) -> (Model, ThinkingLevel) {
         }
     }
 
-    // thinking level: --thinking flag takes precedence, then the model short name, default Off
+    // Thinking level: `--thinking` flag first, then model short name, else DEFAULT_THINKING_LEVEL (requirement ruled High)
     let thinking_level = args
         .thinking
         .or(model_thinking)
-        .unwrap_or(ThinkingLevel::Off);
+        .unwrap_or(DEFAULT_THINKING_LEVEL);
 
     (model, thinking_level)
 }
@@ -600,15 +601,19 @@ mod tests {
         let args = parse(&["--model", "my-model"]);
         let (model, thinking) = resolve_model(&args);
         assert_eq!(model.id, "my-model");
-        assert_eq!(thinking, ThinkingLevel::Off);
+        assert_eq!(
+            thinking, DEFAULT_THINKING_LEVEL,
+            "No thinking specified → requirement decision defaults to High"
+        );
     }
 
     #[test]
     fn model_provider_slash_id_sets_provider_and_id() {
         let args = parse(&["--model", "huoshan/ark-model-x"]);
-        let (model, _) = resolve_model(&args);
+        let (model, thinking) = resolve_model(&args);
         assert_eq!(model.provider, "huoshan");
         assert_eq!(model.id, "ark-model-x");
+        assert_eq!(thinking, DEFAULT_THINKING_LEVEL);
     }
 
     #[test]
@@ -646,7 +651,7 @@ mod tests {
         let args = parse(&[]);
         let (model, thinking) = resolve_model(&args);
         assert!(!model.id.is_empty());
-        assert_eq!(thinking, ThinkingLevel::Off);
+        assert_eq!(thinking, DEFAULT_THINKING_LEVEL);
     }
 
     /// Smoke test for `create_initial_runtime_from_cli`: no CLI flags (zero config) + fake cwd should assemble a runtime.
@@ -750,7 +755,7 @@ mod tests {
     fn restored_ctx_from_none() -> zen_core::session::tree::SessionContext {
         zen_core::session::tree::SessionContext {
             messages: vec![],
-            thinking_level: "off".into(),
+            thinking_level: String::new(), // Empty string = no entry (context.rs convention); recovery noop keeps the default
             model: None,
             active_tool_names: None,
         }
@@ -810,7 +815,7 @@ mod tests {
 
         // New session: no session model/thinking to restore, keep resolve_model defaults (leave untouched)
         assert!(!model.id.is_empty());
-        assert_eq!(thinking, ThinkingLevel::Off);
+        assert_eq!(thinking, DEFAULT_THINKING_LEVEL);
     }
 
     // ── SessionHooks (T-AP-04-2-fix wiring) ──

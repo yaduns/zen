@@ -22,6 +22,7 @@ use crate::components::status_indicator::{
 };
 use crate::components::tool_execution::{ToolExecutionComponent, ToolExecutionResult};
 use crate::components::user_message::UserMessageComponent;
+use crate::config::defaults::{clamp_autocomplete_max_visible, clamp_editor_padding_x};
 use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
 use crate::modes::interactive::{AppAction, InputCommand, SettingsApplyKind, StatusSpec, UiEvent};
 use crossterm::event::KeyEvent;
@@ -407,7 +408,10 @@ impl InteractiveUi {
                 let prefs = Rc::clone(&prefs);
                 Box::new(move |v| {
                     if let Some(s) = &settings {
-                        s.update_global(|s| s.editor_padding_x = Some(v as u32));
+                        // Write path converges to 0..=3 (aligned with pi setter-time clamp, T-AP-02-4)
+                        s.update_global(|s| {
+                            s.editor_padding_x = Some(clamp_editor_padding_x(v as u32))
+                        });
                     }
                     prefs.borrow_mut().editor_padding_x = v;
                 })
@@ -426,7 +430,11 @@ impl InteractiveUi {
                 let settings = settings_handle.clone();
                 Box::new(move |v| {
                     if let Some(s) = &settings {
-                        s.update_global(|s| s.autocomplete_max_visible = Some(v as u32));
+                        // Write path converges to 3..=20 (aligned with pi setter-time clamp, T-AP-02-4)
+                        s.update_global(|s| {
+                            s.autocomplete_max_visible =
+                                Some(clamp_autocomplete_max_visible(v as u32))
+                        });
                     }
                 })
             },

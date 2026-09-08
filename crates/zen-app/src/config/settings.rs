@@ -19,6 +19,7 @@ use thiserror::Error;
 use zen_ai::types::ThinkingLevel;
 use zen_core::paths::{resolve_path, PathInputOptions};
 
+use super::defaults;
 use super::CONFIG_DIR_NAME;
 
 /// Empty editor double-Esc behavior discriminator (aligned one by one with pi's `doubleEscapeAction` values).
@@ -36,7 +37,7 @@ pub enum DoubleEscapeAction {
 
 /// Compaction toggle and token threshold (Option-ized override shape of pi's `CompactionSettings`).
 /// Field aligned with `zen_core::compaction::CompactionSettings`;
-/// Default fallback belongs to effective layer (T-AP-02-4, `DEFAULT_COMPACTION_SETTINGS`).
+/// Default value fallbacks are already handled by defaults.rs (T-AP-02-4: `effective_compaction` folds `DEFAULT_COMPACTION_SETTINGS`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettingsPatch {
@@ -64,7 +65,7 @@ pub struct BranchSummarySettingsPatch {
 }
 
 /// Request retry policy (pi `RetrySettings`; the `retry.provider` sub-object is flattened in,
-/// single provider has no per-provider dimension). Defaults belong to T-AP-02-4
+/// single provider, no per-provider dimension). Default values are already handled by defaults.rs (T-AP-02-4: `effective_retry`)
 /// （pi：enabled=true / maxRetries=3 / baseDelayMs=2000 / timeoutMs / maxRetryDelayMs=60000）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,7 +129,7 @@ pub struct SettingsData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
     /// Theme preference (consumer T-AP-11-3 `ThemeController::new` parameter slot;
-    /// path forms containing `/` ignore logic belongs to T-AP-02-4 effective layer)
+    /// Path-form entries containing `/` are already ignored by defaults.rs (T-AP-02-4: `effective_theme`, folded into `SettingsEffective.theme`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     /// Session storage directory (consumer T-AP-08-5; same format as `--session-dir`,
@@ -158,13 +159,13 @@ pub struct SettingsData {
     /// Double Esc action in empty editor (consumer T-AP-11-1 key routing)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub double_escape_action: Option<DoubleEscapeAction>,
-    /// Input editor horizontal padding (consumer zen-tui editor; clamp 0..=3 belongs to T-AP-02-4)
+    /// Input editor horizontal padding (consumer zen-tui editor; clamp 0..=3 already handled by defaults.rs: `clamp_editor_padding_x`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_padding_x: Option<u32>,
     /// Message output horizontal margin 0/1 (consumer render component)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_pad: Option<u8>,
-    /// Max visible items in autocomplete dropdown (consumer zen-tui autocomplete; clamp 3..=20 belongs to T-AP-02-4)
+    /// Max visible completion dropdown items (consumer zen-tui autocomplete; clamp 3..=20 already handled by defaults.rs: `clamp_autocomplete_max_visible`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autocomplete_max_visible: Option<u32>,
     /// Hardware cursor during IME positioning (consumer zen-tui editor)
@@ -605,9 +606,19 @@ impl SettingsManager {
 
     /// Returns the merged full settings view (overlay > project > global, recursive to leaf fields of nested groups),
     /// for one-shot snapshot reads by each domain. Returns a clone (pi's structuredClone equivalent);
-    /// Default value filling is not in this layer (T-AP-02-4 effective view).
+    /// Default value filling does not happen at this layer (T-AP-02-4 effective view, see `effective()`).
     pub fn merged(&self) -> SettingsData {
         self.lock_inner().merged_view()
+    }
+
+    /// Get the **effective view** (defaults folded) of all settings fields: `merged()` (all-Option patch form)
+    /// folded via `defaults::fold_effective` — pi defaults + clamp + path filtering, producing
+    /// `SettingsEffective` — consumers (services assembly / interactive / T-AP-04-3) always go through this
+    /// to get effective values, instead of each doing its own `unwrap_or` fallback.
+    /// Now handled by defaults.rs (T-AP-02-4).
+    pub fn effective(&self) -> defaults::SettingsEffective {
+        let merged = self.lock_inner().merged_view();
+        defaults::fold_effective(&merged)
     }
 
     /// Single-scope snapshot (excludes the other level and the overlay) — lets the effective view and diagnostics distinguish

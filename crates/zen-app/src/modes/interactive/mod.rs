@@ -14,6 +14,7 @@ use crate::components::footer::{add_usage_to_totals, FooterData, UsageTotals};
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::tree_selector::FilterMode;
 use crate::config;
+use crate::config::defaults::{SettingsEffective, DEFAULT_THINKING_LEVEL};
 use crate::config::settings::{
     DoubleEscapeAction as PersistedDoubleEscape, SettingsData, SettingsManager,
 };
@@ -337,11 +338,11 @@ impl InteractiveMode {
 
         // 1. Theme controller: settings.theme preference (T-AP-02-3 closes the T-AP-11-3 parameter slot) takes priority; otherwise pick a built-in theme based on terminal background.
         //    Unknown theme names fall back to the built-in dark in ThemeController, no failure; path forms containing `/`
-        //    Ignore logic belongs to T-AP-02-4 effective layer.
+        //    Ignore logic is now handled by defaults.rs (T-AP-02-4: `effective_theme` folded into `SettingsEffective.theme`).
         let theme_pref = self
             .settings_manager
             .as_ref()
-            .and_then(|s| s.merged().theme);
+            .and_then(|s| s.effective().theme);
         let controller = ThemeController::new(theme_pref.as_deref(), None, None)?;
         let theme = controller.current().clone();
         self.theme_controller = Some(controller);
@@ -354,12 +355,12 @@ impl InteractiveMode {
         let mut ui_prefs = UiPrefs::default();
         if let Some(settings) = &self.settings_manager {
             settings_warnings.extend(settings.drain_errors().into_iter().map(|e| e.to_string()));
-            let merged = settings.merged();
-            refreshed_config = Some(settings_data_to_config(&merged));
+            let eff = settings.effective();
+            refreshed_config = Some(settings_data_to_config(&eff));
             ui_prefs = UiPrefs {
-                hide_thinking_block: merged.hide_thinking_block.unwrap_or(false),
-                output_pad: merged.output_pad.map(u16::from).unwrap_or(0),
-                editor_padding_x: merged.editor_padding_x.unwrap_or(0) as usize,
+                hide_thinking_block: eff.hide_thinking_block,
+                output_pad: u16::from(eff.output_pad),
+                editor_padding_x: eff.editor_padding_x as usize,
             };
         }
         for warning in settings_warnings {
@@ -1079,38 +1080,25 @@ fn classify_submit(text: &str) -> SubmitKind {
 }
 
 /// v1 default settings (aligned with pi: editorPaddingX defaults to 0; replace with real loading once T-AP-02-3 lands).
-/// Refresh persisted fields of `SettingsConfig` from settings merged view (T-AP-02-3-fix data source wiring):
-/// Set fields take settings values; unset fields keep the v1 baseline of `default_settings()`; runtime fields
-/// (steering/follow_up/thinking/theme, etc.) are supplemented by `build_settings_config` when the panel opens.
-fn settings_data_to_config(data: &SettingsData) -> SettingsConfig {
+/// Refresh the persistent fields of `SettingsConfig` from the settings effective view (T-AP-02-4 data source wiring):
+/// All fields take the `SettingsEffective` folded values (defaults are centralized in defaults.rs; no more `unwrap_or` here);
+/// Runtime fields (steering/follow_up/thinking/theme, etc.) are filled in later by `build_settings_config` when the panel opens.
+fn settings_data_to_config(eff: &SettingsEffective) -> SettingsConfig {
     let mut config = default_settings();
-    config.auto_compact = data
-        .compaction
-        .as_ref()
-        .and_then(|c| c.enabled)
-        .unwrap_or(config.auto_compact);
-    config.show_hardware_cursor = data
-        .show_hardware_cursor
-        .unwrap_or(config.show_hardware_cursor);
-    config.editor_padding_x = data.editor_padding_x.unwrap_or(0) as usize;
-    config.output_pad = data.output_pad.map(u16::from).unwrap_or(0);
-    config.autocomplete_max_visible = data.autocomplete_max_visible.unwrap_or(0) as usize;
-    config.clear_on_shrink = data.clear_on_shrink.unwrap_or(config.clear_on_shrink);
-    config.hide_thinking_block = data
-        .hide_thinking_block
-        .unwrap_or(config.hide_thinking_block);
-    config.show_cache_miss_notices = data
-        .show_cache_miss_notices
-        .unwrap_or(config.show_cache_miss_notices);
-    config.quiet_startup = data.quiet_startup.unwrap_or(config.quiet_startup);
-    config.double_escape_action = data
-        .double_escape_action
-        .map(|a| match a {
-            PersistedDoubleEscape::Fork => DoubleEscapeAction::Fork,
-            PersistedDoubleEscape::Tree => DoubleEscapeAction::Tree,
-            PersistedDoubleEscape::None => DoubleEscapeAction::None,
-        })
-        .unwrap_or(config.double_escape_action);
+    config.auto_compact = eff.compaction.enabled;
+    config.show_hardware_cursor = eff.show_hardware_cursor;
+    config.editor_padding_x = eff.editor_padding_x as usize;
+    config.output_pad = u16::from(eff.output_pad);
+    config.autocomplete_max_visible = eff.autocomplete_max_visible as usize;
+    config.clear_on_shrink = eff.clear_on_shrink;
+    config.hide_thinking_block = eff.hide_thinking_block;
+    config.show_cache_miss_notices = eff.show_cache_miss_notices;
+    config.quiet_startup = eff.quiet_startup;
+    config.double_escape_action = match eff.double_escape_action {
+        PersistedDoubleEscape::Fork => DoubleEscapeAction::Fork,
+        PersistedDoubleEscape::Tree => DoubleEscapeAction::Tree,
+        PersistedDoubleEscape::None => DoubleEscapeAction::None,
+    };
     config
 }
 
@@ -1123,16 +1111,15 @@ fn default_settings() -> SettingsConfig {
         show_hardware_cursor: false,
         editor_padding_x: 0,
         output_pad: 1,
-        autocomplete_max_visible: 10,
+        autocomplete_max_visible: 5, // pi defaults (single source of truth in defaults.rs, T-AP-02-4)
         clear_on_shrink: false,
         hide_thinking_block: false,
-        show_cache_miss_notices: true,
+        show_cache_miss_notices: false, // pi defaults (single source of truth in defaults.rs, T-AP-02-4)
         quiet_startup: false,
-        double_escape_action: DoubleEscapeAction::Fork,
+        double_escape_action: DoubleEscapeAction::Tree, // pi defaults (single source of truth in defaults.rs, T-AP-02-4)
         tree_filter_mode: FilterMode::Default,
-        // thinking defaults to Off repo-wide (aligned with pi session default; settings only holds the panel's current value,
-        // runtime authority is in AgentState—see T-AP-02-3 notes).
-        thinking_level: ThinkingLevel::High,
+        // thinking/panel defaults match the defaults.rs effective view (T-AP-02-4: single source of truth, no literals allowed).
+        thinking_level: DEFAULT_THINKING_LEVEL,
         available_thinking_levels: vec![
             ThinkingLevel::Off,
             ThinkingLevel::Low,
@@ -1472,13 +1459,14 @@ mod tests {
             double_escape_action: Some(PersistedDoubleEscape::None),
             ..Default::default()
         };
-        let config = settings_data_to_config(&data);
+        let eff = crate::config::defaults::fold_effective(&data);
+        let config = settings_data_to_config(&eff);
         assert!(config.hide_thinking_block);
         assert_eq!(config.output_pad, 1);
         assert_eq!(config.editor_padding_x, 2);
         assert_eq!(config.double_escape_action, DoubleEscapeAction::None);
-        // Unset fields keep v1 baseline (do not regress to defaults; baseline values change with default_settings(), so assert baseline consistency here rather than hardcoding)
-        assert_eq!(config.thinking_level, default_settings().thinking_level);
+        // Unset fields keep effective-view defaults (baseline values change with defaults.rs; assert equality with defaults rather than hard-coding)
+        assert_eq!(config.thinking_level, DEFAULT_THINKING_LEVEL);
         assert!(config.enable_skill_commands);
     }
 
