@@ -1,6 +1,7 @@
 use crate::env::ShellConfig;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
+use crate::tools::find::FindTool;
 use crate::tools::read::ReadTool;
 use crate::tools::write::WriteTool;
 use std::collections::HashSet;
@@ -166,10 +167,11 @@ impl ToolFactory {
     }
 
     /// Create the read-only tool group (read + grep + find + ls) — aligned with pi `createReadOnlyTools(cwd)`.
-    /// grep/find/ls are not implemented yet (Phase 2), only read is returned (same restriction note as the original create_readonly_tools).
+    /// Currently grep/ls are not implemented (T-AP-04-5/T-AP-04-6); only returns read + find (same as original
+    /// limitation comment in create_readonly_tools; `create` returns None for unimplemented tools, so they are skipped naturally).
     pub fn create_readonly(&self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        for name in [ToolName::Read] {
+        for name in [ToolName::Read, ToolName::Find] {
             if let Some(tool) = self.create(name) {
                 registry.register(tool);
             }
@@ -186,8 +188,9 @@ impl ToolFactory {
             }
             ToolName::Edit => Arc::new(EditTool::new(self.tool_context.clone())),
             ToolName::Write => Arc::new(WriteTool::new(self.tool_context.clone())),
-            // Grep/Find/Ls tool structs are not implemented yet, cannot be created in v1
-            ToolName::Grep | ToolName::Find | ToolName::Ls => return None,
+            ToolName::Find => Arc::new(FindTool::new(self.tool_context.clone())),
+            // Grep/Ls tool structs not yet implemented (T-AP-04-5/T-AP-04-6); cannot be created in v1 for now
+            ToolName::Grep | ToolName::Ls => return None,
         };
         Some(tool)
     }
@@ -272,6 +275,7 @@ mod tests {
             ToolName::Bash,
             ToolName::Edit,
             ToolName::Write,
+            ToolName::Find,
         ] {
             let tool = factory
                 .create(name)
@@ -284,7 +288,6 @@ mod tests {
     fn factory_create_returns_none_for_unimplemented_tools() {
         let factory = test_factory();
         assert!(factory.create(ToolName::Grep).is_none());
-        assert!(factory.create(ToolName::Find).is_none());
         assert!(factory.create(ToolName::Ls).is_none());
     }
 
@@ -295,9 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn factory_create_readonly_registers_only_read() {
+    fn factory_create_readonly_registers_read_and_find() {
+        // Align with pi `createReadOnlyTools` = [read, grep, find, ls]; grep/ls not implemented (create returns None)
         let registry = test_factory().create_readonly();
-        assert_eq!(registry.names(), vec!["read"]);
+        assert_eq!(registry.names(), vec!["read", "find"]);
     }
 
     #[test]
@@ -361,13 +365,23 @@ mod tests {
 
     #[test]
     fn selection_unimplemented_tools_in_allowlist_produce_nothing() {
-        // grep/find/ls not implemented in v1 (create returns None): silently produce nothing when listed
+        // grep/ls not implemented in v1 (create returns None): silently produces nothing when present in list (find implemented and will produce)
         let factory = test_factory();
         let sel = ToolSelection {
             tools: vec!["grep".into()],
             ..Default::default()
         };
         assert!(factory.create_with_selection(&sel).names().is_empty());
+
+        // find is implemented: produce it when it appears in the allowlist
+        let with_find = ToolSelection {
+            tools: vec!["find".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            factory.create_with_selection(&with_find).names(),
+            vec!["find"]
+        );
     }
 
     #[test]

@@ -1284,7 +1284,12 @@ fn bridge_agent_event(
                 Message::User(_) => {}
             }
             let error_text = match message {
-                Message::Assistant(a) => stop_error_message(a),
+                Message::Assistant(a) => match a.stop_reason {
+                    // Cancellation is already expressed by the message block "Operation aborted" (assistant_message.rs Aborted branch),
+                    // so "Request was aborted" is no longer repeated in the status/Info line (interactive-cancel-fix backfill)
+                    zen_ai::types::StopReason::Aborted => None,
+                    _ => stop_error_message(a),
+                },
                 _ => None,
             };
             if !is_tool_result(message) {
@@ -1637,6 +1642,31 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(UiEvent::MessageEnd { error_text: Some(e), .. }) if e == "provider 500"
+        ));
+    }
+
+    #[test]
+    fn test_bridge_aborted_message_end_suppresses_error_text() {
+        // Cancellation (Aborted) no longer carries error_text: the message block "Operation aborted" already expresses it, avoiding a duplicate status line
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTotals::default());
+        let mut a = assistant_with_usage("x", Usage::default());
+        a.stop_reason = StopReason::Aborted;
+        a.error_message = Some("Request was aborted".into());
+        bridge_agent_event(
+            &AgentEvent::MessageEnd {
+                message: Message::Assistant(a),
+            },
+            &tx,
+            &usage,
+            &test_footer_ctx(),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::MessageEnd {
+                error_text: None,
+                ..
+            })
         ));
     }
 

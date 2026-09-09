@@ -1234,6 +1234,32 @@ fn handle_events(
 /// Background SSE event loop.
 /// Runs in a dedicated tokio task, reading the SSE event stream from the HTTP response body.
 /// Internal flow:
+/// Reconciles the final `stop_reason` with `error_message` (pure-function extraction from `sse_event_loop` Phase 4a, for unit tests).
+///
+/// User cancelled (`cancelled`) and no finish_reason received → `Aborted` (aligned with interactive-cancel-fix acceptance
+/// that partials are finalized as aborted); the UI's Aborted branch in `assistant_message.rs` maps "Request was aborted"
+/// to a clean "Operation aborted"); error present but not cancelled and no finish_reason → `Error`;
+/// finish_reason already received → keep the accumulator's original reason and write the error to error_message (if cancellation lands
+/// right after finish_reason, keep the original reason without re-labeling); no error → accumulator's original reason.
+fn finalize_stop_reason(
+    error_message: &Option<String>,
+    accumulator: &StreamAccumulator,
+    cancelled: bool,
+) -> (StopReason, Option<String>) {
+    match error_message {
+        Some(msg) if accumulator.has_finish_reason => (
+            accumulator.stop_reason.clone().unwrap_or(StopReason::Stop),
+            Some(msg.clone()),
+        ),
+        Some(msg) if cancelled => (StopReason::Aborted, Some(msg.clone())),
+        Some(msg) => (StopReason::Error, Some(msg.clone())),
+        None => (
+            accumulator.stop_reason.clone().unwrap_or(StopReason::Stop),
+            None,
+        ),
+    }
+}
+
 /// 1. Use `eventsource_stream::Eventsource` to parse SSE framing
 /// 2. For each `data: {...}` line, call `parse_chunk()` to convert it into `Vec<StreamEvent>`
 /// 3. For each `StreamEvent`, call `accumulator.process_event()` to accumulate
@@ -1283,9 +1309,13 @@ async fn sse_event_loop(
     loop {
         tokio::select! {
             biased;
-            // 3a. User cancelled → set error message and exit the loop
+            // 3a. User cancelled → set abort info and exit the loop.
+            //     "Request was aborted" is the standard text that the UI Aborted branch (assistant_message.rs) maps to
+            //     "Operation aborted"; the old implementation (T-AI-02-1) used "Request cancelled by user"
+            //     and Phase 4 finalized it as Error, causing cancellations to render as "Error: Request cancelled by user"
+            //     on two lines — see the appendix in tasks/interactive-cancel-fix-plan.md for the fix that finalizes cancellation as Aborted.
             _ = cancel.cancelled() => {
-                error_message = Some("Request cancelled by user".to_string());
+                error_message = Some("Request was aborted".to_string());
                 break;
             }
             // 3b. Read the next SSE event
@@ -1335,18 +1365,13 @@ async fn sse_event_loop(
     let mut content = Vec::new();
     std::mem::swap(&mut content, &mut accumulator.content_blocks);
 
-    // 4a. Reconcile the relationship between stop_reason and error_message:
+    // 4a. Reconcile stop_reason with error_message (pure function finalize_stop_reason, for unit tests):
+    //     - User cancelled and no finish_reason → Aborted (aligns with cancel-fix acceptance "partial finalized as aborted")
     //     - has finish_reason but also an error → keep finish_reason, write the error into error_message
-    //     - Has error and no finish_reason → termination reason is Error
+    //     - Error present and no finish_reason (not cancelled) → termination reason is Error
     //     - normal termination → use the accumulator's stop_reason
-    let (stop_reason, error_msg) = match error_message {
-        Some(ref msg) if accumulator.has_finish_reason => (
-            accumulator.stop_reason.unwrap_or(StopReason::Stop),
-            Some(msg.clone()),
-        ),
-        Some(ref msg) => (StopReason::Error, Some(msg.clone())),
-        None => (accumulator.stop_reason.unwrap_or(StopReason::Stop), None),
-    };
+    let (stop_reason, error_msg) =
+        finalize_stop_reason(&error_message, &accumulator, cancel.is_cancelled());
 
     // 4b. Assemble the final message
     let mut msg = AssistantMessage {
@@ -2370,6 +2395,61 @@ mod tests {
     // ═════════════════════════════════════════════════════════════
     //  handle_events: incremental event push (T-AI-02-1-fix, chunk-level integration)
     // ═════════════════════════════════════════════════════════════
+
+    // ── finalize_stop_reason (interactive-cancel-fix backfill: cancellation finalized as Aborted) ──
+
+    #[test]
+    fn finalize_stop_reason_cancel_without_finish_is_aborted() {
+        // User cancelled and no finish_reason received → Aborted (aligns with cancel-fix acceptance "partial finalized as aborted")
+        let acc = StreamAccumulator::default();
+        let (reason, msg) =
+            finalize_stop_reason(&Some("Request was aborted".to_string()), &acc, true);
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(msg.as_deref(), Some("Request was aborted"));
+    }
+
+    #[test]
+    fn finalize_stop_reason_cancel_after_finish_keeps_original_reason() {
+        // Cancellation lands right after finish_reason: keep the accumulator's original reason, write the error to error_message, do not re-label
+        let mut acc = StreamAccumulator::default();
+        acc.stop_reason = Some(StopReason::Stop);
+        acc.has_finish_reason = true;
+        let (reason, msg) =
+            finalize_stop_reason(&Some("Request was aborted".to_string()), &acc, true);
+        assert_eq!(reason, StopReason::Stop);
+        assert_eq!(msg.as_deref(), Some("Request was aborted"));
+    }
+
+    #[test]
+    fn finalize_stop_reason_error_without_finish_is_error() {
+        // Non-cancellation error (e.g. SSE transport-layer error) and no finish_reason → Error
+        let acc = StreamAccumulator::default();
+        let (reason, msg) =
+            finalize_stop_reason(&Some("SSE stream error: boom".to_string()), &acc, false);
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(msg.as_deref(), Some("SSE stream error: boom"));
+    }
+
+    #[test]
+    fn finalize_stop_reason_no_error_uses_accumulator_reason() {
+        // Normal completion: no error → accumulator's original reason + no error_message
+        let mut acc = StreamAccumulator::default();
+        acc.stop_reason = Some(StopReason::ToolUse);
+        let (reason, msg) = finalize_stop_reason(&None, &acc, false);
+        assert_eq!(reason, StopReason::ToolUse);
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn finalize_stop_reason_error_with_finish_keeps_reason() {
+        // Error with finish_reason (e.g. last chunk failed): keep the original reason, write the error to error_message
+        let mut acc = StreamAccumulator::default();
+        acc.stop_reason = Some(StopReason::Stop);
+        acc.has_finish_reason = true;
+        let (reason, msg) = finalize_stop_reason(&Some("tail error".to_string()), &acc, false);
+        assert_eq!(reason, StopReason::Stop);
+        assert_eq!(msg.as_deref(), Some("tail error"));
+    }
 
     /// Run a set of JSON chunks through `parse_chunk` + `handle_events`; return the collected incremental events and the accumulator's final state.
     /// Enter from real chunk JSON (no manually constructed StreamEvents), covering `parse_chunk`'s path.

@@ -2451,6 +2451,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "globset",
  "home",
  "ignore",
  "libc",
