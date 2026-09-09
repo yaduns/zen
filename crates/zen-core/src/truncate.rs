@@ -264,7 +264,7 @@ pub fn truncate_line(line: &str, max_chars: usize) -> TruncatedLine {
 /// Convert byte counts from truncation stats into human-readable sizes (for tool details/prompt text):
 /// `< 1024` → `"NB"`; `< 1MB` → `"N.NKB"`; otherwise `"N.NMB"` (matching pi's three-tier `formatSize` format).
 ///
-/// Currently has no direct consumers; reserved for T-AP-04-4 (find)/T-AP-04-5 (grep)/T-AP-04-6 (ls);
+/// Current consumers: truncation messages for find (T-AP-04-4), grep (T-AP-04-5), ls (T-AP-04-6);
 /// The read/bash tools can also use this to align their outputSize text with pi.
 pub fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
