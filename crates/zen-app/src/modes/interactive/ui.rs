@@ -25,19 +25,24 @@ use crate::components::user_message::UserMessageComponent;
 use crate::config::defaults::{clamp_autocomplete_max_visible, clamp_editor_padding_x};
 use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
 use crate::modes::interactive::{AppAction, InputCommand, SettingsApplyKind, StatusSpec, UiEvent};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use zen_ai::types::{AssistantMessage, ContentBlock, ContentBlockList, Message, UserMessage};
+use zen_tui::autocomplete::{
+    AutocompleteProvider, AutocompleteSuggestions, CombinedAutocompleteProvider, SlashCommand,
+};
 use zen_tui::components::Component;
 use zen_tui::editor::EditorAction;
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
 use zen_tui::screen::{ScreenBuffer, Style};
-use zen_tui::theme::{ColorToken, Theme};
+use zen_tui::theme::{BgToken, ColorToken, Theme};
 use zen_tui::viewport::ScrollbackCanvas;
 
 /// Height cap for single-line metrics of message blocks (the measure stage enlarges the cap and takes the real height; lines exceeding it are truncated by this value for scroll computation;
@@ -95,6 +100,37 @@ pub struct InteractiveUi {
     panel_apply: Rc<RefCell<Vec<InputCommand>>>,
     /// Panel requests to close (top-level Esc via on_cancel).
     panel_close: Rc<RefCell<bool>>,
+    /// Completion providers (autocomplete-wiring-fix): command data (T-AP-03-2 `build_slash_command_list`)
+    /// Construct with + cwd, `CombinedAutocompleteProvider` (fuzzy_walk_enabled=false aligns with pi fdPath:null);
+    /// used for triggering (get_suggestions) and applying on selection (apply_completion); the overlay holds a clone.
+    provider: Arc<dyn AutocompleteProvider>,
+    /// Budget for visible completion items (settings `autocomplete_max_visible`, constructor already clamps to 3..=20).
+    autocomplete_max_visible: usize,
+    /// Completion overlay (when active, keys first go through `handle_autocomplete_key`; None = not active).
+    autocomplete: Option<AutocompleteOverlay>,
+}
+
+/// UI state container for one autocomplete session (autocomplete-wiring-fix) — holds the completion provider and a row snapshot at trigger time,
+/// async results are finalized via the `pending` join handle + `pending_result` shared result slot: the draw frame's `poll_autocomplete`
+/// Once the poll completes, `suggestions` is populated and the overlay activates; with `suggestions=None` the overlay is **not** activated (trigger missed,
+/// no popup). In-memory UI state only, not serialized, not cross-thread (`Rc` domain within the UI task, aligned with the `panel` precedent).
+struct AutocompleteOverlay {
+    /// Completion provider (clone of `InteractiveUi.provider`, used by `apply_completion`).
+    provider: Arc<dyn AutocompleteProvider>,
+    /// Candidates after async completion (items + prefix, `prefix()` read directly on apply); None = not yet yielded / no candidates.
+    suggestions: Option<AutocompleteSuggestions>,
+    /// Currently selected index (0..items.len(), rendered highlighted; Up/Down clamped).
+    selected: usize,
+    /// `spawn_local` task for `get_suggestions` (draw-frame polls `is_finished`); aborted on close.
+    pending: Option<tokio::task::JoinHandle<()>>,
+    /// Task writes to the result slot (`spawn_local` task holds the clone; drained by `poll_autocomplete` on completion).
+    pending_result: Rc<RefCell<Option<AutocompleteSuggestions>>>,
+    /// Max visible dropdown items (settings `autocomplete_max_visible`, clamped 3..=20).
+    max_visible: usize,
+    /// Editor line snapshot at trigger time (input to get_suggestions/apply_completion).
+    lines: Vec<String>,
+    /// Cursor at trigger time (line, col as char index; input to get_suggestions/apply_completion).
+    cursor: (usize, usize),
 }
 
 /// Shared routing slot between editor callbacks and handle_key.
@@ -118,7 +154,16 @@ impl InteractiveUi {
         cwd: String,
         prefs: UiPrefs,
         settings: Option<Arc<SettingsManager>>,
+        commands: Vec<SlashCommand>,
+        max_visible: usize,
     ) -> Self {
+        // 0. Completion provider (autocomplete-wiring-fix): command data (produced by T-AP-03-2 `build_slash_command_list`)
+        //    + cwd base; fuzzy_walk_enabled=false aligns with pi fdPath:null (`@` attachment fuzzy autocomplete disabled).
+        let provider: Arc<dyn AutocompleteProvider> = Arc::new(CombinedAutocompleteProvider::new(
+            commands,
+            PathBuf::from(cwd.clone()),
+            false,
+        ));
         // 1. Editor: holds a copy of the app keybinding table (no user overrides in v1, both tables identical; after T-AP-06-2 lands, via
         //    `kb.clone()` synced override table) + left padding injected from settings (default 0).
         let mut editor = CustomEditor::new(prefs.editor_padding_x, kb.clone());
@@ -234,6 +279,9 @@ impl InteractiveUi {
             panel_prefs: Rc::new(RefCell::new(prefs)),
             panel_apply: Rc::new(RefCell::new(Vec::new())),
             panel_close: Rc::new(RefCell::new(false)),
+            provider,
+            autocomplete_max_visible: max_visible,
+            autocomplete: None,
         }
     }
 
@@ -251,10 +299,30 @@ impl InteractiveUi {
         if self.panel.is_some() {
             return self.handle_panel_key(key);
         }
+        // 0.5 Completion overlay (autocomplete-wiring-fix): while completion is active, keys go through the overlay first
+        //     (Esc closes / Up-Down moves / Enter applies and may auto-submit / Tab applies / any other key closes and falls back to the editor).
+        if self.autocomplete.is_some() {
+            if self.handle_autocomplete_key(key) {
+                // Overlay consumed the key; if Enter applied a `/`-prefix completion and auto-submitted (editor.submit already wrote
+                // Submit into route), take it here to forward to the main task (aligned with pi fall-through-to-submit).
+                if let Some(cmd) = self.route.borrow_mut().commands.pop() {
+                    return Some(cmd);
+                }
+                return None; // Does not fall through to the editor or forward the command; Esc never reaches the Interrupt branch.
+            }
+            // Non-completion (editing) keys: the overlay was already closed in handle_autocomplete_key; continue with the normal editor flow.
+        } else if key.code == KeyCode::Tab {
+            // Tab triggers completion (editor Tab is a no-op anchor; with no candidates, the poll finishes and closes automatically, silently).
+            self.trigger_autocomplete();
+            return None;
+        }
         // 1. Editor first: internal app keybinding match -> trigger registered callbacks (commands write to route; pure editing actions have no command)
         let handled = self.editor.handle_key(key);
         // 2. Bash indicator sync: on_change already wrote route.bash_mode -> persist to self + border color (false→ThinkingOff / true→BashMode)
         self.sync_bash_mode();
+        // 2.5 Natural trigger (pi trigger_characters semantics): leading `/` while completion is inactive → trigger.
+        //     After the overlay is closed by an editing key, re-query here for per-character refinement (`/s` → `/sk` keeps filtering).
+        self.maybe_trigger_autocomplete();
         // 3. Take the command and strengthen locally; Submit also writes back to submission history (the closure inside new can't borrow &mut editor, patch it here).
         //    Extract the command first and release the route borrow so later branches can use &mut self for localized actions.
         let popped = self.route.borrow_mut().commands.pop();
@@ -327,6 +395,259 @@ impl InteractiveUi {
     pub(crate) fn handle_paste(&mut self, text: &str) {
         self.editor.handle_paste(text);
         self.sync_bash_mode();
+        // Pasting a `/`-prefixed token (e.g. bracketed paste of `/skill:foo`) also naturally triggers completion
+        self.maybe_trigger_autocomplete();
+    }
+
+    // ── Autocomplete overlay (autocomplete-wiring-fix) ────────────────────
+
+    /// Key routing while completion is active (`handle_key` runs after the panel, before the editor): Esc closes, Up/Down move the selection,
+    /// Enter/Tab apply the selection (pi semantics: `tui.select.confirm`/`tui.input.tab` → applyCompletion) —
+    /// "with the list open, arrows select, Enter/Tab confirm, Esc cancels". Returns true = event consumed
+    /// (not passed to the editor); returns false = non-completion key (after closing the overlay the caller continues with the normal editor flow for that key).
+    ///
+    /// Edge case: no candidates (suggestions=None) — Enter/Esc still close as usual, without passing through submit/clear semantics;
+    /// out-of-range `selected` is clamped to 0..items.len() (empty list = 0, no movement).
+    fn handle_autocomplete_key(&mut self, key: &KeyEvent) -> bool {
+        if self.autocomplete.is_none() {
+            return false;
+        }
+        let has_suggestions = self
+            .autocomplete
+            .as_ref()
+            .and_then(|o| o.suggestions.as_ref())
+            .is_some_and(|s| !s.items().is_empty());
+        match key.code {
+            KeyCode::Esc => {
+                self.close_autocomplete();
+                true
+            }
+            KeyCode::Up => {
+                self.autocomplete_select_relative(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.autocomplete_select_relative(1);
+                true
+            }
+            KeyCode::Tab => {
+                // pi semantics: `tui.input.tab` applies the selected item (applyCompletion), it does not submit
+                if has_suggestions {
+                    self.apply_selection();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if has_suggestions {
+                    // pi semantics: `tui.select.confirm` applies; after a `/`-prefix completion **fall through to submit**
+                    // (`editor.submit` already wrote Submit into the route, `handle_key` picks it up and sends it) —
+                    // fixes the deviation where Enter on `/quit` only padded a trailing space and a second Enter was needed to exit.
+                    if self.apply_selection() && self.route.borrow().commands.is_empty() {
+                        self.editor.handle_action(EditorAction::Submit);
+                    }
+                } else {
+                    self.close_autocomplete(); // No candidates: close without passing through submit (avoids accidental submit)
+                }
+                true
+            }
+            _ => {
+                self.close_autocomplete(); // Edit keys: after closing, fall back to the editor (the normal flow re-triggers refinement naturally)
+                false
+            }
+        }
+    }
+
+    /// Called on Tab press or when `/` appears at line start (via `maybe_trigger_autocomplete` after on_change): snapshot current line/cursor
+    /// → `spawn_local` starts the `get_suggestions` async task (result written to `pending_result` slot) → set pending —
+    /// "press Tab once, candidates computed in the background, draw frame `poll_autocomplete` finalizes". Returns whether an autocomplete session was started
+    /// (pending counts as started; if there are no candidates, poll finalization auto-closes without showing the overlay).
+    ///
+    /// Edge case: overlay already active or editor empty → don't trigger (return false); `get_suggestions` returning None
+    /// (no prefix hit) → close the overlay during `poll_autocomplete` finalization.
+    fn trigger_autocomplete(&mut self) -> bool {
+        if self.autocomplete.is_some() {
+            return false;
+        }
+        if self.editor.text().trim().is_empty() {
+            return false; // Empty editor doesn't trigger
+        }
+        let lines = self.editor.lines().to_vec();
+        let cursor = self.editor.cursor();
+        let provider = Arc::clone(&self.provider);
+        let provider_task = Arc::clone(&provider); // The task holds a clone; the overlay keeps a copy for apply_completion
+        let lines_task = lines.clone(); // The task holds a snapshot clone; the overlay keeps the original snapshot for apply_completion
+        let pending_result: Rc<RefCell<Option<AutocompleteSuggestions>>> =
+            Rc::new(RefCell::new(None));
+        let cell = Rc::clone(&pending_result);
+        let ct = CancellationToken::new(); // Per-query independent token (with fuzzy_walk off, queries actually complete synchronously; await returns immediately)
+        let handle = tokio::task::spawn_local(async move {
+            let result = provider_task
+                .get_suggestions(&lines_task, cursor.0, cursor.1, false, &ct)
+                .await;
+            *cell.borrow_mut() = result;
+        });
+        self.autocomplete = Some(AutocompleteOverlay {
+            provider,
+            suggestions: None,
+            selected: 0,
+            pending: Some(handle),
+            pending_result,
+            max_visible: self.autocomplete_max_visible,
+            lines,
+            cursor,
+        });
+        true
+    }
+
+    /// Frame-finalization for draw (called at the start of `render`/`render_scrollback`): poll the `pending` join handle —
+    /// if the task finished, drain `pending_result` → `suggestions` in place + `selected=0`;
+    /// Result is None (no candidates) → close the overlay (no popup). Returns whether a state change occurred.
+    fn poll_autocomplete(&mut self) -> bool {
+        let Some(mut overlay) = self.autocomplete.take() else {
+            return false;
+        };
+        let finished = match &overlay.pending {
+            Some(handle) => handle.is_finished(),
+            None => {
+                self.autocomplete = Some(overlay);
+                return false;
+            }
+        };
+        if !finished {
+            self.autocomplete = Some(overlay);
+            return false;
+        }
+        // Take the result first (release the RefCell borrow) before deciding whether to keep the overlay, to avoid conflicts from moving
+        let result = overlay.pending_result.borrow_mut().take();
+        match result {
+            Some(suggestions) => {
+                overlay.suggestions = Some(suggestions);
+                overlay.selected = 0;
+                overlay.pending = None;
+                self.autocomplete = Some(overlay);
+            }
+            // No candidates: overlay dropped (closed), stay silent to avoid disturbing
+            None => {}
+        }
+        true
+    }
+
+    /// Close the overlay: drop it and abort in-flight query tasks (tasks hold a clone of the result slot; they are naturally discarded after abort).
+    fn close_autocomplete(&mut self) {
+        if let Some(mut overlay) = self.autocomplete.take() {
+            if let Some(handle) = overlay.pending.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Relatively move the selected index (Up=-1 / Down=+1), clamped to 0..items.len(); empty list does nothing.
+    fn autocomplete_select_relative(&mut self, delta: isize) {
+        let Some(overlay) = self.autocomplete.as_mut() else {
+            return;
+        };
+        let Some(suggestions) = &overlay.suggestions else {
+            return;
+        };
+        let len = suggestions.items().len();
+        if len == 0 {
+            return;
+        }
+        overlay.selected = if delta > 0 {
+            (overlay.selected + 1).min(len - 1)
+        } else {
+            overlay.selected.saturating_sub(1)
+        };
+    }
+
+    /// Apply selected item (triggered by Enter/Tab): use `lines`/`cursor` at trigger time and `suggestions.prefix()` to call
+    /// `provider.apply_completion` → replace the editor text entirely with `AppliedCompletion.lines()` +
+    /// reset the cursor via `cursor_position()` → close the overlay — "candidate backfills into the input line, cursor lands at the end of the completion".
+    ///
+    /// # Returns
+    /// `true` = the applied completion was a `/`-prefixed completion (command name; apply_completion already appended the trailing space) — the caller (Enter
+    /// branch) **falls through to submit** based on this (aligned with pi `tui.select.confirm`: auto-submit after a `/`-prefixed completion).
+    fn apply_selection(&mut self) -> bool {
+        let Some(mut overlay) = self.autocomplete.take() else {
+            return false;
+        };
+        let Some(suggestions) = overlay.suggestions.take() else {
+            return false;
+        };
+        let Some(item) = suggestions.items().get(overlay.selected) else {
+            return false;
+        };
+        let is_slash = suggestions.prefix().starts_with('/');
+        let applied = overlay.provider.apply_completion(
+            &overlay.lines,
+            overlay.cursor.0,
+            overlay.cursor.1,
+            item,
+            &suggestions.prefix(),
+        );
+        let text = applied.lines().join("\n");
+        let cursor = applied.cursor_position();
+        self.editor.set_text(&text);
+        self.editor.set_cursor(cursor.0, cursor.1);
+        self.sync_bash_mode(); // set_text triggers on_change which already updates route.bash_mode; set the border color here
+        is_slash
+    }
+
+    /// Natural trigger detection (called after the editor handles the keypress): starts with `/` at line start, within the command-name segment (no whitespace), and completion not active
+    /// → triggered. `/cmd ` (with trailing space) after backfill does not trigger, avoiding pointless re-queries;
+    /// After the overlay is dismissed by an editing key, this re-queries to enable per-character refinement.
+    fn maybe_trigger_autocomplete(&mut self) {
+        if self.autocomplete.is_some() {
+            return;
+        }
+        let text = self.editor.text();
+        if text.starts_with('/') && !text[1..].contains(char::is_whitespace) {
+            self.trigger_autocomplete();
+        }
+    }
+
+    /// Dropdown rendering (called above the editor by `render`/`render_scrollback`): draws the candidate list with theme colors —
+    /// at most `max_visible` items, selected item inverted (Accent fg + SelectedBg bg), `AutocompleteItem.label`
+    /// displayed + secondary `description` line (Dim). Returns the actual drawn height (0 if no candidates / inactive);
+    /// list height = min(items, max_visible) + 2 for top/bottom borders.
+    fn render_autocomplete(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16) -> u16 {
+        let Some(overlay) = self.autocomplete.as_ref() else {
+            return 0;
+        };
+        let Some(suggestions) = &overlay.suggestions else {
+            return 0;
+        };
+        let items = suggestions.items();
+        if items.is_empty() || width < 3 {
+            return 0;
+        }
+        let visible = items.len().min(overlay.max_visible);
+        let height = visible as u16 + 2; // top/bottom borders
+        let theme = &self.theme;
+        let border = Style::fg(theme.fg(ColorToken::Border));
+        // top/bottom borders (full width, simple list boundary indicator)
+        buf.write(x, y, &border, &"─".repeat(width as usize));
+        buf.write(x, y + height - 1, &border, &"─".repeat(width as usize));
+        for i in 0..visible {
+            let row = y + 1 + i as u16;
+            let item = &items[i];
+            // selected item: Accent fg + SelectedBg bg inverted; others Text fg
+            let style = if i == overlay.selected {
+                Style::new(
+                    Some(theme.fg(ColorToken::Accent)),
+                    Some(theme.bg(BgToken::SelectedBg)),
+                    Vec::new(),
+                )
+            } else {
+                Style::fg(theme.fg(ColorToken::Text))
+            };
+            let mut line = format!(" {}", item.label());
+            if let Some(desc) = item.description() {
+                line.push_str(&format!("  {desc}"));
+            }
+            buf.write(x, row, &style, &line);
+        }
+        height
     }
 
     // ── Settings panel (T-AP-02-3-fix) ─────────────────────────────────────
@@ -892,6 +1213,22 @@ impl InteractiveUi {
     /// **Current assembly note**: after T-TU-01-5, interactive mode init has switched to scrollback mode (`run_scrollback` +
     /// [`Self::render_scrollback`]); this method and its windowed subpaths (render_chat/paint_row) follow the task
     /// Scope discipline: keep original as-is (no old code removed, regression surface minimized) for future rollback/comparison use (T-AP-11-4 external
+    /// Current dropdown height (= min(items, max_visible) + 2 for top/bottom borders when active with candidates, otherwise 0) —
+    /// for `render_scrollback` fixed-area budgeting: the dropdown is inserted above the editor, pushing status/editor/footer down.
+    fn autocomplete_list_height(&self, width: u16) -> u16 {
+        let Some(overlay) = self.autocomplete.as_ref() else {
+            return 0;
+        };
+        let Some(suggestions) = &overlay.suggestions else {
+            return 0;
+        };
+        let items = suggestions.items();
+        if items.is_empty() || width < 3 {
+            return 0;
+        }
+        items.len().min(overlay.max_visible) as u16 + 2
+    }
+
     /// editor suspend/resume may revert to the old path); not called yet, hence marked allow(dead_code).
     #[allow(dead_code)] // Old cell-level path retained (see note above), not invoked under scrollback mode
     pub(crate) fn render(&mut self, buf: &mut ScreenBuffer) {
@@ -899,6 +1236,9 @@ impl InteractiveUi {
         if height == 0 {
             return;
         }
+        // Coverage overlay (autocomplete-wiring-fix): old cell-level path also finalizes async candidates
+        // (dropdown drawing is only wired to the active render_scrollback; this path is kept as dead_code).
+        self.poll_autocomplete();
 
         // Budget for the bottom three regions (line counts): editor height computed dynamically from content (cap = 30% of terminal rows with a floor of 5,
         // aligned with pi maxVisibleLines; T-AP-11-1-fix).
@@ -991,24 +1331,37 @@ impl InteractiveUi {
         // Editor height grows dynamically with content (cap = 30% of terminal rows with a floor of 5, aligned with pi maxVisibleLines;
         // T-AP-11-1-fix replaces the former fixed 3 lines — multiline input / long wrapped text fully visible; the lines yielded by the message area are
         // naturally carried by the scrollback line stream).
+        // Coverage overlay (autocomplete-wiring-fix): draw frame finalizes async candidates (in place once the task completes).
+        self.poll_autocomplete();
         let status_h: u16 = 2;
         let editor_h: u16 = self.editor.needed_height(width, canvas.height());
         let footer_h: u16 = 2;
-        let fixed_h = status_h + editor_h + footer_h;
+        // Dropdown list height (> 0 when active with candidates): **below the editor** (aligned with pi — the list renders after the editor's bottom border),
+        // inserted between the editor and the footer, without pushing the editor's position (IME cursor anchor unaffected).
+        let list_h = self.autocomplete_list_height(width);
+        let fixed_h = status_h + editor_h + footer_h + list_h;
         let mut fixed = ScreenBuffer::new(width, fixed_h);
+        let mut y_off: u16 = 0;
 
         // Status line: animated categories draw persistent instances (reused across frames to preserve the clock), Error/Warning drawn directly in semantic color,
         // idle → IdleStatus (see apply_status/render_status).
-        self.render_status(&mut fixed, 0, status_h);
+        self.render_status(&mut fixed, y_off, status_h);
+        y_off += status_h;
         // Editor (fixed 3 rows)
         self.editor
-            .render_editor(&mut fixed, 0, status_h, width, editor_h);
+            .render_editor(&mut fixed, 0, y_off, width, editor_h);
+        y_off += editor_h;
+        // Autocomplete dropdown (below the editor, aligned with pi's render position)
+        if list_h > 0 {
+            self.render_autocomplete(&mut fixed, 0, y_off, width);
+            y_off += list_h;
+        }
         // Footer (fixed 2 rows)
         let mut footer = FooterComponent::new(&self.theme);
         if let Some(data) = &self.footer_data {
             footer.set_data(data.clone());
         }
-        let _ = footer.render(&mut fixed, 0, status_h + editor_h, width, footer_h);
+        let _ = footer.render(&mut fixed, 0, y_off, width, footer_h);
 
         // Bridge the fixed region as the line stream tail (only non-empty rows are pushed, to avoid blank rows appearing in scrollback).
         // IME cursor anchor (terminal-ime-anchor-fix): line of the editor caret within fixed =
@@ -1016,6 +1369,7 @@ impl InteractiveUi {
         // number of lines already pushed) is recorded before push — the fixed region skips empty lines, so the line number cannot be derived directly from the fixed line number.
         // flush uses this to place the (hidden) hardware cursor at the caret, anchoring the system IME composition string/candidate window in place.
         let caret_pos = self.editor.cursor_position();
+        // Dropdown is **below** the editor (no push on the editor), IMI cursor anchor offset unchanged (only the margin above status_h)
         let caret_fixed_row = status_h as usize + caret_pos.1 as usize;
         let caret_col = caret_pos.0 as usize;
         let mut caret_canvas_row: Option<usize> = None;
@@ -1351,6 +1705,7 @@ mod tests {
     use zen_ai::types::{
         StopReason, TextContent, ThinkingContent, ThinkingLevel, ToolResultMessage, Usage,
     };
+    use zen_tui::autocomplete::AutocompleteItem;
     use zen_tui::theme::Theme;
 
     fn theme() -> &'static Theme {
@@ -1409,6 +1764,8 @@ mod tests {
             "/work".into(),
             UiPrefs::default(),
             None,
+            Vec::new(), // Completion command data (autocomplete-wiring-fix; empty list for tests = built-in commands only)
+            5,
         )
     }
 
@@ -1422,6 +1779,8 @@ mod tests {
             "/work".into(),
             UiPrefs::default(),
             Some(Arc::new(manager)),
+            Vec::new(),
+            5,
         );
         (guard, u)
     }
@@ -2154,5 +2513,262 @@ mod tests {
             }
             _other => panic!("expected Bash row"),
         }
+    }
+
+    // ── Autocomplete overlay (autocomplete-wiring-fix) ────────────────────
+
+    /// Construct an autocomplete overlay with candidates (real CombinedAutocompleteProvider + manual suggestions,
+    /// bypassing async triggers, to test only key routing/apply/clamp/render semantics).
+    fn overlay_with(items: Vec<(&str, &str)>) -> AutocompleteOverlay {
+        let items: Vec<AutocompleteItem> = items
+            .into_iter()
+            .map(|(value, label)| AutocompleteItem::new(value, label, None))
+            .collect();
+        AutocompleteOverlay {
+            provider: Arc::new(CombinedAutocompleteProvider::new(
+                Vec::new(),
+                PathBuf::from("/tmp"),
+                false,
+            )),
+            suggestions: Some(AutocompleteSuggestions::new(items, "/")),
+            selected: 0,
+            pending: None,
+            pending_result: Rc::new(RefCell::new(None)),
+            max_visible: 5,
+            lines: vec!["/".to_string()],
+            cursor: (0, 1),
+        }
+    }
+
+    /// UI with the built-in command list (`ui()` uses an empty list, triggering yields no candidates; completion trigger semantics need real command data).
+    fn ui_with_commands() -> InteractiveUi {
+        InteractiveUi::new(
+            theme().clone(),
+            kb(),
+            "/work".into(),
+            UiPrefs::default(),
+            None,
+            crate::commands::build_slash_command_list(&[], &[]),
+            5,
+        )
+    }
+
+    #[test]
+    fn test_autocomplete_esc_closes_and_consumes() {
+        let mut u = ui();
+        u.autocomplete = Some(overlay_with(vec![("settings", "settings")]));
+        let cmd = u.handle_key(&press(KeyCode::Esc));
+        assert!(u.autocomplete.is_none(), "Esc closes the overlay");
+        assert!(
+            cmd.is_none(),
+            "Esc is consumed by the overlay and not forwarded as an Escape command (never reaches Interrupt)"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_up_down_select_and_clamp() {
+        let mut u = ui();
+        u.autocomplete = Some(overlay_with(vec![("a", "a"), ("b", "b"), ("c", "c")]));
+        // Down 0→1→2 (clamp at end)
+        let _ = u.handle_key(&press(KeyCode::Down));
+        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 1);
+        let _ = u.handle_key(&press(KeyCode::Down));
+        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 2);
+        let _ = u.handle_key(&press(KeyCode::Down));
+        assert_eq!(
+            u.autocomplete.as_ref().unwrap().selected,
+            2,
+            "Down clamps at the end"
+        );
+        // Up 2→1→0 (saturate at 0)
+        let _ = u.handle_key(&press(KeyCode::Up));
+        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 1);
+        let _ = u.handle_key(&press(KeyCode::Up));
+        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 0);
+        let _ = u.handle_key(&press(KeyCode::Up));
+        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 0, "Up saturates at 0");
+    }
+
+    #[test]
+    fn test_autocomplete_enter_applies_and_submits_slash() {
+        // pi semantics: `tui.select.confirm` applies the `/`-prefixed completion then falls through to submit (auto-submit) —
+        // fixes the deviation where pressing Enter on "/quit" only filled in a trailing space and required another Enter to quit
+        let mut u = ui();
+        u.editor.set_text("/s");
+        let mut overlay = overlay_with(vec![("settings", "settings")]);
+        overlay.lines = vec!["/s".to_string()];
+        overlay.cursor = (0, 2); // Cursor at end of "/s"
+                                 // suggestions prefix matches the real trigger (provider sets prefix = text_before_cursor = "/s")
+        overlay.suggestions = Some(AutocompleteSuggestions::new(
+            vec![AutocompleteItem::new("settings", "settings", None)],
+            "/s",
+        ));
+        u.autocomplete = Some(overlay);
+        let cmd = u.handle_key(&press(KeyCode::Enter));
+        assert!(u.autocomplete.is_none(), "overlay closes after applying");
+        let submit_text = match &cmd {
+            Some(InputCommand::Submit(t)) => Some(t.as_str()),
+            _ => None,
+        };
+        assert_eq!(
+            submit_text,
+            Some("/settings"),
+            "`/` prefix completions auto-submit after applying (pi fall-through; submit trims the trailing space added by the completion): {cmd:?}"
+        );
+        assert!(
+            u.editor.text().is_empty(),
+            "editor is already cleared after submit (submit semantics)"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_enter_non_slash_does_not_submit() {
+        // Non-`/` prefixes (e.g. path/`@` completion) do not submit after apply (pi: only `/` prefixes fall through)
+        let mut u = ui();
+        u.editor.set_text("src/");
+        let mut overlay = overlay_with(vec![("src/main.rs", "main.rs")]);
+        overlay.lines = vec!["src/".to_string()];
+        overlay.cursor = (0, 4);
+        overlay.suggestions = Some(AutocompleteSuggestions::new(
+            vec![AutocompleteItem::new("src/main.rs", "main.rs", None)],
+            "src/",
+        ));
+        u.autocomplete = Some(overlay);
+        let cmd = u.handle_key(&press(KeyCode::Enter));
+        assert!(u.autocomplete.is_none());
+        assert!(cmd.is_none(), "non-`/` prefix completions do not auto-submit: {cmd:?}");
+        assert_eq!(u.editor.text(), "src/main.rs");
+    }
+
+    #[test]
+    fn test_autocomplete_tab_applies_like_pi() {
+        // pi semantics: `tui.input.tab` while completion is active = applyCompletion (apply the selected item), not cycle, no submit
+        let mut u = ui();
+        u.editor.set_text("/");
+        let mut overlay = overlay_with(vec![("model", "model")]);
+        overlay.lines = vec!["/".to_string()];
+        overlay.cursor = (0, 1);
+        overlay.suggestions = Some(AutocompleteSuggestions::new(
+            vec![AutocompleteItem::new("model", "model", None)],
+            "/",
+        ));
+        u.autocomplete = Some(overlay);
+        let cmd = u.handle_key(&press(KeyCode::Tab));
+        assert!(u.autocomplete.is_none(), "overlay closes after applying with Tab");
+        assert!(
+            cmd.is_none(),
+            "applying with Tab does not submit (only Enter auto-submits for / prefixes)"
+        );
+        assert_eq!(u.editor.text(), "/model ", "Tab applies the selected item + trailing space");
+    }
+
+    #[test]
+    fn test_autocomplete_edit_key_closes_and_falls_back() {
+        let mut u = ui();
+        u.autocomplete = Some(overlay_with(vec![("a", "a")]));
+        // Editing keys (printable characters) close the overlay and fall back to the editor (normally re-triggered naturally)
+        let _ = u.handle_key(&press(KeyCode::Char('x')));
+        assert!(u.autocomplete.is_none(), "edit keys close the overlay");
+    }
+
+    #[test]
+    fn test_autocomplete_list_height() {
+        let mut u = ui();
+        assert_eq!(u.autocomplete_list_height(40), 0, "no overlay = 0");
+        u.autocomplete = Some(overlay_with(vec![("a", "a"), ("b", "b"), ("c", "c")]));
+        assert_eq!(u.autocomplete_list_height(40), 5, "3 items + top and bottom borders 2");
+        // max_visible truncation: 7 candidates, max_visible=3 → 3+2=5
+        let mut overlay = overlay_with(vec![]);
+        overlay.suggestions = Some(AutocompleteSuggestions::new(
+            (0..7)
+                .map(|i| AutocompleteItem::new(format!("c{i}"), format!("c{i}"), None))
+                .collect(),
+            "/",
+        ));
+        overlay.max_visible = 3;
+        u.autocomplete = Some(overlay);
+        assert_eq!(
+            u.autocomplete_list_height(40),
+            5,
+            "min(items=7, max_visible=3) + 2"
+        );
+        // No candidates (pending) → no height reserved
+        let mut overlay2 = overlay_with(vec![]);
+        overlay2.suggestions = None;
+        u.autocomplete = Some(overlay2);
+        assert_eq!(
+            u.autocomplete_list_height(40),
+            0,
+            "suggestions=None (pending) height 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tab_triggers_and_poll_fills_suggestions() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut u = ui_with_commands();
+                u.editor.set_text("/set");
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                assert!(u.autocomplete.is_some(), "Tab starts a completion session (pending)");
+                // Drive the LocalSet tasks to completion and wrap up
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                    if u.poll_autocomplete() {
+                        break;
+                    }
+                }
+                let overlay = u.autocomplete.as_ref().expect("Overlay remains when candidates exist");
+                let sugg = overlay.suggestions.as_ref().expect("Candidates in place");
+                let values: Vec<&str> = sugg.items().iter().map(|i| i.value()).collect();
+                assert!(
+                    values.contains(&"settings"),
+                    "built-in command is among the candidates (fuzzy prefix match /set): {values:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_slash_typing_naturally_triggers() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut u = ui_with_commands();
+                let _ = u.handle_key(&press(KeyCode::Char('/')));
+                // Editor inserts "/" → maybe_trigger fires (natural trigger, pi trigger_characters semantics)
+                assert!(u.autocomplete.is_some(), "/ at line start naturally triggers completion");
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                    if u.poll_autocomplete() {
+                        break;
+                    }
+                }
+                let overlay = u.autocomplete.as_ref().unwrap();
+                let sugg = overlay.suggestions.as_ref().expect("empty prefix = all command candidates");
+                assert!(!sugg.items().is_empty(), "/ prefix yields the full command list");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_tab_on_non_command_quietly_closes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut u = ui_with_commands();
+                u.editor.set_text("hello");
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                assert!(
+                    u.autocomplete.is_some(),
+                    "Tab enabled (pending, path branch may attempt)"
+                );
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                    if u.poll_autocomplete() {
+                        break;
+                    }
+                }
+                assert!(u.autocomplete.is_none(), "No candidates → poll off, stay silent");
+            })
+            .await;
     }
 }

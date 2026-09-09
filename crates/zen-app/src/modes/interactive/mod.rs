@@ -10,7 +10,9 @@ pub mod ui;
 
 pub(crate) use crate::keybindings::{app_default_bindings, AppAction};
 
-use crate::commands::{parse_slash_command, resolve_builtin, BuiltinSlashCommand};
+use crate::commands::{
+    build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
+};
 use crate::components::footer::{add_usage_to_totals, FooterData, UsageTotals};
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::tree_selector::FilterMode;
@@ -386,12 +388,22 @@ impl InteractiveMode {
             .take()
             .expect("init idempotency guard ensures the input sender created by new() is handed off only once");
         let cwd = self.runtime.session.cwd().to_string();
+        // Complete the command data (autocomplete-wiring-fix): three sources — built-in + templates + skills (T-AP-03-2
+        // `build_slash_command_list`) — to build the CombinedAutocompleteProvider for InteractiveUi;
+        // The visible-item budget is taken from settings (init has refreshed self.settings; T-AP-02-4 has clamped 3..=20).
+        let commands = build_slash_command_list(
+            &self.runtime.session.templates(),
+            &self.runtime.session.skills(),
+        );
+        let autocomplete_max_visible = self.settings.autocomplete_max_visible;
         let ui_cell = Rc::new(RefCell::new(InteractiveUi::new(
             theme,
             kb,
             cwd,
             ui_prefs,
             self.settings_manager.clone(),
+            commands,
+            autocomplete_max_visible,
         )));
         // Suspend event queue: on_wake (Send closure) enqueues, draw (!Send closure) dequeues — accessed sequentially within the UI task.
         let pending: Arc<Mutex<VecDeque<UiEvent>>> = Arc::new(Mutex::new(VecDeque::new()));

@@ -54,6 +54,21 @@ impl CustomEditor {
         self.editor.text()
     }
 
+    /// Passthrough Editor: line references (autocomplete provider input, consumed by autocomplete-wiring-fix).
+    pub fn lines(&self) -> &[String] {
+        self.editor.lines()
+    }
+
+    /// Passthrough Editor: logical cursor (line, column) (autocomplete provider input, consumed by autocomplete-wiring-fix).
+    pub fn cursor(&self) -> (usize, usize) {
+        self.editor.cursor()
+    }
+
+    /// Passthrough Editor: programmatically set logical cursor (positioned after `apply_completion` backfill, consumed by autocomplete-wiring-fix).
+    pub fn set_cursor(&mut self, line: usize, col: usize) {
+        self.editor.set_cursor(line, col);
+    }
+
     /// Passthrough to Editor: overwrite text and reset cursor (programmatic set).
     pub fn set_text(&mut self, text: &str) {
         self.editor.set_text(text);
@@ -95,7 +110,9 @@ impl CustomEditor {
     }
 
     /// Whether autocomplete is active (no completion state inside the v1 editor — T-TU-03-3 completion is handled by T-AP-11-1 as an overlay,
-    /// always false here; the logic for Esc suppressing Interrupt is extended when completion assembly is added).
+    /// Always false here; after autocomplete-wiring-fix this flag becomes **moot**—when completion is active, `InteractiveUi::`
+    /// handle_key` already has all keys intercepted by the overlay before calling this editor, so Esc cannot reach the Interrupt branch;
+    /// if completion is moved down into the editor in the future, extend this flag).
     pub fn is_showing_autocomplete(&self) -> bool {
         false
     }

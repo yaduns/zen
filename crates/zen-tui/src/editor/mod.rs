@@ -213,6 +213,18 @@ impl Editor {
         (self.state.cursor_line, self.state.cursor_col)
     }
 
+    /// Programmatically set the logical cursor (line, column); out-of-range values are clamped to valid bounds (line to last line, column to that line's length).
+    /// Use together with `set_text`: after `apply_completion` (autocompletion selection backfill), position the cursor via `AppliedCompletion`'s `cursor_position`
+    /// (T-TU-03-3 contract, consumed by the assembly layer's autocomplete-wiring-fix).
+    /// Consumer: autocomplete-wiring-fix (`InteractiveUi::apply_selection`).
+    pub fn set_cursor(&mut self, line: usize, col: usize) {
+        let line = line.min(self.state.lines.len().saturating_sub(1));
+        self.state.cursor_line = line;
+        self.state.cursor_col = col.min(self.state.lines[line].len());
+        self.preferred_visual_col = None;
+        self.snapped_from_cursor_col = None;
+    }
+
     /// Programmatically insert text at the cursor (multi-line supported). Undo atomicity: a single call = a single snapshot (T-TU-03-5,
     /// insert_text always pushes internally; one undo restores the entire state before the insertion).
     /// Consumers: T-AP-11-2, T-AP-11-4.

@@ -546,6 +546,36 @@ mod tests {
     use super::*;
     use zen_ai::types::{ContentBlockList, UserMessage};
 
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    /// Test helper: serializes tests touching environment variables (same pattern as config/mod.rs — `resolve_model` reads
+    /// `ZEN_PROVIDER`; parallel tests mutating it race with each other).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Test helper: temporarily removes an environment variable, restoring the original value on scope exit (stays unset if it was originally unset).
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// Test helper: construct CliArgs (aligned with args.rs test conventions).
     fn parse(args: &[&str]) -> CliArgs {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
@@ -584,6 +614,10 @@ mod tests {
 
     #[test]
     fn settings_default_provider_rebuilds_model_when_unset() {
+        // Env isolation: assert on the default provider when "ZEN_PROVIDER is unset" (opencode-go); explicitly remove
+        // the variable so the test isn't affected by the shell environment (e.g. ZEN_PROVIDER=huoshan) (provider.rs:86 reads env).
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::remove("ZEN_PROVIDER");
         let args = parse(&[]);
         let ctx = empty_ctx();
         let merged = SettingsData {
@@ -655,6 +689,10 @@ mod tests {
 
     #[test]
     fn settings_unknown_provider_name_ignored() {
+        // env isolation: same as settings_default_provider_rebuilds_model_when_unset — assertion based on
+        // the default provider when ZEN_PROVIDER is unset.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::remove("ZEN_PROVIDER");
         let args = parse(&[]);
         let ctx = empty_ctx();
         let merged = SettingsData {
