@@ -12,8 +12,7 @@
 
 use crate::tools::path_utils::resolve_to_cwd;
 use crate::truncate::{
-    format_size, truncate_head, TruncationKind, TruncationOptions, TruncationResult,
-    DEFAULT_MAX_BYTES,
+    format_size, truncate_head, truncation_to_json, TruncationOptions, DEFAULT_MAX_BYTES,
 };
 use crate::util::now_millis;
 use async_trait::async_trait;
@@ -227,7 +226,8 @@ fn parse_find_args(
 ///
 /// `literal_separator(true)` makes `*`/`?` not cross `/` (globset crosses by default, unlike fd semantics, so it must be explicitly enabled).
 /// Compilation failure (invalid glob) → `ToolError::InvalidArguments`.
-fn compile_find_glob(pattern: &str) -> Result<(GlobMatcher, bool), ToolError> {
+/// Also reused by the grep tool's (T-AP-04-5) `--glob` file filtering (candidates are likewise absolute posix file paths).
+pub(crate) fn compile_find_glob(pattern: &str) -> Result<(GlobMatcher, bool), ToolError> {
     let full_path = pattern.contains('/');
     let effective =
         if full_path && !pattern.starts_with('/') && !pattern.starts_with("**/") && pattern != "**"
@@ -332,8 +332,8 @@ fn find_files(
 /// "Use limit=<limit*2> for more, or refine pattern" suffix, truncation notice
 /// `format_size(DEFAULT_MAX_BYTES) limit reached`, ending with a `\n\n[..]` section, aligned with pi fd path logic)
 /// → details JSON (`resultLimitReached`/`truncation` are omitted from details when absent; `truncation` subfields
-/// using pi camelCase keys). On empty results (including limit=0), returns pi's "No files found matching pattern" message,
-/// details is None (aligning with pi's `if (!output)` early branch).
+/// uses the shared `crate::truncate::truncation_to_json`). On empty results (including limit=0), returns pi's
+/// "No files found matching pattern" message with details None (aligned with pi's early `if (!output)` branch).
 fn assemble_find_result(matches: FindMatches, limit: usize) -> FindResultAssembly {
     if matches.paths.is_empty() {
         return FindResultAssembly {
@@ -388,28 +388,6 @@ fn assemble_find_result(matches: FindMatches, limit: usize) -> FindResultAssembl
         content: result_output,
         details,
     }
-}
-
-/// Map [`TruncationResult`] to pi `FindToolDetails.truncation` camelCase JSON
-/// (Keys field-by-field align with pi `TruncationResult` interface; `content` intentionally omitted, see `assemble_find_result`).
-fn truncation_to_json(t: &TruncationResult) -> serde_json::Value {
-    let truncated_by = match t.truncated_by {
-        Some(TruncationKind::Lines) => serde_json::Value::String("lines".into()),
-        Some(TruncationKind::Bytes) => serde_json::Value::String("bytes".into()),
-        None => serde_json::Value::Null,
-    };
-    serde_json::json!({
-        "truncated": t.truncated,
-        "truncatedBy": truncated_by,
-        "totalLines": t.total_lines,
-        "totalBytes": t.total_bytes,
-        "outputLines": t.output_lines,
-        "outputBytes": t.output_bytes,
-        "lastLinePartial": t.last_line_partial,
-        "firstLineExceedsLimit": t.first_line_exceeds_limit,
-        "maxLines": t.max_lines,
-        "maxBytes": t.max_bytes,
-    })
 }
 
 /// Convert the path to POSIX style (replace only the platform separator; on Unix, `MAIN_SEPARATOR == '/'` makes this a no-op,

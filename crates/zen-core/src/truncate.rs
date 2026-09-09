@@ -14,8 +14,7 @@ pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 
 /// Character limit per line for grep matches—pi `GREP_MAX_LINE_LENGTH`.
-///
-/// Currently no direct consumers; reserved for T-AP-04-5 (grep tool).
+/// Consumer: grep tool (T-AP-04-5; `grep_files` calls `truncate_line` for each match/context line).
 pub const GREP_MAX_LINE_LENGTH: usize = 500;
 
 /// Reason truncation was triggered (pi `truncatedBy: "lines" | "bytes"`; no truncation is represented by the outer `Option`).
@@ -241,13 +240,11 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
 /// Single-line trimming before displaying grep-matched lines—"take the visible window when a single line is too wide":
 /// More than `max_chars` characters (Unicode scalar values; equivalent to pi's UTF-16 `length` case)
 /// Truncate to `max_chars` and append the `... [truncated]` suffix, allowing the caller to annotate details accordingly.
-/// Consumer: grep tool (pi grep.ts calls it for each matching line).
+/// Consumer: grep tool (pi grep.ts calls it for each matching line; T-AP-04-5 `grep_files` is already integrated).
 ///
 /// # Parameters
 /// - `line`: Single-line text (excluding the newline).
 /// - `max_chars`: character limit; callers explicitly pass [`GREP_MAX_LINE_LENGTH`] (Rust has no default parameters).
-///
-/// Currently no consumers; reserved for T-AP-04-5 (grep tool).
 pub fn truncate_line(line: &str, max_chars: usize) -> TruncatedLine {
     if line.chars().count() <= max_chars {
         return TruncatedLine {
@@ -277,6 +274,32 @@ pub fn format_size(bytes: usize) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Map [`TruncationResult`] to pi camelCase JSON in tool details (aligned with pi `TruncationResult`
+/// interface field names; `content` is intentionally omitted—the body is already output as the tool message, avoiding up to 50KB of text being stored twice in details,
+/// session JSONL persistence would amplify disk usage).
+///
+/// Consumers: find tool (`details.truncation`) and grep tool (`details.truncation`); this task (T-AP-04-5)
+/// Move the original private implementation from find.rs up to a shared view (it naturally belongs with the shared truncation types).
+pub fn truncation_to_json(t: &TruncationResult) -> serde_json::Value {
+    let truncated_by = match t.truncated_by {
+        Some(TruncationKind::Lines) => serde_json::Value::String("lines".into()),
+        Some(TruncationKind::Bytes) => serde_json::Value::String("bytes".into()),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "truncated": t.truncated,
+        "truncatedBy": truncated_by,
+        "totalLines": t.total_lines,
+        "totalBytes": t.total_bytes,
+        "outputLines": t.output_lines,
+        "outputBytes": t.output_bytes,
+        "lastLinePartial": t.last_line_partial,
+        "firstLineExceedsLimit": t.first_line_exceeds_limit,
+        "maxLines": t.max_lines,
+        "maxBytes": t.max_bytes,
+    })
 }
 
 /// Frame on `'\n'` and preprocess for line counting (matching pi-354 `splitLinesForCounting`):
@@ -372,6 +395,40 @@ mod tests {
     fn test_format_size_mb() {
         assert_eq!(format_size(1024 * 1024), "1.0MB");
         assert_eq!(format_size(1572864), "1.5MB");
+    }
+
+    // ── truncation_to_json ────────────────────────────────────────
+
+    #[test]
+    fn test_truncation_to_json_camel_case_keys_and_omits_content() {
+        let r = truncate_head(
+            "a\nb\nc\n",
+            TruncationOptions {
+                max_lines: 1,
+                ..Default::default()
+            },
+        );
+        let json = truncation_to_json(&r);
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["truncatedBy"], "lines");
+        assert_eq!(json["maxLines"], 1);
+        assert_eq!(json["maxBytes"], DEFAULT_MAX_BYTES);
+        // content is intentionally omitted (to prevent duplicate storage in JSONL); all other statistics fields are present
+        assert!(json.get("content").is_none());
+        assert!(json.get("totalLines").is_some());
+        assert!(json.get("totalBytes").is_some());
+        assert!(json.get("outputLines").is_some());
+        assert!(json.get("outputBytes").is_some());
+        assert!(json.get("lastLinePartial").is_some());
+        assert!(json.get("firstLineExceedsLimit").is_some());
+    }
+
+    #[test]
+    fn test_truncation_to_json_untrucated_uses_null_truncated_by() {
+        let r = truncate_head("hello\n", TruncationOptions::default());
+        let json = truncation_to_json(&r);
+        assert_eq!(json["truncated"], false);
+        assert_eq!(json["truncatedBy"], serde_json::Value::Null);
     }
 
     // ── truncate_line ────────────────────────────────────────────
