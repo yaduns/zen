@@ -14,6 +14,7 @@ use zen_ai::api::stream_for;
 use zen_ai::types::{Model, ThinkingLevel};
 use zen_app::cli::Mode;
 use zen_app::config::get_agent_dir;
+use zen_app::config::settings::SettingsManager;
 use zen_app::modes::print_mode::run_print_mode;
 use zen_app::session::agent_session::SessionStore;
 use zen_app::session::runtime::{create_initial_runtime, AgentSessionServices, SessionStartReason};
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         stream_fn,
         store.clone(),
         ShellConfig::default(),
+        Arc::new(SettingsManager::empty()),
         Vec::new(),
         Vec::new(),
     );

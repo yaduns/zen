@@ -13,6 +13,7 @@ use crate::compaction::utils::format_file_operations;
 use crate::session::context::build_session_context;
 use crate::session::context::session_entry_to_context_messages;
 use crate::session::tree::SessionTreeEntry;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -46,14 +47,34 @@ pub enum CompactionError {
     SummarizationFailed(String), // Summary LLM call has stop_reason = error
 }
 
+/// Compaction trigger reason (introduced by T-AP-04-3 scheduling), corresponding to pi's string literals `"overflow" | "threshold" | "manual"`.
+/// Threads through compaction lifecycle events (`AgentEvent::CompactionStart/End` payload), scheduling branches, and UI status text
+/// (the three variants map one-to-one to zen-app `CompactionStatusReason`).
+/// serde: `lowercase` produces `"overflow"/"threshold"/"manual"`, exactly matching pi literals; event variant names via
+/// `AgentEvent` outer `snake_case` produces `"compaction_start"/"compaction_end"`, also matching pi event names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactionReason {
+    /// LLM returns a context-overflow error, or a successful response's usage exceeds the configured window
+    Overflow,
+    /// Context tokens exceed the "window − reserve_tokens" threshold
+    Threshold,
+    /// Manually triggered by user `/compact [instructions]`
+    Manual,
+}
+
 /// Typed container for the list of files involved in compaction;
 /// Serialized by zen-app during persistence as SessionTreeEntry::Compaction.details (Option<Value>).
+/// derive(Clone, Serialize): travels with the enum as the AgentEvent::CompactionEnd payload (T-AP-04-3 event surface).
+#[derive(Debug, Clone, Serialize)]
 pub struct CompactionDetails {
     pub read_files: Vec<String>, // Sorted read-only file list (produced by compute_file_lists, excluding modified files)
     pub modified_files: Vec<String>, // Sorted modified-file list (edited ∪ written)
 }
 
-/// output of compact, for callers (T-AP-04-3 scheduling) to build a SessionTreeEntry::Compaction and write it back to the session tree
+/// Output of compact, used by the caller (T-AP-04-3 scheduling) to construct SessionTreeEntry::Compaction and write it back to the session tree.
+/// derive(Clone, Serialize): travels with the enum as the AgentEvent::CompactionEnd payload (T-AP-04-3 event surface).
+#[derive(Debug, Clone, Serialize)]
 pub struct CompactionResult {
     pub summary: String,             // Summary text (including the file operation addendum)
     pub first_kept_entry_id: String, // Retained history start entry id (optional for pi = transitional artifact, required for zen)
@@ -103,7 +124,7 @@ impl FileOperations {
 /// In short: compact when the current context no longer fits the window after subtracting the summary reserve.
 /// Always returns false when `settings.enabled` is false (disables automatic compaction entirely);
 /// The predicate matches pi: `context_tokens > context_window - settings.reserve_tokens`.
-/// Currently has no consumers; reserved for T-AP-04-3 (wired in when the scheduling task is implemented).
+/// Consumers: T-AP-04-3 (AgentSession::check_compaction, zen-app/src/session/compaction.rs).
 pub fn should_compact(
     context_tokens: usize,
     context_window: u64,
@@ -272,7 +293,8 @@ fn entries_to_messages_for_summarization(
 
 /// Seed the file-operation buckets from the previous compaction entry's details: readFiles → read, modifiedFiles → edited.
 /// details is JSON persisted by zen-app; the key-name contract follows the pi JSONL shape (camelCase
-/// readFiles/modifiedFiles) — the T-AP-04-3 persistence side must write the same shape (seam note);
+/// readFiles/modifiedFiles) — already written in the same shape by T-AP-04-3 `SessionStore::append_compaction`
+/// (seam is closed; evidence: tasks/T-AP-04-3-implemented.md, including persist→reopen→seed round-trip tests);
 /// Silently skip non-string array elements (pi calls add directly and relies on callers to guarantee this; zen is defensively stricter).
 pub(crate) fn seed_file_ops_from_details(details: &Value, file_ops: &mut FileOperations) {
     if let Some(read_files) = details.get("readFiles").and_then(Value::as_array) {

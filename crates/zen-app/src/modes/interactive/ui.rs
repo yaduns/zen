@@ -878,6 +878,17 @@ impl InteractiveUi {
                 is_error,
             } => self.apply_tool_end(id, result, is_error),
             UiEvent::PendingChanged(rows) => self.pending_rows = rows,
+            UiEvent::CompactionSummary {
+                summary,
+                tokens_before,
+            } => {
+                // T-AP-04-3: append summary line after compaction (consumes the ChatRow slot reserved by T-AP-11-2;
+                // aligned with pi compaction_end → addMessageToChat(createCompactionSummaryMessage))
+                self.chat_rows.push(ChatRow::CompactionSummary {
+                    summary,
+                    tokens_before,
+                });
+            }
             UiEvent::BashStart {
                 command,
                 exclude_from_context,
@@ -970,12 +981,9 @@ impl InteractiveUi {
                     &self.theme,
                 ));
             }
-            StatusSpec::Compaction => {
-                self.status_indicator = Some(StatusIndicator::compaction(
-                    CompactionStatusReason::Manual,
-                    &self.kb,
-                    &self.theme,
-                ));
+            StatusSpec::Compaction { reason } => {
+                self.status_indicator =
+                    Some(StatusIndicator::compaction(reason, &self.kb, &self.theme));
             }
             StatusSpec::BranchSummary => {
                 self.status_indicator =
@@ -1006,11 +1014,9 @@ impl InteractiveUi {
                 &self.kb,
                 &self.theme,
             )),
-            Some(StatusSpec::Compaction) => Some(StatusIndicator::compaction(
-                CompactionStatusReason::Manual,
-                &self.kb,
-                &self.theme,
-            )),
+            Some(StatusSpec::Compaction { reason }) => {
+                Some(StatusIndicator::compaction(*reason, &self.kb, &self.theme))
+            }
             Some(StatusSpec::BranchSummary) => {
                 Some(StatusIndicator::branch_summary(&self.kb, &self.theme))
             }
@@ -1028,7 +1034,7 @@ impl InteractiveUi {
             Some(
                 StatusSpec::Working { .. }
                     | StatusSpec::Retry { .. }
-                    | StatusSpec::Compaction
+                    | StatusSpec::Compaction { reason: _ }
                     | StatusSpec::BranchSummary
             )
         ) {
@@ -2108,7 +2114,9 @@ mod tests {
             .as_ref()
             .is_some_and(|i| matches!(i.kind(), StatusIndicatorKind::Working)));
         // Category switch: Compaction → rebuild as a Compaction category
-        u.apply(UiEvent::Status(StatusSpec::Compaction));
+        u.apply(UiEvent::Status(StatusSpec::Compaction {
+            reason: CompactionStatusReason::Manual,
+        }));
         assert!(u
             .status_indicator
             .as_ref()

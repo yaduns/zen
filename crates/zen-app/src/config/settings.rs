@@ -604,6 +604,25 @@ impl SettingsManager {
         }
     }
 
+    /// In-memory empty settings (default-value view, no file mounts) — for test/quick-start paths (`AgentSession::new`);
+    /// real assembly always goes through `load` (two-level file view + error queue).
+    pub fn empty() -> SettingsManager {
+        let empty_scope = |path: PathBuf| ScopeState {
+            data: SettingsData::default(),
+            raw: serde_json::Value::Object(Default::default()),
+            path,
+        };
+        SettingsManager {
+            inner: Mutex::new(Inner {
+                global: empty_scope(PathBuf::new()),
+                project: empty_scope(PathBuf::new()),
+                project_cwd: PathBuf::new(),
+                overlay: SettingsData::default(),
+                errors: Vec::new(),
+            }),
+        }
+    }
+
     /// Returns the merged full settings view (overlay > project > global, recursive to leaf fields of nested groups),
     /// for one-shot snapshot reads by each domain. Returns a clone (pi's structuredClone equivalent);
     /// Default value filling does not happen at this layer (T-AP-02-4 effective view, see `effective()`).

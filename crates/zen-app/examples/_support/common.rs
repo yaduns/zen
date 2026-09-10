@@ -11,6 +11,7 @@ use std::sync::Arc;
 use zen_ai::api::stream_for;
 use zen_ai::tool::Tool;
 use zen_ai::types::{ContentBlock, Message, Model, ThinkingLevel};
+use zen_app::config::settings::SettingsManager;
 use zen_app::session::agent_session::{AgentSession, SessionStore};
 use zen_app::session::services::{create_agent_session, NoopHooks};
 use zen_app::session::session_manager::SessionManager;
@@ -53,6 +54,7 @@ pub fn make_session(
         stream_fn,
         store(),
         ShellConfig::default(),
+        Arc::new(SettingsManager::empty()),
         Vec::new(),
         Vec::new(),
     )
@@ -101,6 +103,7 @@ pub async fn run_with_store(
         stream_fn,
         store,
         ShellConfig::default(),
+        Arc::new(SettingsManager::empty()),
         Vec::new(),
         Vec::new(),
     );

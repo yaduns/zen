@@ -15,6 +15,7 @@ use crate::commands::{
 };
 use crate::components::footer::{add_usage_to_totals, FooterData, UsageTotals};
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
+use crate::components::status_indicator::CompactionStatusReason;
 use crate::components::tree_selector::FilterMode;
 use crate::config;
 use crate::config::defaults::{SettingsEffective, DEFAULT_THINKING_LEVEL};
@@ -118,6 +119,9 @@ pub(crate) enum UiEvent {
         truncated: bool,
         full_output_path: Option<String>,
     },
+    /// Compaction done: append summary line (T-AP-04-3 producer, consuming the
+    /// `ChatRow::CompactionSummary` slot reserved by T-AP-11-2; aligned with pi compaction_end → addMessageToChat).
+    CompactionSummary { summary: String, tokens_before: u64 },
     /// Per-frame footer data snapshot (assembled by the main task from AgentSession state).
     Footer(FooterData),
     #[allow(dead_code)] // v1 seam: bash session-state switch (sent explicitly by the main task once T-AP-04-2 lands);
@@ -152,9 +156,8 @@ pub(crate) enum StatusSpec {
         max_attempts: u32,
         delay_ms: u64,
     },
-    /// Context compression in progress.
-    #[allow(dead_code)] // v1 has no compression orchestration (integrate after T-AP-03-2 lands)
-    Compaction,
+    /// Context compaction in progress (reason mapped from the compaction event payload; status text varies by Manual/Threshold/Overflow).
+    Compaction { reason: CompactionStatusReason },
     /// Branch summary generation in progress.
     #[allow(dead_code)] // v1 has no fork/branch digest (wire up after T-AP-08-5 lands)
     BranchSummary,
@@ -162,6 +165,18 @@ pub(crate) enum StatusSpec {
     Error(String),
     /// Warning hint line (semantic colors drawn directly).
     Warning(String),
+}
+
+/// One-to-one mapping from compaction trigger reason → status line text category (Manual/Threshold/Overflow share names;
+/// T-AP-04-3: the CompactionStart event payload enters `StatusSpec::Compaction` through this).
+impl From<zen_core::compaction::CompactionReason> for CompactionStatusReason {
+    fn from(reason: zen_core::compaction::CompactionReason) -> Self {
+        match reason {
+            zen_core::compaction::CompactionReason::Manual => Self::Manual,
+            zen_core::compaction::CompactionReason::Threshold => Self::Threshold,
+            zen_core::compaction::CompactionReason::Overflow => Self::Overflow,
+        }
+    }
 }
 
 /// UI task → main task input commands: output of editor/keybinding routing, consumed by the `run()` dispatch loop.
@@ -907,13 +922,20 @@ impl InteractiveMode {
     /// in `BUILTIN_SLASH_COMMANDS` before calling in; here mode-specific actions are performed based on the registry `name`
     /// (open panel / exit / pending hint). Unregistered commands (templates/skills/unknown) do not land here
     /// (they have fallen back to the `submit_message` expansion path).
-    async fn handle_inline_command(&mut self, command: &BuiltinSlashCommand, _args: &str) {
+    async fn handle_inline_command(&mut self, command: &BuiltinSlashCommand, args: &str) {
         match command.name {
             "settings" => self.open_settings_panel(),
             "quit" => self.exit_requested = true,
-            // Registered built-in commands with deferred execution: use pending prompts as a fallback (lifecycle ownership belongs to each domain task; see
-            // tasks/T-AP-03-2-implemented.md ("Data Model · BUILTIN_SLASH_COMMANDS Lifecycle Ownership Table"))
-            "compact" => self.show_warning("Context compaction pending (T-AP-04-3)"),
+            // Built-in command dispatch (T-AP-03-2 registry): /compact is wired up (T-AP-04-3);
+            // ownership of remaining pending slots belongs to their domain tasks, see
+            // tasks/T-AP-03-2-implemented.md "Data model · BUILTIN_SLASH_COMMANDS ownership table"
+            "compact" => {
+                // pi handleCompactCommand: await session.compact(instructions), catch ignored —
+                // Errors are delivered to the UI via the compaction_end event (see bridge_agent_event)
+                let instructions = args.trim();
+                let custom = (!instructions.is_empty()).then(|| instructions.to_string());
+                let _ = self.runtime.session.compact(custom.as_deref()).await;
+            }
             "new" => self.show_warning("New session pending (T-AP-08-5)"),
             "tree" => self.show_warning("Session tree pending (T-AP-08-5)"),
             "fork" => self.show_warning("Fork pending (T-AP-08-5)"),
@@ -1333,6 +1355,46 @@ fn bridge_agent_event(
                 is_error: *is_error,
             });
         }
+        AgentEvent::CompactionStart { reason } => {
+            // T-AP-04-3: compaction status line (wording varies by Manual/Threshold/Overflow)
+            let _ = tx.send(UiEvent::Status(StatusSpec::Compaction {
+                reason: (*reason).into(),
+            }));
+        }
+        AgentEvent::CompactionEnd {
+            reason,
+            result,
+            aborted,
+            error_message,
+            ..
+        } => {
+            // Status line cleared + result feedback (aligned with pi interactive compaction_end branch):
+            // Cancelled: manual -> Error("Compaction cancelled"); auto -> Warning("Auto-compaction cancelled");
+            // Failure -> Error(error_message); success -> clear status + append summary line (v1 does not rebuild history scrollback,
+            // simply appends the summary line — pi does clear+rebuild; the zen deviation is registered in the task doc).
+            let _ = tx.send(UiEvent::ClearStatus);
+            if *aborted {
+                match reason {
+                    zen_core::compaction::CompactionReason::Manual => {
+                        let _ = tx.send(UiEvent::Status(StatusSpec::Error(
+                            "Compaction cancelled".into(),
+                        )));
+                    }
+                    _ => {
+                        let _ = tx.send(UiEvent::Status(StatusSpec::Warning(
+                            "Auto-compaction cancelled".into(),
+                        )));
+                    }
+                }
+            } else if let Some(msg) = error_message {
+                let _ = tx.send(UiEvent::Status(StatusSpec::Error(msg.clone())));
+            } else if let Some(r) = result {
+                let _ = tx.send(UiEvent::CompactionSummary {
+                    summary: r.summary.clone(),
+                    tokens_before: r.tokens_before,
+                });
+            }
+        }
         AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
     }
 }
@@ -1354,6 +1416,7 @@ mod tests {
     };
     use zen_core::harness::agent_hooks::AgentLoopHooks;
     use zen_core::harness::types::AgentState;
+    use zen_core::session::tree::SessionTreeEntry;
 
     // ── Runtime fixtures (aligned with session/runtime.rs test conventions, for convenient construction of InteractiveMode) ──
 
@@ -1372,6 +1435,16 @@ mod tests {
         }
         fn cwd(&self) -> &str {
             &self.cwd_val
+        }
+        fn branch_entries(&self) -> Vec<SessionTreeEntry> {
+            Vec::new()
+        }
+        fn append_compaction(
+            &self,
+            _result: &zen_core::compaction::CompactionResult,
+            _from_hook: bool,
+        ) -> String {
+            "mock-compaction-id".to_string()
         }
     }
 
@@ -1806,6 +1879,16 @@ mod tests {
         }
         fn cwd(&self) -> &str {
             "/work"
+        }
+        fn branch_entries(&self) -> Vec<SessionTreeEntry> {
+            Vec::new()
+        }
+        fn append_compaction(
+            &self,
+            _result: &zen_core::compaction::CompactionResult,
+            _from_hook: bool,
+        ) -> String {
+            "mock-compaction-id".to_string()
         }
     }
 

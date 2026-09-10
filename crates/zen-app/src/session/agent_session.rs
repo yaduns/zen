@@ -1,14 +1,19 @@
 use crate::commands::expand_prompt_input;
+use crate::config::settings::SettingsManager;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use zen_ai::types::{ContentBlockList, Message, Model, ThinkingLevel, UserMessage};
+use tokio_util::sync::CancellationToken;
+use zen_ai::types::{ContentBlockList, Message, Model, StopReason, ThinkingLevel, UserMessage};
+use zen_core::compaction::CompactionError;
 use zen_core::env::shell_output::{execute_shell_with_capture, ShellCaptureOptions};
 use zen_core::env::{ExecutionEnv, ExecutionError, ShellConfig};
 use zen_core::harness::agent_hooks::AgentLoopError;
 use zen_core::harness::engine::Agent;
 use zen_core::harness::types::AgentEvent;
 use zen_core::prompt_templates::PromptTemplate;
+use zen_core::session::tree::SessionTreeEntry;
 use zen_core::skills::skill::Skill;
 use zen_core::util::now_millis;
 
@@ -35,36 +40,69 @@ pub trait SessionStore: Send + Sync {
 
     /// Gets the working directory.
     fn cwd(&self) -> &str;
+
+    /// Compaction scheduling reads the current branch entries (T-AP-04-3) — prepare_compaction and the "stale usage check"
+    /// both take the branch as input; the path entries backtracked from leaf to root are the complete source of truth for compaction.
+    /// Returns: entry list ordered by branch (root→leaf).
+    /// Mirrors pi `sessionManager.getBranch()`.
+    fn branch_entries(&self) -> Vec<SessionTreeEntry>;
+
+    /// After compaction completes, append a Compaction entry and redirect the leaf (T-AP-04-3) — not persisting the compaction result is equivalent to
+    /// not compacting (the next build_context would still carry all old messages). Mirrors pi `appendCompaction`.
+    /// Parameter mapping see `SessionManager::append_compaction`; details key-name contract camelCase
+    /// `readFiles`/`modifiedFiles` (consumer `seed_file_ops_from_details` seeds by these keys).
+    /// Returns: new entry id (follows append_message's return convention).
+    fn append_compaction(
+        &self,
+        result: &zen_core::compaction::CompactionResult,
+        from_hook: bool,
+    ) -> String;
 }
 // Consumers: T-AP-01-1 (subscription closure invoked inside AgentSession), T-AP-01-4 (SessionManager implements this trait)
 
 /// Higher-level session abstraction shared across modes.
 ///
 /// Holds a pre-built Agent engine (with AgentState single source of truth + resident persistence subscription), SessionStore
-/// Persistence delegate. **All session state (model/thinking_level/tools/messages/is_run)
-/// are all read/written via `self.agent.state()` delegation; this struct stores no runtime state fields** (matching pi
-/// `agent.state.*` delegate pattern of `AgentSession`).
-/// `shell_config`/`skills`/`templates` are **config/resource fields injected once at construction time** (not runtime state,
-/// and do not participate in AgentState delegation) — `skills`/`templates` feed the pre-submit `expand_prompt_input` expansion
-/// (T-AP-03-2, routing for /skill: and /template-name).
+/// Persistence delegation. **Except for compaction scheduling runtime state, all session state (model/thinking_level/tools/messages/is_run)
+/// All reads/writes are delegated through `self.agent` (aligned with pi's `AgentSession` `agent.state.*` delegation pattern);
+/// Compaction scheduler runtime-state exceptions (T-AP-04-3, aligned with same-named private fields in pi's `AgentSession`):
+/// `overflow_recovery_attempted` (overflow recovery flag, pi `_overflowRecoveryAttempted`) and
+/// `compaction_cancel` (in-flight compaction cancellation handle, pi `_compactionAbortController`/`_autoCompactionAbortController`).
+/// `shell_config`/`settings`/`skills`/`templates` are **config/resource fields injected once at construction** (not runtime
+/// state, not part of AgentState delegation) — `skills`/`templates` feed pre-submission expansion via `expand_prompt_input`
+/// (T-AP-03-2, /skill: and /template-name routing); `settings` provides compaction scheduler liveness read thresholds/retry config (T-AP-04-3,
+/// aligned with pi's `settingsManager` member).
 ///
 /// # Lifecycle
 /// - Construct (establishes resident persistence subscription) → prompt (may be called multiple times) → drop (subscription cleaned up with the agent)
-/// - abort can be called cross-thread during a prompt run (only manipulates the cancel token)
+/// - abort can be called across threads while a prompt is running (cancels the current run and any in-flight compaction)
 /// - subscribe should be called before the first prompt
 pub struct AgentSession {
-    agent: Agent,
-    session_store: Arc<dyn SessionStore>,
+    // The following engine/storage/settings handles are `pub(crate)`: `impl AgentSession` in session::compaction.rs
+    // (T-AP-04-3 scheduling orchestration, same crate, different module) needs direct access; all other in-crate code should still go through the method surface.
+    pub(crate) agent: Agent,
+    pub(crate) session_store: Arc<dyn SessionStore>,
     /// Identity registry for `!!` bash messages (excluded from the LLM context), shared with the engine-side `SessionHooks`
     /// (services.rs, T-AP-04-2-fix) via the same Arc — the key is the value of `exclusion_key`
     /// (user bash = UserMessage timestamp).
     excluded: Arc<Mutex<HashSet<String>>>,
     /// Shell override config (shell_path/command_prefix, injected by T-AP-02-3-fix; consumed by `execute_bash`)
     shell_config: ShellConfig,
+    /// Settings manager (injected at T-AP-04-3; the compaction scheduler liveness-reads the compaction/retry section via `effective()`,
+    /// aligned with the per-check read semantics of pi's `settingsManager.getCompactionSettings()`)
+    pub(crate) settings: Arc<SettingsManager>,
     /// Session prompt preprocessing skill set (injected during T-AP-03-2 assembly; /skill: routing in `expand_prompt_input`)
     skills: Vec<Skill>,
     /// Session prompt preprocessing template set (T-AP-03-2 assembly injection; /template-name routing in `expand_prompt_input`)
     templates: Vec<PromptTemplate>,
+    /// Overflow recovery flag (T-AP-04-3; pi `_overflowRecoveryAttempted`): overflow compaction+retry is attempted
+    /// only once; reset on a successful assistant response (resident subscription, pi :649) and on new user input (prompt submission, pi :597).
+    /// Wrapped in Arc: the resident subscription closure must capture it before Self is constructed (same sharing pattern as `excluded`).
+    pub(crate) overflow_recovery_attempted: Arc<AtomicBool>,
+    /// Cancellation handle for in-flight compaction (T-AP-04-3; merge of pi's two AbortControllers — zen runs at most
+    /// one compaction at a time): set to Some when compact()/run_auto_compaction starts, cleared when it ends (including on error);
+    /// `abort()` cancels it as well. The other end of the token is consumed by zen-core's `compact(cancel)`.
+    pub(crate) compaction_cancel: Mutex<Option<CancellationToken>>,
 }
 
 impl AgentSession {
@@ -95,6 +133,8 @@ impl AgentSession {
             session_store,
             Arc::new(Mutex::new(HashSet::new())),
             ShellConfig::default(),
+            // Test/quick-start path: in-memory empty settings (default-values view, no file mounted, sealed for testing)
+            Arc::new(SettingsManager::empty()),
             Vec::new(),
             Vec::new(),
         )
@@ -112,17 +152,26 @@ impl AgentSession {
         session_store: Arc<dyn SessionStore>,
         excluded: Arc<Mutex<HashSet<String>>>,
         shell_config: ShellConfig,
+        settings: Arc<SettingsManager>,
         skills: Vec<Skill>,
         templates: Vec<PromptTemplate>,
     ) -> Self {
         // Establish a persistent subscription (option 1, aligned with pi construction as `agent.subscribe(this._handleAgentEvent)`):
-        // message_end → session_store.append_message (persist to disk in real time). Subscription closure lives in the engine's listener list,
-        // dropped and auto-cleaned together with the Agent (held by value in this struct); no return/no stored unsubscribe handle.
+        // - message_end → session_store.append_message (persist in real time)
+        // - message_end (assistant and not error) → reset overflow recovery flag (aligned with pi :597; successful
+        //   response returns recovery budget) — T-AP-04-3. Subscription closure lives in the engine's listener list, cleaned up when the Agent drops.
         let store = session_store.clone();
+        let overflow_flag = Arc::new(AtomicBool::new(false));
+        let flag_for_closure = Arc::clone(&overflow_flag);
         // The subscription closure lives in the engine's listener list; unsubscription is left to agent drop (design: no unsubscribe handle stored)
         let _ = agent.subscribe(Box::new(move |event: &AgentEvent| {
             if let AgentEvent::MessageEnd { message } = event {
                 store.append_message(message);
+                if let Message::Assistant(a) = message {
+                    if a.stop_reason != StopReason::Error {
+                        flag_for_closure.store(false, Ordering::Relaxed);
+                    }
+                }
             }
         }));
         Self {
@@ -130,8 +179,11 @@ impl AgentSession {
             session_store,
             excluded,
             shell_config,
+            settings,
             skills,
             templates,
+            overflow_recovery_attempted: overflow_flag,
+            compaction_cancel: Mutex::new(None),
         }
     }
 
@@ -155,8 +207,15 @@ impl AgentSession {
     /// # Behavior
     /// 1. Before submission, expand `/skill:` and `/template_name` via `expand_prompt_input` (T-AP-03-2;
     ///    aligned with pi agent-session prompt chain's skill → template expansion order)
-    /// 2. Calls `self.agent.prompt(&expanded)` (the engine renews the run token internally; pi's surface takes no args; D2/D4)
-    /// 3. A persistent subscription writes to disk in real time during the run (message_end → append_message); callers
+    /// 2. **Compaction scheduling wiring (T-AP-04-3)**:
+    ///    - Reset the overflow recovery budget before submitting (aligned with pi :597 message_start-user reset: new user input =
+    ///      new recovery budget) and precheck (aligned with pi :1192-1205, `skip_aborted_check=false` captures compaction needs
+    ///      from the previous aborted/error turn) — compaction only, no continue; new prompt is then issued; precheck failure
+    ///      does not block submission (the error is already delivered via the `CompactionEnd` event; pi ignores the return value semantics)
+    ///    - Post-run check (aligned with pi :1094 agent_end handling): threshold compaction / overflow
+    ///      recovery retry / deliver queued messages — return true → `continue_turn` for another round, its output merged into the return value
+    /// 3. Call `self.agent.prompt(&expanded)` (engine refreshes tokens inside run; pi has no-arg surface, D2/D4)
+    /// 4. A persistent subscription runs during execution to persist in real time (message_end → append_message); consumers
     ///    Events subscribed via `subscribe` are delivered synchronously
     /// 4. Return all messages newly added this round
     ///
@@ -168,7 +227,26 @@ impl AgentSession {
     ///   (&self after the engine is shared; see interactive cancellation fix plan D)
     pub async fn prompt(&self, text: &str) -> Result<Vec<Message>, AgentSessionError> {
         let expanded = expand_prompt_input(text, &self.skills, &self.templates);
-        Ok(self.agent.prompt(&expanded).await)
+        // Reset overflow recovery budget (aligned with pi :597 message_start-user reset: new user input = new recovery budget)
+        self.overflow_recovery_attempted
+            .store(false, Ordering::Relaxed);
+        // Precheck before submitting (aligned with pi :1192-1205): skip_aborted_check=false captures the previous aborted/error turn;
+        // Return value ignored (same as pi) — compaction only, no continue; new prompt is then issued; failure does not block submission
+        if let Some(last) = super::compaction::last_assistant_message(&self.agent.messages()) {
+            let _ = self.check_compaction(last, false).await;
+        }
+        let mut msgs = self.agent.prompt(&expanded).await;
+        // Post-run check (aligned with pi :1094 agent_end handling): return true → continue_turn (overflow
+        // recovery retry / deliver queued messages), continued-round output merged into the return value
+        let should_continue =
+            match super::compaction::last_assistant_message(&self.agent.messages()) {
+                Some(last) => self.check_compaction(last, true).await.unwrap_or(false),
+                None => false,
+            };
+        if should_continue {
+            msgs.extend(self.agent.continue_turn().await?);
+        }
+        Ok(msgs)
     }
     // Consumers: T-AP-07-1 (print mode prompt), T-AP-11-1 (interactive mode prompt)
 
@@ -263,6 +341,16 @@ impl AgentSession {
     /// - `&self`: only manipulates the cancellation token, no conflict with `&mut self` of prompt (safe to call across threads)
     /// - No-op when idle
     pub fn abort(&self) {
+        // Cancel in-flight compaction (T-AP-04-3; pi abort also resets `_compactionAbortController`) —
+        // compaction and engine run are never concurrent, so resetting both is safe (empty Option = no-op)
+        if let Some(token) = self
+            .compaction_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            token.cancel();
+        }
         self.agent.abort();
     }
 
@@ -416,6 +504,18 @@ pub enum AgentSessionError {
     /// User bash execution error (`execute_bash` underlying shell channel, wired up in T-AP-04-2-fix)
     #[error("bash execution error: {0}")]
     Execution(#[from] ExecutionError),
+
+    /// For manual compaction, the last entry is already a Compaction entry (T-AP-04-3; aligned with pi "Already compacted")
+    #[error("Already compacted")]
+    AlreadyCompacted,
+
+    /// Nothing to compact — session too small (T-AP-04-3; aligned with pi "Nothing to compact (session too small)")
+    #[error("Nothing to compact (session too small)")]
+    NothingToCompact,
+
+    /// Compaction flow error (summary LLM failure/abort, T-AP-04-3; passes through zen-core `CompactionError`)
+    #[error("compaction error: {0}")]
+    Compaction(#[from] CompactionError),
 }
 
 /// Result snapshot of a one-shot user `!`/`!!` bash execution (T-AP-04-2-fix), for the UI to backfill `ChatRow::Bash`.
@@ -527,6 +627,16 @@ mod tests {
         }
         fn cwd(&self) -> &str {
             "/work/dir"
+        }
+        fn branch_entries(&self) -> Vec<SessionTreeEntry> {
+            Vec::new()
+        }
+        fn append_compaction(
+            &self,
+            _result: &zen_core::compaction::CompactionResult,
+            _from_hook: bool,
+        ) -> String {
+            "mock-compaction-id".to_string()
         }
     }
 

@@ -172,6 +172,7 @@ pub fn create_agent_session(
     stream_fn: zen_ai::types::StreamFn,
     session_store: Arc<dyn SessionStore>,
     shell_config: ShellConfig,
+    settings: Arc<SettingsManager>,
     skills: Vec<Skill>,
     templates: Vec<PromptTemplate>,
 ) -> AgentSession {
@@ -200,6 +201,7 @@ pub fn create_agent_session(
         session_store,
         excluded,
         shell_config,
+        settings,
         skills,
         templates,
     )
@@ -253,7 +255,7 @@ pub async fn create_initial_runtime_from_cli(
     // 2.5 Settings assembly (T-AP-02-3 wrap-up): load the two-tier settings, provide default_model/default_thinking_level
     //     fill-in (priority: CLI > session restore > settings > built-in defaults) and shell override config.
     //     A corrupt file degrades to empty + is recorded in the manager error queue (not surfaced at this assembly point; the interactive side's drain_errors handles that).
-    let settings = SettingsManager::load(&cwd, &agent_dir);
+    let settings = Arc::new(SettingsManager::load(&cwd, &agent_dir));
     let merged = settings.merged();
     // settings fill-in (priority: CLI > session restore > settings > env/default): default_provider
     // Known provider matched → rebuild the model by provider (provider side); default_model only changes the id,
@@ -384,6 +386,7 @@ pub async fn create_initial_runtime_from_cli(
         stream_fn,
         session_store.clone(),
         shell,
+        Arc::clone(&settings),
         skills,
         templates,
     );

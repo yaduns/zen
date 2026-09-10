@@ -24,7 +24,10 @@ pub enum StatusIndicatorKind {
     BranchSummary,
 }
 
-/// Reason the compaction was triggered (for message selection; a pure discriminant enum).
+/// Compaction trigger reason (selects the message text; pure discriminant enum). derive side: StatusSpec payload requires Debug+Clone
+/// (Copy, then pass by value via `*reason`, avoiding a clone); one-to-one mapping with zen-core `CompactionReason` via From
+/// （T-AP-04-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionStatusReason {
     /// User-initiated /compact.
     Manual,

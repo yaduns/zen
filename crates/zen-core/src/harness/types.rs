@@ -1,3 +1,4 @@
+use crate::compaction::{CompactionReason, CompactionResult};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -134,7 +135,11 @@ impl AgentState {
             AgentEvent::TurnStart
             | AgentEvent::AgentStart
             | AgentEvent::AgentEnd { .. }
-            | AgentEvent::ToolExecutionUpdate { .. } => {}
+            | AgentEvent::ToolExecutionUpdate { .. }
+            // Compaction lifecycle events are injected and consumed by the app-layer scheduler (T-AP-04-3) via Agent::emit,
+            // They are outside the engine state-machine reduction surface (streaming_message/pending_tool_calls are unrelated to compaction)
+            | AgentEvent::CompactionStart { .. }
+            | AgentEvent::CompactionEnd { .. } => {}
         }
     }
 }
@@ -183,6 +188,19 @@ pub enum AgentEvent {
         tool_name: String,
         result: ToolExecutionResult,
         is_error: bool,
+    },
+    /// Compaction begins (T-AP-04-3: injected by the app-layer scheduler via `Agent::emit`, not an engine-generated event;
+    /// Broadcast after prepare succeeds and before the summary LLM call starts; the UI displays the 「Compacting context...」 status line accordingly)
+    CompactionStart { reason: CompactionReason },
+    /// Compaction ends (success: result=Some/aborted=false; canceled: aborted=true; failure: error_message=Some).
+    /// The result is boxed: CompactionResult is large (contains the summary and retained_tail), substantially larger than the other lightweight variants
+    /// (clippy::large_enum_variant); this also reduces the cost of cloning events.
+    CompactionEnd {
+        reason: CompactionReason,
+        result: Option<Box<CompactionResult>>,
+        aborted: bool,
+        will_retry: bool,
+        error_message: Option<String>,
     },
 }
 

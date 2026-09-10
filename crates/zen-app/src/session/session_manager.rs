@@ -7,6 +7,7 @@ use crate::session::jsonl::{
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zen_ai::types::Message;
+use zen_core::compaction::{CompactionDetails, CompactionResult};
 use zen_core::session::context::build_session_context;
 use zen_core::session::tree::{SessionContext, SessionTree, SessionTreeEntry, SessionTreeError};
 
@@ -321,6 +322,53 @@ impl SessionManager {
     }
     // Consumers: T-AP-01-1 (via SessionStore), T-AP-11-1 (/thinking)
 
+    /// Append a compaction entry and redirect the leaf, returning the entry id (T-AP-04-3 scheduling persistence exit).
+    ///
+    /// # Parameter mapping (CompactionResult → SessionTreeEntry::Compaction)
+    /// - `summary`/`tokens_before` → passed through under the same name;
+    /// - `first_kept_entry_id: String` → `Option<String>` (always Some when non-empty; pi optional is a transitional artifact);
+    /// - `retained_tail: Vec<Message>` → `Option<Vec<Message>>` (empty Vec → None; entry shape matches pi "no tail");
+    /// - `usage` → passed through; `details` → serialized via [`compaction_details_to_json`];
+    /// - `from_hook` → `Some(from_hook)` (app-layer compaction is always false).
+    pub fn append_compaction(&self, result: &CompactionResult, from_hook: bool) -> String {
+        // 1. Inside the lock: pure in-memory operations (ID generation + tree append)
+        let (entry_id, entry_to_persist, session_file) = {
+            let mut inner = self.inner.lock().unwrap();
+            let entry_id = inner.tree.generate_entry_id();
+            let parent_id = inner.tree.leaf_id().map(|s| s.to_string());
+            let entry = SessionTreeEntry::Compaction {
+                id: entry_id.clone(),
+                parent_id,
+                timestamp: create_timestamp(),
+                summary: result.summary.clone(),
+                first_kept_entry_id: Some(result.first_kept_entry_id.clone()),
+                tokens_before: result.tokens_before,
+                retained_tail: (!result.retained_tail.is_empty())
+                    .then(|| result.retained_tail.clone()),
+                details: Some(compaction_details_to_json(&result.details)),
+                usage: result.usage.clone(),
+                from_hook: Some(from_hook),
+            };
+            inner.tree.append(entry.clone());
+            let file = if self.persist {
+                inner.session_file.clone()
+            } else {
+                None
+            };
+            (entry_id, entry, file)
+        }; // ← lock released
+
+        // 2. Outside the lock: file I/O (doesn't block other threads)
+        if let Some(path) = session_file {
+            if let Err(e) = append_entry(&path, &entry_to_persist) {
+                tracing::warn!("JSONL append failed (entry in memory only): {e}");
+            }
+        }
+
+        entry_id
+    }
+    // Consumer: T-AP-04-3 (via SessionStore::append_compaction)
+
     /// Append a model change, returning the entry id.
     pub fn append_model_change(&self, provider: &str, model_id: &str) -> String {
         // 1. Inside the lock: pure in-memory operations (ID generation + tree append)
@@ -516,6 +564,17 @@ impl SessionManager {
 /// an entry id `String`, the trait returns `()`). Rust allows them to coexist — calls through `&SessionManager` use the inherent
 /// methods (returning the id), calls through `&dyn SessionStore` use the trait methods (returning ()). During implementation, the inherent
 /// methods are the real implementation and the trait methods delegate to them (`todo!()` placeholders, internally delegating to the inherent methods at implementation time).
+/// Serialize compaction details to entry JSON—**key-name contract camelCase `readFiles`/`modifiedFiles`
+/// (same shape as pi JSONL)**: consumer `zen_core::compaction::seed_file_ops_from_details` seeds by these keys
+/// file-operation buckets; if written as snake_case, seeding silently fails after reopening the session (missing keys do not error).
+/// Acceptance: the round-trip test in session_manager tests (write to disk → reopen → seed) prevents key-name drift.
+fn compaction_details_to_json(details: &CompactionDetails) -> serde_json::Value {
+    serde_json::json!({
+        "readFiles": details.read_files,
+        "modifiedFiles": details.modified_files,
+    })
+}
+
 impl SessionStore for SessionManager {
     /// Append a message. Called via AgentSession's resident subscription (persisted to disk in real time).
     fn append_message(&self, _message: &Message) {
@@ -536,6 +595,14 @@ impl SessionStore for SessionManager {
     /// The current working directory.
     fn cwd(&self) -> &str {
         &self.cwd
+    }
+    /// Compaction scheduling reads current-branch entries (T-AP-04-3: input for prepare_compaction and stale usage checks).
+    fn branch_entries(&self) -> Vec<SessionTreeEntry> {
+        self.get_branch(None)
+    }
+    /// Write a compaction entry and redirect the leaf (T-AP-04-3). Delegates to the inherent method, returning the entry id.
+    fn append_compaction(&self, result: &CompactionResult, from_hook: bool) -> String {
+        self.append_compaction(result, from_hook)
     }
 }
 
@@ -1049,6 +1116,110 @@ mod tests {
 
         // Trait methods are backed by inherent methods on the same tree
         assert_eq!(mgr.get_entries().len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── append_compaction（T-AP-04-3）───────────────────────────
+
+    fn compaction_result() -> CompactionResult {
+        CompactionResult {
+            summary: "summary text".to_string(),
+            first_kept_entry_id: "e1".to_string(),
+            tokens_before: 12_345,
+            usage: None,
+            retained_tail: vec![],
+            details: CompactionDetails {
+                read_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                modified_files: vec!["src/c.rs".to_string()],
+            },
+        }
+    }
+
+    #[test]
+    fn test_append_compaction_writes_camelcase_details_and_redirects_leaf() {
+        // Key-name contract: details must use camelCase readFiles/modifiedFiles (same shape as pi JSONL),
+        // Consumer seed_file_ops_from_details seeds by these keys; if written as snake_case, it silently fails
+        let root = test_dir("append_compaction");
+        let mgr = create_in(&root, "/proj", None);
+        mgr.append_message(&user_message("hi"));
+        let result = compaction_result();
+        let id = mgr.append_compaction(&result, false);
+        assert!(!id.is_empty());
+        // Redirect leaf to the compaction entry
+        let entries = mgr.get_entries();
+        assert_eq!(entries.len(), 2);
+        let last = entries.last().unwrap();
+        assert!(matches!(last, SessionTreeEntry::Compaction { .. }));
+        assert_eq!(mgr.get_leaf_id().as_deref(), Some(id.as_str()));
+        // details key-name contract
+        if let SessionTreeEntry::Compaction {
+            details,
+            from_hook,
+            first_kept_entry_id,
+            ..
+        } = last
+        {
+            let details = details.as_ref().unwrap();
+            assert!(
+                details.get("readFiles").is_some(),
+                "readFiles key must be camelCase"
+            );
+            assert!(
+                details.get("modifiedFiles").is_some(),
+                "modifiedFiles key must be camelCase"
+            );
+            assert!(
+                details.get("read_files").is_none(),
+                "Must not contain snake_case keys"
+            );
+            assert_eq!(
+                details
+                    .get("readFiles")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["src/a.rs", "src/b.rs"]
+            );
+            assert_eq!(first_kept_entry_id.as_deref(), Some("e1"));
+            assert_eq!(*from_hook, Some(false));
+        } else {
+            panic!("expected compaction entry");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_append_compaction_roundtrip_empty_tail_maps_to_none() {
+        // Write to disk → reopen: JSONL serialization preserves all entry fields; empty retained_tail Vec → None
+        let root = test_dir("compaction_roundtrip");
+        let mgr = create_in(&root, "/proj", None);
+        mgr.append_message(&user_message("hi"));
+        let result = compaction_result();
+        mgr.append_compaction(&result, false);
+        let file = mgr.get_session_file().unwrap();
+        drop(mgr);
+
+        let reopened = SessionManager::open(&file, None, &root).expect("reopen should succeed");
+        let entries = reopened.get_entries();
+        assert_eq!(entries.len(), 2);
+        if let SessionTreeEntry::Compaction {
+            summary,
+            tokens_before,
+            retained_tail,
+            details,
+            ..
+        } = entries.last().unwrap()
+        {
+            assert_eq!(summary, "summary text");
+            assert_eq!(*tokens_before, 12_345);
+            assert!(retained_tail.is_none(), "empty retained_tail should be written as None");
+            assert!(details.as_ref().unwrap().get("readFiles").is_some());
+        } else {
+            panic!("expected compaction entry");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

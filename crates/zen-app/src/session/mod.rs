@@ -1,4 +1,5 @@
 pub mod agent_session;
+pub mod compaction;
 pub mod jsonl;
 pub mod runtime;
 pub mod services;

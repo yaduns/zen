@@ -457,6 +457,32 @@ impl Agent {
 
     // Consumer: T-AP-01-1 (persistent subscription via AgentSession::new + pass-through in AgentSession::subscribe)
 
+    /// The sole entry point where the application layer injects compaction lifecycle events into the agent event bus (T-AP-04-3) — compaction does not run
+    /// inside the engine loop, but the UI only recognizes a single event channel, so the scheduler broadcasts through here at start/end.
+    /// Behavior: synchronously dispatches `event` to the same listener list as `subscribe` (invoked one by one, indistinguishable from engine-emitted
+    /// events; see the EventListenerList consumption path for details).
+    /// Boundary: for use only by the zen-app scheduling layer; engine events never go through this method (prevents bypassing the state machine),
+    /// `AgentState::apply_event` reduces compaction events to no-op.
+    pub fn emit(&self, event: AgentEvent) {
+        let listeners: Vec<_> = {
+            let guard = self
+                .event_listeners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.entries.iter().map(|(_, l)| Arc::clone(l)).collect()
+        };
+        for listener in listeners {
+            listener(&event);
+        }
+    }
+
+    /// Accessor for the engine stream function used by compaction scheduling (T-AP-04-3) — the summary LLM call must share the same source as the prompt loop
+    /// (same auth resolution, same provider endpoint), otherwise a split of "conversation works, compaction fails" occurs.
+    /// Behavior: clones and returns the internal stream_fn (`StreamFn: Clone`, same way the engine passes it each prompt round).
+    pub fn stream_fn(&self) -> StreamFn {
+        self.stream_fn.clone()
+    }
+
     // ── State snapshot accessors (cannot return references while holding the lock, so all return owned snapshots; replaces the original state(), III.3/III.4) ──
 
     /// Whether a run is in progress (`state.is_run`, maintained by start_run/run_with_lifecycle/RunGuard).

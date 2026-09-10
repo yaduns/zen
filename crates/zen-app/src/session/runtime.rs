@@ -134,6 +134,16 @@ mod tests {
         fn cwd(&self) -> &str {
             &self.cwd_val
         }
+        fn branch_entries(&self) -> Vec<zen_core::session::tree::SessionTreeEntry> {
+            Vec::new()
+        }
+        fn append_compaction(
+            &self,
+            _result: &zen_core::compaction::CompactionResult,
+            _from_hook: bool,
+        ) -> String {
+            "mock-compaction-id".to_string()
+        }
     }
 
     struct MockHooks;
