@@ -1,14 +1,22 @@
-use crate::env::ShellConfig;
-use crate::truncate::{truncate_tail, TruncationOptions, TruncationResult};
+use crate::env::shell_output::{
+    execute_shell_with_capture, ShellCaptureOptions, StreamSnapshot, StreamSnapshotCallback,
+};
+use crate::env::{ExecutionEnv, ExecutionError, ShellConfig};
+use crate::truncate::{
+    format_size, truncation_to_json, TruncationKind, TruncationResult, DEFAULT_MAX_BYTES,
+};
 use crate::util::now_millis;
 use async_trait::async_trait;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolContext, ToolError, ToolExecutionResult, ToolUpdateCallback};
 use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 
 /// Bash command execution tool that allows the agent to run commands in a shell.
 /// Supports:
-/// - Execute any shell command (invokes the system shell via `tokio::process::Command`)
+/// - Arbitrary shell command execution (via unified execution channel `env::execute_shell_with_capture`, T-AP-04-7)
 /// - Combined stdout/stderr capture
 /// - Timeout control (via the timeout parameter, in seconds)
 /// - Cancellation signal (CancellationToken)
@@ -22,7 +30,7 @@ use zen_ai::types::{ContentBlock, TextContent, ToolResultMessage, Usage};
 /// # Edge Cases
 /// - Empty command returns `ToolError::InvalidArguments`.
 /// - `timeout` must be a positive number, otherwise returns `ToolError::InvalidArguments`.
-/// - If the working directory does not exist, `tokio::process::Command` returns an error, passed through as `ToolError::Execution`.
+/// - When the working directory does not exist, the unified channel's cwd precheck returns an error, passed through as `ToolError::Execution`.
 /// - When the command's exit code is non-zero, the output is still returned to the LLM, but the error is flagged via `is_error`.
 /// - On timeout, `ToolError::Execution` contains the text "timed out".
 /// - On cancellation, returns `ToolError::Cancelled`.
@@ -107,13 +115,14 @@ impl Tool for BashTool {
     ) -> Result<ToolExecutionResult, ToolError> {
         let (command, timeout) = parse_bash_args(params)?;
         let resolved = self.resolve_command(&command);
-        let (content, exit_code, info) = execute_command(
+        let (content, exit_code, info, full_output_path) = execute_command(
             &resolved,
             &self.tool_context.working_dir,
             self.shell.shell_path.as_deref(),
             timeout,
             cancel,
-            Some(&on_update),
+            tool_call_id,
+            Some(on_update),
         )
         .await?;
 
@@ -121,11 +130,14 @@ impl Tool for BashTool {
 
         let is_error = exit_code.map_or(false, |c| c != 0);
 
+        // Truncation hint text (aligned with pi formatOutput's three branches; on truncation full_output_path must have spilled)
+        let text = format_bash_output(&content, &info, full_output_path.as_deref());
+
         let message = ToolResultMessage {
             tool_call_id: tool_call_id.to_string(),
             tool_name: "bash".to_string(),
             content: vec![ContentBlock::Text(TextContent {
-                text: content,
+                text,
                 text_signature: None,
             })],
             details: Some(serde_json::json!({
@@ -133,6 +145,7 @@ impl Tool for BashTool {
                 "totalLines": info.total_lines,
                 "outputLines": info.output_lines,
                 "truncated": info.truncated,
+                "fullOutputPath": full_output_path.map(|p| p.to_string_lossy().into_owned()),
             })),
             usage: Some(Usage::default()),
             is_error,
@@ -144,6 +157,69 @@ impl Tool for BashTool {
             message,
             terminate: false,
         })
+    }
+}
+
+/// Truncation hint text assembly (aligned with pi `formatOutput`'s three branches): the bash tool appends to the end of the result text
+/// a `[Showing ...]` section so the LLM/user knows the displayed output is the truncated tail rather than the full output, and gives the full
+/// output file path. Returns content unchanged when not truncated or no full output path exists.
+///
+/// Branch semantics (verbatim alignment with pi bash.ts `formatOutput`):
+/// - `last_line_partial`: single line exceeds limit, reports "Showing last {output_bytes} of line {end_line}
+///   (line is {last line byte count})" — line size derived from the last line of content (equivalent to pi `getLastLineBytes`);
+/// - `truncated_by == Lines`: reports "Showing lines {start}-{end} of {total_lines}";
+/// - Otherwise (bytes): append `({format_size(DEFAULT_MAX_BYTES)} limit)` text.
+fn format_bash_output(
+    content: &str,
+    truncation: &TruncationResult,
+    full_output_path: Option<&std::path::Path>,
+) -> String {
+    if !truncation.truncated {
+        return content.to_string();
+    }
+    let Some(path) = full_output_path else {
+        return content.to_string();
+    };
+    let start_line = truncation.total_lines - truncation.output_lines + 1;
+    let end_line = truncation.total_lines;
+    let mut text = content.to_string();
+    if truncation.last_line_partial {
+        let last_line_size = content.rsplit('\n').next().unwrap_or("").len();
+        text.push_str(&format!(
+            "\n\n[Showing last {} of line {} (line is {}). Full output: {}]",
+            format_size(truncation.output_bytes),
+            end_line,
+            format_size(last_line_size),
+            path.display()
+        ));
+    } else if truncation.truncated_by == Some(TruncationKind::Lines) {
+        text.push_str(&format!(
+            "\n\n[Showing lines {}-{} of {}. Full output: {}]",
+            start_line,
+            end_line,
+            truncation.total_lines,
+            path.display()
+        ));
+    } else {
+        text.push_str(&format!(
+            "\n\n[Showing lines {}-{} of {} ({} limit). Full output: {}]",
+            start_line,
+            end_line,
+            truncation.total_lines,
+            format_size(DEFAULT_MAX_BYTES),
+            path.display()
+        ));
+    }
+    text
+}
+
+/// Unified execution channel error → tool error mapping: after the bash tool migration, `execute_shell_with_capture`'s
+/// `ExecutionError` is converted to `ToolError`; cancellation/timeout semantics match the existing contract.
+fn map_exec_error(e: ExecutionError) -> ToolError {
+    match e {
+        ExecutionError::Aborted => ToolError::Cancelled,
+        ExecutionError::Timeout(_) => ToolError::Execution("Command timed out".into()),
+        other => ToolError::Execution(format!("Command failed: {other}")),
     }
 }
 
@@ -179,26 +255,27 @@ fn parse_bash_args(params: &serde_json::Value) -> Result<(String, Option<f64>), 
 
 /// Executes a shell command, captures output, and applies tail truncation.
 ///
-/// Execute commands through the system shell using `tokio::process::Command`.
-/// Merge stdout/stderr into a single output stream.
-/// If `timeout` is provided, wrap with `tokio::time::timeout`.
-/// If `on_update` is provided, periodically push partial results while output accumulates.
-/// Truncate output from the end (keep the last N lines/bytes).
+/// Migrated to the unified `env` channel (`execute_shell_with_capture`, T-AP-04-7):
+/// - Bounded in-memory streaming accumulation + spill to temp file on overflow (full output exposed via `full_output_path`);
+/// - 100ms throttled snapshots drive `on_update` streaming partials (aligned with pi `BASH_UPDATE_THROTTLE_MS`);
+/// - Inherits `env.exec`'s 5303 wait semantics (detached descendants holding the pipe don't hang) and process tree cleanup;
+/// - `sanitize: false` keeps raw text (aligned with the pi bash tool not sanitizing); stdout/stderr arrive interleaved.
 ///
 /// # Parameters
 /// - `command`: The command string to execute.
-/// - `working_dir`: working directory.
+/// - `working_dir`: working directory (base_dir for constructing the execution environment).
 /// - `shell_path`: custom shell path (None = system default `sh`).
 /// - `timeout`: Timeout in seconds (None = no timeout).
 /// - `cancel`: cancellation token.
-/// - `on_update`: streaming update callback (optional).
+/// - `tool_call_id`: current tool call id (for assembling partial messages).
+/// - `on_update`: streaming update callback (optional; ownership moved so the throttle closure can hold it).
 ///
 /// # Return Value
-/// A tuple containing the output content, exit code, and truncation info.
+/// Tuple of four (output content, exit code, truncation info, full output temp file path).
 ///
 /// # Edge Cases
-/// - If the cancellation token is triggered during command execution, the process is killed and `ToolError::Cancelled` is returned.
-/// - After a timeout triggers, the process is killed and `ToolError::Execution` containing "timed out" is returned.
+/// - If the cancellation token is triggered during command execution, returns `ToolError::Cancelled`.
+/// - After a timeout fires, the process tree is killed and `ToolError::Execution` is returned containing "timed out".
 /// - A non-zero exit code is not treated as an error — the output and exit code are both returned to the caller, which decides whether to flag them as an error.
 async fn execute_command(
     command: &str,
@@ -206,81 +283,78 @@ async fn execute_command(
     shell_path: Option<&std::path::Path>,
     timeout: Option<f64>,
     cancel: &CancellationToken,
-    on_update: Option<&ToolUpdateCallback>,
-) -> Result<(String, Option<i32>, TruncationResult), ToolError> {
-    // 1. spawn process (shell_path overrides the system default `sh`, matching pi `createLocalBashOperations({shellPath})`)
-    let mut child =
-        tokio::process::Command::new(shell_path.unwrap_or_else(|| std::path::Path::new("sh")))
-            .arg("-c")
-            .arg(command)
-            .current_dir(working_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| ToolError::Execution(format!("Failed to spawn process: {}", e)))?;
+    tool_call_id: &str,
+    on_update: Option<ToolUpdateCallback>,
+) -> Result<(String, Option<i32>, TruncationResult, Option<PathBuf>), ToolError> {
+    // 1. Construct the unified execution channel (mirroring the agent_session.rs::execute_bash precedent)
+    let env = ExecutionEnv::new(
+        working_dir.to_path_buf(),
+        shell_path.map(|p| p.to_path_buf()),
+        None,
+        None,
+    );
 
-    // 2. Take the stdout/stderr pipes (wait_with_output consumes the child, so read manually instead)
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    // 3. Read stdout/stderr in the background
-    use tokio::io::AsyncReadExt;
-    let read_stdout = stdout_pipe.map(|mut pipe| {
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            pipe.read_to_end(&mut buf).await.ok();
-            buf
-        })
-    });
-    let read_stderr = stderr_pipe.map(|mut pipe| {
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            pipe.read_to_end(&mut buf).await.ok();
-            buf
-        })
-    });
-
-    // 4. Wait for the process to finish (with timeout + cancellation)
-    let status = tokio::select! {
-        _ = cancel.cancelled() => {
-            let _ = child.kill();
-            return Err(ToolError::Cancelled);
-        }
-        result = async {
-            let wait_result = if let Some(t) = timeout {
-                let dur = std::time::Duration::from_secs_f64(t);
-                match tokio::time::timeout(dur, child.wait()).await {
-                    Ok(r) => r,
-                    Err(_) => return Err(ToolError::Execution("Command timed out".into())),
-                }
-            } else {
-                child.wait().await
+    // 2. Throttled snapshots (100ms, aligned with pi BASH_UPDATE_THROTTLE_MS) → partial on_update
+    let snapshot_interval = Duration::from_millis(100);
+    let on_snapshot: Option<StreamSnapshotCallback> = on_update.map(|cb| {
+        let tool_call_id = tool_call_id.to_string();
+        let cb: StreamSnapshotCallback = Arc::new(move |snap: &StreamSnapshot| {
+            let message = ToolResultMessage {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "bash".to_string(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: snap.content.clone(),
+                    text_signature: None,
+                })],
+                details: Some(serde_json::json!({
+                    "truncation": if snap.truncation.truncated {
+                        truncation_to_json(&snap.truncation)
+                    } else {
+                        serde_json::Value::Null
+                    },
+                    "fullOutputPath": snap
+                        .full_output_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                })),
+                usage: Some(Usage::default()),
+                is_error: false,
+                added_tool_names: None,
+                timestamp: now_millis(),
             };
-            wait_result.map_err(|e| ToolError::Execution(format!("Process error: {}", e)))
-        } => result?,
+            cb(ToolExecutionResult {
+                message,
+                terminate: false,
+            });
+        });
+        cb
+    });
+
+    // 3. Assemble options and execute (unified channel)
+    let options = ShellCaptureOptions {
+        cwd: None, // Default to env.base_dir (= working_dir)
+        env: None,
+        timeout: timeout.map(Duration::from_secs_f64),
+        cancellation: Some(cancel.clone()),
+        on_chunk: Arc::new(|_| {}), // This path pushes via on_snapshot throttling and does not consume per-chunk callbacks
+        sanitize: false,            // Keep raw text (aligned with the pi bash tool not sanitizing)
+        on_snapshot,
+        snapshot_interval: Some(snapshot_interval),
     };
+    let captured = execute_shell_with_capture(&env, command, &options)
+        .await
+        .map_err(map_exec_error)?;
 
-    // 5. Collect output
-    let exit_code = status.code();
-    let mut merged = Vec::new();
-    if let Some(handle) = read_stdout {
-        // handle.await can only complete after (or concurrently with) child.wait(), because if the process does not exit, the pipe never reaches EOF and read_to_end keeps waiting.
-        if let Ok(buf) = handle.await {
-            merged.extend_from_slice(&buf);
-        }
+    // 4. Semantic mapping: cancellation → Cancelled; all other results passed through as-is
+    if captured.cancelled {
+        return Err(ToolError::Cancelled);
     }
-    if let Some(handle) = read_stderr {
-        if let Ok(buf) = handle.await {
-            merged.extend_from_slice(&buf);
-        }
-    }
-    let text = String::from_utf8_lossy(&merged).into_owned();
-
-    // 6. Tail truncation (shared module crate::truncate, T-AG-06-3)
-    let info = truncate_tail(&text, TruncationOptions::default());
-    let content = info.content.clone();
-
-    Ok((content, exit_code, info))
+    Ok((
+        captured.output,
+        captured.exit_code,
+        captured.truncation,
+        captured.full_output_path,
+    ))
 }
 
 #[cfg(test)]
@@ -429,20 +503,252 @@ mod tests {
             None,
             None,
             &cancel,
+            "test-id",
             None,
         )
         .await;
         assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 
-    // The process-execution part of execute_command relies on the actual system shell,
-    // Recommended to cover in integration tests:
-    // - simple command executes normally (echo)
-    // - command output merges stdout/stderr
-    // - timeout triggers (sleep command + short timeout)
-    // - cancel a running command
-    // - command does not exist (spawn fails)
-    // - non-zero exit code
-    // - large output truncated by MAX_LINES
-    // - large output truncated by MAX_BYTES
+    // ─── execute_command (real shell, unified channel integration) ───────────────────
+
+    #[tokio::test]
+    async fn test_execute_command_echo() {
+        let cancel = CancellationToken::new();
+        let (content, exit_code, info, full_output_path) = execute_command(
+            "echo hello",
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            &cancel,
+            "test-id",
+            None,
+        )
+        .await
+        .expect("exec ok");
+        assert_eq!(content, "hello\n");
+        assert_eq!(exit_code, Some(0));
+        assert!(!info.truncated);
+        assert!(full_output_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_nonzero_exit() {
+        let cancel = CancellationToken::new();
+        let (_content, exit_code, _info, _path) = execute_command(
+            "exit 3",
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            &cancel,
+            "test-id",
+            None,
+        )
+        .await
+        .expect("exec ok");
+        assert_eq!(exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_timeout() {
+        let cancel = CancellationToken::new();
+        let result = execute_command(
+            "sleep 5",
+            std::path::Path::new("/tmp"),
+            None,
+            Some(0.5),
+            &cancel,
+            "test-id",
+            None,
+        )
+        .await;
+        match result {
+            Err(ToolError::Execution(msg)) => {
+                assert!(msg.contains("timed out"), "msg: {msg}")
+            }
+            other => panic!("expected Execution timed out, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_cancelled_during_execution() {
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            c2.cancel();
+        });
+        let result = execute_command(
+            "sleep 5",
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            &cancel,
+            "test-id",
+            None,
+        )
+        .await;
+        canceller.await.expect("canceller task");
+        assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_large_output_truncated_with_notice() {
+        // End-to-end via BashTool::execute: truncation hint text and fullOutputPath are assembled in execute()
+        let tool = bash_tool();
+        let params = json!({ "command": "yes line | head -n 15000" });
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute("test-id", &params, &cancel, Box::new(|_| {}))
+            .await
+            .expect("execute ok");
+        let msg = result.message;
+        let text = match &msg.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text block, got {other:?}"),
+        };
+        assert!(
+            text.contains("[Showing lines 13001-15000 of 15000. Full output:"),
+            "text: {text}"
+        );
+        let full_output_path = msg
+            .details
+            .as_ref()
+            .and_then(|d| d["fullOutputPath"].as_str())
+            .expect("details.fullOutputPath")
+            .to_string();
+        assert!(text.contains(&full_output_path));
+        assert_eq!(msg.details.as_ref().unwrap()["truncated"], true);
+        let _ = std::fs::remove_file(&full_output_path);
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_on_update_receives_partial_snapshots() {
+        let cancel = CancellationToken::new();
+        let received: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got = received.clone();
+        let on_update: ToolUpdateCallback = Box::new(move |res: ToolExecutionResult| {
+            if let Some(ContentBlock::Text(t)) = res.message.content.first() {
+                got.lock().unwrap().push(t.text.clone());
+            }
+        });
+        let (_content, exit_code, _info, _path) = execute_command(
+            "for i in 1 2 3 4 5 6 7 8; do echo \"line-$i\"; sleep 0.08; done",
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            &cancel,
+            "test-id",
+            Some(on_update),
+        )
+        .await
+        .expect("exec ok");
+        assert_eq!(exit_code, Some(0));
+        let parts = received.lock().unwrap();
+        assert!(!parts.is_empty(), "expected >=1 partial snapshot");
+        assert!(parts.iter().any(|t| t.contains("line-")));
+    }
+
+    // ─── format_bash_output (pure function) ─────────────────────────────────
+
+    #[test]
+    fn test_format_bash_output_not_truncated_passthrough() {
+        let info =
+            crate::truncate::truncate_tail("hello", crate::truncate::TruncationOptions::default());
+        assert_eq!(
+            format_bash_output("hello", &info, Some(std::path::Path::new("/tmp/x.log"))),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn test_format_bash_output_lines_branch() {
+        let text = (0..3000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let info = crate::truncate::truncate_tail(
+            &text,
+            crate::truncate::TruncationOptions {
+                max_lines: 2000,
+                max_bytes: usize::MAX,
+            },
+        );
+        assert_eq!(info.truncated_by, Some(TruncationKind::Lines));
+        let out = format_bash_output(
+            &info.content,
+            &info,
+            Some(std::path::Path::new("/tmp/x.log")),
+        );
+        assert!(
+            out.contains("[Showing lines 1001-3000 of 3000. Full output: /tmp/x.log]"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_bash_output_bytes_branch() {
+        let line = "x".repeat(100);
+        let text = (0..3000)
+            .map(|_| line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let info = crate::truncate::truncate_tail(
+            &text,
+            crate::truncate::TruncationOptions {
+                max_lines: usize::MAX,
+                max_bytes: 100 * 1024,
+            },
+        );
+        assert_eq!(info.truncated_by, Some(TruncationKind::Bytes));
+        let out = format_bash_output(
+            &info.content,
+            &info,
+            Some(std::path::Path::new("/tmp/x.log")),
+        );
+        assert!(
+            out.contains("(50.0KB limit). Full output: /tmp/x.log]"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_bash_output_last_line_partial_branch() {
+        let text = "y".repeat(200_000); // Single line 200KB > 50KB → tail truncation keeps only the line's tail portion
+        let info =
+            crate::truncate::truncate_tail(&text, crate::truncate::TruncationOptions::default());
+        assert!(info.last_line_partial);
+        let out = format_bash_output(
+            &info.content,
+            &info,
+            Some(std::path::Path::new("/tmp/x.log")),
+        );
+        assert!(
+            out.starts_with("yyy"),
+            "content tail expected, got prefix: {}",
+            &out[..20.min(out.len())]
+        );
+        assert!(out.contains("[Showing last "), "out: {out}");
+        assert!(out.contains(" of line 1 (line is "), "out: {out}");
+        assert!(out.contains("). Full output: /tmp/x.log]"), "out: {out}");
+    }
+
+    #[test]
+    fn test_format_bash_output_truncated_without_path_passthrough() {
+        let text = (0..3000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let info = crate::truncate::truncate_tail(
+            &text,
+            crate::truncate::TruncationOptions {
+                max_lines: 2000,
+                max_bytes: usize::MAX,
+            },
+        );
+        assert!(info.truncated);
+        let out = format_bash_output(&info.content, &info, None);
+        assert_eq!(out, info.content);
+    }
 }

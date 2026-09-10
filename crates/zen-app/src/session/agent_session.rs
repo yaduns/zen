@@ -219,6 +219,9 @@ impl AgentSession {
             timeout: None,
             cancellation: None,
             on_chunk: on_chunk.unwrap_or_else(|| Arc::new(|_| {})),
+            sanitize: true, // `!/!!` paths remain sanitized (aligned with pi bash-executor.ts)
+            on_snapshot: None,
+            snapshot_interval: None,
         };
         let captured = execute_shell_with_capture(&env, &resolved_command, &options).await?;
 

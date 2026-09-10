@@ -7,8 +7,24 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Streaming snapshot payload at some point during execution (the `ShellCaptureOptions::on_snapshot` callback argument):
+/// the bash tool uses it to assemble throttled partial `on_update`, so that during bash tool execution in an agent session
+/// the tail output and truncation state are visible in real time (matching the snapshot contents of `emitOutputUpdate` in pi bash.ts).
+pub struct StreamSnapshot {
+    /// Display text after tail-buffer truncation (the result of `truncate_tail` on the tail buffer; the full tail when not over the limit).
+    pub content: String,
+    /// Truncation metadata (derived from the tail buffer; same semantics as [`ShellCaptureResult::truncation`], not cumulative over the full output).
+    pub truncation: crate::truncate::TruncationResult,
+    /// Path of the full output spilled so far; `None` if not yet overflowed.
+    pub full_output_path: Option<PathBuf>,
+}
+
+/// Throttled snapshot callback type (`ShellCaptureOptions::on_snapshot`; the bash tool uses it to assemble partial `on_update`).
+/// Named alias to avoid the `type_complexity` warning (following the `zen_ai::tool::ToolUpdateCallback` precedent).
+pub type StreamSnapshotCallback = Arc<dyn Fn(&StreamSnapshot) + Send + Sync>;
 
 pub struct ShellCaptureOptions {
     // Working directory of the command, passed through as ExecOptions.cwd
@@ -21,6 +37,15 @@ pub struct ShellCaptureOptions {
     pub cancellation: Option<CancellationToken>,
     // Streaming callback for each chunk of sanitized text (\r removed); infallible contract (panic unwinds directly, aligning with ExecOptions.on_stdout)
     pub on_chunk: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Whether to run `sanitize_binary_output` + strip `\r` on each chunk. `true` = sanitize (current behavior of the `!/!!` path,
+    /// matching pi bash-executor.ts); `false` keeps the raw text (the bash tool passes false, matching the pi bash tool's no-sanitize behavior).
+    pub sanitize: bool,
+    /// Throttled snapshot callback (`None` = disabled); internally emits [`StreamSnapshot`] from the tail buffer per [`Self::snapshot_interval`].
+    /// The callback is a synchronous closure; snapshot collection happens outside the internal lock (take tail text, release lock, then call back), so user code is never invoked while holding the lock.
+    pub on_snapshot: Option<StreamSnapshotCallback>,
+    /// Trigger interval for [`Self::on_snapshot`] (the bash tool passes `Some(Duration::from_millis(100))`);
+    /// not triggered when this is `None` or `on_snapshot` is `None`.
+    pub snapshot_interval: Option<Duration>,
 }
 
 // Complete result of a capture call returned to the caller
@@ -35,6 +60,8 @@ pub struct ShellCaptureResult {
     pub truncated: bool,
     // Full-output temp file path (prefix `bash-`, suffix `.log`); exists only on overflow/truncation
     pub full_output_path: Option<PathBuf>,
+    // final truncation metadata (already computed internally; exposed for the bash tool to assemble details and hint text)
+    pub truncation: crate::truncate::TruncationResult,
 }
 
 // ---- Serial write coordination (replaces pi's writeChain promise chain) ----
@@ -50,6 +77,8 @@ struct SharedCaptureState {
     create_sent: bool,
     tail: VecDeque<String>,
     tail_bytes: usize,
+    /// Timestamp of the last throttled snapshot; `None` = no snapshot emitted yet (the first snapshot fires immediately).
+    last_snapshot_at: Option<Instant>,
 }
 
 /// Create temp file + write initial content; on success return the persisted path
@@ -159,6 +188,7 @@ pub async fn execute_shell_with_capture(
         create_sent: false,
         tail: VecDeque::new(),
         tail_bytes: 0,
+        last_snapshot_at: None,
     }));
     let full_output_path: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
 
@@ -193,15 +223,25 @@ pub async fn execute_shell_with_capture(
     });
 
     // 3) Per-chunk internal handler (synchronous closure; can only try_send to queue write operations)
+    //    throttled snapshot: inside the lock only check whether due and update the timestamp; snapshot computation and callback happen outside the lock
+    //    (take tail text, release lock, then call back, avoiding calling user code while holding the lock — the recommended strategy for open question 1).
+    let sanitize = options.sanitize;
+    let snapshot_interval = options.snapshot_interval;
+    let on_snapshot = options.on_snapshot.clone();
     let on_chunk = options.on_chunk.clone();
     let state_handler = state.clone();
     let tx_handler = tx.clone();
+    let path_snapshot = full_output_path.clone();
     let handler: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |chunk: &str| {
         let Ok(mut st) = state_handler.lock() else {
             return; // Lock poisoning (should not happen): best effort
         };
         st.total_bytes += chunk.len();
-        let text = sanitize_binary_output(chunk).replace('\r', "");
+        let text = if sanitize {
+            sanitize_binary_output(chunk).replace('\r', "")
+        } else {
+            chunk.to_string()
+        };
 
         // Full output overflow: create the file on the first overflow (initial content = all text so far), then append each chunk
         if st.total_bytes > DEFAULT_MAX_BYTES {
@@ -222,7 +262,39 @@ pub async fn execute_shell_with_capture(
                 st.tail_bytes -= removed.len();
             }
         }
+
+        // throttled snapshot check: if due, mark and update the timestamp (computation outside the lock)
+        let snapshot_due = match (on_snapshot.as_ref(), snapshot_interval) {
+            (Some(_), Some(interval)) => {
+                let now = Instant::now();
+                let due = st
+                    .last_snapshot_at
+                    .is_none_or(|t| now.duration_since(t) >= interval);
+                if due {
+                    st.last_snapshot_at = Some(now);
+                }
+                due
+            }
+            _ => false,
+        };
         drop(st); // Callback after releasing the lock
+
+        // outside the lock: get tail text + current full output path → build snapshot → callback (no lock held, callback may do anything)
+        if snapshot_due {
+            let tail_text: String = state_handler
+                .lock()
+                .map(|st| st.tail.iter().cloned().collect::<Vec<_>>().concat())
+                .unwrap_or_default();
+            let path = path_snapshot.lock().ok().and_then(|g| g.clone());
+            let truncation = truncate_tail(&tail_text, TruncationOptions::default());
+            if let Some(cb) = &on_snapshot {
+                cb(&StreamSnapshot {
+                    content: truncation.content.clone(),
+                    truncation,
+                    full_output_path: path,
+                });
+            }
+        }
         on_chunk(&text); // Direct call on Arc<dyn Fn>
     });
 
@@ -304,11 +376,12 @@ pub async fn execute_shell_with_capture(
     };
 
     Ok(ShellCaptureResult {
-        output: truncation.content,
+        output: truncation.content.clone(),
         exit_code,
         cancelled,
         truncated: truncation.truncated,
         full_output_path,
+        truncation,
     })
 }
 
@@ -329,6 +402,9 @@ mod tests {
             timeout: None,
             cancellation: None,
             on_chunk: Arc::new(|_s: &str| {}),
+            sanitize: true, // sanitize by default (current behavior of the `!/!!` path)
+            on_snapshot: None,
+            snapshot_interval: None,
         }
     }
 
@@ -546,6 +622,111 @@ mod tests {
         assert!(full.lines().count() > 10_000);
         assert!(res.output.lines().count() <= DEFAULT_MAX_LINES);
         assert!(res.output.len() < full.len());
+        // truncation metadata exposed: total line count (15000 lines < 100KB tail buffer, no rolling trim)
+        assert_eq!(res.truncation.total_lines, 15_000);
+        assert_eq!(res.truncation.output_lines, DEFAULT_MAX_LINES);
+        assert_eq!(res.truncation.content, res.output);
         let _ = std::fs::remove_file(path);
+    }
+
+    // ── sanitize switch (T-AP-04-7: the bash tool passes false to keep raw text) ──────────
+
+    #[tokio::test]
+    async fn test_execute_capture_sanitize_false_keeps_raw() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
+        // 0x01 control char + \r: removed on the sanitize path, kept as-is on the raw path
+        let raw_opts = ShellCaptureOptions {
+            sanitize: false,
+            ..default_options()
+        };
+        let res = execute_shell_with_capture(&env, "printf 'a\\001b\\r\\n'", &raw_opts)
+            .await
+            .expect("capture ok");
+        assert_eq!(res.output, "a\u{1}b\r\n");
+
+        let sanitized =
+            execute_shell_with_capture(&env, "printf 'a\\001b\\r\\n'", &default_options())
+                .await
+                .expect("capture ok");
+        assert_eq!(sanitized.output, "ab\n");
+    }
+
+    // ── throttled snapshot callback (T-AP-04-7: on_snapshot + snapshot_interval) ──────
+
+    #[tokio::test]
+    async fn test_execute_capture_on_snapshot_fires_with_tail() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
+        let snapshots: std::sync::Arc<std::sync::Mutex<Vec<StreamSnapshot>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got = snapshots.clone();
+        let opts = ShellCaptureOptions {
+            on_snapshot: Some(Arc::new(move |s: &StreamSnapshot| {
+                got.lock().unwrap().push(StreamSnapshot {
+                    content: s.content.clone(),
+                    truncation: s.truncation.clone(),
+                    full_output_path: s.full_output_path.clone(),
+                });
+            })),
+            snapshot_interval: Some(Duration::ZERO), // fires for every chunk, timing-independent
+            ..default_options()
+        };
+        let res = execute_shell_with_capture(
+            &env,
+            "for i in 1 2 3; do echo \"line-$i\"; sleep 0.05; done",
+            &opts,
+        )
+        .await
+        .expect("capture ok");
+        assert_eq!(res.output, "line-1\nline-2\nline-3\n");
+        let snaps = snapshots.lock().unwrap();
+        assert!(!snaps.is_empty(), "expected >=1 snapshot");
+        // snapshot content includes tail text received so far (the first snapshot already contains the first line)
+        assert!(snaps.iter().any(|s| s.content.contains("line-1")));
+        // small output does not overflow: full_output_path is None in all snapshots
+        assert!(snaps.iter().all(|s| s.full_output_path.is_none()));
+        // when the snapshot truncation is not truncated, truncated=false
+        assert!(snaps.iter().all(|s| !s.truncation.truncated));
+    }
+
+    /// Multi-thread flavor: the writer task writing to the temp file must be scheduled concurrently with other workers —
+    /// under a current-thread runtime, the read loop in `wait_for_child_process` never really blocks (data is continuously available),
+    /// so the spawned writer task is starved and snapshots never see the path; the production runtime is multi-threaded, so the behavior is observable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_capture_on_snapshot_reports_spill_path() {
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
+        let snapshots: std::sync::Arc<std::sync::Mutex<Vec<StreamSnapshot>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got = snapshots.clone();
+        let opts = ShellCaptureOptions {
+            on_snapshot: Some(Arc::new(move |s: &StreamSnapshot| {
+                got.lock().unwrap().push(StreamSnapshot {
+                    content: s.content.clone(),
+                    truncation: s.truncation.clone(),
+                    full_output_path: s.full_output_path.clone(),
+                });
+            })),
+            snapshot_interval: Some(Duration::ZERO),
+            ..default_options()
+        };
+        // 160KB output > 50KB overflow threshold: snapshots after overflow should carry the full output path
+        let res = execute_shell_with_capture(
+            &env,
+            "yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -n 5000",
+            &opts,
+        )
+        .await
+        .expect("capture ok");
+        assert!(res.truncated);
+        let snaps = snapshots.lock().unwrap();
+        assert!(
+            snaps.iter().any(|s| s.full_output_path.is_some()),
+            "expected a snapshot with spill path, got {}",
+            snaps.len()
+        );
+        // snapshots after overflow should already have truncation marked
+        assert!(snaps.iter().any(|s| s.truncation.truncated));
+        if let Some(path) = &res.full_output_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
