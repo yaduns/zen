@@ -368,26 +368,19 @@ fn detect_terminal_theme_from_env(colorfgbg: Option<&str>) -> TerminalTheme {
 /// Load all custom themes from a directory—
 /// Scan `*.json`, load each one, and collect them.
 /// Invalid topics are skipped (no error); returns the list of valid topics.
+/// Implementation delegates to `resources::themes::load_themes_from_dir` (T-AP-05-3 unified primitive) and discards diagnostics
+/// (ThemeController consumers only look at available theme names); behavioral equivalence (follow symlinks/skip broken links) is accepted based on
+/// "visible theme set unchanged" as acceptance; see tasks/T-AP-05-3-implemented.md "Integration with existing code" review ②.
 pub fn load_custom_themes_from_dir(themes_dir: &Path) -> Vec<Theme> {
-    let mut themes = Vec::new();
-    if !themes_dir.exists() {
-        return themes;
-    }
-    let entries = match std::fs::read_dir(themes_dir) {
-        Ok(entries) => entries,
-        Err(_) => return themes,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(json) = std::fs::read_to_string(&path) {
-                if let Ok(theme) = theme::load_theme_from_json(&json, Some(path)) {
-                    themes.push(theme);
-                }
-            }
-        }
-    }
-    themes
+    let mut out = Vec::new();
+    let mut diagnostics = Vec::new();
+    crate::resources::themes::load_themes_from_dir(
+        themes_dir,
+        crate::resources::themes::ThemeSource::Path,
+        &mut out,
+        &mut diagnostics,
+    );
+    out.into_iter().map(|loaded| loaded.theme).collect()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

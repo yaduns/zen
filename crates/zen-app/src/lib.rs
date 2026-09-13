@@ -6,6 +6,7 @@ pub mod keybindings;
 pub mod modes;
 pub mod output;
 pub mod prompt_templates;
+pub mod resources;
 pub mod session;
 pub mod skills;
 pub mod system_prompt;

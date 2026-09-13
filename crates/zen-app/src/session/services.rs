@@ -22,14 +22,12 @@ use crate::cli::{parse_thinking_level, CliArgs};
 use crate::config::defaults::DEFAULT_THINKING_LEVEL;
 use crate::config::get_agent_dir;
 use crate::config::settings::{SettingsData, SettingsManager};
-use crate::prompt_templates::{load_prompt_templates, LoadPromptTemplatesOptions};
+use crate::resources::{load_resources, LoadResourcesOptions};
 use crate::session::agent_session::{AgentSession, SessionStore};
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
 };
 use crate::session::session_manager::SessionManager;
-use crate::skills::{load_skills, LoadSkillsOptions};
-use crate::system_prompt::load_project_context_files;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::stream_for;
@@ -232,8 +230,9 @@ pub fn create_agent_session(
 /// The fully assembled `AgentSessionRuntime` (session + services + session store)
 ///
 /// # Edge Cases
-/// - Resource loading (skills/prompt templates, T-AP-03-2 interim) is done **inside this function** — T-AP-05-3
-///   takes over this assembly section once unified loading lands (see seam backfill in tasks/T-AP-03-2-implemented.md)
+/// - Resource loading (skills/prompt templates/themes/context/system prompt discovery, unified loading in T-AP-05-3) happens **inside this function**
+///   — `load_resources` converges all five resource paths in one call; this section only maps the results
+///   (see tasks/T-AP-05-3-implemented.md for the seam backfill)
 /// - `--session` only supports full paths (partial UUID resolution is T-AP-08-5)
 /// - Phase 2's SettingsManager/ResourceLoader append their assembly steps within this function.
 ///
@@ -269,10 +268,11 @@ pub async fn create_initial_runtime_from_cli(
     // default_thinking_level fills in thinking. Extracted as a free function for unit testing (T-AP-02-3 additional fields).
     apply_settings_defaults(args, &ctx, &merged, &mut model, &mut thinking_level);
 
-    // 2.6 Resource loading (T-AP-03-2 interim, taken over by T-AP-05-3 later): skills + prompt templates
-    //     (default dir + CLI `--skill`/`--prompt-template` + merged settings.skills/prompts).
-    //     `--no-prompt-templates` disables template loading (aligns with pi resource-loader branch);
-    //     loading diagnostics are non-fatal (missing/broken files don't abort), log tracing warnings, not surfaced in v1.
+    // 2.6 Resource loading (unified loading taken over by T-AP-05-3): skills + prompt templates + themes + context + system prompt discovery
+    //     (default directories + CLI `--skill`/`--prompt-template`/`--theme` + settings.skills/prompts/themes
+    //     merged; SYSTEM.md/APPEND_SYSTEM.md discovery is inlined via load_resources, CLI values take precedence).
+    //     no_* flags toggle each path individually (aligned with pi resource-loader branches); loading diagnostics are non-fatal (missing/broken files do not interrupt),
+    //     logged as tracing warnings, not shown in v1.
     let skill_paths: Vec<PathBuf> = merged
         .skills
         .clone()
@@ -289,42 +289,41 @@ pub async fn create_initial_runtime_from_cli(
         .chain(args.prompt_templates.iter().cloned())
         .map(PathBuf::from)
         .collect();
-    let skills: Vec<Skill>;
-    let mut templates: Vec<PromptTemplate> = Vec::new();
-    // Skills are always loaded (`--no-prompt-templates` only governs templates); templates are controlled by that flag (aligns with pi resource-loader branch)
-    let skills_result = load_skills(&LoadSkillsOptions {
+    let theme_paths: Vec<PathBuf> = merged
+        .themes
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(args.themes.iter().cloned())
+        .map(PathBuf::from)
+        .collect();
+    let resources = load_resources(&LoadResourcesOptions {
         cwd: cwd.clone(),
         agent_dir: agent_dir.clone(),
         skill_paths,
-        include_defaults: true,
+        prompt_paths,
+        theme_paths,
+        no_skills: args.no_skills,
+        no_prompt_templates: args.no_prompt_templates,
+        no_themes: args.no_themes,
+        no_context_files: args.no_context_files,
+        system_prompt: args.system_prompt.clone(),
+        append_system_prompt: args.append_system_prompt.clone(),
     })
     .await;
-    skills = skills_result
+    let skills: Vec<Skill> = resources
         .skills
         .into_iter()
         .map(|loaded| loaded.skill)
         .collect();
-    for d in &skills_result.diagnostics {
-        if let crate::skills::SkillLoadDiagnostic::Warning { message, .. } = d {
-            tracing::warn!(target: "zen::resources", "skill load: {message}");
-        }
-    }
-    if !args.no_prompt_templates {
-        let prompts_result = load_prompt_templates(&LoadPromptTemplatesOptions {
-            cwd: cwd.clone(),
-            agent_dir: agent_dir.clone(),
-            prompt_paths,
-            include_defaults: true,
-        })
-        .await;
-        templates = prompts_result
-            .prompt_templates
-            .into_iter()
-            .map(|loaded| loaded.template)
-            .collect();
-        for d in &prompts_result.diagnostics {
-            tracing::warn!(target: "zen::resources", "prompt load: {}", d.message);
-        }
+    let templates: Vec<PromptTemplate> = resources
+        .prompts
+        .into_iter()
+        .map(|loaded| loaded.template)
+        .collect();
+    // The theme-loading output currently has no consumer (interactive /theme registration belongs to T-AP-11-1, a reserved seam); diagnostics only
+    for d in &resources.diagnostics {
+        tracing::warn!(target: "zen::resources", "resource load: {d:?}");
     }
 
     // 3. Session ID (supplied by a manager chosen by the caller; the session_id of the persisted/forked session)
@@ -359,22 +358,19 @@ pub async fn create_initial_runtime_from_cli(
     let tool_refs: Vec<&dyn Tool> = tools.iter().map(|t| t.as_ref()).collect();
     let meta = collect_tool_prompt_metadata(&tool_refs);
     let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
-        custom_prompt: args.system_prompt.clone(),
+        custom_prompt: resources.system_prompt,
         selected_tools: None,
         tool_snippets: meta.tool_snippets,
         prompt_guidelines: meta.prompt_guidelines,
-        append_system_prompt: if args.append_system_prompt.is_empty() {
+        append_system_prompt: if resources.append_system_prompt.is_empty() {
             None
         } else {
-            Some(args.append_system_prompt.join("\n"))
+            // Aligns with pi agent-session.ts `loaderAppendSystemPrompt.join("\n\n")`
+            Some(resources.append_system_prompt.join("\n\n"))
         },
         cwd: cwd_str,
         skills: skills.clone(),
-        context_files: if args.no_context_files {
-            vec![]
-        } else {
-            load_project_context_files(&cwd, &agent_dir)
-        },
+        context_files: resources.context_files,
     });
 
     // 6. Protocol stream implementation + common assembly (stream_for binding table from T-AI-02-8)

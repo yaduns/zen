@@ -7,7 +7,7 @@
 //! (lightweight `PromptTemplateSource`, full SourceInfo belongs to T-AP-05-4), `/name args` routing expansion
 //! (`expand_prompt_template`, designated landing point per the T-AG-05-3 seam).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -36,15 +36,20 @@ pub enum PromptTemplateSource {
     Path,
 }
 
-/// A loaded template + its source — the zen assembly form of pi `PromptTemplate` (with sourceInfo/baseDir):
-/// zen-core `PromptTemplate` (pure domain data, finalized in T-AG-05-3, no path field) + app-layer source provenance;
-/// `baseDir` is derived by the consumer from the load input path and does not occupy a field.
+/// A loaded template + its source + source file path—pi `PromptTemplate` (including sourceInfo/filePath) in zen's
+/// assembly form: zen-core `PromptTemplate` (pure domain data, finalized by T-AG-05-3, no path field) + application-layer source tracing.
+/// `path` is the T-AP-03-4 seam-note option B addition (`LoadedPromptTemplate` has no per-file path → extend core result
+/// to carry the path): for T-AP-05-3 collision diagnostics and T-AP-05-4 source tracing; `baseDir` is derived by the consumer from the path's parent directory,
+/// and does not occupy a field.
 #[derive(Debug)]
 pub struct LoadedPromptTemplate {
     /// Template loaded by zen-core (name/description/argument_hint/content).
     pub template: PromptTemplate,
     /// Template origin (default directory user/project / explicit path).
     pub source: PromptTemplateSource,
+    /// Template source file path (for display/diagnostics/source tracing; not used for re-addressing)—default directory = `<dir>/<name>.md`,
+    /// explicit file = the file itself (attached by `merge_batch` per batch input path).
+    pub path: String,
 }
 
 /// Assembly input for `load_prompt_templates` (field-by-field alignment with pi's `LoadPromptTemplatesOptions`).
@@ -156,16 +161,18 @@ pub async fn load_prompt_templates(
         // Default directory ①: <agentDir>/prompts (User)
         let user_dir = options.agent_dir.join("prompts");
         merge_batch(
-            core_load_prompt_templates(&[user_dir]).await,
+            core_load_prompt_templates(std::slice::from_ref(&user_dir)).await,
             PromptTemplateSource::User,
+            &user_dir,
             &mut result,
         );
 
         // Default directory ②: <cwd>/.zen/prompts (Project)
         let project_dir = options.cwd.join(CONFIG_DIR_NAME).join("prompts");
         merge_batch(
-            core_load_prompt_templates(&[project_dir]).await,
+            core_load_prompt_templates(std::slice::from_ref(&project_dir)).await,
             PromptTemplateSource::Project,
+            &project_dir,
             &mut result,
         );
     }
@@ -185,8 +192,9 @@ pub async fn load_prompt_templates(
             Err(_) => continue, // Skip silently on path resolution failure (e.g. no home directory), aligning with the explicit path branch of skills.rs
         };
         merge_batch(
-            core_load_prompt_templates(&[resolved]).await,
+            core_load_prompt_templates(std::slice::from_ref(&resolved)).await,
             PromptTemplateSource::Path,
+            &resolved,
             &mut result,
         );
     }
@@ -194,17 +202,35 @@ pub async fn load_prompt_templates(
     result
 }
 
+/// Derive the source file path for a single template (T-AP-03-4 seam-note option B: core result carries path)—
+/// input is a directory → `<dir>/<name>.md` (core names by name = file_stem); input is a file → the file itself.
+/// For display/diagnostics/source tracing only; not used for re-addressing.
+fn derive_template_path(input: &Path, name: &str) -> String {
+    if input.is_dir() {
+        input
+            .join(format!("{name}.md"))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        input.to_string_lossy().into_owned()
+    }
+}
+
 /// Merge one core loading result into the assembly result: attach source metadata to templates in batches (path-prefix comparison from pi `getSourceInfo`
-/// that determination is replaced in zen by "source known at call time", see T-AP-03-4 implementation notes 5.2); diagnostics forwarded as-is.
+/// The determination is replaced in zen by "source known at call time", see T-AP-03-4 implementation note 5.2) and source file path; diagnostics are forwarded as-is.
 fn merge_batch(
     core: CoreLoadResult,
     source: PromptTemplateSource,
+    input_path: &Path,
     result: &mut LoadPromptTemplatesResult,
 ) {
     for template in core.prompt_templates {
-        result
-            .prompt_templates
-            .push(LoadedPromptTemplate { template, source });
+        let path = derive_template_path(input_path, &template.name);
+        result.prompt_templates.push(LoadedPromptTemplate {
+            template,
+            source,
+            path,
+        });
     }
     result.diagnostics.extend(core.diagnostics);
 }
@@ -354,12 +380,26 @@ mod tests {
             .find(|p| p.template.name == "global")
             .unwrap();
         assert_eq!(user.source, PromptTemplateSource::User);
+        assert_eq!(
+            user.path,
+            agent_dir
+                .join("prompts")
+                .join("global.md")
+                .to_string_lossy()
+        );
         let project = result
             .prompt_templates
             .iter()
             .find(|p| p.template.name == "local")
             .unwrap();
         assert_eq!(project.source, PromptTemplateSource::Project);
+        assert_eq!(
+            project.path,
+            cwd.join(CONFIG_DIR_NAME)
+                .join("prompts")
+                .join("local.md")
+                .to_string_lossy()
+        );
     }
 
     #[tokio::test]
@@ -376,7 +416,7 @@ mod tests {
         let opts = LoadPromptTemplatesOptions {
             cwd: cwd.clone(),
             agent_dir: tmp.path().to_path_buf(),
-            prompt_paths: vec![extra_dir, single_file],
+            prompt_paths: vec![extra_dir.clone(), single_file.clone()],
             include_defaults: false,
         };
         let result = load_prompt_templates(&opts).await;
@@ -385,14 +425,18 @@ mod tests {
             .prompt_templates
             .iter()
             .all(|p| p.source == PromptTemplateSource::Path));
-        assert!(result
+        let extra = result
             .prompt_templates
             .iter()
-            .any(|p| p.template.name == "extra"));
-        assert!(result
+            .find(|p| p.template.name == "extra")
+            .unwrap();
+        assert_eq!(extra.path, extra_dir.join("extra.md").to_string_lossy());
+        let single = result
             .prompt_templates
             .iter()
-            .any(|p| p.template.name == "single"));
+            .find(|p| p.template.name == "single")
+            .unwrap();
+        assert_eq!(single.path, single_file.to_string_lossy());
         assert!(result.diagnostics.is_empty());
     }
 
