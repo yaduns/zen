@@ -22,12 +22,14 @@ use crate::cli::{parse_thinking_level, CliArgs};
 use crate::config::defaults::DEFAULT_THINKING_LEVEL;
 use crate::config::get_agent_dir;
 use crate::config::settings::{SettingsData, SettingsManager};
+use crate::prompt_templates::LoadedPromptTemplate;
 use crate::resources::{load_resources, LoadResourcesOptions};
 use crate::session::agent_session::{AgentSession, SessionStore};
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
 };
 use crate::session::session_manager::SessionManager;
+use crate::skills::LoadedSkill;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::stream_for;
@@ -47,9 +49,7 @@ use zen_core::harness::types::{
     ShouldStopAfterTurnContext,
 };
 use zen_core::paths::{resolve_path, PathInputOptions};
-use zen_core::prompt_templates::PromptTemplate;
 use zen_core::session::tree::{SessionContext, SessionModel};
-use zen_core::skills::skill::Skill;
 use zen_core::tools::factory::{ToolFactory, ToolSelection};
 
 /// Phase 1 default empty hook implementation: all hook methods use `AgentLoopHooks` trait defaults
@@ -173,8 +173,8 @@ pub fn create_agent_session(
     session_store: Arc<dyn SessionStore>,
     shell_config: ShellConfig,
     settings: Arc<SettingsManager>,
-    skills: Vec<Skill>,
-    templates: Vec<PromptTemplate>,
+    skills: Vec<LoadedSkill>,
+    templates: Vec<LoadedPromptTemplate>,
 ) -> AgentSession {
     let state = AgentState {
         system_prompt,
@@ -311,16 +311,8 @@ pub async fn create_initial_runtime_from_cli(
         append_system_prompt: args.append_system_prompt.clone(),
     })
     .await;
-    let skills: Vec<Skill> = resources
-        .skills
-        .into_iter()
-        .map(|loaded| loaded.skill)
-        .collect();
-    let templates: Vec<PromptTemplate> = resources
-        .prompts
-        .into_iter()
-        .map(|loaded| loaded.template)
-        .collect();
+    let skills: Vec<LoadedSkill> = resources.skills;
+    let templates: Vec<LoadedPromptTemplate> = resources.prompts;
     // The theme-loading output currently has no consumer (interactive /theme registration belongs to T-AP-11-1, a reserved seam); diagnostics only
     for d in &resources.diagnostics {
         tracing::warn!(target: "zen::resources", "resource load: {d:?}");
@@ -369,7 +361,8 @@ pub async fn create_initial_runtime_from_cli(
             Some(resources.append_system_prompt.join("\n\n"))
         },
         cwd: cwd_str,
-        skills: skills.clone(),
+        // T-AP-05-4: session side keeps the Loaded form (source end-to-end); the system prompt only needs domain data → clone once at assembly phase
+        skills: skills.iter().map(|loaded| loaded.skill.clone()).collect(),
         context_files: resources.context_files,
     });
 

@@ -81,23 +81,25 @@ pub struct LoadPromptTemplatesResult {
 /// The slash command expansion path (T-AP-03-2) is called before user input is submitted to the agent: if the text has the form `/templateName args` and
 /// a template with the same name is found in the template list, substitute the parameters into the template body to produce the final prompt—expand known / commands and leave unknown
 /// ones unchanged. It is a pure function, performs no file I/O, and does not depend on session state.
+/// Signature upgrade (T-AP-05-4 P4 decision): input changed from core type to Loaded form, consistent with `expand_prompt_input`
+/// chain (domain data is read via `t.template.name`/`t.template.content`; `t.path` does not participate in expansion).
 ///
 /// Behavior (aligned with pi-307 `expandPromptTemplate`; routing uses first-match order):
 /// - Text does not start with `/` → return unchanged (pi `if (!text.startsWith("/")) return text`);
 /// - Matches `^/([^\s]+)(?:\s+([\s\S]*))?$` exactly: group 1 = template name (non-whitespace string), group 2 = parameter string
 ///   (may be empty or contain newlines—`[\s\S]` semantics; equivalent to `(?s:.*)` in Rust); no match → return unchanged;
-/// - Template hit (`templates.iter().find(|t| t.name == template_name)`) →
+/// - matched template (`templates.iter().find(|t| t.template.name == template_name)`) →
 ///   `substitute_args(&template.content, &parse_command_args(args_string))`；
 /// - No match → return unchanged (template-name matching against `name` is case-sensitive, consistent with pi).
 ///
 /// # Parameters
 /// - `text`: full user input (may include a leading `/`);
-/// - `templates`: list of loaded templates (slice of the session's `Vec<PromptTemplate>`; on name conflicts
-///   list order determines priority — assembly order global > project > explicit, first occurrence wins; see the T-AP-03-4 implementation notes for the rationale).
+/// - `templates`: loaded template list (slice in Loaded form held by the session; on same-name conflict, list order determines priority —
+///   assembly order global > project > explicit, first occurrence wins; see T-AP-03-4 implementation notes for the decision).
 ///
 /// # Returns
 /// The substituted template body (`String`) on a match; the original text (`text.to_string()`) on no match or for non-template input.
-pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
+pub fn expand_prompt_template(text: &str, templates: &[LoadedPromptTemplate]) -> String {
     if !text.starts_with('/') {
         return text.to_string();
     }
@@ -110,11 +112,11 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
     let template_name = &captures[1];
     let args_string = captures.get(2).map(|m| m.as_str()).unwrap_or("");
 
-    let Some(template) = templates.iter().find(|t| t.name == template_name) else {
+    let Some(template) = templates.iter().find(|t| t.template.name == template_name) else {
         return text.to_string();
     };
 
-    substitute_args(&template.content, &parse_command_args(args_string))
+    substitute_args(&template.template.content, &parse_command_args(args_string))
 }
 
 /// Matching pattern for expanding `/name args` routes (aligned with pi-307 `expandPromptTemplate` regex):
@@ -240,12 +242,16 @@ mod tests {
     use super::*;
     use zen_core::prompt_templates::PromptTemplateDiagnosticCode;
 
-    fn make_template(name: &str, content: &str) -> PromptTemplate {
-        PromptTemplate {
-            name: name.to_string(),
-            description: String::new(),
-            argument_hint: None,
-            content: content.to_string(),
+    fn make_template(name: &str, content: &str) -> LoadedPromptTemplate {
+        LoadedPromptTemplate {
+            template: PromptTemplate {
+                name: name.to_string(),
+                description: String::new(),
+                argument_hint: None,
+                content: content.to_string(),
+            },
+            source: PromptTemplateSource::User,
+            path: format!("/templates/{name}.md"),
         }
     }
 
@@ -518,12 +524,11 @@ mod tests {
                 PromptTemplateSource::Path
             ]
         );
-        let templates: Vec<PromptTemplate> = result
-            .prompt_templates
-            .iter()
-            .map(|p| p.template.clone())
-            .collect();
-        assert_eq!(expand_prompt_template("/clash", &templates), "global body");
+        // T-AP-05-4 signature upgrade: expansion directly consumes Loaded form (`path` field does not participate in expansion)
+        assert_eq!(
+            expand_prompt_template("/clash", &result.prompt_templates),
+            "global body"
+        );
     }
 
     #[tokio::test]

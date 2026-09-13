@@ -7,11 +7,11 @@
 //! T-AP-03-4 `expand_prompt_template`); this module only does composition and assembly.
 //! Implementation notes in tasks/T-AP-03-2-implemented.md.
 
-use crate::prompt_templates::expand_prompt_template;
+use crate::prompt_templates::{expand_prompt_template, LoadedPromptTemplate};
+use crate::skills::LoadedSkill;
+use crate::source_info::SourceInfo;
 use std::path::Path;
 
-use zen_core::prompt_templates::PromptTemplate;
-use zen_core::skills::skill::Skill;
 use zen_tui::autocomplete::SlashCommand;
 
 /// Static registry entry for a built-in slash command — `name` is the routing key for dispatch and completion;
@@ -158,6 +158,8 @@ pub fn resolve_builtin(name: &str) -> Option<&'static BuiltinSlashCommand> {
 /// Pre-submit prompt preprocessing for session (sink of seam T-AP-03-4 consumed by T-AP-03-2): expand
 /// `/skill:name args` and `/name args` in user input into the final prompt — "skill wrapped as a block, template with params filled,
 /// everything else passed through unchanged." Pure function; called by AgentSession's prompt/steer/follow_up before delegating to the engine.
+/// signature upgrade (T-AP-05-4 P4 ruling): input changed from core types to Loaded form — session retains source end-to-end
+/// after which `&self.skills`/`&self.templates` are passed through directly, zero allocation, no per-submit collect drift.
 ///
 /// Behavior (aligned with pi agent-session `_expandSkillCommand` → `expandPromptTemplate` order chain):
 /// - Skill expansion first (`/skill:name args`): look up by name in `skills` (case-sensitive); hit → assemble
@@ -169,12 +171,16 @@ pub fn resolve_builtin(name: &str) -> Option<&'static BuiltinSlashCommand> {
 ///
 /// # Parameters
 /// - `text`: full user input;
-/// - `skills`: skill set assembled for the session (`AgentSession::skills()`);
-/// - `templates`: template set assembled for the session (`AgentSession::templates()`).
+/// - `skills`: skill set assembled by the session (`AgentSession::skills()`, Loaded form);
+/// - `templates`: template set assembled by the session (`AgentSession::templates()`, Loaded form).
 ///
 /// # Returns
 /// The expanded prompt text; on no hit, returns input unchanged (`text.to_string()`).
-pub fn expand_prompt_input(text: &str, skills: &[Skill], templates: &[PromptTemplate]) -> String {
+pub fn expand_prompt_input(
+    text: &str,
+    skills: &[LoadedSkill],
+    templates: &[LoadedPromptTemplate],
+) -> String {
     let expanded = expand_skill_command(text, skills);
     expand_prompt_template(&expanded, templates)
 }
@@ -182,7 +188,8 @@ pub fn expand_prompt_input(text: &str, skills: &[Skill], templates: &[PromptTemp
 /// `/skill:name args` expansion (private, only called by `expand_prompt_input`) — aligned with pi
 /// `_expandSkillCommand`: on skill hit, assemble a single `<skill>` block (distinct from the system prompt `<available_skills>`
 /// block in zen-core skills/format.rs; different scenarios so no duplication), on miss/non-skill input return as-is.
-fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+/// domain data is accessed via `s.skill.*` (LoadedSkill = zen-core Skill + source, finalized in T-AP-03-3).
+fn expand_skill_command(text: &str, skills: &[LoadedSkill]) -> String {
     if !text.starts_with("/skill:") {
         return text.to_string();
     }
@@ -193,19 +200,19 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
         None => (rest, ""),
     };
     let args = args.trim();
-    let Some(skill) = skills.iter().find(|s| s.name == name) else {
+    let Some(skill) = skills.iter().find(|s| s.skill.name == name) else {
         return text.to_string(); // Unknown skill passes through (pi pass-through)
     };
-    let base_dir = Path::new(&skill.file_path)
+    let base_dir = Path::new(&skill.skill.file_path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut block = format!(
         "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-        skill.name,
-        skill.file_path,
+        skill.skill.name,
+        skill.skill.file_path,
         base_dir,
-        skill.content.trim(), // Explicit .trim() semantics from pi (T-AP-03-5 trims everything; kept here defensively)
+        skill.skill.content.trim(), // Explicit .trim() semantics from pi (T-AP-03-5 trims everything; kept here defensively)
     );
     if !args.is_empty() {
         block.push_str("\n\n");
@@ -214,28 +221,31 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     block
 }
 
-/// Interactive-mode completion assembly (interim): converge built-in commands + templates + skills into a zen-tui completable command list —
+/// interactive-mode completion assembly: converge built-in commands + templates + skills into a zen-tui completable command list —
 /// "One-screen dropdown, all three categories as candidates." Called by interactive init before constructing `CombinedAutocompleteProvider`
 /// (T-TU-03-3 declares that feeding the command list belongs to this task).
+/// signature upgrade (T-AP-05-4): input changed from core types to Loaded form; template/skill descriptions via
+/// `SourceInfo::prefix_description` add `[u]/[p]/[t]` source prefixes (closes T-AP-03-2 open question).
 ///
 /// Behavior (aligned with pi interactive `createBaseAutocompleteProvider`'s builtin + template + skill three sources):
 /// - Order: built-in (`BUILTIN_SLASH_COMMANDS`) → templates → skills;
+/// - built-in command descriptions **do not** add source prefixes (align with pi: only template/skill commands get `prefixAutocompleteDescription`);
 /// - Templates: name/description/argument_hint come from `PromptTemplate` (no duplicate T-AP-03-4 loading,
-///   consumes the list already assembled into the session);
+///   consume the list already assembled into the session), descriptions prefixed via `SourceInfo::local(path, source)` ([u]/[p]/[t]);
 /// - Skills: command name is `skill:{name}` (aligned with pi `skill:${skill.name}`), description from
-///   `Skill.description`, no argument_hint; v1 skill commands are always enabled (settings'
+///   `Skill.description` and add the same source prefix, no argument_hint; v1 skill commands are always enabled (settings'
 ///   `enableSkillCommands` was already listed as a dropped v1 field in T-AP-02-3);
 /// - All `get_argument_completions = None` (argument completion callbacks only exist for pi model/login; dropped in v1).
 ///
 /// # Parameters
-/// - `templates`: assembled templates (`AgentSession::templates()`);
-/// - `skills`: assembled skills (`AgentSession::skills()`).
+/// - `templates`: already assembled templates (`AgentSession::templates()`, Loaded form);
+/// - `skills`: assembled skills (`AgentSession::skills()`, Loaded form).
 ///
 /// # Returns
 /// `zen_tui::autocomplete::SlashCommand` list (built-in + templates + skills, in order).
 pub fn build_slash_command_list(
-    templates: &[PromptTemplate],
-    skills: &[Skill],
+    templates: &[LoadedPromptTemplate],
+    skills: &[LoadedSkill],
 ) -> Vec<SlashCommand> {
     let mut commands =
         Vec::with_capacity(BUILTIN_SLASH_COMMANDS.len() + templates.len() + skills.len());
@@ -248,17 +258,19 @@ pub fn build_slash_command_list(
         ));
     }
     for template in templates {
+        let info = SourceInfo::local(template.path.clone(), template.source.into(), None);
         commands.push(SlashCommand::new(
-            template.name.clone(),
-            Some(template.description.clone()),
-            template.argument_hint.clone(),
+            template.template.name.clone(),
+            info.prefix_description(Some(&template.template.description)),
+            template.template.argument_hint.clone(),
             None,
         ));
     }
     for skill in skills {
+        let info = SourceInfo::local(skill.skill.file_path.clone(), skill.source.into(), None);
         commands.push(SlashCommand::new(
-            format!("skill:{}", skill.name),
-            Some(skill.description.clone()),
+            format!("skill:{}", skill.skill.name),
+            info.prefix_description(Some(&skill.skill.description)),
             None,
             None,
         ));
@@ -269,23 +281,34 @@ pub fn build_slash_command_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_templates::PromptTemplateSource;
+    use crate::skills::SkillSource;
+    use zen_core::prompt_templates::PromptTemplate;
+    use zen_core::skills::skill::Skill;
 
-    fn skill(name: &str, file_path: &str, content: &str) -> Skill {
-        Skill {
-            name: name.to_string(),
-            description: format!("desc of {name}"),
-            content: content.to_string(),
-            file_path: file_path.to_string(),
-            disable_model_invocation: false,
+    fn skill(name: &str, file_path: &str, content: &str) -> LoadedSkill {
+        LoadedSkill {
+            skill: Skill {
+                name: name.to_string(),
+                description: format!("desc of {name}"),
+                content: content.to_string(),
+                file_path: file_path.to_string(),
+                disable_model_invocation: false,
+            },
+            source: SkillSource::User,
         }
     }
 
-    fn template(name: &str, content: &str) -> PromptTemplate {
-        PromptTemplate {
-            name: name.to_string(),
-            description: format!("desc of {name}"),
-            argument_hint: Some("hint".to_string()),
-            content: content.to_string(),
+    fn template(name: &str, content: &str) -> LoadedPromptTemplate {
+        LoadedPromptTemplate {
+            template: PromptTemplate {
+                name: name.to_string(),
+                description: format!("desc of {name}"),
+                argument_hint: Some("hint".to_string()),
+                content: content.to_string(),
+            },
+            source: PromptTemplateSource::User,
+            path: format!("/templates/{name}.md"),
         }
     }
 
@@ -493,6 +516,30 @@ mod tests {
         let values: Vec<&str> = sugg.items().iter().map(|i| i.value()).collect();
         assert!(values.contains(&"skill:refactor"), "got: {values:?}");
         assert!(values.contains(&"settings"), "got: {values:?}");
+        // T-AP-05-4: template/skill descriptions carry [u]/[p]/[t] source prefixes (test template/skill source = User)
+        let skill_item = sugg
+            .items()
+            .iter()
+            .find(|i| i.value() == "skill:refactor")
+            .expect("skill:refactor candidate");
+        assert!(
+            skill_item
+                .description()
+                .is_some_and(|d| d.starts_with("[u] ")),
+            "Skill description should have a source prefix, got: {:?}",
+            skill_item.description()
+        );
+        // Built-in command descriptions **do not** add source prefixes (align with pi: only template/skill commands get prefixAutocompleteDescription)
+        let settings_item = sugg
+            .items()
+            .iter()
+            .find(|i| i.value() == "settings")
+            .expect("settings candidate");
+        assert_eq!(
+            settings_item.description(),
+            Some("Open settings menu"),
+            "Built-in command description should be plain text"
+        );
 
         // prefix /r → the review template
         let sugg = provider
@@ -501,5 +548,17 @@ mod tests {
             .expect("/r prefix should match template commands");
         let values: Vec<&str> = sugg.items().iter().map(|i| i.value()).collect();
         assert!(values.contains(&"review"), "got: {values:?}");
+        let review_item = sugg
+            .items()
+            .iter()
+            .find(|i| i.value() == "review")
+            .expect("review template candidate");
+        assert!(
+            review_item
+                .description()
+                .is_some_and(|d| d.contains("[u] ")),
+            "Template description should have a source prefix (joined with argument_hint), got: {:?}",
+            review_item.description()
+        );
     }
 }

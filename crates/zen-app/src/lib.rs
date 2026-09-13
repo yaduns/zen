@@ -9,5 +9,6 @@ pub mod prompt_templates;
 pub mod resources;
 pub mod session;
 pub mod skills;
+pub mod source_info;
 pub mod system_prompt;
 pub mod theme;

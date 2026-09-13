@@ -1,5 +1,7 @@
 use crate::commands::expand_prompt_input;
 use crate::config::settings::SettingsManager;
+use crate::prompt_templates::LoadedPromptTemplate;
+use crate::skills::LoadedSkill;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +14,7 @@ use zen_core::env::{ExecutionEnv, ExecutionError, ShellConfig};
 use zen_core::harness::agent_hooks::AgentLoopError;
 use zen_core::harness::engine::Agent;
 use zen_core::harness::types::AgentEvent;
-use zen_core::prompt_templates::PromptTemplate;
 use zen_core::session::tree::SessionTreeEntry;
-use zen_core::skills::skill::Skill;
 use zen_core::util::now_millis;
 
 /// Session persistence interface, defining the persistence operations required by AgentSession.
@@ -91,10 +91,12 @@ pub struct AgentSession {
     /// Settings manager (injected at T-AP-04-3; the compaction scheduler liveness-reads the compaction/retry section via `effective()`,
     /// aligned with the per-check read semantics of pi's `settingsManager.getCompactionSettings()`)
     pub(crate) settings: Arc<SettingsManager>,
-    /// Session prompt preprocessing skill set (injected during T-AP-03-2 assembly; /skill: routing in `expand_prompt_input`)
-    skills: Vec<Skill>,
-    /// Session prompt preprocessing template set (T-AP-03-2 assembly injection; /template-name routing in `expand_prompt_input`)
-    templates: Vec<PromptTemplate>,
+    /// Session prompt preprocessing skill set (T-AP-03-2 assembly injection + T-AP-05-4 upgraded Loaded form;
+    /// `/skill:` routing in `expand_prompt_input` + interactive completion source prefix)
+    skills: Vec<LoadedSkill>,
+    /// Session prompt preprocessing template set (T-AP-03-2 assembly injection + T-AP-05-4 upgraded Loaded form;
+    /// `/template-name` routing in `expand_prompt_input` + interactive completion source prefix)
+    templates: Vec<LoadedPromptTemplate>,
     /// Overflow recovery flag (T-AP-04-3; pi `_overflowRecoveryAttempted`): overflow compaction+retry is attempted
     /// only once; reset on a successful assistant response (resident subscription, pi :649) and on new user input (prompt submission, pi :597).
     /// Wrapped in Arc: the resident subscription closure must capture it before Self is constructed (same sharing pattern as `excluded`).
@@ -145,16 +147,17 @@ impl AgentSession {
     /// `excluded` must be the **same Arc** as the exclusion set inside the `SessionHooks` injected into the engine (`services.rs::create_agent_session`)
     /// so that identities registered by `execute_bash(!!)` can be read by `filter_messages`
     /// in the loop. `new` uses an empty set (test path, does not participate in filtering).
-    /// `skills`/`templates` (T-AP-03-2) are session prompt preprocessing resources: injected once at construction time,
-    /// Immutable, for expansion by `expand_prompt_input` for `prompt`/`steer`/`follow_up`.
+    /// `skills`/`templates` (T-AP-03-2; T-AP-05-4 upgrades to the Loaded form) are session prompt preprocessing resources:
+    /// injected once at construction, immutable, for `prompt`/`steer`/`follow_up`'s `expand_prompt_input` to expand
+    /// and for interaction-completion source prefixes (`skills()`/`templates()` accessors) to consume.
     pub(crate) fn new_with_exclusions(
         agent: Agent,
         session_store: Arc<dyn SessionStore>,
         excluded: Arc<Mutex<HashSet<String>>>,
         shell_config: ShellConfig,
         settings: Arc<SettingsManager>,
-        skills: Vec<Skill>,
-        templates: Vec<PromptTemplate>,
+        skills: Vec<LoadedSkill>,
+        templates: Vec<LoadedPromptTemplate>,
     ) -> Self {
         // Establish a persistent subscription (option 1, aligned with pi construction as `agent.subscribe(this._handleAgentEvent)`):
         // - message_end → session_store.append_message (persist in real time)
@@ -192,13 +195,15 @@ impl AgentSession {
         &self.shell_config
     }
 
-    /// Accessor for the session prompt preprocessing skill set (T-AP-03-2; consumed by interactive completion `build_slash_command_list`).
-    pub fn skills(&self) -> &[Skill] {
+    /// Session prompt preprocessing skill-set accessor (T-AP-03-2; consumed by interaction-completion `build_slash_command_list`) —
+    /// T-AP-05-4 upgrade: returns the Loaded form so that source info (source/path) is preserved through the display chain;
+    /// `expand_prompt_input` consumes the same slice directly (same signature as Loaded).
+    pub fn skills(&self) -> &[LoadedSkill] {
         &self.skills
     }
 
-    /// Accessor for the session prompt preprocessing template set (T-AP-03-2; consumed by interactive completion `build_slash_command_list`).
-    pub fn templates(&self) -> &[PromptTemplate] {
+    /// Session prompt preprocessing template-set accessor — same as above, returns the Loaded form (with source/path).
+    pub fn templates(&self) -> &[LoadedPromptTemplate] {
         &self.templates
     }
 
