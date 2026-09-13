@@ -12,6 +12,8 @@
 //! - After SettingsManager / ResourceLoader land in Phase 2, in `create_initial_runtime_from_cli`
 //!   just append assembly steps (wrap-up of T-AP-02-3 / T-AP-05-3); main not rewritten.
 
+use crate::session::assert_session_cwd_exists;
+use anyhow::Context;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -242,6 +244,11 @@ pub async fn create_initial_runtime_from_cli(
     cwd: PathBuf,
     session_manager: SessionManager,
 ) -> anyhow::Result<AgentSessionRuntime> {
+    // T-AP-01-5: assembly fuse (same-line defensive check in pi createAgentSessionRuntime)
+    let process_cwd =
+        std::env::current_dir().context("failed to resolve process working directory")?;
+    assert_session_cwd_exists(&session_manager, &process_cwd.to_string_lossy())?;
+
     // 0. Restore context from session (model/thinking/history). New session (empty tree) → messages empty, model None, naturally unified.
     let ctx = session_manager.build_context();
 
@@ -783,7 +790,68 @@ mod tests {
             .expect("Zero config should be able to assemble runtime");
         // Model has a default value (env or provider default chain); session is accessible
         assert_eq!(runtime.services.cwd, cwd);
-        assert_eq!(runtime.session.session_id().len() >= 36, true);
+        assert!(runtime.session.session_id().len() >= 36);
+    }
+
+    /// T-AP-01-5 wiring test (mirror of the future T-AP-08-5 resume capture branch, now locked down against regressions):
+    /// Session storage cwd points to a non-existent directory → create persists to disk → open reopens (header cwd takes effect) →
+    /// call the factory with the session cwd → first-line assertion hits → `downcast_ref::<MissingSessionCwdError>()` on the anyhow chain
+    /// yields a snapshot, with `issue.fallback_cwd` set to the process cwd (not the ghost directory).
+    #[tokio::test]
+    async fn create_runtime_asserts_missing_session_cwd() {
+        // unique temporary root directory (std-only; open's root param is the same root as create)
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "zen-session-cwd-wiring-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ghost = root.join("deleted-project");
+
+        let opts = crate::session::jsonl::CreateSessionOptions {
+            session_id: None,
+            parent_session_path: None,
+            metadata: None,
+        };
+        let created = SessionManager::create(ghost.to_str().unwrap(), &root, opts).unwrap();
+        let session_file = created
+            .get_session_file()
+            .expect("Persisted session must have session_file");
+
+        // reopen with open: no cwd_override passed → header cwd takes effect (T-AP-01-5 integration semantics 1)
+        let manager = SessionManager::open(&session_file, None, &root).unwrap();
+        let session_cwd = PathBuf::from(manager.get_cwd());
+
+        let args = parse(&[]);
+        // AgentSessionRuntime does not derive Debug, so expect_err is unavailable; use match to get the Err
+        let err = match create_initial_runtime_from_cli(&args, session_cwd, manager).await {
+            Ok(_) => panic!("Session storage cwd missing → assembly must abort"),
+            Err(e) => e,
+        };
+
+        let missing = err
+            .downcast_ref::<crate::session::MissingSessionCwdError>()
+            .expect("MissingSessionCwdError should be catchable by type on anyhow chain");
+        let process_cwd = std::env::current_dir()
+            .expect("Test process cwd should be resolvable")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            missing.issue.fallback_cwd, process_cwd,
+            "fallback should be process cwd"
+        );
+        assert_ne!(
+            missing.issue.fallback_cwd,
+            ghost.to_string_lossy(),
+            "fallback must not write to ghost directory (otherwise reopening the session falls back into a missing-directory infinite loop)"
+        );
+        assert_eq!(missing.issue.session_file, session_file);
+        assert_eq!(missing.issue.session_cwd, ghost.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Tool selection flags (cli-tools-flags-fix: --tools/--exclude-tools/--no-tools/--no-builtin-tools) ──

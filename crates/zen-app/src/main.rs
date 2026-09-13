@@ -3,7 +3,7 @@
 // Implementation notes in tasks/T-AP-08-3-implemented.md (thin-shell main + assembly factory, dual delivery)
 
 use clap::Parser;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 use zen_app::cli::{build_initial_message, read_piped_stdin, stdin_is_terminal, CliArgs, Mode};
 use zen_app::config::{get_sessions_dir, VERSION};
@@ -12,6 +12,9 @@ use zen_app::modes::print_mode::run_print_mode;
 use zen_app::session::jsonl::CreateSessionOptions;
 use zen_app::session::services::create_initial_runtime_from_cli;
 use zen_app::session::session_manager::SessionManager;
+use zen_app::session::{
+    format_missing_session_cwd_error, get_missing_session_cwd_issue, SessionCwdIssue,
+};
 
 /// Application run mode.
 /// Corresponds to pi's `AppMode` (`"print" | "interactive"`; `"rpc"` removed for simplification per REQ-APP-08).
@@ -94,9 +97,24 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Layer 3: assembly factory (refactoring point 3 — assembly logic extracted to services.rs; session chosen by main)
-    let cwd = std::env::current_dir()?;
-    let session_manager = select_session_manager(&args, &cwd)?;
-    let runtime = create_initial_runtime_from_cli(&args, cwd, session_manager).await?;
+    // process cwd: only used for session selection (--session restores its original cwd)
+    let process_cwd = std::env::current_dir()?;
+    let session_manager = select_session_manager(&args, &process_cwd)?;
+
+    // T-AP-01-5 gate: after select_session_manager, before assembly (same location as pi)
+    let process_cwd_lossy = process_cwd.to_string_lossy();
+    let issue = get_missing_session_cwd_issue(&session_manager, &process_cwd_lossy);
+
+    // session's cwd directory does not exist; exit directly
+    if let Some((message, code)) = missing_cwd_disposition(issue.as_ref(), &app_mode) {
+        eprintln!("{message}");
+        std::process::exit(code);
+    }
+
+    // Assembled cwd = session cwd (drives settings/skills/AGENTS.md/tool base dir to migrate with the session)
+    let session_cwd = PathBuf::from(session_manager.get_cwd());
+    let runtime = create_initial_runtime_from_cli(&args, session_cwd, session_manager).await?;
+
     info!(
         session_id = runtime.session.session_id(),
         model_id = %runtime.session.model().id,
@@ -139,6 +157,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Startup disposition decision for the missing-cwd issue (testable pure function: no IO, no exit).
+///
+/// Return `Some((stderr message, exit code))` to indicate startup should terminate; `None` to allow it to proceed.
+/// During the interim phase, print and interactive both use "error message + exit 1";
+/// After T-AP-08-6 goes live, the interactive branch switches to a Continue/Cancel selector flow
+/// (Continue → reopen with the fallback); the print branch remains unchanged.
+///
+/// # Consumers
+/// Called only internally within `main` (this file).
+fn missing_cwd_disposition(
+    issue: Option<&SessionCwdIssue>,
+    app_mode: &AppMode,
+) -> Option<(String, i32)> {
+    let issue = issue?;
+    match app_mode {
+        AppMode::Print(_) | AppMode::Interactive => {
+            Some((format_missing_session_cwd_error(issue), 1))
+        }
+    }
 }
 
 /// Determine the application run mode (print / interactive).
@@ -214,11 +253,8 @@ fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionM
         return Ok(SessionManager::continue_recent(&cwd_str, &root)?);
     }
     if let Some(session) = args.session.as_ref().or(args.session_id.as_ref()) {
-        return Ok(SessionManager::open(
-            Path::new(session),
-            Some(&cwd_str),
-            &root,
-        )?);
+        // // T-AP-01-5: Remove the Phase 1 simplification—the header cwd takes effect, and session restoration returns to its original directory
+        return Ok(SessionManager::open(Path::new(session), None, &root)?);
     }
     Ok(SessionManager::create(&cwd_str, &root, default_opts)?)
 }
@@ -263,5 +299,54 @@ mod tests {
     fn tty_without_flags_defaults_to_interactive() {
         let args = parse(&[]);
         assert_eq!(resolve_app_mode(&args, true), AppMode::Interactive);
+    }
+
+    // ── missing_cwd_disposition (T-AP-01-5 gate) ──────────────────
+
+    #[test]
+    fn missing_cwd_gate_passes_in_memory_session() {
+        // In-memory sessions are exempt (guard 1): get_missing_session_cwd_issue → None → allow through, no exit code produced
+        let sm = SessionManager::in_memory("/current");
+        let issue = get_missing_session_cwd_issue(&sm, "/current");
+        assert_eq!(
+            missing_cwd_disposition(issue.as_ref(), &AppMode::Print(Mode::Text)),
+            None
+        );
+        assert_eq!(
+            missing_cwd_disposition(issue.as_ref(), &AppMode::Interactive),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_cwd_disposition_print_error_exit_1_mentions_session_cwd() {
+        let issue = SessionCwdIssue {
+            session_file: PathBuf::from("/sessions/abc.jsonl"),
+            session_cwd: "/project/ghost".to_string(),
+            fallback_cwd: "/current".to_string(),
+        };
+        let (msg, code) =
+            missing_cwd_disposition(Some(&issue), &AppMode::Print(Mode::Text)).expect("should be handled");
+        assert_eq!(code, 1, "print branch error exit code aligned with pi exit(1)");
+        assert!(
+            msg.contains("/project/ghost"),
+            "dispose message should include the stored session_cwd"
+        );
+    }
+
+    #[test]
+    fn missing_cwd_disposition_interim_interactive_error_exit_1() {
+        let issue = SessionCwdIssue {
+            session_file: PathBuf::from("/sessions/abc.jsonl"),
+            session_cwd: "/project/ghost".to_string(),
+            fallback_cwd: "/current".to_string(),
+        };
+        let (msg, code) =
+            missing_cwd_disposition(Some(&issue), &AppMode::Interactive).expect("should be handled");
+        assert_eq!(
+            code, 1,
+            "interim: interactive exits with the same error as print (before T-AP-08-6 takes over)"
+        );
+        assert!(msg.contains("does not exist"), "disposition message should contain the error text");
     }
 }
