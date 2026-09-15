@@ -14,11 +14,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use zen_ai::types::ThinkingLevel;
 use zen_tui::components::select_list::SelectListTheme;
-use zen_tui::components::select_list::{SelectItem, SelectList, SelectListLayoutOptions};
+use zen_tui::components::select_list::{
+    SelectAction, SelectItem, SelectList, SelectListLayoutOptions,
+};
 use zen_tui::components::settings_list::{
     SettingItem, SettingsList, SettingsListOptions, SettingsListTheme, ValueChange,
 };
 use zen_tui::components::Component;
+use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::screen::{ScreenBuffer, Style};
 use zen_tui::theme::{ColorToken, Theme};
 
@@ -172,6 +175,8 @@ impl Default for SettingsCallbacks {
 type SubmenuClose = Rc<RefCell<Option<Option<String>>>>;
 
 /// Build a submenu (title + optional description + SelectList); on select/cancel, write to the close signal.
+/// parameters align with the pi make_submenu family + keybinding map injection (T-AP-06-2); the extra parameters are needed for assembly-surface completeness.
+#[allow(clippy::too_many_arguments)]
 fn make_submenu(
     title: String,
     description: Option<String>,
@@ -179,6 +184,7 @@ fn make_submenu(
     current_value: &str,
     list_theme: SelectListTheme,
     accent_style: Style,
+    select_kb: KeybindingsManager<SelectAction>,
     close: SubmenuClose,
 ) -> Box<dyn Component> {
     let layout = SelectListLayoutOptions {
@@ -186,7 +192,13 @@ fn make_submenu(
         max_primary_column_width: Some(32),
         truncate_primary: None,
     };
-    let mut list = SelectList::new(items.clone(), items.len().max(1), list_theme, layout);
+    let mut list = SelectList::new(
+        items.clone(),
+        items.len().max(1),
+        list_theme,
+        layout,
+        select_kb,
+    );
     if let Some(idx) = items.iter().position(|i| i.value() == current_value) {
         list.set_selected_index(idx);
     }
@@ -301,13 +313,16 @@ pub struct SettingsSelectorComponent {
 }
 
 impl SettingsSelectorComponent {
-    /// Constructed from the config snapshot, callback integrations, theme, and the settings list theme; list items and the on_change mapping are built during construction.
+    /// Constructs from a config snapshot, callback bundle, theme, settings-list theme, and SelectAction-domain keybinding map; list items and
+    /// the on_change mapping are built inside the constructor. `select_kb` is passed through to `SettingsList` and the submenu `SelectList`
+    /// (T-AP-06-2 constructor injection: user overrides enter the select-action routing through this).
     #[allow(clippy::vec_init_then_push)] // Settings items built one by one in pi order, readability first
     pub fn new(
         config: SettingsConfig,
         callbacks: SettingsCallbacks,
         theme: &Theme,
         settings_theme: SettingsListTheme,
+        select_kb: KeybindingsManager<SelectAction>,
     ) -> Self {
         let close: SubmenuClose = Rc::new(RefCell::new(None));
         let list_theme = theme.select_list_theme();
@@ -459,6 +474,7 @@ impl SettingsSelectorComponent {
             let close = close.clone();
             let lt = list_theme.clone();
             let accent = accent_style.clone();
+            let skb = select_kb.clone();
             let current = config.thinking_level.to_string().to_ascii_lowercase();
             let levels = config.available_thinking_levels.clone();
             items.push(SettingItem {
@@ -475,6 +491,7 @@ impl SettingsSelectorComponent {
                         &current,
                         lt.clone(),
                         accent.clone(),
+                        skb.clone(),
                         close.clone(),
                     )
                 })),
@@ -484,6 +501,7 @@ impl SettingsSelectorComponent {
         {
             let lt = list_theme.clone();
             let accent = accent_style.clone();
+            let skb = select_kb.clone();
             let themes = config.available_themes.clone();
             let current_theme = config.current_theme.clone();
             let close = close.clone();
@@ -505,6 +523,7 @@ impl SettingsSelectorComponent {
                         &current_theme,
                         lt.clone(),
                         accent.clone(),
+                        skb.clone(),
                         close.clone(),
                     )
                 })),
@@ -564,6 +583,7 @@ impl SettingsSelectorComponent {
                 enable_search: false,
                 filter: None,
             },
+            select_kb,
         );
 
         SettingsSelectorComponent {
@@ -633,6 +653,14 @@ mod tests {
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()
+    }
+
+    /// Test constructor: default SelectAction keymap (no user overrides).
+    fn select_kb() -> KeybindingsManager<SelectAction> {
+        KeybindingsManager::new(
+            zen_tui::keybindings::select_default_bindings(),
+            std::collections::HashMap::new(),
+        )
     }
 
     fn config() -> SettingsConfig {
@@ -707,6 +735,7 @@ mod tests {
             SettingsCallbacks::default(),
             theme(),
             theme().settings_list_theme(),
+            select_kb(),
         );
         let mut buf = ScreenBuffer::new(80, 20);
         let painted = comp.render(&mut buf, 0, 0, 80, 20);
@@ -729,6 +758,7 @@ mod tests {
             callbacks,
             theme(),
             theme().settings_list_theme(),
+            select_kb(),
         );
         // First item selected by default (Auto-compact true → cycle to "false")
         let enter = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter);
@@ -749,6 +779,7 @@ mod tests {
             callbacks,
             theme(),
             theme().settings_list_theme(),
+            select_kb(),
         );
         let esc = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc);
         assert!(comp.handle_key(&esc));
@@ -768,6 +799,7 @@ mod tests {
             callbacks,
             theme(),
             theme().settings_list_theme(),
+            select_kb(),
         );
         // Navigate to the "thinking" item (index 14) and press Enter to open the submenu
         for _ in 0..14 {
@@ -799,6 +831,7 @@ mod tests {
             callbacks,
             theme(),
             theme().settings_list_theme(),
+            select_kb(),
         );
         // Navigate to the "theme" item (index 15)
         for _ in 0..15 {
@@ -829,6 +862,7 @@ mod tests {
             callbacks,
             theme(),
             theme().settings_list_theme(),
+            select_kb(),
         );
         for _ in 0..14 {
             assert!(comp.handle_key(&crossterm::event::KeyEvent::from(

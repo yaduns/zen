@@ -1,5 +1,7 @@
+use crate::keybindings::KeybindingsManager;
+use crate::keys::KeyId;
 use crate::screen::{ScreenBuffer, Style};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// Input semantics contract for selection-type components
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +24,8 @@ pub struct SelectList {
     on_select: Option<Box<dyn FnMut(&SelectItem)>>, // Fired on Confirm (not fired when nothing is selected)
     on_cancel: Option<Box<dyn FnMut()>>, // Fired on Cancel
     on_selection_change: Option<Box<dyn FnMut(&SelectItem)>>, // Fired on navigation (↑↓)
+    // SelectAction-domain keybinding registry (T-AP-06-2 constructor injection): authoritative source for handle_key action routing
+    keybindings: KeybindingsManager<SelectAction>,
 }
 
 /// Filterable list item data
@@ -120,12 +124,15 @@ pub struct SelectListTruncatePrimaryContext<'a> {
 }
 
 impl SelectList {
-    /// Constructor. Consumers: T-AP-11-2 (settings-selector), T-AP-08-6 (config/model selection).
+    /// Construct. Parameter `keybindings`: SelectAction-domain keybinding registry (T-AP-06-2 constructor injection)—the default table uses
+    /// `select_default_bindings()` for construction (user overrides can be layered on); `KeybindingsManager` is Clone.
+    /// Consumers: T-AP-11-2 (settings-selector), T-AP-08-6 (config/model selection).
     pub fn new(
         items: Vec<SelectItem>,
         max_visible: usize,
         theme: SelectListTheme,
         layout: SelectListLayoutOptions,
+        keybindings: KeybindingsManager<SelectAction>,
     ) -> Self {
         let filtered_items = items.clone();
         SelectList {
@@ -138,6 +145,7 @@ impl SelectList {
             on_select: None,
             on_cancel: None,
             on_selection_change: None,
+            keybindings,
         }
     }
 
@@ -397,28 +405,43 @@ impl super::Component for SelectList {
         painted
     }
 
-    /// Inline default keybindings (↑↓/Enter/Esc/Ctrl+C) → handle_action; other keys are not consumed.
-    /// After T-TU-03-1 lands, this method can be driven by a keybinding table (see "Open Issues" 1).
+    /// Registry-driven keybindings (default ↑↓/Enter/Esc/Ctrl+C; user overrides take effect via the injected table—T-AP-06-2):
+    /// After events are normalized to `KeyId`, on a hit in MoveUp/MoveDown/Confirm/Cancel order, dispatch to `handle_action`;
+    /// If no action matches, do not consume; let the upper layer continue routing.
     fn handle_key(&mut self, key: &KeyEvent) -> bool {
-        match (key.code, key.modifiers) {
-            (KeyCode::Up, _) => self.handle_action(SelectAction::MoveUp),
-            (KeyCode::Down, _) => self.handle_action(SelectAction::MoveDown),
-            (KeyCode::Enter, _) => self.handle_action(SelectAction::Confirm),
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                self.handle_action(SelectAction::Cancel)
+        let Some(kid) = KeyId::from_key_event(*key) else {
+            return false;
+        };
+        for action in [
+            SelectAction::MoveUp,
+            SelectAction::MoveDown,
+            SelectAction::Confirm,
+            SelectAction::Cancel,
+        ] {
+            if self.keybindings.matches(&kid, action) {
+                return self.handle_action(action);
             }
-            _ => false,
         }
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Test constructor: default SelectAction keymap (no user overrides).
+    fn kb() -> KeybindingsManager<SelectAction> {
+        KeybindingsManager::new(
+            crate::keybindings::select_default_bindings(),
+            HashMap::new(),
+        )
+    }
     use super::*;
     use crate::components::Component;
     use crate::screen::{ScreenBuffer, Style};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn item(value: &str) -> SelectItem {
@@ -452,7 +475,7 @@ mod tests {
 
     #[test]
     fn new_mirrors_items_and_starts_at_first() {
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         assert_eq!(l.items.len(), 3);
         assert_eq!(l.filtered_items.len(), 3);
         assert_eq!(l.selected_index, 0);
@@ -461,7 +484,7 @@ mod tests {
 
     #[test]
     fn set_items_resets_selection_and_filtered() {
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         l.set_selected_index(2);
         l.set_items(items(&["x", "y"]));
         assert_eq!(l.selected_index, 0);
@@ -471,7 +494,13 @@ mod tests {
 
     #[test]
     fn set_filter_prefix_case_insensitive_and_resets_selection() {
-        let mut l = SelectList::new(items(&["Alpha", "beta", "gamma"]), 3, theme(), layout());
+        let mut l = SelectList::new(
+            items(&["Alpha", "beta", "gamma"]),
+            3,
+            theme(),
+            layout(),
+            kb(),
+        );
         l.set_selected_index(2);
         l.set_filter("al");
         assert_eq!(l.filtered_items.len(), 1);
@@ -487,7 +516,7 @@ mod tests {
 
     #[test]
     fn set_filter_safe_across_multi_byte_boundary() {
-        let mut l = SelectList::new(items(&["你好", "再见", "abc"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["你好", "再见", "abc"]), 3, theme(), layout(), kb());
         // Valid prefix (full grapheme) hit
         l.set_filter("你");
         assert_eq!(l.filtered_items.len(), 1);
@@ -502,25 +531,25 @@ mod tests {
 
     #[test]
     fn set_selected_index_clamps_and_empty_keeps_zero() {
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         l.set_selected_index(10);
         assert_eq!(l.selected_index, 2);
         l.set_selected_index(0);
         assert_eq!(l.selected_index, 0);
-        let mut empty = SelectList::new(vec![], 3, theme(), layout());
+        let mut empty = SelectList::new(vec![], 3, theme(), layout(), kb());
         empty.set_selected_index(5);
         assert_eq!(empty.selected_index, 0);
     }
 
     #[test]
     fn get_selected_item_none_when_empty() {
-        let l = SelectList::new(vec![], 3, theme(), layout());
+        let l = SelectList::new(vec![], 3, theme(), layout(), kb());
         assert!(l.get_selected_item().is_none());
     }
 
     #[test]
     fn handle_action_move_wraps_around() {
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         assert!(l.handle_action(SelectAction::MoveDown));
         assert_eq!(l.selected_index, 1);
         assert!(l.handle_action(SelectAction::MoveDown));
@@ -535,7 +564,7 @@ mod tests {
 
     #[test]
     fn handle_action_move_empty_not_consumed() {
-        let mut l = SelectList::new(vec![], 3, theme(), layout());
+        let mut l = SelectList::new(vec![], 3, theme(), layout(), kb());
         assert!(!l.handle_action(SelectAction::MoveUp));
         assert!(!l.handle_action(SelectAction::MoveDown));
         assert_eq!(l.selected_index, 0);
@@ -545,7 +574,7 @@ mod tests {
     fn handle_action_confirm_fires_on_select_and_consumes() {
         let selected = Rc::new(RefCell::new(Vec::new()));
         let s = selected.clone();
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         l.set_on_select(move |item| s.borrow_mut().push(item.value.clone()));
         l.set_selected_index(1);
         assert!(l.handle_action(SelectAction::Confirm));
@@ -554,23 +583,23 @@ mod tests {
 
     #[test]
     fn handle_action_confirm_without_callback_still_consumes() {
-        let mut l = SelectList::new(items(&["a"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a"]), 3, theme(), layout(), kb());
         assert!(l.handle_action(SelectAction::Confirm)); // Has selection → consume (callback absent)
     }
 
     #[test]
     fn handle_action_confirm_empty_not_consumed() {
-        let mut l = SelectList::new(vec![], 3, theme(), layout());
+        let mut l = SelectList::new(vec![], 3, theme(), layout(), kb());
         assert!(!l.handle_action(SelectAction::Confirm));
     }
 
     #[test]
     fn handle_action_cancel_always_consumed() {
-        let mut l = SelectList::new(items(&["a"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a"]), 3, theme(), layout(), kb());
         assert!(l.handle_action(SelectAction::Cancel)); // Also consumed without a callback
         let cancelled = Rc::new(RefCell::new(0));
         let c = cancelled.clone();
-        let mut l2 = SelectList::new(items(&["a"]), 3, theme(), layout());
+        let mut l2 = SelectList::new(items(&["a"]), 3, theme(), layout(), kb());
         l2.set_on_cancel(move || *c.borrow_mut() += 1);
         assert!(l2.handle_action(SelectAction::Cancel));
         assert_eq!(*cancelled.borrow(), 1);
@@ -580,7 +609,7 @@ mod tests {
     fn handle_action_navigation_fires_on_selection_change() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let s = seen.clone();
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         l.set_on_selection_change(move |item| s.borrow_mut().push(item.value.clone()));
         assert!(l.handle_action(SelectAction::MoveDown));
         assert!(l.handle_action(SelectAction::MoveDown));
@@ -593,7 +622,7 @@ mod tests {
         let cancelled = Rc::new(RefCell::new(0));
         let s = selected.clone();
         let c = cancelled.clone();
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         l.set_on_select(move |item| s.borrow_mut().push(item.value.clone()));
         l.set_on_cancel(move || *c.borrow_mut() += 1);
 
@@ -615,14 +644,14 @@ mod tests {
     #[test]
     fn render_height_zero_returns_zero() {
         let mut buf = ScreenBuffer::new(40, 10);
-        let mut l = SelectList::new(items(&["a", "b"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b"]), 3, theme(), layout(), kb());
         assert_eq!(l.render(&mut buf, 0, 0, 40, 0), 0);
     }
 
     #[test]
     fn render_empty_shows_no_match_row() {
         let mut buf = ScreenBuffer::new(40, 10);
-        let mut l = SelectList::new(vec![], 3, theme(), layout());
+        let mut l = SelectList::new(vec![], 3, theme(), layout(), kb());
         assert_eq!(l.render(&mut buf, 0, 0, 40, 10), 1);
     }
 
@@ -630,7 +659,13 @@ mod tests {
     fn render_counts_window_and_scroll_info() {
         let mut buf = ScreenBuffer::new(40, 10);
         // 5 items, max_visible=3 → window of 3 rows + 1 scroll-info row = 4
-        let mut l = SelectList::new(items(&["a", "b", "c", "d", "e"]), 3, theme(), layout());
+        let mut l = SelectList::new(
+            items(&["a", "b", "c", "d", "e"]),
+            3,
+            theme(),
+            layout(),
+            kb(),
+        );
         assert_eq!(l.render(&mut buf, 0, 0, 40, 10), 4);
     }
 
@@ -638,7 +673,13 @@ mod tests {
     fn render_window_clamped_by_height() {
         let mut buf = ScreenBuffer::new(40, 10);
         // 5 items, max_visible=5, height=2 → window of 2 rows; item count ≤ max_visible → no scroll info
-        let mut l = SelectList::new(items(&["a", "b", "c", "d", "e"]), 5, theme(), layout());
+        let mut l = SelectList::new(
+            items(&["a", "b", "c", "d", "e"]),
+            5,
+            theme(),
+            layout(),
+            kb(),
+        );
         assert_eq!(l.render(&mut buf, 0, 0, 40, 2), 2);
     }
 
@@ -651,6 +692,7 @@ mod tests {
             5,
             theme(),
             layout(),
+            kb(),
         );
         assert_eq!(l.render(&mut buf, 0, 0, 40, 3), 3);
     }
@@ -674,7 +716,7 @@ mod tests {
                 "CUSTOM".to_string()
             })),
         };
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout);
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout, kb());
         let mut buf = ScreenBuffer::new(80, 10);
         assert_eq!(l.render(&mut buf, 0, 0, 80, 10), 3);
         assert_eq!(l.render(&mut buf, 0, 0, 80, 10), 3);
@@ -692,8 +734,30 @@ mod tests {
     #[test]
     fn render_narrow_width_no_desc_single_column() {
         let mut buf = ScreenBuffer::new(40, 10);
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout());
+        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         // width=30 ≤ 40 → not two-column; primary column spans the full width, still renders 3 items
         assert_eq!(l.render(&mut buf, 0, 0, 30, 10), 3);
+    }
+
+    // ── User override routing (T-AP-06-2) ──
+
+    #[test]
+    fn user_override_reroutes_select_action() {
+        use crate::keys::KeyId;
+        let mut user = HashMap::new();
+        user.insert(
+            SelectAction::MoveDown,
+            vec![KeyId::parse("ctrl+n").unwrap()],
+        );
+        let mut l = SelectList::new(
+            vec![item("a")],
+            5,
+            theme(),
+            layout(),
+            KeybindingsManager::new(crate::keybindings::select_default_bindings(), user),
+        );
+        // Default down is disabled; ctrl+n matches MoveDown
+        assert!(!l.handle_key(&KeyEvent::from(KeyCode::Down)));
+        assert!(l.handle_key(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)));
     }
 }

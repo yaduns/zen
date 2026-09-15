@@ -36,7 +36,7 @@ pub struct KeybindingConflict<A> {
 pub struct KeybindingsManager<A> {
     /// Default definition table (indexed by action).
     definitions: HashMap<A, KeybindingDefinition<A>>,
-    /// User binding overrides (may be an empty table = all defaults); persistence is handled by the app layer T-AP-06-2; this layer only holds runtime overrides.
+    /// User override bindings (may be an empty table = all defaults); persistence (loading keybindings.json) is implemented by application layer T-AP-06-2; this layer only holds runtime overrides.
     user_bindings: HashMap<A, Vec<KeyId>>,
     /// Merged table of effective keybindings (cached and maintained by `rebuild`).
     resolved: HashMap<A, Vec<KeyId>>,
@@ -60,7 +60,7 @@ impl<A: Clone + Eq + Hash> KeybindingsManager<A> {
     /// `defaults` contains all action definitions for the action scope (editor/selection widget); `user_bindings` is a nullable user override table
     /// (If empty, all actions fall back to their default bindings.) After construction, `matches`/`get_keys`/`get_conflicts` are immediately queryable.
     /// Boundary: entries in `user_bindings` that reference actions not defined in `defaults` are ignored (aligns with pi: skip if not in definitions).
-    /// Consumers: planned consumers T-AP-11-2 (app layer builds the registries for editor/select components) and T-AP-06-2 (injects user config).
+    /// Consumers: T-AP-11-2 (application layer constructs separate registries for editor/selection components), T-AP-06-2 (injected after loading user config; already implemented).
     pub fn new(
         defaults: Vec<KeybindingDefinition<A>>,
         user_bindings: HashMap<A, Vec<KeyId>>,
@@ -131,28 +131,28 @@ impl<A: Clone + Eq + Hash> KeybindingsManager<A> {
 
     /// Queries the default definition metadata for an action (default key + description). Used by the configuration UI to display default values and help text.
     /// Returning `None` means the action is not in the registry (undefined).
-    /// Consumers: planned consumers T-AP-06-2 (display default bindings), config/help UI.
+    /// Consumers: T-AP-06-2 (id table/defaultKeys comparison), config/help UI.
     pub fn get_definition(&self, action: A) -> Option<&KeybindingDefinition<A>> {
         self.definitions.get(&action)
     }
 
     /// Returns the list of key conflicts caused by user overrides (the same key is claimed by multiple actions). Used for validation/notifications before saving the configuration.
     /// Returns a borrowed slice of the cached `conflicts`; empty when there are no conflicts.
-    /// Consumers: planned consumer T-AP-06-2 (detects ambiguity before saving user keybindings).
+    /// Consumers: config/help UI (detects ambiguity before saving user shortcuts; v1 has no save UI, reserved for that scenario).
     pub fn get_conflicts(&self) -> &[KeybindingConflict<A>] {
         &self.conflicts
     }
 
     /// Replaces all user override bindings and rebuilds the resolution/conflict tables (called when the user changes the keybinding configuration).
     /// An empty override `HashMap` clears all user overrides and reverts everything to the defaults. `get_user_bindings`/`get_resolved_bindings`
-    /// Companion read of current state. Consumers: planned consumer T-AP-06-2 (called after saving new config).
+    /// Reads the current state alongside it. Consumers: v2 /reload (if the command is restored, replaces all user overrides after reloading).
     pub fn set_user_bindings(&mut self, user_bindings: HashMap<A, Vec<KeyId>>) {
         self.user_bindings = user_bindings;
         self.rebuild();
     }
 
     /// Returns a read-only view of the current user override binding table. Use with `set_user_bindings` for read-modify-write round trips.
-    /// Consumers: planned consumer T-AP-06-2.
+    /// Consumers: application-layer load/write-back round trip (T-AP-06-2 v1 only loads at startup; write-back is reserved for the v2 /reload scenario).
     pub fn get_user_bindings(&self) -> &HashMap<A, Vec<KeyId>> {
         &self.user_bindings
     }

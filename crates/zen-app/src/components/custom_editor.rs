@@ -23,10 +23,15 @@ pub struct CustomEditor {
 }
 
 impl CustomEditor {
-    /// Construct with the initial left padding and app keybinding table.
-    pub fn new(padding_x: usize, kb: KeybindingsManager<AppAction>) -> Self {
+    /// Constructed with initial left padding, the app keymap, and the editor-domain keymap. `editor_kb` is passed through to the inner zen-tui `Editor`.
+    /// (T-AP-06-2 constructor injection: user overrides enter editor action routing here; default table `editor_default_bindings()`).
+    pub fn new(
+        padding_x: usize,
+        kb: KeybindingsManager<AppAction>,
+        editor_kb: KeybindingsManager<EditorAction>,
+    ) -> Self {
         CustomEditor {
-            editor: Editor::new(padding_x),
+            editor: Editor::new(padding_x, editor_kb),
             kb,
             action_handlers: HashMap::new(),
             on_escape: None,
@@ -222,9 +227,15 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
+    use zen_tui::keybindings::editor_default_bindings;
 
     fn kb() -> KeybindingsManager<AppAction> {
         KeybindingsManager::new(app_default_bindings(), HashMap::new())
+    }
+
+    /// Editor domain keybinding table (default, no user overrides).
+    fn editor_kb() -> KeybindingsManager<EditorAction> {
+        KeybindingsManager::new(editor_default_bindings(), HashMap::new())
     }
 
     fn press(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
@@ -240,7 +251,7 @@ mod tests {
 
     #[test]
     fn printable_keys_go_to_editor() {
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         assert!(editor.handle_key(&press(crossterm::event::KeyCode::Char('a'))));
         assert!(editor.handle_key(&press(crossterm::event::KeyCode::Char('b'))));
         assert_eq!(editor.text(), "ab");
@@ -248,7 +259,7 @@ mod tests {
 
     #[test]
     fn tools_expand_routes_to_handler() {
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         let fired = Rc::new(RefCell::new(0));
         let f = fired.clone();
         editor.on_action(
@@ -263,7 +274,7 @@ mod tests {
     fn esc_fires_on_escape() {
         let mutated = Rc::new(RefCell::new(0));
         let m = mutated.clone();
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         editor.set_on_escape(Box::new(move || *m.borrow_mut() += 1));
         assert!(editor.handle_key(&press(crossterm::event::KeyCode::Esc)));
         assert_eq!(*mutated.borrow(), 1);
@@ -274,13 +285,13 @@ mod tests {
         // Empty editor: Ctrl+D → on_exit
         let exited = Rc::new(RefCell::new(0));
         let e = exited.clone();
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         editor.set_on_exit(Box::new(move || *e.borrow_mut() += 1));
         assert!(editor.handle_key(&ctrl('d')));
         assert_eq!(*exited.borrow(), 1);
 
         // Non-empty editor: Ctrl+D falls to the editor (delete previous char, does not trigger on_exit)
-        let mut editor2 = CustomEditor::new(0, kb());
+        let mut editor2 = CustomEditor::new(0, kb(), editor_kb());
         editor2.set_text("ab");
         let _ = editor2.handle_key(&press(crossterm::event::KeyCode::Home));
         assert!(editor2.handle_key(&ctrl('d')));
@@ -289,7 +300,7 @@ mod tests {
 
     #[test]
     fn delegates_text_and_history() {
-        let mut editor = CustomEditor::new(2, kb());
+        let mut editor = CustomEditor::new(2, kb(), editor_kb());
         editor.set_text("hello");
         assert_eq!(editor.text(), "hello");
         editor.add_to_history("hello");
@@ -301,7 +312,7 @@ mod tests {
 
     #[test]
     fn render_returns_height() {
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         editor.set_text("x");
         let mut buf = ScreenBuffer::new(40, 5);
         let painted = editor.render(&mut buf, 0, 0, 40, 5);
@@ -310,7 +321,7 @@ mod tests {
 
     #[test]
     fn needed_height_delegates_to_editor() {
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         // empty -> 3; 3 short lines -> 5; rows=40 gives cap=12, 7 lines of content -> 9
         assert_eq!(editor.needed_height(40, 24), 3);
         editor.set_text("a\nb\nc");
@@ -329,15 +340,15 @@ mod tests {
 
     #[test]
     fn handle_paste_delegates_to_editor() {
-        let mut editor = CustomEditor::new(0, kb());
+        let mut editor = CustomEditor::new(0, kb(), editor_kb());
         editor.handle_paste("line1\r\nline2");
         assert_eq!(editor.text(), "line1\nline2", "Delegates newline normalization semantics to Editor");
         // tab expansion + non-printable filtering also take effect
-        let mut editor2 = CustomEditor::new(0, kb());
+        let mut editor2 = CustomEditor::new(0, kb(), editor_kb());
         editor2.handle_paste("a\tb\x01c");
         assert_eq!(editor2.text(), "a    bc");
         // empty paste is a no-op
-        let mut editor3 = CustomEditor::new(0, kb());
+        let mut editor3 = CustomEditor::new(0, kb(), editor_kb());
         editor3.set_text("keep");
         editor3.handle_paste("");
         assert_eq!(editor3.text(), "keep");

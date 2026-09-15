@@ -361,13 +361,27 @@ fn normalize_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::keybindings::KeybindingsManager;
+    use std::collections::HashMap;
+
+    /// Test constructor: default keymap (no user overrides). Test-only — production assembly must pass an injected registry.
+    fn e(padding_x: usize) -> Editor {
+        Editor::new(
+            padding_x,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        )
+    }
     use super::super::Editor;
 
     // ── insert_char ──
 
     #[test]
     fn test_insert_char_basic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_char('a');
         e.insert_char('b');
         assert_eq!(e.text(), "ab");
@@ -376,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_insert_char_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("ac");
         e.set_cursor_col(1);
         e.insert_char('b');
@@ -386,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_insert_char_multibyte() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_char('你');
         assert_eq!(e.text(), "你");
         assert_eq!(e.cursor(), (0, 3)); // 3 UTF-8 bytes
@@ -394,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_insert_char_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -407,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_backspace_basic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("abc");
         e.backspace();
         assert_eq!(e.text(), "ab");
@@ -416,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_backspace_multibyte() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("a你b");
         e.set_cursor_col(4); // after the CJK char (bytes 1..4)
         e.backspace();
@@ -426,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_backspace_at_start_of_line_merges() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello\nworld");
         e.set_cursor_col(0);
         e.state.cursor_line = 1;
@@ -437,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_backspace_at_first_line_first_col_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         e.set_cursor_col(0);
         e.backspace();
@@ -447,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_backspace_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -459,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_delete_forward_basic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("abc");
         e.set_cursor_col(1);
         e.delete_forward();
@@ -469,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_delete_forward_at_end_merges_lines() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello\nworld");
         e.set_cursor_col(5);
         e.state.cursor_line = 0;
@@ -480,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_delete_forward_at_end_of_last_line_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         // cursor at end
         e.delete_forward();
@@ -489,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_delete_forward_multibyte() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("a你b");
         e.set_cursor_col(1); // before the CJK char
         e.delete_forward();
@@ -498,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_delete_forward_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -510,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_single_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text("hello");
         assert_eq!(e.text(), "hello");
         assert_eq!(e.cursor(), (0, 5));
@@ -518,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_multiline() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text("a\nb\nc");
         assert_eq!(e.text(), "a\nb\nc");
         assert_eq!(e.cursor(), (2, 1));
@@ -526,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_mid_line_splits() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.set_cursor_col(6); // before "world"
         e.insert_text("beautiful ");
@@ -535,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_multiline_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("abcdef");
         e.set_cursor_col(3); // after "abc"
         e.insert_text("\nXY");
@@ -546,21 +560,21 @@ mod tests {
 
     #[test]
     fn test_insert_text_normalizes_crlf() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text("a\r\nb");
         assert_eq!(e.text(), "a\nb");
     }
 
     #[test]
     fn test_insert_text_normalizes_tabs() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text("a\tb");
         assert_eq!(e.text(), "a    b");
     }
 
     #[test]
     fn test_insert_text_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -572,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_newline_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.set_cursor_col(5);
         e.newline();
@@ -582,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_newline_at_end() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         e.newline();
         assert_eq!(e.text(), "hello\n");
@@ -591,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_newline_at_start() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         e.set_cursor_col(0);
         e.newline();
@@ -601,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_newline_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -613,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_start_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.set_cursor_col(6);
         e.delete_to_line_start();
@@ -623,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_start_at_start_merges() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello\nworld");
         e.state.cursor_line = 1;
         e.set_cursor_col(0);
@@ -634,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_start_first_line_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         e.set_cursor_col(0);
         e.delete_to_line_start();
@@ -643,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_start_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -655,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_end_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.set_cursor_col(5);
         e.delete_to_line_end();
@@ -665,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_end_at_end_merges() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello\nworld");
         e.set_cursor_col(5);
         e.state.cursor_line = 0;
@@ -675,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_end_last_line_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         // cursor at end
         e.delete_to_line_end();
@@ -684,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_delete_to_line_end_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -696,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_backward_basic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.delete_word_backward();
         assert_eq!(e.text(), "hello ");
@@ -705,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_backward_at_start_merges() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello\nworld");
         e.state.cursor_line = 1;
         e.set_cursor_col(0);
@@ -716,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_backward_first_line_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         e.set_cursor_col(0);
         e.delete_word_backward();
@@ -725,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_backward_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -737,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_forward_basic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.set_cursor_col(0);
         e.delete_word_forward();
@@ -746,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_forward_at_end_merges() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello\nworld");
         e.set_cursor_col(5);
         e.state.cursor_line = 0;
@@ -756,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_forward_last_line_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         // cursor at end
         e.delete_word_forward();
@@ -765,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_delete_word_forward_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);

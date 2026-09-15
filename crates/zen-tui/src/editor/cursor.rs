@@ -345,6 +345,20 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::keybindings::KeybindingsManager;
+    use std::collections::HashMap;
+
+    /// Test constructor: default keymap (no user overrides). Test-only — production assembly must pass an injected registry.
+    fn e(padding_x: usize) -> Editor {
+        Editor::new(
+            padding_x,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        )
+    }
     use super::*;
 
     /// Construct an editor with the given line text and cursor (line, col).
@@ -357,7 +371,7 @@ mod tests {
         last_width: usize,
         last_height: usize,
     ) -> Editor {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.state.lines = lines.iter().map(|s| s.to_string()).collect();
         if e.state.lines.is_empty() {
             e.state.lines.push(String::new());

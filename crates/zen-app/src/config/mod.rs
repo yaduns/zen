@@ -42,6 +42,14 @@ pub fn get_settings_path() -> Result<PathBuf, PathError> {
     Ok(get_agent_dir()?.join("settings.json"))
 }
 
+/// User keybinding config file path: `<agentDir>/keybindings.json` (aligned with pi `KeybindingsManager::create`).
+/// Source of truth for user keybinding overrides, consumed by the T-AP-06-2 loader.
+/// # Errors
+/// Depends on `get_agent_dir`; when env overrides are missing and home is unavailable → `PathError::NoHomeDir`.
+pub fn get_keybindings_path() -> Result<PathBuf, PathError> {
+    Ok(get_agent_dir()?.join("keybindings.json"))
+}
+
 /// Self-installed managed binaries directory: `<agentDir>/bin` (fd/rg etc.).
 /// # Consumers
 /// T-AP-04-2 (`getShellEnv` prepends bin to PATH, see T-AP-09-3 open question 1)
@@ -182,6 +190,16 @@ mod tests {
         assert_eq!(
             get_settings_path().unwrap(),
             PathBuf::from("/fake/agent/settings.json")
+        );
+    }
+
+    #[test]
+    fn test_get_keybindings_path_appends_keybindings_json() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::set(ENV_AGENT_DIR, "/fake/agent");
+        assert_eq!(
+            get_keybindings_path().unwrap(),
+            PathBuf::from("/fake/agent/keybindings.json")
         );
     }
 

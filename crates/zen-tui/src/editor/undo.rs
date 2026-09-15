@@ -48,13 +48,27 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::keybindings::KeybindingsManager;
+    use std::collections::HashMap;
+
+    /// Test constructor: default keymap (no user overrides). Test-only — production assembly must pass an injected registry.
+    fn e(padding_x: usize) -> Editor {
+        Editor::new(
+            padding_x,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        )
+    }
     use super::super::{Editor, EditorAction};
 
     // ── Basic undo stack semantics (driven through the public entry point handle_action) ──
 
     #[test]
     fn test_undo_empty_stack_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // Empty stack: no operation, no on_change
         e.handle_action(EditorAction::Undo);
         assert_eq!(e.text(), "");
@@ -63,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_undo_restores_text_and_cursor() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         // Move the cursor to the start of the line, then insert (creating a second undo unit)
         e.handle_action(EditorAction::MoveToLineStart);
@@ -82,7 +96,7 @@ mod tests {
 
     #[test]
     fn test_undo_exits_history_browsing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("draft");
         e.navigate_history(-1);
@@ -95,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_undo_fires_on_change() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         let changes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         {
             let c = changes.clone();
@@ -112,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_undo_resets_view_state() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_char('a');
         e.preferred_visual_col = Some(7);
         e.snapped_from_cursor_col = Some(3);
@@ -126,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_undo_coalesces_consecutive_word_chars() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // Consecutive word characters: one undo unit
         for c in "hello".chars() {
             e.insert_char(c);
@@ -139,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_undo_space_is_separate_undoable() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         for c in "hello ".chars() {
             e.insert_char(c);
         }
@@ -156,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_undo_cursor_move_breaks_coalescing() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         for c in "hel".chars() {
             e.insert_char(c);
         }
@@ -175,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_undo_delete_operations() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
 
         // Ctrl+U (delete to start of line): cursor at end of line → delete the entire line; Ctrl+- restores (including cursor position)
@@ -196,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_undo_noop_delete_does_not_push() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // (0,0) Empty editor, Backspace: no actual deletion → no snapshot is pushed (aligns with pi's no-op guard)
         e.handle_action(EditorAction::DeleteCharBackward);
         assert_eq!(e.undo_stack.len(), 0);
@@ -204,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_undo_paste_is_atomic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.handle_paste("a\nb");
         assert_eq!(e.text(), "a\nb");
         assert_eq!(e.undo_stack.len(), 1);
@@ -215,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_undo_newline_is_atomic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("abc");
         e.handle_action(EditorAction::NewLine);
         assert_eq!(e.undo_stack.len(), 2);
@@ -226,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_submit_clears_undo_stack() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.on_submit = Some(Box::new(|_| {}));
         e.insert_char('a');
         assert_eq!(e.undo_stack.len(), 1);
@@ -241,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_set_text_different_pushes_snapshot() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("first version");
         assert!(!e.text().is_empty());
         assert_eq!(e.undo_stack.len(), 1);
@@ -253,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_set_text_same_content_no_push() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("");
         assert_eq!(e.undo_stack.len(), 0);
 
@@ -266,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_entry_protects_draft() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("old");
         e.insert_text_at_cursor("my draft");
         let n = e.undo_stack.len();
@@ -283,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_undo_multiline_mid_edit() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("a\nb");
         // After insertion, the cursor moves from the end of the last line (1,1) → the start of the line (1,0); insert X
         e.handle_action(EditorAction::MoveToLineStart);

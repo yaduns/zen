@@ -251,6 +251,20 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::keybindings::KeybindingsManager;
+    use std::collections::HashMap;
+
+    /// Test constructor: default keymap (no user overrides). Test-only — production assembly must pass an injected registry.
+    fn e(padding_x: usize) -> Editor {
+        Editor::new(
+            padding_x,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        )
+    }
     use super::super::Editor;
     use crate::screen::ScreenBuffer;
 
@@ -258,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_render_too_small_width_is_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         let mut buf = ScreenBuffer::new(1, 5);
         // width < 2 → early return
@@ -268,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_render_too_small_height_is_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         let mut buf = ScreenBuffer::new(20, 2);
         // height < 3 → early return
@@ -278,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_render_sets_last_width_and_height() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -288,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_render_sets_effective_padding() {
-        let mut e = Editor::new(4);
+        let mut e = e(4);
         e.insert_text_at_cursor("hello");
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -297,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_render_clamps_padding_to_max() {
-        let mut e = Editor::new(100);
+        let mut e = e(100);
         e.insert_text_at_cursor("hello");
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -307,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_render_scroll_clamps_cursor_visible() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // Insert enough lines to overflow visible area
         for i in 0..20 {
             if i > 0 {
@@ -328,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_render_no_scroll_when_content_fits() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("short");
         let mut buf = ScreenBuffer::new(40, 10);
         e.render(&mut buf, 0, 0, 40, 10);
@@ -339,13 +353,13 @@ mod tests {
 
     #[test]
     fn test_cursor_position_zero_width_returns_origin() {
-        let e = Editor::new(0);
+        let e = e(0);
         assert_eq!(e.cursor_position(), (0, 0));
     }
 
     #[test]
     fn test_cursor_position_empty_editor() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
         let (col, row) = e.cursor_position();
@@ -356,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_cursor_position_with_padding() {
-        let mut e = Editor::new(3);
+        let mut e = e(3);
         e.insert_text_at_cursor("hi");
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -368,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_cursor_position_after_text() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -379,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_cursor_position_multiline_second_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("first\nsecond");
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -391,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_cursor_position_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         e.move_char(-5); // cursor before "world"
         let mut buf = ScreenBuffer::new(20, 10);
@@ -405,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_layout_text_single_line_no_wrap() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("short");
         let mut buf = ScreenBuffer::new(40, 10);
         e.render(&mut buf, 0, 0, 40, 10);
@@ -416,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_layout_text_wraps_long_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // Insert text longer than layout width
         e.insert_text_at_cursor("abcdefghijklmnopqrstuvwxyz");
         let mut buf = ScreenBuffer::new(20, 10);
@@ -427,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_layout_text_empty_line_has_cursor() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // Empty editor: single empty line
         let mut buf = ScreenBuffer::new(20, 10);
         e.render(&mut buf, 0, 0, 20, 10);
@@ -449,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_needed_height_empty_is_three() {
-        let e = Editor::new(0);
+        let e = e(0);
         // empty editor layout is always 1 cursor row → 2 borders + 1 content = 3
         assert_eq!(e.needed_height(40, 24), 3);
         assert_eq!(e.needed_height(40, 10), 3);
@@ -457,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_needed_height_three_lines_is_five() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("a\nb\nc");
         // 3 content rows → 2 borders + 3 = 5 (cap 24*30%=7 not hit)
         assert_eq!(e.needed_height(40, 24), 5);
@@ -465,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_needed_height_counts_wrapped_rows() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // 26 chars at width=20 (layout_width=19) wrap into 2 visual lines
         e.insert_text_at_cursor("abcdefghijklmnopqrstuvwxyz");
         assert_eq!(e.needed_height(20, 24), 4);
@@ -475,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_needed_height_caps_at_max_5_or_30pct() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         // rows=10 → cap = max(5, 3) = 5: 5 content rows → 7 (capped), 8 content rows still 7
         let t5 = "a\nb\nc\nd\ne";
         let t8 = "a\nb\nc\nd\ne\nf\ng\nh";
@@ -513,7 +527,7 @@ mod tests {
         for (content_lines, rows, expected_h) in
             [(0usize, 24u16, 3u16), (3, 24, 5), (7, 40, 9), (12, 40, 14)]
         {
-            let mut e = Editor::new(0);
+            let mut e = e(0);
             if content_lines > 0 {
                 let t = (0..content_lines)
                     .map(|i| format!("row {i}"))
@@ -541,7 +555,7 @@ mod tests {
     /// P0-A acceptance: 7 content rows + rows=40 → budget 9; after render all 7 rows are visible, no blanks, no ↓ indicator.
     #[test]
     fn test_render_shows_all_budgeted_lines() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("a\nb\nc\nd\ne\nf\ng");
         let h = e.needed_height(40, 40);
         assert_eq!(h, 9);
@@ -559,7 +573,7 @@ mod tests {
     /// Old fixed-height h=3 path behavior unchanged (regression guard: visible=1, matching the old clamp(5,1,1)).
     #[test]
     fn test_render_fixed_height_3_unchanged() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("hello\nworld");
         let mut buf = ScreenBuffer::new(40, 3);
         e.render(&mut buf, 0, 0, 40, 3);
@@ -579,28 +593,28 @@ mod tests {
     /// up/down indicators appear per scroll offset).
     #[test]
     fn test_render_scroll_indicator_only_when_exceeds_budget() {
-        let mut e = Editor::new(0);
+        let mut ed = e(0);
         let mut t = String::new();
         for i in 0..15 {
             t.push_str(&format!("line {i}\n"));
         }
         t.pop(); // 15 content rows
-        e.set_text(&t);
+        ed.set_text(&t);
         // move cursor to the first line (clamped before render) so content below exceeds the visible area → ↓N more should appear
-        e.state.cursor_line = 0;
-        e.state.cursor_col = 0;
+        ed.state.cursor_line = 0;
+        ed.state.cursor_col = 0;
 
-        let h = e.needed_height(40, 40); // cap=12 → 14
+        let h = ed.needed_height(40, 40); // cap=12 → 14
         assert_eq!(h, 14);
         let mut buf = ScreenBuffer::new(40, h);
-        e.render(&mut buf, 0, 0, 40, h);
+        ed.render(&mut buf, 0, 0, 40, h);
         let bottom = join_row(&buf, 13);
         assert!(
             bottom.contains('↓'),
             "15 content lines exceed cap=12; ↓N more should appear; actual {bottom:?}"
         );
         // within-budget scenario: 7 content rows → no ↓
-        let mut e2 = Editor::new(0);
+        let mut e2 = e(0);
         e2.set_text("a\nb\nc\nd\ne\nf\ng");
         let h2 = e2.needed_height(40, 40);
         let mut buf2 = ScreenBuffer::new(40, h2);

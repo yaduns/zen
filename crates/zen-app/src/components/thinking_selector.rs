@@ -1,12 +1,15 @@
 // REQ-APP-11 (pi-358): thinking-selector — thinking level selection popup.
 // Corresponds to the original TS: reference/pi-original/packages/coding-agent/src/modes/interactive/components/thinking-selector.ts.
-// compose SelectList (T-TU-01-4) + DynamicBorder; keys (↑↓/Enter/Esc) come from SelectList's inline default keys
-// handling (per assembly boundaries, the T-TU-03-1 keybinding table is left to the upper layer; see T-TU-03-1-implemented.md).
+// Composes SelectList (T-TU-01-4) + DynamicBorder; keys (↑↓/Enter/Esc) come from the injected SelectAction-domain
+// registry routing (T-AP-06-2 constructor injection; user overrides take effect through this).
 
 use crate::components::dynamic_border::DynamicBorder;
 use zen_ai::types::ThinkingLevel;
-use zen_tui::components::select_list::{SelectItem, SelectList, SelectListLayoutOptions};
+use zen_tui::components::select_list::{
+    SelectAction, SelectItem, SelectList, SelectListLayoutOptions,
+};
 use zen_tui::components::Component;
+use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::screen::{ScreenBuffer, Style};
 use zen_tui::theme::{ColorToken, Theme};
 
@@ -47,11 +50,13 @@ pub struct ThinkingSelectorComponent {
 }
 
 impl ThinkingSelectorComponent {
-    /// Construct from current level, available level list, and theme; pre-select the current level item.
+    /// Constructs from the current level, available-levels list, theme, and SelectAction-domain keybinding map; pre-selects the current level entry.
+    /// `select_kb` is passed through to the inner `SelectList` (T-AP-06-2 constructor injection: user overrides enter the select-action routing through this).
     pub fn new(
         current_level: ThinkingLevel,
         available_levels: Vec<ThinkingLevel>,
         theme: &Theme,
+        select_kb: KeybindingsManager<SelectAction>,
         on_select: Box<dyn FnMut(ThinkingLevel)>,
         on_cancel: Box<dyn FnMut()>,
     ) -> Self {
@@ -77,6 +82,7 @@ impl ThinkingSelectorComponent {
             items.len().max(1),
             theme.select_list_theme(),
             layout,
+            select_kb,
         );
 
         // Preselect the current level
@@ -154,6 +160,14 @@ mod tests {
         zen_tui::theme::builtin_dark_theme()
     }
 
+    /// Test constructor: default SelectAction keymap (no user overrides).
+    fn select_kb() -> KeybindingsManager<SelectAction> {
+        KeybindingsManager::new(
+            zen_tui::keybindings::select_default_bindings(),
+            std::collections::HashMap::new(),
+        )
+    }
+
     #[test]
     fn from_str_roundtrip_all_levels() {
         for level in [
@@ -177,6 +191,7 @@ mod tests {
             ThinkingLevel::High,
             vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High],
             theme(),
+            select_kb(),
             Box::new(|_| {}),
             Box::new(|| {}),
         );
@@ -196,6 +211,7 @@ mod tests {
             ThinkingLevel::Off,
             vec![ThinkingLevel::Off, ThinkingLevel::Low],
             theme(),
+            select_kb(),
             Box::new(|_| {}),
             Box::new(|| {}),
         );
@@ -216,6 +232,7 @@ mod tests {
             ThinkingLevel::Off,
             vec![ThinkingLevel::Low, ThinkingLevel::Medium],
             theme(),
+            select_kb(),
             Box::new(move |level| *s.borrow_mut() = Some(level)),
             Box::new(|| {}),
         );
@@ -234,6 +251,7 @@ mod tests {
             ThinkingLevel::Off,
             vec![ThinkingLevel::Off],
             theme(),
+            select_kb(),
             Box::new(|_| {}),
             Box::new(move || *c.borrow_mut() += 1),
         );
@@ -254,6 +272,7 @@ mod tests {
             ThinkingLevel::Off,
             vec![ThinkingLevel::Off],
             theme(),
+            select_kb(),
             Box::new(|_| {}),
             Box::new(|| {}),
         );

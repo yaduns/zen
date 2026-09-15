@@ -2,8 +2,10 @@
 // See reference/pi-original/packages/tui/src/components/settings-list.ts
 // Shares SelectAction with SelectList (selection-action contract); embeds Input for the search row (composition rather than inheritance).
 
+use crate::keybindings::KeybindingsManager;
+use crate::keys::KeyId;
 use crate::screen::{ScreenBuffer, Style};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 use super::input::Input;
 use super::select_list::SelectAction;
@@ -74,11 +76,16 @@ pub struct SettingsList {
     filter: Option<ItemFilter>, // Search matcher (passes through options.filter)
     submenu_component: Option<Box<dyn Component>>, // Active submenu (when Some, render/handle_key only route through it)
     submenu_item_index: Option<usize>, // Selected position before opening the submenu (restored on close and used to locate the updated item)
+    // SelectAction-domain keybinding registry (T-AP-06-2 constructor injection): authoritative source for handle_key selection-action routing
+    keybindings: KeybindingsManager<SelectAction>,
 }
 
 impl SettingsList {
     /// Construct; `on_change` fires when the value changes; `on_cancel` fires on Esc/Ctrl+C
-    /// (matches pi's constructor parameters). Consumers: T-AP-11-2 (settings-selector), T-AP-08-6.
+    /// (aligned with pi constructor parameters). Parameter `keybindings`: SelectAction-domain keybinding registry (T-AP-06-2 constructor injection)—
+    /// The default table is constructed with `select_default_bindings()` (user overrides can be layered on).
+    /// Consumers: T-AP-11-2 (settings-selector), T-AP-08-6.
+    #[allow(clippy::too_many_arguments)] // Aligned with the pi SettingsList constructor parameter surface + keybinding table injection
     pub fn new(
         items: Vec<SettingItem>,
         max_visible: usize,
@@ -86,6 +93,7 @@ impl SettingsList {
         on_change: ValueChange,
         on_cancel: Box<dyn FnMut() + 'static>,
         options: SettingsListOptions,
+        keybindings: KeybindingsManager<SelectAction>,
     ) -> Self {
         let filtered = (0..items.len()).collect();
         let search_input = if options.enable_search {
@@ -106,6 +114,7 @@ impl SettingsList {
             filter: options.filter,
             submenu_component: None,
             submenu_item_index: None,
+            keybindings,
         }
     }
 
@@ -453,42 +462,59 @@ impl super::Component for SettingsList {
         if let Some(comp) = self.submenu_component.as_mut() {
             return comp.handle_key(key);
         }
-        match (key.code, key.modifiers) {
-            (KeyCode::Up, _) => self.handle_action(SelectAction::MoveUp),
-            (KeyCode::Down, _) => self.handle_action(SelectAction::MoveDown),
-            (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
-                self.handle_action(SelectAction::Confirm)
-            }
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                self.handle_action(SelectAction::Cancel)
-            }
-            _ => {
-                // Search not enabled: do not consume
-                if !self.search_enabled {
-                    return false;
+        // Selection actions are routed via the registry (user overrides take effect via the injected table—T-AP-06-2); Space confirm is this component's
+        // Local extension semantics (not in the registry, any modifier, aligned with the original inline check).
+        let kid = KeyId::from_key_event(*key);
+        if let Some(kid) = &kid {
+            for action in [
+                SelectAction::MoveUp,
+                SelectAction::MoveDown,
+                SelectAction::Confirm,
+                SelectAction::Cancel,
+            ] {
+                if self.keybindings.matches(kid, action) {
+                    self.handle_action(action);
+                    return true;
                 }
-                // Delegate to the embedded search box (borrow to finish, then retrieve the term, avoiding a conflict with apply_filter's &mut self)
-                let consumed = if let Some(input) = self.search_input.as_mut() {
-                    input.handle_key(key)
-                } else {
-                    false
-                };
-                let query = self
-                    .search_input
-                    .as_ref()
-                    .map(|i| i.get_value().to_string())
-                    .unwrap_or_default();
-                self.apply_filter(&query);
-                consumed
+            }
+            if key.code == crossterm::event::KeyCode::Char(' ') {
+                self.handle_action(SelectAction::Confirm);
+                return true;
             }
         }
+        // Search not enabled: do not consume
+        if !self.search_enabled {
+            return false;
+        }
+        // Delegate to the embedded search box (borrow to finish, then retrieve the term, avoiding a conflict with apply_filter's &mut self)
+        let consumed = if let Some(input) = self.search_input.as_mut() {
+            input.handle_key(key)
+        } else {
+            false
+        };
+        let query = self
+            .search_input
+            .as_ref()
+            .map(|i| i.get_value().to_string())
+            .unwrap_or_default();
+        self.apply_filter(&query);
+        consumed
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Test constructor: default SelectAction keymap (no user overrides).
+    fn kb() -> KeybindingsManager<SelectAction> {
+        KeybindingsManager::new(
+            crate::keybindings::select_default_bindings(),
+            HashMap::new(),
+        )
+    }
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn item(id: &str, label: &str, values: Option<&[&str]>) -> SettingItem {
@@ -532,6 +558,7 @@ mod tests {
             Box::new(|_, _| {}),
             Box::new(|| {}),
             options(),
+            kb(),
         )
     }
 
@@ -557,6 +584,7 @@ mod tests {
             Box::new(|_, _| {}),
             Box::new(|| {}),
             options(),
+            kb(),
         );
         assert!(!empty.handle_action(SelectAction::MoveUp));
         assert!(!empty.handle_action(SelectAction::MoveDown));
@@ -574,6 +602,7 @@ mod tests {
             Box::new(move |id, v| c.borrow_mut().push((id.to_string(), v.to_string()))),
             Box::new(|| {}),
             options(),
+            kb(),
         );
         assert!(list.handle_action(SelectAction::Confirm));
         assert_eq!(list.items[0].current_value, "y");
@@ -597,6 +626,7 @@ mod tests {
             Box::new(|_, _| {}),
             Box::new(move || *c.borrow_mut() = true),
             options(),
+            kb(),
         );
         assert!(list.handle_action(SelectAction::Cancel));
         assert!(*cancelled.borrow());
@@ -614,6 +644,7 @@ mod tests {
             Box::new(move |id, v| c.borrow_mut().push((id.to_string(), v.to_string()))),
             Box::new(|| {}),
             options(),
+            kb(),
         );
         // Select position 1, open the submenu, then close with selected
         list.selected_index = 1;
@@ -664,6 +695,7 @@ mod tests {
             Box::new(|_, _| {}),
             Box::new(|| {}),
             options(),
+            kb(),
         );
         list.apply_filter("al");
         // Case-insensitive: Alpha matches

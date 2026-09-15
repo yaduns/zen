@@ -38,6 +38,7 @@ use zen_ai::types::{AssistantMessage, ContentBlock, ContentBlockList, Message, U
 use zen_tui::autocomplete::{
     AutocompleteProvider, AutocompleteSuggestions, CombinedAutocompleteProvider, SlashCommand,
 };
+use zen_tui::components::select_list::SelectAction;
 use zen_tui::components::Component;
 use zen_tui::editor::EditorAction;
 use zen_tui::keybindings::KeybindingsManager;
@@ -72,7 +73,10 @@ pub(crate) struct UiPrefs {
 /// so it is inherently non-Send—the UI task does not cross threads and the main task never holds this type (it only communicates via channels), so `Rc` is safe.
 pub struct InteractiveUi {
     theme: Theme, // Cloned from ThemeController; hot reload replaces it wholesale via ThemeChanged
-    kb: KeybindingsManager<AppAction>, // constructed via KeybindingsManager::new(app_default_bindings()) (defaults only until T-AP-06-2 user overrides land)
+    // App-domain keymap table (default table + user overrides, T-AP-06-2 load injection); editor action routing holds a separate table within editor
+    kb: KeybindingsManager<AppAction>,
+    // SelectAction domain keymap (T-AP-06-2): clone-injected components when open_settings_panel opens the panel
+    select_kb: KeybindingsManager<SelectAction>,
     editor: CustomEditor, // owned; contains on_action/on_escape/on_exit/on_submit/on_change callbacks—callbacks fire inside handle_key and are routed as InputCommand
     chat_rows: Vec<ChatRow>, // Message/tool/bash/summary line data snapshot
     pending_rows: Vec<String>, // Snapshot of queued follow-up message texts (strictly aligned with UiEvent::PendingChanged(Vec<String>))
@@ -147,11 +151,15 @@ struct EditorRoute {
 }
 
 impl InteractiveUi {
-    /// Build the UI state from the theme, app keybinding table, and cwd: create `CustomEditor` (with on_action/on_escape/
-    /// on_exit/on_submit/on_change callbacks), initial footer baseline.
+    /// Constructs the UI state from the theme, app keymap, editor-domain and SelectAction-domain keymaps (T-AP-06-2 assembly injection) and cwd,
+    /// building the `CustomEditor` (with on_action/on_escape/on_exit/on_submit/on_change callbacks),
+    /// and the initial footer baseline.
+    #[allow(clippy::too_many_arguments)] // Assembly injection surface (theme / three-domain keymaps / settings / completion data) required for completeness
     pub(crate) fn new(
         theme: Theme,
         kb: KeybindingsManager<AppAction>,
+        editor_kb: KeybindingsManager<EditorAction>,
+        select_kb: KeybindingsManager<SelectAction>,
         cwd: String,
         prefs: UiPrefs,
         settings: Option<Arc<SettingsManager>>,
@@ -165,9 +173,9 @@ impl InteractiveUi {
             PathBuf::from(cwd.clone()),
             false,
         ));
-        // 1. Editor: holds a copy of the app keybinding table (no user overrides in v1, both tables identical; after T-AP-06-2 lands, via
-        //    `kb.clone()` synced override table) + left padding injected from settings (default 0).
-        let mut editor = CustomEditor::new(prefs.editor_padding_x, kb.clone());
+        // 1. Editor: carries a copy of the app keymap + editor-domain keymap (T-AP-06-2 user override injection) +
+        //    the left-pad injected from settings (default 0).
+        let mut editor = CustomEditor::new(prefs.editor_padding_x, kb.clone(), editor_kb);
 
         // 2. Shared routing slot (implementation of constraint 1).
         let route = Rc::new(RefCell::new(EditorRoute::default()));
@@ -261,6 +269,7 @@ impl InteractiveUi {
         InteractiveUi {
             theme,
             kb,
+            select_kb,
             editor,
             chat_rows: Vec::new(),
             pending_rows: Vec::new(),
@@ -693,6 +702,7 @@ impl InteractiveUi {
             callbacks,
             &self.theme,
             self.theme.settings_list_theme(),
+            self.select_kb.clone(),
         );
         self.panel = Some(component);
     }
@@ -1764,10 +1774,24 @@ mod tests {
         }
     }
 
+    use zen_tui::keybindings::{editor_default_bindings, select_default_bindings};
+
+    /// Editor domain keybinding table (default, no user overrides).
+    fn editor_kb() -> KeybindingsManager<EditorAction> {
+        KeybindingsManager::new(editor_default_bindings(), HashMap::new())
+    }
+
+    /// SelectAction-domain keymap (default, no user override).
+    fn select_kb() -> KeybindingsManager<SelectAction> {
+        KeybindingsManager::new(select_default_bindings(), HashMap::new())
+    }
+
     fn ui() -> InteractiveUi {
         InteractiveUi::new(
             theme().clone(),
             kb(),
+            editor_kb(),
+            select_kb(),
             "/work".into(),
             UiPrefs::default(),
             None,
@@ -1783,6 +1807,8 @@ mod tests {
         let u = InteractiveUi::new(
             theme().clone(),
             kb(),
+            editor_kb(),
+            select_kb(),
             "/work".into(),
             UiPrefs::default(),
             Some(Arc::new(manager)),
@@ -2554,6 +2580,8 @@ mod tests {
         InteractiveUi::new(
             theme().clone(),
             kb(),
+            editor_kb(),
+            select_kb(),
             "/work".into(),
             UiPrefs::default(),
             None,

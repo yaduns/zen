@@ -135,6 +135,20 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::keybindings::KeybindingsManager;
+    use std::collections::HashMap;
+
+    /// Test constructor: default keymap (no user overrides). Test-only — production assembly must pass an injected registry.
+    fn e(padding_x: usize) -> Editor {
+        Editor::new(
+            padding_x,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        )
+    }
     use super::super::Editor;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -148,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_submit_trims_text_and_calls_on_submit() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         let submitted = capture();
         {
             let s = submitted.clone();
@@ -163,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_submit_clears_editor_state() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.on_submit = Some(Box::new(|_| {}));
         editor.insert_text_at_cursor("some text");
         editor.submit();
@@ -173,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_submit_calls_on_change_with_empty_before_on_submit() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         let changes = capture();
         let submitted = capture();
         {
@@ -199,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_submit_resets_history_browsing() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.on_submit = Some(Box::new(|_| {}));
         editor.add_to_history("old1");
         editor.add_to_history("old2");
@@ -216,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_submit_with_multiline_text() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         let submitted = capture();
         {
             let s = submitted.clone();
@@ -234,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_empty_does_nothing() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.insert_text_at_cursor("hello");
         editor.navigate_history(-1);
         // Should not change text since history is empty
@@ -243,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_go_to_older() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("first");
         editor.add_to_history("second");
         editor.insert_text_at_cursor("current");
@@ -255,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_go_to_older_twice() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("first");
         editor.add_to_history("second");
         editor.insert_text_at_cursor("current");
@@ -268,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_clamp_at_oldest() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("only");
         editor.insert_text_at_cursor("current");
 
@@ -280,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_go_back_to_newer() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("first");
         editor.add_to_history("second");
         editor.insert_text_at_cursor("current");
@@ -294,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_restore_draft_when_going_back_to_minus_1() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("old");
         editor.insert_text_at_cursor("my draft");
 
@@ -308,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_clamp_past_minus_1() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("old");
         editor.insert_text_at_cursor("current");
 
@@ -320,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_triggers_on_change() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         let changes = capture();
         {
             let c = changes.clone();
@@ -338,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_cursor_at_end_of_history_entry() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("hello");
         editor.insert_text_at_cursor("draft");
 
@@ -348,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_navigate_history_multiline_entry() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         // Manually add multiline history entry
         editor.history.push("line1\nline2".to_string());
         editor.insert_text_at_cursor("draft");
@@ -362,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_exit_history_browsing_resets_state() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.add_to_history("old");
         editor.insert_text_at_cursor("draft");
         editor.navigate_history(-1);
@@ -375,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_exit_history_browsing_when_not_browsing() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         // Should be a no-op
         editor.exit_history_browsing();
         assert_eq!(editor.history_index, -1);
@@ -386,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_handle_newline_inserts_newline_normally() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.insert_text_at_cursor("hello");
         editor.handle_newline();
         assert_eq!(editor.text(), "hello\n");
@@ -394,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_handle_newline_backslash_triggers_submit() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         let submitted = capture();
         {
             let s = submitted.clone();
@@ -411,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_handle_newline_backslash_no_submit_when_disabled() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.disable_submit = true;
         let submitted = capture();
         {
@@ -429,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_handle_newline_no_backslash_inserts_newline() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         let submitted = capture();
         {
             let s = submitted.clone();
@@ -447,21 +461,21 @@ mod tests {
 
     #[test]
     fn test_char_before_cursor_is_backslash_true() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.insert_text_at_cursor("abc\\");
         assert!(editor.char_before_cursor_is_backslash());
     }
 
     #[test]
     fn test_char_before_cursor_is_backslash_false() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.insert_text_at_cursor("abc");
         assert!(!editor.char_before_cursor_is_backslash());
     }
 
     #[test]
     fn test_char_before_cursor_is_backslash_at_start() {
-        let editor = Editor::new(0);
+        let editor = e(0);
         // Empty editor, cursor at (0,0)
         assert!(!editor.char_before_cursor_is_backslash());
     }
@@ -470,20 +484,20 @@ mod tests {
 
     #[test]
     fn test_is_editor_empty_true() {
-        let editor = Editor::new(0);
+        let editor = e(0);
         assert!(editor.is_editor_empty());
     }
 
     #[test]
     fn test_is_editor_empty_false_with_text() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.insert_text_at_cursor("hello");
         assert!(!editor.is_editor_empty());
     }
 
     #[test]
     fn test_is_editor_empty_false_with_multiple_lines() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.insert_text_at_cursor("\n");
         assert!(!editor.is_editor_empty());
     }
@@ -492,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_set_text_without_history_via_navigate_resets_scroll() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.scroll_offset = 5;
         editor.add_to_history("hist");
         editor.insert_text_at_cursor("draft");
@@ -503,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_set_text_without_history_via_navigate_resets_preferred_col() {
-        let mut editor = Editor::new(0);
+        let mut editor = e(0);
         editor.preferred_visual_col = Some(42);
         editor.snapped_from_cursor_col = Some(10);
         editor.add_to_history("hist");

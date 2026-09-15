@@ -5,6 +5,7 @@
 // Shared layout types (LayoutLine/VisualLine) live here for submodules to reference via `use super::`;
 // TextChunk and word-wrapping logic have been moved to crate::wrap (the width-text family) per the T-TU-01-4 integration plan,
 // see `tasks/T-TU-01-4-implemented.md`; `impl Editor` blocks in submodules can access this module's private fields.
+use crate::keybindings::KeybindingsManager;
 use crate::screen::Style;
 
 mod cursor;
@@ -118,6 +119,9 @@ pub struct Editor {
     on_submit: Option<Box<dyn FnMut(&str)>>, // Submit callback; receives the expanded text after trim (no marker in this task, i.e. trim of the full text)
     on_change: Option<Box<dyn FnMut(&str)>>, // Called on every text change
     disable_submit: bool,                    // When set, Submit is not triggered
+    // Action-domain keybinding registry (T-AP-06-2 constructor injection): authoritative source for handle_key action routing;
+    // The default table is provided by `editor_default_bindings()`; user overrides are injected by the application layer at load time.
+    keybindings: KeybindingsManager<EditorAction>,
 }
 
 /// Rendered layout line: one line of visible text + whether it carries the cursor (with its position within the line when it does).
@@ -142,8 +146,11 @@ impl Editor {
     /// Construct the editor with empty text (single blank line, cursor at (0,0)).
     /// Parameter `padding_x`: initial left/right padding column count (default 0, aligned with pi `options.paddingX`); can be passed at construction,
     /// and later adjusted via `set_padding_x`.
+    /// Parameter `keybindings`: action-domain keybinding registry (T-AP-06-2 constructor injection, aligned with pi EditorFactory's
+    /// `keybindings` injection point)—`handle_key` uses this table for action routing; the default table is built with `editor_default_bindings()`
+    /// (with user overrides layered on); `KeybindingsManager` is Clone, so the same table can be shared by multiple components.
     /// Consumer: T-AP-11-2 (CustomEditor construction, passes settingsManager.getEditorPaddingX()).
-    pub fn new(padding_x: usize) -> Self {
+    pub fn new(padding_x: usize, keybindings: KeybindingsManager<EditorAction>) -> Self {
         Self {
             state: EditorState::default(),
             focused: false,
@@ -163,6 +170,7 @@ impl Editor {
             on_submit: None,
             on_change: None,
             disable_submit: false,
+            keybindings,
         }
     }
 
@@ -303,6 +311,7 @@ impl Editor {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn capture() -> Rc<RefCell<Vec<String>>> {
@@ -321,9 +330,20 @@ mod tests {
 
     // ── Editor::new ──
 
+    /// Test constructor: default keymap (no user overrides). Test-only — production assembly must pass an injected registry.
+    fn e(padding_x: usize) -> Editor {
+        Editor::new(
+            padding_x,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        )
+    }
+
     #[test]
     fn test_new_creates_empty_editor() {
-        let e = Editor::new(0);
+        let e = e(0);
         assert_eq!(e.text(), "");
         assert_eq!(e.cursor(), (0, 0));
         assert_eq!(e.lines(), &[""]);
@@ -331,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_new_with_padding() {
-        let e = Editor::new(4);
+        let e = e(4);
         assert_eq!(e.padding_x, 4);
     }
 
@@ -339,20 +359,20 @@ mod tests {
 
     #[test]
     fn test_text_empty() {
-        let e = Editor::new(0);
+        let e = e(0);
         assert_eq!(e.text(), "");
     }
 
     #[test]
     fn test_text_single_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         assert_eq!(e.text(), "hello");
     }
 
     #[test]
     fn test_text_multiline_joined_by_newline() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("a\nb\nc");
         assert_eq!(e.text(), "a\nb\nc");
     }
@@ -361,7 +381,7 @@ mod tests {
 
     #[test]
     fn test_set_text_simple() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("hello world");
         assert_eq!(e.text(), "hello world");
         assert_eq!(e.cursor(), (0, 11));
@@ -369,35 +389,35 @@ mod tests {
 
     #[test]
     fn test_set_text_normalizes_crlf() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("line1\r\nline2");
         assert_eq!(e.text(), "line1\nline2");
     }
 
     #[test]
     fn test_set_text_normalizes_cr() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("line1\rline2");
         assert_eq!(e.text(), "line1\nline2");
     }
 
     #[test]
     fn test_set_text_expands_tabs() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("a\tb");
         assert_eq!(e.text(), "a    b");
     }
 
     #[test]
     fn test_set_text_multiline_cursor_at_end() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("abc\ndef");
         assert_eq!(e.cursor(), (1, 3));
     }
 
     #[test]
     fn test_set_text_resets_scroll_and_sticky() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.scroll_offset = 10;
         e.preferred_visual_col = Some(5);
         e.snapped_from_cursor_col = Some(3);
@@ -409,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_set_text_triggers_on_change() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         let changes = capture();
         {
             let c = changes.clone();
@@ -423,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_set_text_empty_string() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("");
         assert_eq!(e.text(), "");
         assert_eq!(e.lines(), &[""]);
@@ -433,14 +453,14 @@ mod tests {
 
     #[test]
     fn test_lines_empty() {
-        let e = Editor::new(0);
+        let e = e(0);
         assert_eq!(e.lines().len(), 1);
         assert_eq!(e.lines()[0], "");
     }
 
     #[test]
     fn test_lines_multiline() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_text("a\nb\nc");
         assert_eq!(e.lines(), &["a", "b", "c"]);
     }
@@ -449,13 +469,13 @@ mod tests {
 
     #[test]
     fn test_cursor_initial() {
-        let e = Editor::new(0);
+        let e = e(0);
         assert_eq!(e.cursor(), (0, 0));
     }
 
     #[test]
     fn test_cursor_after_insert() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         assert_eq!(e.cursor(), (0, 5));
     }
@@ -464,14 +484,14 @@ mod tests {
 
     #[test]
     fn test_insert_text_at_cursor_single_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         assert_eq!(e.text(), "hello");
     }
 
     #[test]
     fn test_insert_text_at_cursor_multiline() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("a\nb\nc");
         assert_eq!(e.text(), "a\nb\nc");
         assert_eq!(e.cursor(), (2, 1));
@@ -479,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_at_cursor_mid_line() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello world");
         // Move cursor to after "hello "
         e.move_char(-5); // cursor at (0, 6)
@@ -491,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_add_to_history_basic() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("first");
         e.add_to_history("second");
         // history[0] = most recent
@@ -501,14 +521,14 @@ mod tests {
 
     #[test]
     fn test_add_to_history_trims_whitespace() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("  hello  ");
         assert_eq!(e.history[0], "hello");
     }
 
     #[test]
     fn test_add_to_history_skips_empty() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("");
         e.add_to_history("   ");
         assert!(e.history.is_empty());
@@ -516,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_add_to_history_deduplicates_recent() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("same");
         e.add_to_history("same");
         assert_eq!(e.history.len(), 1);
@@ -524,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_add_to_history_allows_non_consecutive_duplicates() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.add_to_history("a");
         e.add_to_history("b");
         e.add_to_history("a"); // not consecutive with first "a"
@@ -533,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_add_to_history_limit_100() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         for i in 0..105 {
             e.add_to_history(&format!("entry-{i}"));
         }
@@ -548,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_set_padding_x() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.set_padding_x(8);
         assert_eq!(e.padding_x, 8);
     }
@@ -557,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_set_border_style() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         let style = Style::default();
         e.set_border_style(style);
         // No panic; border_style is set (fields are private, so we just verify no crash)
@@ -567,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_emit_change_fires_callback() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         let changes = capture();
         {
             let c = changes.clone();
@@ -584,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_emit_change_no_callback_is_noop() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         e.insert_text_at_cursor("hello");
         // No on_change set; should not panic
         e.emit_change();
@@ -592,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_emit_change_multiline() {
-        let mut e = Editor::new(0);
+        let mut e = e(0);
         let changes = capture();
         {
             let c = changes.clone();

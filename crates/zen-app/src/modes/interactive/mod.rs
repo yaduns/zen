@@ -8,7 +8,10 @@
 
 pub mod ui;
 
-pub(crate) use crate::keybindings::{app_default_bindings, AppAction};
+pub(crate) use crate::keybindings::{
+    app_default_bindings, load_user_keybindings, AppAction, KeybindingLoadDiagnostic,
+    UserKeybindings,
+};
 
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
@@ -32,7 +35,7 @@ use crate::session::session_manager::SessionManagerError;
 use crate::theme::{ControllerError, ThemeController};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -44,7 +47,7 @@ use zen_ai::tool::ToolExecutionResult;
 use zen_ai::types::{ImageContent, Message, ThinkingLevel};
 use zen_core::harness::types::AgentEvent;
 use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop, WakeOutcome};
-use zen_tui::keybindings::KeybindingsManager;
+use zen_tui::keybindings::{editor_default_bindings, select_default_bindings, KeybindingsManager};
 use zen_tui::keys::{
     is_apple_terminal_session, native_shift_pressed, normalize_apple_terminal_enter,
 };
@@ -347,7 +350,8 @@ impl InteractiveMode {
     ///    (T-AP-02-3 closes its settings_theme parameter slot) takes priority; when no preference or settings are unavailable, pick
     ///    a built-in theme based on terminal background; v1 does not enable file watching (themes_dir=None; custom theme dir
     ///    assembly is owned by T-AP-11-1's full settings wiring)
-    /// 2. Construct `KeybindingsManager::new(app_default_bindings())` (v1 default table only)
+    /// 2. Keybinding table assembly (T-AP-06-2): default table + user overrides (loaded from `<agent_dir>/keybindings.json`,
+    ///    bad files degrade to empty + diagnostics shown via `show_warning`), producing app/editor/select domain registries
     /// 3. Spawn UI task: `TuiLoop` + `Rc<RefCell<InteractiveUi>>`, running a four-way loop—
     ///    - on_event (!Send): key event → handle_key → `InputCommand` sent to the main task via input_tx
     ///    - fourth-way wake (Send): enqueue `UiEvent` into `Arc<Mutex<VecDeque>>` + declare `WakeOutcome`;
@@ -400,8 +404,24 @@ impl InteractiveMode {
         let footer_data = FooterDataProvider::new(Path::new(self.runtime.session.cwd()));
         self.footer_data = Some(footer_data);
 
-        // 2. Keybinding table (v1 default table only).
-        let kb = KeybindingsManager::new(app_default_bindings(), HashMap::new());
+        // 2. Keybindings (T-AP-06-2): load user overrides (bad file degrades to empty table + diagnostics, does not block startup),
+        //    merged with defaults into three domain registries. If the path is unavailable (no home; settings are likewise unusable), degrade to empty overrides.
+        let (user_kb, kb_warnings) = match crate::config::get_keybindings_path() {
+            Ok(path) => load_user_keybindings(&path),
+            Err(err) => (
+                UserKeybindings::default(),
+                vec![KeybindingLoadDiagnostic::Io {
+                    path: std::path::PathBuf::from("<agent_dir>/keybindings.json"),
+                    message: err.to_string(),
+                }],
+            ),
+        };
+        for warning in &kb_warnings {
+            self.show_warning(format!("Keybindings: {warning}"));
+        }
+        let kb = KeybindingsManager::new(app_default_bindings(), user_kb.app);
+        let editor_kb = KeybindingsManager::new(editor_default_bindings(), user_kb.editor);
+        let select_kb = KeybindingsManager::new(select_default_bindings(), user_kb.select);
 
         // 3. UI task assembly (dual tasks + channels).
         //    - `ui_event_rx`: receiver for the fourth-way external wake (main task pushes via ui_event_tx);
@@ -426,6 +446,8 @@ impl InteractiveMode {
         let ui_cell = Rc::new(RefCell::new(InteractiveUi::new(
             theme,
             kb,
+            editor_kb,
+            select_kb,
             cwd,
             ui_prefs,
             self.settings_manager.clone(),
