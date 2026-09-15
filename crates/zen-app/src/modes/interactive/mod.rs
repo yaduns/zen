@@ -24,6 +24,7 @@ use crate::config::settings::{
 };
 use crate::modes::interactive::ui::{InteractiveUi, UiPrefs};
 use crate::modes::print_mode::stop_error_message;
+use crate::output::footer_data::FooterDataProvider;
 use crate::session::agent_session::{AgentSession, AgentSessionError};
 use crate::session::runtime::AgentSessionRuntime;
 use crate::session::session_manager::SessionManagerError;
@@ -36,7 +37,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionResult;
 use zen_ai::types::{ImageContent, Message, ThinkingLevel};
@@ -263,6 +264,8 @@ pub struct InteractiveMode {
     ui_task: Option<tokio::task::JoinHandle<Result<(), TuiError>>>,
     /// Theme controller (Option because there is no Default placeholder; lazily constructed in init).
     theme_controller: Option<ThemeController>,
+    /// Footer branch data provider (T-AP-06-3; Option due to the contract that new() does no IO, lazily constructed in init).
+    footer_data: Option<FooterDataProvider>,
     /// Agent subscription/unsubscription handles (registered in init, called in shutdown/stop).
     subscription: Option<Box<dyn FnOnce() + Send>>,
     /// T-AP-11-2 type: v1 uses default values; real settings land after T-AP-02-3.
@@ -317,6 +320,7 @@ impl InteractiveMode {
             ui_event_rx: Some(ui_event_rx),
             ui_task: None,
             theme_controller: None,
+            footer_data: None,
             subscription: None,
             settings: default_settings(),
             settings_manager,
@@ -387,6 +391,12 @@ impl InteractiveMode {
         if let Some(config) = refreshed_config {
             self.settings = config;
         }
+
+        // 1.6 Footer branch data provider (T-AP-06-3): constructed with the session cwd, synchronously parses the current branch and starts
+        //    notify watcher + a background debounced refresh task (silent empty provider for non-repo/watcher failure).
+        //    Must complete before subscribe_to_agent (the subscription closure needs to capture the branch watch receiver).
+        let footer_data = FooterDataProvider::new(Path::new(self.runtime.session.cwd()));
+        self.footer_data = Some(footer_data);
 
         // 2. Keybinding table (v1 default table only).
         let kb = KeybindingsManager::new(app_default_bindings(), HashMap::new());
@@ -594,6 +604,12 @@ impl InteractiveMode {
     ///   when `run_task` is None the whole branch is disabled for the round (no busy-loop). **Do not** move the `is_some()` check inside the async block
     ///   to self-check on return——that would make the branch always Ready when None, degenerating into a busy-loop.
     async fn dispatch_loop(&mut self) -> Result<(), InteractiveModeError> {
+        // git branch change subscription (T-AP-06-3): at subscribe time the current value is already marked as seen, so only real changes are received
+        let mut branch_rx = self
+            .footer_data
+            .as_ref()
+            .expect("init idempotent guard ensures footer_data is constructed")
+            .branch_rx();
         loop {
             tokio::select! {
                 cmd = self.input_rx.recv() => {
@@ -631,6 +647,11 @@ impl InteractiveMode {
                     if self.exit_requested {
                         break;
                     }
+                }
+                _ = branch_rx.changed() => {
+                    // git branch change → refresh footer status bar (T-AP-06-3); sender drop
+                    // after (dispose), the Err branch is a no-op (shutdown would break anyway)
+                    self.push_footer();
                 }
                 _ = async {
                     if let Some(h) = &mut self.run_task {
@@ -699,6 +720,11 @@ impl InteractiveMode {
             task.await??;
         }
 
+        // 3.5 footer branch data provider dispose (T-AP-06-3): stop watcher + cancel background refresh task
+        if let Some(fd) = &mut self.footer_data {
+            fd.dispose();
+        }
+
         // 4. Resume hint (not printed on the signal path, aligned with pi shutdown's fromSignal branch; wording aligned with
         //    `--resume` semantics — the path for `--session <path>` requires T-AP-08-5's session tree to land before it can be assembled).
         if !from_signal {
@@ -764,7 +790,13 @@ impl InteractiveMode {
     fn subscribe_to_agent(&mut self) -> Box<dyn FnOnce() + Send> {
         let tx = self.ui_event_tx.clone();
         let usage = Arc::clone(&self.usage_totals);
-        let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings);
+        // T-AP-06-3: footer branch subscription (owned Receiver is clonable, 'static-safe)
+        let branch_rx = self
+            .footer_data
+            .as_ref()
+            .expect("init idempotent guard ensures footer_data is constructed")
+            .branch_rx();
+        let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings, branch_rx);
         self.runtime
             .session
             .subscribe(Box::new(move |event: &AgentEvent| {
@@ -774,7 +806,12 @@ impl InteractiveMode {
 
     /// Main-task-side footer refresh (e.g., after switching thinking level): assemble and push based on current session state + usage accumulator.
     fn push_footer(&self) {
-        let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings);
+        let branch_rx = self
+            .footer_data
+            .as_ref()
+            .expect("init idempotent guard ensures footer_data is constructed")
+            .branch_rx();
+        let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings, branch_rx);
         let usage = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ui_event_tx.send(UiEvent::Footer(ctx.footer(&usage)));
     }
@@ -1207,11 +1244,18 @@ struct FooterCtx {
     context_window: u64,
     /// Auto-compaction switch (footer `(auto)` marker).
     auto_compact: bool,
+    /// git branch latest-value subscription (T-AP-06-3; owned is clonable, subscription closure / assembly point synchronously reads via borrow).
+    git_branch_rx: watch::Receiver<Option<String>>,
 }
 
 impl FooterCtx {
-    /// Built from session and settings snapshots.
-    fn from_session(session: &AgentSession, settings: &SettingsConfig) -> Self {
+    /// Built from session and settings snapshots. `git_branch_rx` is the watch subscription of the footer branch data provider
+    /// (T-AP-06-3); at footer assembly time the latest branch is read synchronously via `borrow()`.
+    fn from_session(
+        session: &AgentSession,
+        settings: &SettingsConfig,
+        git_branch_rx: watch::Receiver<Option<String>>,
+    ) -> Self {
         FooterCtx {
             pwd: session.cwd().to_string(),
             model_id: session.model().id.clone(),
@@ -1219,6 +1263,7 @@ impl FooterCtx {
             thinking_level: session.thinking_level(),
             context_window: session.model().context_window,
             auto_compact: settings.auto_compact,
+            git_branch_rx,
         }
     }
 
@@ -1241,7 +1286,7 @@ impl FooterCtx {
 
         FooterData {
             pwd: self.pwd.clone(),
-            git_branch: None,   // After T-AP-06-3 lands, hook up git branch
+            git_branch: (*self.git_branch_rx.borrow()).clone(),
             session_name: None, // Hook up session name after T-AP-08-5 lands
             model_provider: self.model_provider.clone(),
             model_id: self.model_id.clone(),
@@ -1603,6 +1648,7 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             context_window: 2000,
             auto_compact: true,
+            git_branch_rx: test_branch_rx(),
         };
         let data = ctx.footer(&usage);
         // prompt = 1000/2000 = 50%；cache hit = 900/1000 = 90%
@@ -1610,6 +1656,13 @@ mod tests {
         assert!((data.cache_hit_rate.unwrap() - 90.0).abs() < 0.01);
         assert!(data.auto_compact_enabled);
         assert_eq!(data.model_id, "m");
+        assert_eq!(data.git_branch, None);
+    }
+
+    /// Branch watch receiver for tests (initial None, not connected to a real provider).
+    fn test_branch_rx() -> watch::Receiver<Option<String>> {
+        let (tx, _) = watch::channel(None);
+        tx.subscribe()
     }
 
     // ── bridge_agent_event (events → UiEvent channel) ───────────────────
@@ -1660,6 +1713,7 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             context_window: 8192,
             auto_compact: false,
+            git_branch_rx: test_branch_rx(),
         }
     }
 
@@ -1976,6 +2030,10 @@ mod tests {
             start_reason: crate::session::runtime::SessionStartReason::Startup,
         };
         let mut mode = InteractiveMode::new(runtime, options(), None);
+        // T-AP-06-3: init constructs footer_data (dispatch_loop depends on its branch_rx);
+        // this test bypasses init and drives dispatch_loop directly, so it constructs the equivalent here (/work is not a repo → empty provider,
+        // branch_rx never fires, which does not affect the two-round run-count assertion).
+        mode.footer_data = Some(FooterDataProvider::new(Path::new("/work")));
         let tx = mode.input_tx.take().expect("input_tx");
         let cancel = mode.cancel.clone();
 
