@@ -13,7 +13,7 @@ pub(crate) use crate::keybindings::{app_default_bindings, AppAction};
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
 };
-use crate::components::footer::{add_usage_to_totals, FooterData, UsageTotals};
+use crate::components::footer::FooterData;
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::status_indicator::CompactionStatusReason;
 use crate::components::tree_selector::FilterMode;
@@ -25,6 +25,7 @@ use crate::config::settings::{
 use crate::modes::interactive::ui::{InteractiveUi, UiPrefs};
 use crate::modes::print_mode::stop_error_message;
 use crate::output::footer_data::FooterDataProvider;
+use crate::output::usage_totals::{add_usage_to_totals, UsageTotals};
 use crate::session::agent_session::{AgentSession, AgentSessionError};
 use crate::session::runtime::AgentSessionRuntime;
 use crate::session::session_manager::SessionManagerError;
@@ -288,8 +289,9 @@ pub struct InteractiveMode {
     /// Current run task handle (plan D): set synchronously at spawn time (sticky guard, at most one run in flight at any instant);
     /// The RunDone branch / shutdown own the reset point.
     run_task: Option<tokio::task::JoinHandle<()>>,
-    /// Footer usage accumulators (mutable within subscription callbacks; std Mutex guarantees callback thread safety).
-    usage_totals: Arc<Mutex<UsageTotals>>,
+    /// Footer usage state (mutable within the subscription callback; std Mutex guarantees callback thread safety).
+    /// T-AP-06-4 split: session-cumulative totals + last turn's last_input carried under the same lock (see `UsageTurnState`).
+    usage_totals: Arc<Mutex<UsageTurnState>>,
     /// SIGTERM/SIGHUP listener task (register/unregister lifecycle pair).
     signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Exit code written by the signal task (0 = no signal received; SIGTERM→143 / SIGHUP→129).
@@ -331,7 +333,7 @@ impl InteractiveMode {
             last_ctrl_c_at: None,
             exit_requested: false,
             run_task: None,
-            usage_totals: Arc::new(Mutex::new(UsageTotals::default())),
+            usage_totals: Arc::new(Mutex::new(UsageTurnState::default())),
             signal_task: None,
             signal_exit_code: Arc::new(AtomicI32::new(0)),
         }
@@ -1231,6 +1233,17 @@ fn default_settings() -> SettingsConfig {
 /// Assemble the immutable context snapshot needed by the footer inside the subscription callback (model/thinking level/cwd do not change with the event stream during the session run;
 /// v1 has no model switching; thinking level switching refreshes via the main task's `push_footer`).
 #[derive(Clone)]
+/// Footer usage state (private, product of the T-AP-06-4 split): session-cumulative totals (monotonically accumulated on MessageEnd)
+/// and the most recent turn's prompt input (overwritten each turn, used for the footer context ratio) — kept separate because the two have different lifecycles
+/// `UsageTotals` (pi's five fields), carried by the consumer side (T-AP-11-1's interaction state); same-lock mutual exclusion preserves ordering.
+#[derive(Debug, Default)]
+struct UsageTurnState {
+    /// Session-level token/cost accumulation (spec defined in `output::usage_totals`).
+    totals: UsageTotals,
+    /// Input tokens of the most recent full request (including cache-hit portion; the context% semantics fixed in a3a02b6).
+    last_input: u64,
+}
+
 struct FooterCtx {
     /// Working directory.
     pwd: String,
@@ -1267,9 +1280,9 @@ impl FooterCtx {
         }
     }
 
-    /// Assemble `FooterData`: context ratio = prompt tokens (input+cache_read+cache_write) / window;
-    /// cache hit rate = cache_read / prompt tokens.
-    fn footer(&self, usage: &UsageTotals) -> FooterData {
+    /// Assemble `FooterData`: context ratio = most recent prompt tokens (last_input) / window;
+    /// cache hit rate = cumulative cache_read / cumulative input.
+    fn footer(&self, usage: &UsageTurnState) -> FooterData {
         // context_percent uses the current turn's input tokens
         let context_percent = if self.context_window > 0 {
             Some((usage.last_input as f64 / self.context_window as f64) * 100.0)
@@ -1278,8 +1291,8 @@ impl FooterCtx {
         };
 
         // Cache hit rate computed from cumulative values
-        let cache_hit_rate = if usage.input > 0 {
-            Some(usage.cache_read as f64 / usage.input as f64 * 100.0)
+        let cache_hit_rate = if usage.totals.input > 0 {
+            Some(usage.totals.cache_read as f64 / usage.totals.input as f64 * 100.0)
         } else {
             None
         };
@@ -1291,7 +1304,7 @@ impl FooterCtx {
             model_provider: self.model_provider.clone(),
             model_id: self.model_id.clone(),
             thinking_level: Some(self.thinking_level),
-            usage: *usage,
+            usage: usage.totals,
             context_percent,
             context_window: self.context_window,
             cache_hit_rate,
@@ -1308,7 +1321,7 @@ impl FooterCtx {
 fn bridge_agent_event(
     event: &AgentEvent,
     tx: &mpsc::UnboundedSender<UiEvent>,
-    usage: &Mutex<UsageTotals>,
+    usage: &Mutex<UsageTurnState>,
     ctx: &FooterCtx,
 ) {
     match event {
@@ -1333,18 +1346,19 @@ fn bridge_agent_event(
             }
         }
         AgentEvent::MessageEnd { message } => {
-            // Usage accumulation (assistant / toolResult each carry usage)
+            // Usage accumulation (assistant / toolResult each carry usage): totals accumulates monotonically;
+            // assistant also overwrites last_input (for footer context%, split by T-AP-06-4)
             match message {
                 Message::Assistant(a) => {
                     if let Ok(mut u) = usage.lock() {
-                        add_usage_to_totals(&mut u, &a.usage);
+                        add_usage_to_totals(&mut u.totals, &a.usage);
                         u.last_input = a.usage.input; // ← overwritten each turn
                     }
                 }
                 Message::ToolResult(t) => {
                     if let Some(u) = &t.usage {
-                        if let Ok(mut totals) = usage.lock() {
-                            add_usage_to_totals(&mut totals, u);
+                        if let Ok(mut state) = usage.lock() {
+                            add_usage_to_totals(&mut state.totals, u);
                         }
                     }
                 }
@@ -1633,13 +1647,17 @@ mod tests {
 
     #[test]
     fn test_footer_ctx_computes_percent_and_cache_hit() {
-        let usage = UsageTotals {
-            input: 1000, // Cumulative values (for footer statistics display; not used for percentages)
-            output: 50,
-            cache_read: 900,
-            cache_write: 0,
-            cost: 0.0,
-            last_input: 1000, // ← Most recent full request (including cache-hit portion)
+        // totals is the session cumulative total (for footer stats display, not used in percentage); last_input is the latest turn
+        // (context% = 1000/2000 = 50%); after the T-AP-06-4 split these belong to two UsageTurnState fields.
+        let usage = UsageTurnState {
+            totals: UsageTotals {
+                input: 1000,
+                output: 50,
+                cache_read: 900,
+                cache_write: 0,
+                cost: 0.0,
+            },
+            last_input: 1000,
         };
         let ctx = FooterCtx {
             pwd: "/work".into(),
@@ -1720,7 +1738,7 @@ mod tests {
     #[test]
     fn test_bridge_agent_start_sets_working_and_animation() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTotals::default());
+        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(&AgentEvent::AgentStart, &tx, &usage, &test_footer_ctx());
         assert!(matches!(
             rx.try_recv(),
@@ -1732,7 +1750,7 @@ mod tests {
     #[test]
     fn test_bridge_message_end_accumulates_usage_and_pushes_footer() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTotals::default());
+        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageEnd {
                 message: Message::Assistant(assistant_with_usage("hi", mk_usage(100, 20, 30))),
@@ -1743,18 +1761,19 @@ mod tests {
         );
         // MessageEnd delivered
         assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
-        // Usage accumulation + carried by footer
-        let totals = usage.lock().unwrap();
-        assert_eq!(totals.input, 100);
-        assert_eq!(totals.output, 20);
-        assert_eq!(totals.cache_read, 30);
+        // Usage accumulation (totals monotonically accumulates + last_input overwrites) + carried by footer
+        let state = usage.lock().unwrap();
+        assert_eq!(state.totals.input, 100);
+        assert_eq!(state.totals.output, 20);
+        assert_eq!(state.totals.cache_read, 30);
+        assert_eq!(state.last_input, 100);
         assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
     }
 
     #[test]
     fn test_bridge_error_message_end_attaches_error_text() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTotals::default());
+        let usage = StdMutex::new(UsageTurnState::default());
         let mut a = assistant_with_usage("x", Usage::default());
         a.stop_reason = StopReason::Error;
         a.error_message = Some("provider 500".into());
@@ -1776,7 +1795,7 @@ mod tests {
     fn test_bridge_aborted_message_end_suppresses_error_text() {
         // Cancellation (Aborted) no longer carries error_text: the message block "Operation aborted" already expresses it, avoiding a duplicate status line
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTotals::default());
+        let usage = StdMutex::new(UsageTurnState::default());
         let mut a = assistant_with_usage("x", Usage::default());
         a.stop_reason = StopReason::Aborted;
         a.error_message = Some("Request was aborted".into());
@@ -1800,7 +1819,7 @@ mod tests {
     #[test]
     fn test_bridge_tool_events_map_to_ui_events() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTotals::default());
+        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::ToolExecutionStart {
                 tool_call_id: "t1".into(),
@@ -1852,7 +1871,7 @@ mod tests {
     #[test]
     fn test_bridge_tool_result_message_skipped_for_chat_rows() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTotals::default());
+        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageStart {
                 message: Message::ToolResult(ToolResultMessage {

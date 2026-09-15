@@ -1,39 +1,17 @@
 // REQ-APP-11 (pi-358): footer — bottom status bar.
 // Mirrors the original TS: reference/pi-original/packages/coding-agent/src/modes/interactive/components/footer.ts.
-// Attribution note: `UsageTotals` is the fallback definition for pi-324 (T-AP-06-4, Todo) — delete this definition if that task lands first
-// and use its module instead; git branch/session name is supplied by the caller (T-AP-11-1) via `FooterData` (wired up after T-AP-06-3 lands).
+// Attribution note: canonical definitions of `UsageTotals`/`add_usage_to_totals` have moved to output/usage_totals.rs
+// (pi-324, landed in T-AP-06-4, closing the fallback migration seam registered by T-AP-11-2); this file retains the footer display domain's
+// `compute_usage_totals` (including the latest assistant cache hit rate) and `format_tokens`. git branch/session name
+// Supplied by the caller (T-AP-11-1) via `FooterData` (wired in once T-AP-06-3 lands).
 
+use crate::output::usage_totals::{add_usage_to_totals, UsageTotals};
 use zen_ai::types::Message;
 use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::components::Component;
 use zen_tui::screen::{ScreenBuffer, Style};
 use zen_tui::theme::{ColorToken, Theme};
 use zen_tui::wrap::truncate_to_width;
-
-/// Usage totals (pi `createUsageTotals`/`addUsageToTotals`; fallback definition for T-AP-06-4, see file header).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct UsageTotals {
-    /// Cumulative input tokens.
-    pub input: u64,
-    /// Cumulative output tokens.
-    pub output: u64,
-    /// Cumulative cache-hit read tokens.
-    pub cache_read: u64,
-    /// Cumulative cache-write tokens.
-    pub cache_write: u64,
-    /// Cumulative cost (usage.cost.total semantics).
-    pub cost: f64,
-    pub last_input: u64, // ← new: input tokens of the latest turn
-}
-
-/// Accumulate a single usage into totals.
-pub fn add_usage_to_totals(totals: &mut UsageTotals, usage: &zen_ai::types::Usage) {
-    totals.input += usage.input;
-    totals.output += usage.output;
-    totals.cache_read += usage.cache_read;
-    totals.cache_write += usage.cache_write;
-    totals.cost += usage.cost.total;
-}
 
 /// Compact formatting for token counts (<1000 as-is; <10k one decimal + k; <1M integer + k; likewise for M) —
 /// the footer status bar compresses large numbers to "1.2k / 345k / 2.1M". Consumer: footer rendering.
@@ -375,7 +353,6 @@ mod tests {
                 cache_read: 800,
                 cache_write: 100,
                 cost: 0.0,
-                last_input: 0,
             },
             context_percent: Some(42.0),
             context_window: 128_000,

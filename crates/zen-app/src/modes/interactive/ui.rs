@@ -12,7 +12,7 @@ use crate::components::compaction_summary_message::CompactionSummaryMessageCompo
 use crate::components::custom_editor::CustomEditor;
 use crate::components::custom_entry::CustomEntryComponent;
 use crate::components::custom_message::CustomMessageComponent;
-use crate::components::footer::{FooterComponent, FooterData, UsageTotals};
+use crate::components::footer::{FooterComponent, FooterData};
 use crate::components::settings_selector::{
     DoubleEscapeAction, SettingsCallbacks, SettingsConfig, SettingsSelectorComponent,
 };
@@ -25,6 +25,7 @@ use crate::components::user_message::UserMessageComponent;
 use crate::config::defaults::{clamp_autocomplete_max_visible, clamp_editor_padding_x};
 use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
 use crate::modes::interactive::{AppAction, InputCommand, SettingsApplyKind, StatusSpec, UiEvent};
+use crate::output::usage_totals::UsageTotals;
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 use std::cell::RefCell;
