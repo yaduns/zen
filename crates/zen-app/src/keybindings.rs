@@ -6,7 +6,8 @@
 // app.suspend / app.editor.external, etc.) are represented as None entries in the id tables (reserved items; silently skipped if present in user config),
 // see the *_ID_TABLE entries below and tasks/T-AP-06-2-implemented.md for the full list and ownership.
 // Reference: reference/pi-original/packages/coding-agent/src/core/keybindings.ts (defaultKeys comparison,
-// config loading/type validation aligns with pi toKeybindingsConfig; migration table/reload/on-disk ordering dropped in v1, see task doc).
+// Config loading/type validation aligned with pi toKeybindingsConfig; the legacy key-name migration table is delivered by T-AP-08-7 — the pure function lives in
+// this module + the file IO shell in migrations.rs; reload/disk-write ordering dropped in v1, see task doc).
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -583,6 +584,112 @@ pub fn load_user_keybindings(path: &Path) -> (UserKeybindings, Vec<KeybindingLoa
     (out, diagnostics)
 }
 
+// ── Legacy key-name migration (T-AP-08-7: pure function for the keybindings domain of startup data migration) ───────────────
+
+/// Legacy old key name → canonical namespaced name mapping table (aligned item-by-item with pi `KEYBINDING_NAME_MIGRATIONS`, 59 entries).
+/// Target names match the id table above (some targets are None placeholders — the loader skips them silently, same behavior as pi).
+/// Source: reference/pi-original/packages/coding-agent/src/core/keybindings.ts
+const LEGACY_KEYBINDING_NAMES: &[(&str, &str)] = &[
+    // ── tui.editor.* ──
+    ("cursorUp", "tui.editor.cursorUp"),
+    ("cursorDown", "tui.editor.cursorDown"),
+    ("cursorLeft", "tui.editor.cursorLeft"),
+    ("cursorRight", "tui.editor.cursorRight"),
+    ("cursorWordLeft", "tui.editor.cursorWordLeft"),
+    ("cursorWordRight", "tui.editor.cursorWordRight"),
+    ("cursorLineStart", "tui.editor.cursorLineStart"),
+    ("cursorLineEnd", "tui.editor.cursorLineEnd"),
+    ("jumpForward", "tui.editor.jumpForward"),
+    ("jumpBackward", "tui.editor.jumpBackward"),
+    ("pageUp", "tui.editor.pageUp"),
+    ("pageDown", "tui.editor.pageDown"),
+    ("deleteCharBackward", "tui.editor.deleteCharBackward"),
+    ("deleteCharForward", "tui.editor.deleteCharForward"),
+    ("deleteWordBackward", "tui.editor.deleteWordBackward"),
+    ("deleteWordForward", "tui.editor.deleteWordForward"),
+    ("deleteToLineStart", "tui.editor.deleteToLineStart"),
+    ("deleteToLineEnd", "tui.editor.deleteToLineEnd"),
+    ("yank", "tui.editor.yank"),
+    ("yankPop", "tui.editor.yankPop"),
+    ("undo", "tui.editor.undo"),
+    // ── tui.input.* ──
+    ("newLine", "tui.input.newLine"),
+    ("submit", "tui.input.submit"),
+    ("tab", "tui.input.tab"),
+    ("copy", "tui.input.copy"),
+    // ── tui.select.* ──
+    ("selectUp", "tui.select.up"),
+    ("selectDown", "tui.select.down"),
+    ("selectPageUp", "tui.select.pageUp"),
+    ("selectPageDown", "tui.select.pageDown"),
+    ("selectConfirm", "tui.select.confirm"),
+    ("selectCancel", "tui.select.cancel"),
+    // ── app.* ──
+    ("interrupt", "app.interrupt"),
+    ("clear", "app.clear"),
+    ("exit", "app.exit"),
+    ("suspend", "app.suspend"),
+    ("cycleThinkingLevel", "app.thinking.cycle"),
+    ("cycleModelForward", "app.model.cycleForward"),
+    ("cycleModelBackward", "app.model.cycleBackward"),
+    ("selectModel", "app.model.select"),
+    ("expandTools", "app.tools.expand"),
+    ("toggleThinking", "app.thinking.toggle"),
+    ("toggleSessionNamedFilter", "app.session.toggleNamedFilter"),
+    ("externalEditor", "app.editor.external"),
+    ("followUp", "app.message.followUp"),
+    ("dequeue", "app.message.dequeue"),
+    ("pasteImage", "app.clipboard.pasteImage"),
+    ("newSession", "app.session.new"),
+    ("tree", "app.session.tree"),
+    ("fork", "app.session.fork"),
+    ("resume", "app.session.resume"),
+    ("treeFoldOrUp", "app.tree.foldOrUp"),
+    ("treeUnfoldOrDown", "app.tree.unfoldOrDown"),
+    ("treeEditLabel", "app.tree.editLabel"),
+    ("treeToggleLabelTimestamp", "app.tree.toggleLabelTimestamp"),
+    ("toggleSessionPath", "app.session.togglePath"),
+    ("toggleSessionSort", "app.session.toggleSort"),
+    ("renameSession", "app.session.rename"),
+    ("deleteSession", "app.session.delete"),
+    ("deleteSessionNoninvasive", "app.session.deleteNoninvasive"),
+];
+
+/// Rewrites legacy old key names in a keybinding config to canonical namespaced names (`cursorUp` → `tui.editor.cursorUp`) —
+/// before zen interactive mode starts, `load_user_keybindings` sees the old name, emits an unknown action diagnostic and ignores that binding,
+/// so this function rewrites it first during startup migration, keeping keybindings.json carried over from older pi versions working.
+/// Input must be a non-array JSON object (otherwise returns None, meaning nothing to migrate); each key is looked up in `LEGACY_KEYBINDING_NAMES`,
+/// on a hit it is rewritten and marked as changed; on a **same-name conflict** (both the old key and the canonical key present in the original config) the old key is dropped and the canonical key wins
+/// (aligned with pi's `Object.hasOwn(rawConfig, nextKey)` branch); unknown keys are kept as-is. Returning `Some(new object)` means
+/// there were changes and the caller should write to disk; `None` means no rewrite needed. Pure function, no filesystem access.
+/// Consumers: `migrations::migrate_keybindings_config_file` (file IO shell in the same crate) + this module's unit tests.
+pub(crate) fn migrate_keybindings_config(raw: &Value) -> Option<Value> {
+    let entries = raw.as_object()?;
+    let mut config = serde_json::Map::new();
+    let mut migrated = false;
+    for (key, value) in entries {
+        let next_key: &str = LEGACY_KEYBINDING_NAMES
+            .iter()
+            .find(|(legacy, _)| *legacy == key.as_str())
+            .map(|(_, canonical)| *canonical)
+            .unwrap_or(key.as_str());
+        if next_key != key.as_str() {
+            migrated = true;
+        }
+        if next_key != key.as_str() && entries.contains_key(next_key) {
+            // Old and new keys both present: drop the old key, canonical key wins (aligned with pi Object.hasOwn branch)
+            migrated = true;
+            continue;
+        }
+        config.insert(next_key.to_string(), value.clone());
+    }
+    if migrated {
+        Some(Value::Object(config))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1046,102 @@ mod tests {
         assert_eq!(
             d.to_string(),
             "unknown keybinding action `x` (entry ignored)"
+        );
+    }
+
+    // ── migrate_keybindings_config（T-AP-08-7）──
+
+    #[test]
+    fn legacy_names_rewritten_and_unknown_preserved() {
+        let raw = serde_json::json!({
+            "cursorUp": "ctrl+k",
+            "selectConfirm": "enter",
+            "custom.unknown": "f1"
+        });
+        let migrated = migrate_keybindings_config(&raw).expect("Should be rewritten");
+        let obj = migrated.as_object().expect("Should be an object");
+        assert_eq!(
+            obj.get("tui.editor.cursorUp"),
+            Some(&serde_json::json!("ctrl+k"))
+        );
+        assert_eq!(
+            obj.get("tui.select.confirm"),
+            Some(&serde_json::json!("enter"))
+        );
+        assert_eq!(obj.get("custom.unknown"), Some(&serde_json::json!("f1")));
+        assert!(!obj.contains_key("cursorUp"), "Old key name should be rewritten");
+    }
+
+    #[test]
+    fn no_legacy_names_returns_none() {
+        let raw = serde_json::json!({
+            "tui.editor.cursorUp": "ctrl+k",
+            "unknown.id": "f1"
+        });
+        assert!(migrate_keybindings_config(&raw).is_none());
+    }
+
+    #[test]
+    fn non_object_input_returns_none() {
+        assert!(migrate_keybindings_config(&serde_json::json!([1, 2])).is_none());
+        assert!(migrate_keybindings_config(&serde_json::json!("str")).is_none());
+        assert!(migrate_keybindings_config(&serde_json::json!(42)).is_none());
+    }
+
+    #[test]
+    fn collision_keeps_canonical_drops_legacy() {
+        let raw = serde_json::json!({
+            "cursorUp": "f1",
+            "tui.editor.cursorUp": "ctrl+k"
+        });
+        let migrated = migrate_keybindings_config(&raw).expect("Should be rewritten");
+        let obj = migrated.as_object().expect("Should be an object");
+        assert_eq!(
+            obj.get("tui.editor.cursorUp"),
+            Some(&serde_json::json!("ctrl+k"))
+        );
+        assert_eq!(obj.len(), 1, "old key should be dropped on conflict");
+    }
+
+    #[test]
+    fn legacy_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for (legacy, _) in LEGACY_KEYBINDING_NAMES {
+            assert!(seen.insert(*legacy), "duplicate legacy key name: {legacy}");
+        }
+    }
+
+    #[test]
+    fn legacy_targets_are_all_loadable() {
+        // Migration targets must be recognized by the loader (action id or placeholder), otherwise migration is pointless
+        for (legacy, canonical) in LEGACY_KEYBINDING_NAMES {
+            assert_ne!(legacy, canonical, "legacy key name must not equal the canonical name: {legacy}");
+            let known = app_action_from_id(canonical).is_some()
+                || editor_action_from_id(canonical).is_some()
+                || select_action_from_id(canonical).is_some()
+                || is_reserved_pi_id(canonical);
+            assert!(known, "migration target {canonical} (from {legacy}) is not in any id table");
+        }
+    }
+
+    #[test]
+    fn migrated_config_loads_without_unknown_action() {
+        // Closed-loop verification: the migrated config is recognized by the loader (no UnknownAction diagnostic)
+        let raw = serde_json::json!({ "cursorUp": "ctrl+k", "clear": "f2" });
+        let migrated = migrate_keybindings_config(&raw).expect("Should be rewritten");
+        let (_dir, path) = write_config(&serde_json::to_string(&migrated).unwrap());
+        let (out, diags) = load_user_keybindings(&path);
+        assert!(
+            diags.is_empty(),
+            "no unknown action after migration, actual {diags:?}"
+        );
+        assert_eq!(
+            out.editor.get(&EditorAction::MoveCursorUp).unwrap()[0],
+            KeyId::parse("ctrl+k").unwrap()
+        );
+        assert_eq!(
+            out.app.get(&AppAction::Clear).unwrap()[0],
+            KeyId::parse("f2").unwrap()
         );
     }
 }

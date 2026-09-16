@@ -10,6 +10,7 @@ use zen_app::cli::{
     Mode,
 };
 use zen_app::config::{get_sessions_dir, VERSION};
+use zen_app::migrations::run_migrations;
 use zen_app::modes::interactive::run_interactive_mode;
 use zen_app::modes::print_mode::run_print_mode;
 use zen_app::session::jsonl::CreateSessionOptions;
@@ -92,6 +93,11 @@ async fn main() -> anyhow::Result<()> {
     // Layer 2: read stdin + @file handling + initial messages (T-AP-08-2 + T-AP-08-4)
     // Process cwd: @file path resolution (T-AP-08-4) + session selection (--session restores its original cwd)
     let process_cwd = std::env::current_dir()?;
+
+    // Layer 2.5: startup data migration (T-AP-08-7: session relocation / commands→prompts / key renames).
+    // pi counterpart: after resolveAppMode, before session selection — migration first relocates sessions scattered in the root directory,
+    // so that node 4's select_session_manager can see them (aligned with pi main.ts runMigrations(cwd)).
+    run_migrations(&process_cwd);
     let stdin_content = read_piped_stdin().await?;
     let messages: Vec<&str> = args.messages();
     let file_args = args.file_args();

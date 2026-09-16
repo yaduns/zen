@@ -3,6 +3,7 @@ pub mod commands;
 pub mod components;
 pub mod config;
 pub mod keybindings;
+pub mod migrations;
 pub mod modes;
 pub mod output;
 pub mod prompt_templates;
