@@ -64,6 +64,9 @@ anyhow = "1"
 # ── CLI argument parsing ─────────────────────────────────────────
 clap = { version = "4", features = ["derive"] }
 
+# ── base64 encoding (@file image attachment data, T-AP-08-4) ──────────────
+base64 = "0.22"
+
 # ── TUI ──────────────────────────────────────────────────────────
 # crossterm: terminal manipulation library for TUI (raw mode, cursor, colors, keyboard).
 # Used directly instead of ratatui — better fit for chat-style TUI.

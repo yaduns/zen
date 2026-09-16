@@ -21,6 +21,7 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
+base64 = { workspace = true }
 crossterm = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }

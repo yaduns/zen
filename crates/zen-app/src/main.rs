@@ -5,7 +5,10 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use tracing::info;
-use zen_app::cli::{build_initial_message, read_piped_stdin, stdin_is_terminal, CliArgs, Mode};
+use zen_app::cli::{
+    build_initial_message, process_file_arguments, read_piped_stdin, stdin_is_terminal, CliArgs,
+    Mode,
+};
 use zen_app::config::{get_sessions_dir, VERSION};
 use zen_app::modes::interactive::run_interactive_mode;
 use zen_app::modes::print_mode::run_print_mode;
@@ -86,10 +89,25 @@ async fn main() -> anyhow::Result<()> {
         "[main] node 2: mode resolution (--mode > --print > non-TTY stdin > interactive)"
     );
 
-    // Layer 2: read stdin + initial message (T-AP-08-2)
+    // Layer 2: read stdin + @file handling + initial messages (T-AP-08-2 + T-AP-08-4)
+    // Process cwd: @file path resolution (T-AP-08-4) + session selection (--session restores its original cwd)
+    let process_cwd = std::env::current_dir()?;
     let stdin_content = read_piped_stdin().await?;
     let messages: Vec<&str> = args.messages();
-    let initial = build_initial_message(&messages, stdin_content, None, vec![]);
+    let file_args = args.file_args();
+    let (file_text, file_images) = if file_args.is_empty() {
+        (None, vec![])
+    } else {
+        match process_file_arguments(&file_args, &process_cwd).await {
+            Ok(processed) => (Some(processed.text), processed.images),
+            Err(e) => {
+                // Align with pi processFileArguments' console.error(chalk.red(...)) + exit(1)
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    let initial = build_initial_message(&messages, stdin_content, file_text, file_images);
     info!(
         has_initial = initial.initial_message.is_some(),
         remaining = initial.remaining_messages.len(),
@@ -97,8 +115,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Layer 3: assembly factory (refactoring point 3 — assembly logic extracted to services.rs; session chosen by main)
-    // process cwd: only used for session selection (--session restores its original cwd)
-    let process_cwd = std::env::current_dir()?;
     let session_manager = select_session_manager(&args, &process_cwd)?;
 
     // T-AP-01-5 gate: after select_session_manager, before assembly (same location as pi)
