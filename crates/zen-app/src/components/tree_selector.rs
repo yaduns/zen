@@ -1,6 +1,10 @@
 // REQ-APP-11 (pi-358): tree-selector — session tree navigation popup.
 // Corresponds to the original TS: reference/pi-original/packages/coding-agent/src/modes/interactive/components/tree-selector.ts (49KB).
-// v1 simplification: drop onCopy (no clipboard command surface); ASCII tree art simplified to "indent + connector + summary",
+// v1 simplification: remove onCopy (no clipboard command surface); simplify ASCII tree art to "indent + connector + summary";
+// Indentation rules ported from pi flattenTree: only branch points (parent with >1 child) and the first generation after a branch add one level,
+// Single-child chains stay flat without adding levels (linear long sessions do not shift right per level). Horizontal viewport panning (renderHorizontalViewport) is not ported in v1.
+// Textless assistant lines follow the pi getEntryDisplayText fallback chain: error_message (error color, truncated to 80 chars)/
+// (aborted)/(no content)。
 // Preserve filter (default/no-tools/user-only/labeled-only/all), search, collapse/expand, label editing, and callback contract.
 // request_render resolution (same as session-selector: no async loading; state is ready on the render frame). Timestamp display toggle preserved.
 // （app.tree.toggleLabelTimestamp）。
@@ -105,7 +109,24 @@ impl TreeFlatNode {
         match &self.entry {
             SessionTreeEntry::Message { message, .. } => match message {
                 Message::User(_) => ColorToken::UserMessageText,
-                Message::Assistant(_) => ColorToken::ThinkingText,
+                Message::Assistant(a) => {
+                    // Lines with no text that use error_message as the summary use error color
+                    // (Aligned with pi: errorMessage is displayed in error color; when text exists, use normal color)
+                    let has_text = a
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::Text(t) if !t.text.trim().is_empty()));
+                    let error_fallback = !has_text
+                        && !matches!(a.stop_reason, StopReason::Aborted)
+                        && a.error_message
+                            .as_deref()
+                            .is_some_and(|e| !normalize_single_line(e).is_empty());
+                    if error_fallback {
+                        ColorToken::Error
+                    } else {
+                        ColorToken::ThinkingText
+                    }
+                }
                 Message::ToolResult(_) => ColorToken::ToolOutput,
             },
             _ => ColorToken::Muted,
@@ -129,18 +150,43 @@ fn kind_name(e: &SessionTreeEntry) -> &'static str {
     }
 }
 
+/// Maximum character count for error summaries in tree lines (aligned with pi: errorMessage.slice(0, 80)).
+const MAX_ERROR_SUMMARY_CHARS: usize = 80;
+
+/// Single-line normalization (aligned with pi normalize: replace newlines/tabs with spaces, then trim).
+fn normalize_single_line(s: &str) -> String {
+    s.replace(['\n', '\t'], " ").trim().to_string()
+}
+
 fn message_summary(message: &Message) -> String {
     match message {
         Message::User(u) => text_of(&u.content),
-        Message::Assistant(a) => a
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                ContentBlock::Text(t) if !t.text.trim().is_empty() => Some(t.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+        Message::Assistant(a) => {
+            let text = a
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    ContentBlock::Text(t) if !t.text.trim().is_empty() => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return text;
+            }
+            // Textless fallback chain (aligned with the assistant branch of pi getEntryDisplayText, same order):
+            // aborted → "(aborted)"; has error_message → normalize and truncate to 80 chars; otherwise "(no content)"
+            if matches!(a.stop_reason, StopReason::Aborted) {
+                return "(aborted)".to_string();
+            }
+            if let Some(err) = a.error_message.as_deref() {
+                let normalized = normalize_single_line(err);
+                if !normalized.is_empty() {
+                    return normalized.chars().take(MAX_ERROR_SUMMARY_CHARS).collect();
+                }
+            }
+            "(no content)".to_string()
+        }
         Message::ToolResult(t) => t
             .content
             .iter()
@@ -182,11 +228,11 @@ fn is_settings_entry(e: &SessionTreeEntry) -> bool {
 /// Session tree navigation overlay: ASCII tree + search + collapse/expand + label editing + filter —
 /// Shown on the /tree command (T-AP-11-1); input is the current branch entry slice (it builds its own hierarchy and FlatNode internally).
 #[allow(clippy::type_complexity)] // Callback fields (Box<dyn FnMut> composition)
-pub struct TreeSelectorComponent<'a> {
-    entries: &'a [SessionTreeEntry],
+pub struct TreeSelectorComponent {
+    entries: Vec<SessionTreeEntry>,
     current_leaf_id: Option<String>,
-    theme: &'a Theme,
-    app_kb: &'a KeybindingsManager<AppAction>,
+    theme: Theme,
+    app_kb: KeybindingsManager<AppAction>,
     on_select: Option<Box<dyn FnMut(String)>>,
     on_cancel: Option<Box<dyn FnMut()>>,
     on_label_change: Option<Box<dyn FnMut(String, Option<String>)>>,
@@ -206,15 +252,17 @@ pub struct TreeSelectorComponent<'a> {
     bottom_border: DynamicBorder,
 }
 
-impl<'a> TreeSelectorComponent<'a> {
+impl TreeSelectorComponent {
     /// Construct the tree selector; an empty tree (no visible nodes) triggers on_cancel at construction (aligned with pi setTimeout semantics).
+    /// **Owned conversion (T-AP-08-5)**: entry snapshots/theme/app keybinding table are held by value (constructor clones/preloads),
+    /// Allows the component to be stored in `InteractiveUi` mount fields (avoids self-referential borrow, following the SettingsSelectorComponent precedent).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn new(
-        entries: &'a [SessionTreeEntry],
+        entries: Vec<SessionTreeEntry>,
         current_leaf_id: Option<&str>,
         terminal_height: u16,
-        theme: &'a Theme,
-        app_kb: &'a KeybindingsManager<AppAction>,
+        theme: Theme,
+        app_kb: KeybindingsManager<AppAction>,
         on_select: Option<Box<dyn FnMut(String)>>,
         on_cancel: Option<Box<dyn FnMut()>>,
         on_label_change: Option<Box<dyn FnMut(String, Option<String>)>>,
@@ -222,6 +270,7 @@ impl<'a> TreeSelectorComponent<'a> {
         initial_filter_mode: FilterMode,
     ) -> Self {
         let _max_visible = std::cmp::max(5, terminal_height / 2);
+        let border = Style::fg(theme.fg(ColorToken::Border));
         let mut comp = TreeSelectorComponent {
             entries,
             current_leaf_id: current_leaf_id.map(|s| s.to_string()),
@@ -240,12 +289,12 @@ impl<'a> TreeSelectorComponent<'a> {
             label_mode: false,
             label_input: Input::new(),
             label_target: None,
-            top_border: DynamicBorder::new(Style::fg(theme.fg(ColorToken::Border))),
-            bottom_border: DynamicBorder::new(Style::fg(theme.fg(ColorToken::Border))),
+            top_border: DynamicBorder::new(border.clone()),
+            bottom_border: DynamicBorder::new(border),
         };
         // Expand all entries with children by default (aligned with pi: initially all expanded, collapsible).
-        for e in entries {
-            let has_children = entries.iter().any(|x| x.parent_id() == Some(e.id()));
+        for e in &comp.entries {
+            let has_children = comp.entries.iter().any(|x| x.parent_id() == Some(e.id()));
             if has_children {
                 comp.expanded.insert(e.id().to_string());
             }
@@ -259,10 +308,26 @@ impl<'a> TreeSelectorComponent<'a> {
                 cb();
             }
         }
-        // initial selection
-        if let Some(id) = initial_selected_id {
-            if let Some(idx) = comp.flat.iter().position(|n| n.id == id) {
-                comp.selected_index = idx;
+        // Initial selection (aligned with pi `initialSelectedId ?? currentLeafId` + `findNearestVisibleIndex`):
+        // Default to the current leaf — after user navigation/summarization, reopening /tree should place the cursor at the new leaf position (e.g., branch summary entry);
+        // If the target is filtered out and invisible, walk up the parent chain to the nearest visible ancestor; if all are invisible → last line (same as pi).
+        if !comp.flat.is_empty() {
+            let mut current = initial_selected_id.or_else(|| comp.current_leaf_id.clone());
+            let mut placed = false;
+            while let Some(id) = current {
+                if let Some(idx) = comp.flat.iter().position(|n| n.id == id) {
+                    comp.selected_index = idx;
+                    placed = true;
+                    break;
+                }
+                current = comp
+                    .entries
+                    .iter()
+                    .find(|e| e.id() == id)
+                    .and_then(entry_parent_id);
+            }
+            if !placed {
+                comp.selected_index = comp.flat.len() - 1;
             }
         }
         comp
@@ -272,18 +337,64 @@ impl<'a> TreeSelectorComponent<'a> {
     #[allow(clippy::type_complexity)] // Hierarchy/label table is locally large
     fn rebuild(&mut self) {
         let mut by_parent: HashMap<Option<String>, Vec<&SessionTreeEntry>> = HashMap::new();
-        for e in self.entries {
+        for e in &self.entries {
             let pid = entry_parent_id(e);
             by_parent.entry(pid).or_default().push(e);
         }
         // Order preserved: in original `entries` order
         for list in by_parent.values_mut() {
-            list.sort_by_key(|e| entry_index(self.entries, e));
+            list.sort_by_key(|e| entry_index(&self.entries, e));
         }
+
+        // Branch point child sorting (aligned with pi flattenTree's containsActive priority):
+        // First build roots in original order, then post-order collect from each root the node set whose subtree contains the current leaf,
+        // Then stably sort each branch point's child list and the root list — those containing the current leaf come first, the rest keep their original relative order.
+        // Effect: after summarize, the newest summary (current leaf) appears next to the return point instead of after the entire abandoned chain.
+        // When the leaf is None (e.g., navigated to root), the set is empty = all original order (same as pi).
+        let mut roots: Vec<&SessionTreeEntry> = self
+            .entries
+            .iter()
+            .filter(|e| match entry_parent_id(e) {
+                Some(pid) => !self.entries.iter().any(|x| x.id() == pid),
+                None => true,
+            })
+            .collect();
+        fn collect_contains_active<'x>(
+            e: &'x SessionTreeEntry,
+            by_parent: &HashMap<Option<String>, Vec<&'x SessionTreeEntry>>,
+            leaf: Option<&str>,
+            out: &mut HashSet<&'x str>,
+        ) -> bool {
+            let mut has = leaf == Some(e.id());
+            if let Some(children) = by_parent.get(&Some(e.id().to_string())) {
+                for c in children {
+                    if collect_contains_active(c, by_parent, leaf, out) {
+                        has = true;
+                    }
+                }
+            }
+            if has {
+                out.insert(e.id());
+            }
+            has
+        }
+        let mut contains_active: HashSet<&str> = HashSet::new();
+        for r in &roots {
+            collect_contains_active(
+                r,
+                &by_parent,
+                self.current_leaf_id.as_deref(),
+                &mut contains_active,
+            );
+        }
+        for list in by_parent.values_mut() {
+            list.sort_by_key(|e| !contains_active.contains(e.id()));
+        }
+        roots.sort_by_key(|e| !contains_active.contains(e.id()));
 
         // 2. label index (Label entry → target_id)
         let mut labels: HashMap<&str, String> = HashMap::new();
-        for e in self.entries {
+        for e in &self.entries {
             if let SessionTreeEntry::Label {
                 target_id,
                 label: Some(l),
@@ -295,6 +406,10 @@ impl<'a> TreeSelectorComponent<'a> {
         }
 
         // 3. DFS flatten (subtree of collapsed node skipped entirely)
+        // Indentation rules ported from pi flattenTree (tree-selector.ts):
+        // - Parent branch (>1 child) → child level +1
+        // - First generation after a branch (just_branched and not at root level) → +1 (visual grouping of subtree)
+        // - Other single-child chains → flat, no increase (entries in linear long sessions stay at the same level)
         let search_tokens: Vec<String> = self
             .query
             .to_lowercase()
@@ -303,23 +418,15 @@ impl<'a> TreeSelectorComponent<'a> {
             .collect();
 
         let mut flat: Vec<TreeFlatNode> = Vec::new();
-        let roots: Vec<&SessionTreeEntry> = self
-            .entries
-            .iter()
-            .filter(|e| match entry_parent_id(e) {
-                Some(pid) => !self.entries.iter().any(|x| x.id() == pid),
-                None => true,
-            })
-            .collect();
 
         fn walk<'x>(
             e: &'x SessionTreeEntry,
             depth: usize,
+            just_branched: bool,
             by_parent: &HashMap<Option<String>, Vec<&'x SessionTreeEntry>>,
             expanded: &HashSet<String>,
             flat: &mut Vec<TreeFlatNode>,
             labels: &HashMap<&'x str, String>,
-            _root: bool,
         ) {
             let children = by_parent
                 .get(&Some(e.id().to_string()))
@@ -335,14 +442,28 @@ impl<'a> TreeSelectorComponent<'a> {
                 has_children,
                 is_expanded,
             });
+            let multiple_children = children.len() > 1;
+            let child_depth = if multiple_children || (just_branched && depth > 0) {
+                depth + 1
+            } else {
+                depth
+            };
             if is_expanded {
                 for child in children {
-                    walk(child, depth + 1, by_parent, expanded, flat, labels, false);
+                    walk(
+                        child,
+                        child_depth,
+                        multiple_children,
+                        by_parent,
+                        expanded,
+                        flat,
+                        labels,
+                    );
                 }
             }
         }
         for r in roots {
-            walk(r, 0, &by_parent, &self.expanded, &mut flat, &labels, false);
+            walk(r, 0, false, &by_parent, &self.expanded, &mut flat, &labels);
         }
 
         // 4. Filter (pi filterNodes logic)
@@ -509,9 +630,9 @@ fn entry_index(entries: &[SessionTreeEntry], e: &SessionTreeEntry) -> usize {
     entries.iter().position(|x| x.id() == e.id()).unwrap_or(0)
 }
 
-impl Component for TreeSelectorComponent<'_> {
+impl Component for TreeSelectorComponent {
     fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
-        let theme = self.theme;
+        let theme = &self.theme;
         let accent = Style::fg(theme.fg(ColorToken::Accent));
         let muted = Style::fg(theme.fg(ColorToken::Muted));
         let mut painted = 0u16;
@@ -632,14 +753,14 @@ impl Component for TreeSelectorComponent<'_> {
                 };
                 let label = node.label.as_deref().unwrap_or("");
                 let summary = node.summary();
-                let text = format!(
-                    "{indent}{connector}[{marker}] {ts}{label}{}",
-                    if label.is_empty() {
-                        summary
-                    } else {
-                        String::new()
-                    }
-                );
+                // label prefix has a trailing space separator (aligned with pi: `[${label}] `), content always follows
+                // (Previously, when label existed, summary was set empty, causing content loss)
+                let label_part = if label.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{label}] ")
+                };
+                let text = format!("{indent}{connector}[{marker}] {ts}{label_part}{summary}");
                 let style = if is_selected {
                     accent.clone()
                 } else {
@@ -834,8 +955,8 @@ mod tests {
     use std::collections::HashMap;
     use zen_ai::types::{TextContent, Usage, UserMessage};
 
-    fn theme() -> &'static Theme {
-        zen_tui::theme::builtin_dark_theme()
+    fn theme() -> Theme {
+        zen_tui::theme::builtin_dark_theme().clone()
     }
 
     fn kb() -> KeybindingsManager<AppAction> {
@@ -879,6 +1000,21 @@ mod tests {
         })
     }
 
+    fn error_assistant(error_message: Option<&str>, stop: StopReason) -> Message {
+        Message::Assistant(zen_ai::types::AssistantMessage {
+            content: vec![],
+            api: "openai".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: stop,
+            error_message: error_message.map(|s| s.to_string()),
+            timestamp: 0,
+        })
+    }
+
     #[test]
     fn filter_mode_roundtrip() {
         for m in [
@@ -899,11 +1035,11 @@ mod tests {
         let cancelled_captured = cancelled.clone();
         let kb = kb();
         let comp = TreeSelectorComponent::new(
-            &[],
+            vec![],
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             Some(Box::new(move || *cancelled_captured.borrow_mut() += 1)),
             None,
@@ -923,11 +1059,11 @@ mod tests {
         ];
         let kb = kb();
         let comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             None,
@@ -964,11 +1100,11 @@ mod tests {
         ];
         let kb = kb();
         let comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             None,
@@ -987,11 +1123,11 @@ mod tests {
         ];
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             None,
@@ -1018,11 +1154,11 @@ mod tests {
         let entries = vec![entry("e1", None, user_msg("x"))];
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             None,
@@ -1044,11 +1180,11 @@ mod tests {
         let selected_captured = selected.clone();
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             Some(Box::new(move |id| {
                 *selected_captured.borrow_mut() = Some(id)
             })),
@@ -1070,15 +1206,15 @@ mod tests {
         ];
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             None,
-            None,
+            Some("e1".to_string()), // Explicitly select e1 (with pi's no-leaf semantics, default to last line instead of always first line)
             FilterMode::Default,
         );
         assert_eq!(
@@ -1096,17 +1232,379 @@ mod tests {
     }
 
     #[test]
+    fn linear_chain_stays_flat() {
+        // pi flattenTree indentation rule: single-child chains stay flat without adding levels (linear long sessions do not shift right per level)
+        let entries = vec![
+            entry("e1", None, user_msg("m1")),
+            entry("e2", Some("e1"), user_msg("m2")),
+            entry("e3", Some("e2"), user_msg("m3")),
+            entry("e4", Some("e3"), user_msg("m4")),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let depths: Vec<usize> = comp.flat.iter().map(|n| n.depth).collect();
+        assert_eq!(depths, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn branch_increases_indent_once_then_flat() {
+        // pi flattenTree indentation rule: branch point children +1, first generation after a branch +1 again, then single-child chains stay flat.
+        // e1 branches to e2/e3 (+1); e2→e4 is the first generation after a branch (+1 again); e4→e5 is a single-child chain (flat).
+        let entries = vec![
+            entry("e1", None, user_msg("root")),
+            entry("e2", Some("e1"), user_msg("branch a")),
+            entry("e3", Some("e1"), user_msg("branch b")),
+            entry("e4", Some("e2"), user_msg("a child")),
+            entry("e5", Some("e4"), user_msg("a grandchild")),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let depths: Vec<usize> = comp.flat.iter().map(|n| n.depth).collect();
+        // DFS order: e1, e2, e4, e5, e3
+        assert_eq!(depths, vec![0, 1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn error_assistant_summary_shows_error_message() {
+        // Aligned with pi: textless error assistant entries remain in the default filter and display errorMessage instead of blank [A]
+        let entries = vec![
+            entry("e1", None, user_msg("hello")),
+            entry(
+                "e2",
+                Some("e1"),
+                error_assistant(Some("connection refused"), StopReason::Error),
+            ),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        assert_eq!(comp.visible_count(), 2, "error assistant kept in default");
+        assert_eq!(comp.flat[1].summary(), "connection refused");
+    }
+
+    #[test]
+    fn aborted_assistant_shows_aborted_marker() {
+        // Aligned with pi order: aborted takes priority over errorMessage (stopReason === "aborted" branch comes first)
+        let entries = vec![entry(
+            "e1",
+            None,
+            error_assistant(Some("boom"), StopReason::Aborted),
+        )];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        assert_eq!(comp.flat[0].summary(), "(aborted)");
+    }
+
+    #[test]
+    fn error_message_normalized_and_truncated_to_80() {
+        // Aligned with pi: normalize newlines/tabs to spaces, truncate to 80 chars
+        let raw = format!("net{}\n\t fail", "x".repeat(100));
+        let entries = vec![entry(
+            "e1",
+            None,
+            error_assistant(Some(&raw), StopReason::Error),
+        )];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let summary = comp.flat[0].summary();
+        assert_eq!(summary.chars().count(), 80);
+        assert!(summary.starts_with("net"));
+        assert!(summary.ends_with('x'), "truncate within the first 80 characters after normalization");
+        assert!(!summary.contains(' '));
+    }
+
+    #[test]
+    fn no_content_fallback_for_current_tool_call_assistant() {
+        // Aligned with pi: a pure tool-call assistant on the current leaf (no text, no error) displays (no content)
+        let entries = vec![entry(
+            "e1",
+            None,
+            error_assistant(None, StopReason::ToolUse),
+        )];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            Some("e1"),
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        assert_eq!(comp.visible_count(), 1, "keep the current leaf");
+        assert_eq!(comp.flat[0].summary(), "(no content)");
+    }
+
+    #[test]
+    fn labeled_row_shows_label_and_content() {
+        // Aligned with pi: label is a prefix, node content still follows (previously content was set empty when label existed)
+        let label_entry = SessionTreeEntry::Label {
+            id: "l1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T10:00:00Z".to_string(),
+            target_id: "e1".into(),
+            label: Some("mytag".into()),
+        };
+        let entries = vec![entry("e1", None, user_msg("hello world")), label_entry];
+        let kb = kb();
+        let mut comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let mut buf = ScreenBuffer::new(120, 20);
+        let _ = comp.render(&mut buf, 0, 0, 120, 20);
+        let mut out = Vec::new();
+        buf.flush(&mut out).unwrap();
+        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        assert!(text.contains("[mytag]"), "line should contain a label: {text}");
+        assert!(
+            text.contains("hello world"),
+            "node content should still follow the label: {text}"
+        );
+    }
+
+    #[test]
+    fn initial_selection_defaults_to_current_leaf() {
+        // Aligned with pi: reopening /tree places the cursor at the current leaf by default (not line 1 after navigation/summarization)
+        let entries = vec![
+            entry("e1", None, user_msg("m1")),
+            entry("e2", Some("e1"), user_msg("m2")),
+            entry("e3", Some("e2"), user_msg("m3")),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            Some("e3"),
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        assert_eq!(comp.flat[comp.selected_index].id, "e3");
+    }
+
+    #[test]
+    fn initial_selection_walks_up_when_leaf_filtered_out() {
+        // Leaf is filtered out (assistant invisible under user-only) → walk up the parent chain to the nearest visible ancestor
+        let entries = vec![
+            entry("e1", None, user_msg("m1")),
+            entry("e2", Some("e1"), user_msg("m2")),
+            entry("e3", Some("e2"), assistant_msg(Some("a3"))),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            Some("e3"),
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::UserOnly,
+        );
+        assert_eq!(comp.flat[comp.selected_index].id, "e2");
+    }
+
+    #[test]
+    fn initial_selected_id_takes_precedence_over_leaf() {
+        // Explicit initialSelectedId (summary aborted and tree redisplayed) takes priority over the current leaf
+        let entries = vec![
+            entry("e1", None, user_msg("m1")),
+            entry("e2", Some("e1"), user_msg("m2")),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            Some("e2"),
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            Some("e1".to_string()),
+            FilterMode::Default,
+        );
+        assert_eq!(comp.flat[comp.selected_index].id, "e1");
+    }
+
+    fn branch_summary_entry(id: &str, parent: Option<&str>, summary: &str) -> SessionTreeEntry {
+        SessionTreeEntry::BranchSummary {
+            id: id.into(),
+            parent_id: parent.map(|s| s.into()),
+            timestamp: "2025-01-01T10:00:00Z".to_string(),
+            from_id: "old-leaf".into(),
+            summary: summary.into(),
+            details: None,
+            usage: None,
+            from_hook: Some(false),
+        }
+    }
+
+    #[test]
+    fn active_branch_ordered_first_at_branch_point() {
+        // Aligned with pi containsActive priority: after summarize (leaf = summary entry),
+        // Branch point (n1)'s children sort the current chain first → display order n1, B, n2, n3, n4 (instead of B at the bottom)
+        let entries = vec![
+            entry("n1", None, user_msg("m1")),
+            entry("n2", Some("n1"), user_msg("m2")),
+            entry("n3", Some("n2"), user_msg("m3")),
+            entry("n4", Some("n3"), user_msg("m4")),
+            branch_summary_entry("B", Some("n1"), "summary of n2..n4"),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            Some("B"),
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let ids: Vec<&str> = comp.flat.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "B", "n2", "n3", "n4"]);
+        // Cursor lands on the current leaf (summary entry, now first at the branch point)
+        assert_eq!(comp.flat[comp.selected_index].id, "B");
+    }
+
+    #[test]
+    fn latest_summary_tops_sibling_summaries() {
+        // Multiple summarizes: the newest summary (current leaf) comes first; older summaries keep their original relative order after the abandoned chain
+        let entries = vec![
+            entry("n1", None, user_msg("m1")),
+            entry("n2", Some("n1"), user_msg("m2")),
+            branch_summary_entry("B1", Some("n1"), "old"),
+            branch_summary_entry("B2", Some("n1"), "new"),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            Some("B2"),
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let ids: Vec<&str> = comp.flat.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "B2", "n2", "B1"]);
+    }
+
+    #[test]
+    fn no_leaf_keeps_append_order() {
+        // Leaf is None (e.g., navigated to root): contains set is empty = all original order (aligned with pi)
+        let entries = vec![
+            entry("n1", None, user_msg("m1")),
+            entry("n2", Some("n1"), user_msg("m2")),
+            branch_summary_entry("B", Some("n1"), "old"),
+        ];
+        let kb = kb();
+        let comp = TreeSelectorComponent::new(
+            entries,
+            None,
+            20,
+            theme(),
+            kb,
+            None,
+            None,
+            None,
+            None,
+            FilterMode::Default,
+        );
+        let ids: Vec<&str> = comp.flat.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "n2", "B"]);
+    }
+
+    #[test]
     fn label_edit_flow() {
         let entries = vec![entry("e1", None, user_msg("hello"))];
         let changed = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
         let changed_captured = changed.clone();
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             Some(Box::new(move |id, label| {
@@ -1143,11 +1641,11 @@ mod tests {
         let changed_captured = changed.clone();
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             Some(Box::new(move |id, label| {
@@ -1174,11 +1672,11 @@ mod tests {
         ];
         let kb = kb();
         let mut comp = TreeSelectorComponent::new(
-            &entries,
+            entries.clone(),
             None,
             20,
             theme(),
-            &kb,
+            kb.clone(),
             None,
             None,
             None,

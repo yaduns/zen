@@ -338,18 +338,10 @@ impl AgentSession {
     /// Returns: None when `retry.enabled` is false (semantics of zen-core compact's retry parameter).
     ///
     /// # Consumers
-    /// Internal to this task (compact/run_auto_compaction); **T-AP-08-5 must consume the same assembly pattern**
-    /// (generate_branch_summary assembly; the plan seam note says "reserved").
+    /// Internal to this task (compact/run_auto_compaction); T-AP-08-5 has extracted the shared implementation into
+    /// `session/navigation.rs::build_retry_policy` (assembled by generate_branch_summary); this method delegates to it.
     fn build_retry_policy(&self) -> Option<RetryPolicy> {
-        let retry = self.settings.effective().retry;
-        if !retry.enabled {
-            return None;
-        }
-        Some(RetryPolicy {
-            enabled: true,
-            max_retries: retry.max_retries,
-            base_delay_ms: retry.base_delay_ms,
-        })
+        crate::session::navigation::build_retry_policy(&self.settings)
     }
 
     /// Stale message check — whether the given assistant message predates the most recent Compaction entry on the branch.
@@ -593,6 +585,64 @@ mod tests {
                     from_hook: Some(_from_hook),
                 });
             format!("c{}", self.compactions.lock().unwrap().len())
+        }
+        fn entries(&self) -> Vec<SessionTreeEntry> {
+            self.entries.lock().unwrap().clone()
+        }
+        fn get_leaf_id(&self) -> Option<String> {
+            self.entries
+                .lock()
+                .unwrap()
+                .last()
+                .map(|e| e.id().to_string())
+        }
+        fn append_branch_summary(
+            &self,
+            result: &zen_core::compaction::branch::BranchSummaryResult,
+            _new_leaf_id: Option<&str>,
+            _from_hook: bool,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .push(SessionTreeEntry::BranchSummary {
+                    id: "bs1".to_string(),
+                    parent_id: None,
+                    timestamp: self.compaction_ts.to_string(),
+                    from_id: "root".to_string(),
+                    summary: result.summary.clone(),
+                    details: Some(serde_json::json!({
+                        "readFiles": result.read_files,
+                        "modifiedFiles": result.modified_files,
+                    })),
+                    usage: result.usage.clone(),
+                    from_hook: Some(_from_hook),
+                });
+            Ok("bs1".to_string())
+        }
+        fn branch(
+            &self,
+            _branch_from_id: &str,
+        ) -> Result<(), crate::session::session_manager::SessionManagerError> {
+            Ok(())
+        }
+        fn reset_leaf(&self) {}
+        fn append_label_change(
+            &self,
+            _target_id: &str,
+            _label: Option<&str>,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("label1".to_string())
+        }
+        fn append_session_info(&self, _name: Option<&str>) -> String {
+            "sinfo1".to_string()
+        }
+        fn create_branched_session(
+            &self,
+            _leaf_id: &str,
+        ) -> Result<Option<std::path::PathBuf>, crate::session::session_manager::SessionManagerError>
+        {
+            Ok(None)
         }
     }
 

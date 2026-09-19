@@ -13,6 +13,7 @@ use crate::components::custom_editor::CustomEditor;
 use crate::components::custom_entry::CustomEntryComponent;
 use crate::components::custom_message::CustomMessageComponent;
 use crate::components::footer::{FooterComponent, FooterData};
+use crate::components::session_selector::{SessionListLoader, SessionSelectorComponent};
 use crate::components::settings_selector::{
     DoubleEscapeAction, SettingsCallbacks, SettingsConfig, SettingsSelectorComponent,
 };
@@ -21,11 +22,14 @@ use crate::components::status_indicator::{
     CompactionStatusReason, IdleStatus, StatusIndicator, StatusIndicatorKind,
 };
 use crate::components::tool_execution::{ToolExecutionComponent, ToolExecutionResult};
+use crate::components::tree_selector::{FilterMode, TreeSelectorComponent};
 use crate::components::user_message::UserMessageComponent;
+use crate::components::user_message_selector::{UserMessageListItem, UserMessageSelectorComponent};
 use crate::config::defaults::{clamp_autocomplete_max_visible, clamp_editor_padding_x};
 use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
 use crate::modes::interactive::{AppAction, InputCommand, SettingsApplyKind, StatusSpec, UiEvent};
 use crate::output::usage_totals::UsageTotals;
+use crate::session::session_listing::SessionListing;
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -35,9 +39,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zen_ai::types::{AssistantMessage, ContentBlock, ContentBlockList, Message, UserMessage};
+use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::autocomplete::{
     AutocompleteProvider, AutocompleteSuggestions, CombinedAutocompleteProvider, SlashCommand,
 };
+use zen_tui::components::input::Input;
 use zen_tui::components::select_list::SelectAction;
 use zen_tui::components::Component;
 use zen_tui::editor::EditorAction;
@@ -113,6 +119,220 @@ pub struct InteractiveUi {
     autocomplete_max_visible: usize,
     /// Completion overlay (when active, keys first go through `handle_autocomplete_key`; None = not active).
     autocomplete: Option<AutocompleteOverlay>,
+    /// Session/tree/fork selector and options popup overlay (T-AP-08-5): key presses are forwarded first on mount,
+    /// rendering a full-screen overlay (aligned with the panel precedent). Selection/cancellation pushes `InputCommand` to the route via callback.
+    selector: Option<SelectorOverlay>,
+}
+
+/// Selector overlays (T-AP-08-5): session selector / tree selector / user message selector / generic options popup /
+/// custom command input. All are owned (no lifetimes after the T-AP-08-5 component rework), so they can be stored in this field directly.
+enum SelectorOverlay {
+    /// /resume session selector (two preloaded lists: current/all).
+    Session(SessionSelectorComponent),
+    /// /tree tree selector (full-entry snapshot).
+    Tree(TreeSelectorComponent),
+    /// /fork user message selector.
+    UserMessage(UserMessageSelectorComponent),
+    /// Generic options popup (summary question / missing-cwd Continue-Cancel): title + option list.
+    Choice(ChoiceOverlay),
+    /// Custom summary command input popup (zen-tui Input).
+    CustomInput(CustomInputOverlay),
+}
+
+impl SelectorOverlay {
+    /// Forward a key press; returns true = the event was consumed (does not fall through to the editor/keymap).
+    fn handle_key(&mut self, key: &KeyEvent) -> bool {
+        match self {
+            SelectorOverlay::Session(c) => c.handle_key(key),
+            SelectorOverlay::Tree(c) => c.handle_key(key),
+            SelectorOverlay::UserMessage(c) => c.handle_key(key),
+            SelectorOverlay::Choice(c) => c.handle_key(key),
+            SelectorOverlay::CustomInput(c) => c.handle_key(key),
+        }
+    }
+
+    /// Render to buffer (full-screen overlay; x/y/width/height are provided by the caller with full-screen dimensions).
+    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+        match self {
+            SelectorOverlay::Session(c) => c.render(buf, x, y, width, height),
+            SelectorOverlay::Tree(c) => c.render(buf, x, y, width, height),
+            SelectorOverlay::UserMessage(c) => c.render(buf, x, y, width, height),
+            SelectorOverlay::Choice(c) => c.render(buf, x, y, width, height),
+            SelectorOverlay::CustomInput(c) => c.render(buf, x, y, width, height),
+        }
+    }
+}
+
+/// Generic options popup (T-AP-08-5): title + option list, ↑↓ to move, Enter to select (index sent upstream
+/// via `ChoiceSelected`), Esc to cancel. Aligns with the minimal form of pi's `showExtensionSelector`.
+struct ChoiceOverlay {
+    title: String,
+    options: Vec<String>,
+    selected: usize,
+    theme: Theme,
+    commands: Rc<RefCell<EditorRoute>>,
+}
+
+impl ChoiceOverlay {
+    fn new(
+        title: String,
+        options: Vec<String>,
+        theme: Theme,
+        commands: Rc<RefCell<EditorRoute>>,
+    ) -> Self {
+        ChoiceOverlay {
+            title,
+            options,
+            selected: 0,
+            theme,
+            commands,
+        }
+    }
+
+    fn handle_key(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                true
+            }
+            KeyCode::Down => {
+                if !self.options.is_empty() {
+                    self.selected = (self.selected + 1) % self.options.len();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                let idx = self.selected;
+                self.commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::ChoiceSelected(idx));
+                true
+            }
+            KeyCode::Esc => {
+                self.commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorCancelled);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn render(&self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+        let border = Style::fg(self.theme.fg(ColorToken::Border));
+        let mut painted = 0u16;
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &Style::default());
+            painted += 1;
+        }
+        if height > painted {
+            buf.write(
+                x + 1,
+                y + painted,
+                &Style::fg(self.theme.fg(ColorToken::Accent)),
+                &format!(" {}", self.title),
+            );
+            painted += 1;
+        }
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &Style::default());
+            painted += 1;
+        }
+        for (i, opt) in self.options.iter().enumerate() {
+            if height - painted == 0 {
+                break;
+            }
+            let (prefix, style) = if i == self.selected {
+                ("→ ", Style::fg(self.theme.fg(ColorToken::Accent)))
+            } else {
+                ("  ", Style::default())
+            };
+            buf.fill(x, y + painted, width, 1, &Style::default());
+            buf.write(x + 1, y + painted, &style, &format!("{prefix}{opt}"));
+            painted += 1;
+        }
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &Style::default());
+            painted += 1;
+        }
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &border);
+            painted += 1;
+        }
+        painted
+    }
+}
+
+/// Custom summary command input popup (T-AP-08-5): prompt line + zen-tui Input (Enter submits ->
+/// `CustomInput(text)` sent upstream; Esc -> `SelectorCancelled`).
+struct CustomInputOverlay {
+    prompt: String,
+    input: Input,
+    theme: Theme,
+}
+
+impl CustomInputOverlay {
+    fn new(prompt: String, theme: Theme, commands: Rc<RefCell<EditorRoute>>) -> Self {
+        let mut input = Input::new();
+        let commands_submit = Rc::clone(&commands);
+        input.set_on_submit(move |text| {
+            commands_submit
+                .borrow_mut()
+                .commands
+                .push(InputCommand::CustomInput(text.to_string()));
+        });
+        let commands_esc = Rc::clone(&commands);
+        input.set_on_escape(move || {
+            commands_esc
+                .borrow_mut()
+                .commands
+                .push(InputCommand::SelectorCancelled);
+        });
+        CustomInputOverlay {
+            prompt,
+            input,
+            theme,
+        }
+    }
+
+    fn handle_key(&mut self, key: &KeyEvent) -> bool {
+        self.input.handle_key(key)
+    }
+
+    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+        let border = Style::fg(self.theme.fg(ColorToken::Border));
+        let mut painted = 0u16;
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &Style::default());
+            painted += 1;
+        }
+        if height > painted {
+            buf.write(
+                x + 1,
+                y + painted,
+                &Style::fg(self.theme.fg(ColorToken::Accent)),
+                &self.prompt,
+            );
+            painted += 1;
+        }
+        if height > painted {
+            let n = self
+                .input
+                .render(buf, x + 1, y + painted, width - 2, height - painted);
+            painted += n;
+        }
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &Style::default());
+            painted += 1;
+        }
+        if height > painted {
+            buf.fill(x, y + painted, width, 1, &border);
+            painted += 1;
+        }
+        painted
+    }
 }
 
 /// UI state container for one autocomplete session (autocomplete-wiring-fix) — holds the completion provider and a row snapshot at trigger time,
@@ -292,6 +512,7 @@ impl InteractiveUi {
             provider,
             autocomplete_max_visible: max_visible,
             autocomplete: None,
+            selector: None,
         }
     }
 
@@ -308,6 +529,11 @@ impl InteractiveUi {
         //    Changes go through panel callbacks (persistence writes directly to disk) → local preferences take effect immediately / runtime changes forwarded to the main task.
         if self.panel.is_some() {
             return self.handle_panel_key(key);
+        }
+        // 0.2 Selector overlay (T-AP-08-5): on mount, key presses are routed first (session/tree/fork/option popups);
+        //     callbacks go via route push commands → this method collects them uniformly and forwards them to the main task.
+        if self.selector.is_some() {
+            return self.handle_selector_key(key);
         }
         // 0.5 Completion overlay (autocomplete-wiring-fix): while completion is active, keys go through the overlay first
         //     (Esc closes / Up-Down moves / Enter applies and may auto-submit / Tab applies / any other key closes and falls back to the editor).
@@ -707,6 +933,215 @@ impl InteractiveUi {
         self.panel = Some(component);
     }
 
+    // ── T-AP-08-5: Selector overlay (session/tree/fork/option/custom input) ──
+
+    /// Selector overlay key routing (handle_key is called after the panel, before the editor):
+    /// first take leftover route commands, then pass the key to the selector (callbacks may push new commands via route),
+    /// finally take the new commands and forward them to the main task — "while a selector is open, keys go to the selector first; selection/cancel returns via commands".
+    fn handle_selector_key(&mut self, key: &KeyEvent) -> Option<InputCommand> {
+        let stale = self.route.borrow_mut().commands.pop();
+        if let Some(sel) = self.selector.as_mut() {
+            sel.handle_key(key);
+        }
+        let fresh = self.route.borrow_mut().commands.pop();
+        fresh.or(stale)
+    }
+
+    /// Mount the session selector (/resume): build the component from the preloaded current/all lists + callbacks on this task side;
+    /// rename → append session_info (via `append_session_info`), delete → `delete_session` + remove from list.
+    fn open_session_selector(&mut self, current: Vec<SessionListing>, all: Vec<SessionListing>) {
+        let commands = Rc::clone(&self.route);
+        let current_cell = Rc::new(RefCell::new(current));
+        let all_cell = Rc::new(RefCell::new(all));
+        let loader_current: SessionListLoader = {
+            let cell = Rc::clone(&current_cell);
+            Box::new(
+                move |_p: &mut dyn FnMut(crate::session::session_listing::SessionListProgress)| {
+                    cell.borrow().clone()
+                },
+            )
+        };
+        let loader_all: SessionListLoader = {
+            let cell = Rc::clone(&all_cell);
+            Box::new(
+                move |_p: &mut dyn FnMut(crate::session::session_listing::SessionListProgress)| {
+                    cell.borrow().clone()
+                },
+            )
+        };
+        let on_select = {
+            let commands = Rc::clone(&commands);
+            Box::new(move |path: String| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorSelected(path));
+            })
+        };
+        let on_cancel = {
+            let commands = Rc::clone(&commands);
+            Box::new(move || {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorCancelled);
+            })
+        };
+        let on_delete = {
+            let current_cell = Rc::clone(&current_cell);
+            let all_cell = Rc::clone(&all_cell);
+            Some(Box::new(move |path: String| {
+                let _ = crate::session::jsonl::delete_session(std::path::Path::new(&path));
+                current_cell
+                    .borrow_mut()
+                    .retain(|l| l.path.to_string_lossy() != path);
+                all_cell
+                    .borrow_mut()
+                    .retain(|l| l.path.to_string_lossy() != path);
+            }) as Box<dyn FnMut(String)>)
+        };
+        let rename_session = {
+            // Rename goes through SessionManager::open + append_session_info (root uses the default session directory)
+            Some(Box::new(move |path: String, name: Option<&str>| {
+                if let Ok(root) = crate::config::get_sessions_dir() {
+                    if let Ok(mgr) = crate::session::session_manager::SessionManager::open(
+                        std::path::Path::new(&path),
+                        None,
+                        &root,
+                    ) {
+                        mgr.append_session_info(name);
+                    }
+                }
+            }) as Box<dyn FnMut(String, Option<&str>)>)
+        };
+        self.selector = Some(SelectorOverlay::Session(SessionSelectorComponent::new(
+            loader_current,
+            loader_all,
+            None,
+            self.theme.clone(),
+            self.kb.clone(),
+            on_select,
+            on_cancel,
+            rename_session,
+            on_delete,
+        )));
+    }
+
+    /// Mount tree selector (/tree and double Esc): full entry snapshot + current leaf + initial selection + filter mode.
+    fn open_tree_selector(
+        &mut self,
+        entries: Vec<SessionTreeEntry>,
+        leaf_id: Option<String>,
+        initial_selected_id: Option<String>,
+        filter_mode: FilterMode,
+    ) {
+        let commands = Rc::clone(&self.route);
+        let on_select = {
+            let commands = Rc::clone(&commands);
+            Some(Box::new(move |id: String| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorSelected(id));
+            }) as Box<dyn FnMut(String)>)
+        };
+        let on_cancel = {
+            let commands = Rc::clone(&commands);
+            Some(Box::new(move || {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorCancelled);
+            }) as Box<dyn FnMut()>)
+        };
+        let on_label_change = {
+            let commands = Rc::clone(&commands);
+            Some(Box::new(move |id: String, label: Option<String>| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::LabelChange {
+                        target_id: id,
+                        label,
+                    });
+            }) as Box<dyn FnMut(String, Option<String>)>)
+        };
+        // Terminal height injection: the component uses `max(5, height/2)` as the visible budget (reserved for T-AP-11-2).
+        let terminal_height = self.selector_height_hint();
+        self.selector = Some(SelectorOverlay::Tree(TreeSelectorComponent::new(
+            entries,
+            leaf_id.as_deref(),
+            terminal_height,
+            self.theme.clone(),
+            self.kb.clone(),
+            on_select,
+            on_cancel,
+            on_label_change,
+            initial_selected_id,
+            filter_mode,
+        )));
+    }
+
+    /// Mount user message selector (/fork): user message list snapshot.
+    fn open_user_message_selector(
+        &mut self,
+        messages: Vec<UserMessageListItem>,
+        initial_selected_id: Option<String>,
+    ) {
+        let commands = Rc::clone(&self.route);
+        let on_select = {
+            let commands = Rc::clone(&commands);
+            Some(Box::new(move |id: String| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorSelected(id));
+            }) as Box<dyn FnMut(String)>)
+        };
+        let on_cancel = {
+            let commands = Rc::clone(&commands);
+            Some(Box::new(move || {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorCancelled);
+            }) as Box<dyn FnMut()>)
+        };
+        self.selector = Some(SelectorOverlay::UserMessage(
+            UserMessageSelectorComponent::new(
+                messages,
+                self.theme.clone(),
+                on_select,
+                on_cancel,
+                initial_selected_id,
+            ),
+        ));
+    }
+
+    /// Mount the generic option popup (summary prompt / missing-cwd Continue-Cancel).
+    fn open_choice(&mut self, title: String, options: Vec<String>) {
+        self.selector = Some(SelectorOverlay::Choice(ChoiceOverlay::new(
+            title,
+            options,
+            self.theme.clone(),
+            Rc::clone(&self.route),
+        )));
+    }
+
+    /// Mount the custom summary instruction input popup.
+    fn open_custom_input(&mut self, prompt: String) {
+        self.selector = Some(SelectorOverlay::CustomInput(CustomInputOverlay::new(
+            prompt,
+            self.theme.clone(),
+            Rc::clone(&self.route),
+        )));
+    }
+
+    /// Terminal height hint for the tree selector (for the component's visible budget; under scrollback use the current canvas height).
+    fn selector_height_hint(&self) -> u16 {
+        24
+    }
+
     /// Build panel callback set (T-AP-02-3-fix): persisted -> `update_global` synchronous write-to-disk (silent no-op when settings are unavailable);
     /// local immediate-effect -> `panel_prefs`; runtime -> `panel_apply` (theme/thinking);
     /// steering/follow_up/skill commands/tree filtering are v1 no-ops (no runtime sink, see fix doc).
@@ -955,6 +1390,39 @@ impl InteractiveUi {
                 self.sync_bash_mode();
             }
             UiEvent::OpenSettings(config) => self.open_settings_panel(config),
+            // T-AP-08-5: selector mount/unmount/summary line/session switch
+            UiEvent::OpenSessionSelector { current, all } => {
+                self.open_session_selector(current, all);
+            }
+            UiEvent::OpenTreeSelector {
+                entries,
+                leaf_id,
+                initial_selected_id,
+                filter_mode,
+            } => self.open_tree_selector(entries, leaf_id, initial_selected_id, filter_mode),
+            UiEvent::OpenUserMessageSelector {
+                messages,
+                initial_selected_id,
+            } => self.open_user_message_selector(messages, initial_selected_id),
+            UiEvent::OpenChoice { title, options } => self.open_choice(title, options),
+            UiEvent::OpenCustomInput { prompt } => self.open_custom_input(prompt),
+            UiEvent::CloseSelector => {
+                self.selector = None;
+            }
+            UiEvent::BranchSummaryRow { summary } => {
+                // Append-only UI deviation (same type as T-AP-04-3): after navigation completes, append a summary line without rebuilding the chat
+                self.chat_rows.push(ChatRow::BranchSummary { summary });
+            }
+            UiEvent::ChatReset => {
+                self.chat_rows.clear();
+                self.pending_rows.clear();
+                self.streaming_index = None;
+                self.bash_index = None;
+                self.tool_indices.clear();
+                self.status = None;
+                self.status_indicator = None;
+            }
+            UiEvent::RestoreHistory { messages } => self.apply_restore_history(messages),
         }
     }
 
@@ -1000,8 +1468,8 @@ impl InteractiveUi {
                 self.status_indicator =
                     Some(StatusIndicator::branch_summary(&self.kb, &self.theme));
             }
-            StatusSpec::Error(_) | StatusSpec::Warning(_) => {
-                // Semantic colors drawn directly; no persistent instances.
+            StatusSpec::Info(_) | StatusSpec::Error(_) | StatusSpec::Warning(_) => {
+                // Static/semantic colors drawn directly, no persistent instance.
                 self.status_indicator = None;
             }
         }
@@ -1031,7 +1499,10 @@ impl InteractiveUi {
             Some(StatusSpec::BranchSummary) => {
                 Some(StatusIndicator::branch_summary(&self.kb, &self.theme))
             }
-            Some(StatusSpec::Error(_)) | Some(StatusSpec::Warning(_)) | None => None,
+            Some(StatusSpec::Error(_))
+            | Some(StatusSpec::Warning(_))
+            | Some(StatusSpec::Info(_))
+            | None => None,
         };
     }
 
@@ -1056,6 +1527,10 @@ impl InteractiveUi {
         }
         let theme = &self.theme;
         match &self.status {
+            Some(StatusSpec::Info(msg)) => {
+                let style = Style::fg(theme.fg(ColorToken::Muted));
+                buf.write(0, y, &style, msg);
+            }
             Some(StatusSpec::Error(msg)) => {
                 let style = Style::fg(theme.fg(ColorToken::Error));
                 buf.write(0, y, &style, msg);
@@ -1067,6 +1542,24 @@ impl InteractiveUi {
             _ => {
                 let mut idle = IdleStatus;
                 let _ = idle.render(buf, 0, y, width, height);
+            }
+        }
+    }
+
+    /// Restore session history rendering (T-AP-08-5 fix; aligned with pi renderInitialMessages):
+    /// User → user line (`extract_user_text`), Assistant → final line (non-streaming), ToolResult skipped
+    /// (history has no ToolStart events; tool results are not displayed; deviation recorded). Does not touch streaming indices.
+    fn apply_restore_history(&mut self, messages: Vec<Message>) {
+        for msg in messages {
+            match msg {
+                Message::User(user) => {
+                    let text = extract_user_text(&user);
+                    self.chat_rows.push(ChatRow::User { text });
+                }
+                Message::Assistant(a) => {
+                    self.chat_rows.push(ChatRow::Assistant(a));
+                }
+                Message::ToolResult(_) => {}
             }
         }
     }
@@ -1305,6 +1798,19 @@ impl InteractiveUi {
             panel.render(&mut panel_buf, 0, 0, width, height);
             for r in 0..height {
                 let segs = panel_buf.line_segments(r);
+                if !segs.is_empty() {
+                    canvas.push_line(segs);
+                }
+            }
+            return;
+        }
+        // Selector overlay (T-AP-08-5): full-screen rendering (aligned with panel bridging; message history remains after close).
+        if let Some(sel) = self.selector.as_mut() {
+            let height = canvas.height();
+            let mut sel_buf = ScreenBuffer::new(width, height);
+            sel.render(&mut sel_buf, 0, 0, width, height);
+            for r in 0..height {
+                let segs = sel_buf.line_segments(r);
                 if !segs.is_empty() {
                     canvas.push_line(segs);
                 }
@@ -2151,6 +2657,10 @@ mod tests {
         // Error → drawn directly in semantic color, no persistent instance
         u.apply(UiEvent::Status(StatusSpec::Error("boom".into())));
         assert!(u.status_indicator.is_none());
+        // Info → static hint (no spinner), terminal-state message such as "Navigated to selected point"
+        u.apply(UiEvent::Status(StatusSpec::Info("Navigated".into())));
+        assert!(matches!(u.status, Some(StatusSpec::Info(_))));
+        assert!(u.status_indicator.is_none());
         // ClearStatus → clear the snapshot and the instance
         u.apply(UiEvent::Status(StatusSpec::Working {
             message: "again".into(),
@@ -2807,5 +3317,189 @@ mod tests {
                 assert!(u.autocomplete.is_none(), "No candidates → poll off, stay silent");
             })
             .await;
+    }
+
+    // ── T-AP-08-5: selector overlay / summary row / session switching ──────────────────
+
+    #[test]
+    fn chat_reset_clears_chat_and_streaming_state() {
+        let mut u = ui();
+        // Seed two messages + one streaming row first
+        u.apply(UiEvent::MessageStart(zen_ai::types::Message::User(
+            user_message("hello"),
+        )));
+        u.apply(UiEvent::MessageStart(zen_ai::types::Message::Assistant(
+            assistant(vec![text_block("streaming")], StopReason::Stop),
+        )));
+        assert!(!u.chat_rows.is_empty());
+        assert!(u.streaming_index.is_some());
+
+        u.apply(UiEvent::ChatReset);
+        assert!(u.chat_rows.is_empty(), "ChatReset clears chat line");
+        assert!(u.streaming_index.is_none());
+        assert!(u.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn branch_summary_row_appends_summary_line() {
+        let mut u = ui();
+        u.apply(UiEvent::BranchSummaryRow {
+            summary: "explored branch".to_string(),
+        });
+        let row = u.chat_rows.last().unwrap();
+        match row {
+            ChatRow::BranchSummary { summary } => assert_eq!(summary, "explored branch"),
+            _ => panic!("expected BranchSummary row"),
+        }
+    }
+
+    #[test]
+    fn choice_overlay_mounts_and_selects() {
+        let mut u = ui();
+        u.apply(UiEvent::OpenChoice {
+            title: "Summarize branch?".to_string(),
+            options: vec!["No summary".into(), "Summarize".into()],
+        });
+        assert!(u.selector.is_some());
+        // ↓ Move to second item → Enter → ChoiceSelected(1)
+        assert!(u.handle_key(&press(KeyCode::Down)).is_none());
+        let cmd = u.handle_key(&press(KeyCode::Enter)).expect("Should send selection");
+        assert_eq!(cmd, InputCommand::ChoiceSelected(1));
+        // Main task sends back CloseSelector → unmount
+        u.apply(UiEvent::CloseSelector);
+        assert!(u.selector.is_none());
+    }
+
+    #[test]
+    fn choice_overlay_escape_cancels() {
+        let mut u = ui();
+        u.apply(UiEvent::OpenChoice {
+            title: "t".to_string(),
+            options: vec!["Continue".into(), "Cancel".into()],
+        });
+        let cmd = u.handle_key(&press(KeyCode::Esc)).expect("Should send cancellation");
+        assert_eq!(cmd, InputCommand::SelectorCancelled);
+    }
+
+    #[test]
+    fn custom_input_overlay_submits_and_cancels() {
+        let mut u = ui();
+        u.apply(UiEvent::OpenCustomInput {
+            prompt: "Custom instructions".to_string(),
+        });
+        assert!(matches!(u.selector, Some(SelectorOverlay::CustomInput(_))));
+        // Type + Enter → CustomInput(text)
+        for c in "focus".chars() {
+            let _ = u.handle_key(&char_key(c));
+        }
+        let cmd = u.handle_key(&press(KeyCode::Enter)).expect("Should send command");
+        assert_eq!(cmd, InputCommand::CustomInput("focus".to_string()));
+    }
+
+    #[test]
+    fn session_selector_mounts_and_selects_path() {
+        let mut u = ui();
+        let listing = SessionListing::new(
+            "s1".into(),
+            PathBuf::from("/tmp/s1.jsonl"),
+            "/work".into(),
+            None,
+            None,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            1,
+            "first".into(),
+            "text".into(),
+        );
+        u.apply(UiEvent::OpenSessionSelector {
+            current: vec![listing],
+            all: vec![],
+        });
+        assert!(matches!(u.selector, Some(SelectorOverlay::Session(_))));
+        // Enter selects first item → SelectorSelected(path)
+        let cmd = u.handle_key(&press(KeyCode::Enter)).expect("Should send path");
+        assert_eq!(
+            cmd,
+            InputCommand::SelectorSelected("/tmp/s1.jsonl".to_string())
+        );
+    }
+
+    #[test]
+    fn tree_selector_mounts_with_entries() {
+        let mut u = ui();
+        let entry = SessionTreeEntry::Message {
+            id: "e1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            message: zen_ai::types::Message::User(user_message("hello")),
+        };
+        u.apply(UiEvent::OpenTreeSelector {
+            entries: vec![entry],
+            leaf_id: Some("e1".into()),
+            initial_selected_id: None,
+            filter_mode: FilterMode::Default,
+        });
+        assert!(matches!(u.selector, Some(SelectorOverlay::Tree(_))));
+        // Esc → SelectorCancelled
+        let cmd = u.handle_key(&press(KeyCode::Esc)).expect("Should send cancellation");
+        assert_eq!(cmd, InputCommand::SelectorCancelled);
+    }
+
+    #[test]
+    fn restore_history_renders_user_assistant_and_skips_tool_result() {
+        let mut u = ui();
+        u.apply(UiEvent::RestoreHistory {
+            messages: vec![
+                zen_ai::types::Message::User(user_message("hello world")),
+                zen_ai::types::Message::Assistant(assistant(
+                    vec![text_block("assistant reply")],
+                    StopReason::Stop,
+                )),
+                zen_ai::types::Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "read".into(),
+                    content: vec![text_block("file body")],
+                    details: None,
+                    usage: None,
+                    is_error: false,
+                    added_tool_names: None,
+                    timestamp: 0,
+                }),
+            ],
+        });
+        // user + assistant two rows; ToolResult skipped
+        assert_eq!(u.chat_rows.len(), 2);
+        match &u.chat_rows[0] {
+            ChatRow::User { text } => assert_eq!(text, "hello world"),
+            _ => panic!("Line 0 should be user"),
+        }
+        match &u.chat_rows[1] {
+            ChatRow::Assistant(a) => {
+                let text = zen_ai::utils::text::content_text(&a.content, "");
+                assert_eq!(text, "assistant reply");
+            }
+            _ => panic!("Line 1 should be assistant"),
+        }
+        // Restoring history does not touch the streaming index (non-streaming finalized rows)
+        assert!(u.streaming_index.is_none());
+    }
+
+    #[test]
+    fn restore_history_after_chat_reset_refills_rows() {
+        // Switching session: ChatReset clears → RestoreHistory repopulates (queued in order for apply)
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(zen_ai::types::Message::User(
+            user_message("old"),
+        )));
+        u.apply(UiEvent::ChatReset);
+        assert!(u.chat_rows.is_empty());
+        u.apply(UiEvent::RestoreHistory {
+            messages: vec![zen_ai::types::Message::User(user_message("new"))],
+        });
+        assert_eq!(u.chat_rows.len(), 1);
+        match &u.chat_rows[0] {
+            ChatRow::User { text } => assert_eq!(text, "new"),
+            _ => panic!("Should be new session user line"),
+        }
     }
 }

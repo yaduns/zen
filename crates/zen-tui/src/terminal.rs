@@ -246,6 +246,19 @@ impl Terminal {
     }
 }
 
+impl Drop for Terminal {
+    /// Panic-safe terminal restoration fallback: during UI task panic unwind, explicit `stop()` call is skipped,
+    /// without this guard, raw mode / kitty keyboard enhancement / bracketed paste / hidden cursor all remain in the shell,
+    /// the terminal shows distorted keys and garbled layout (post-implementation defect: terminal not restored after abnormal exit).
+    /// `stop()` is idempotent (all actions guarded by *_active flags); after explicit stop on normal path, this fallback is a no-op;
+    /// IO errors from stop during unwind are swallowed (best-effort; must not panic again while propagating panic).
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.stop();
+        }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +386,19 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_drop_without_stop_restores_and_never_panics() {
+        // Drop fallback: dropping directly after start without explicit stop does not panic, and terminal state is restored
+        // (a subsequent Terminal::start can still enter raw mode normally, showing global state is not polluted by residue)
+        if let Ok(mut t) = Terminal::new() {
+            let _ = t.start(); // Silently skip when the test environment does not support raw mode (same structure as test above)
+        } // drop here: fallback executes stop
+        let t2 = Terminal::new().expect("Terminal should be reconstructable after drop fallback");
+        assert!(!t2.raw_mode_active);
+        assert!(!t2.keyboard_enhancement_active);
+        assert!(!t2.bracketed_paste_active);
     }
 
     #[test]

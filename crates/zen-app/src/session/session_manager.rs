@@ -402,6 +402,146 @@ impl SessionManager {
         entry_id
     }
 
+    /// Append a session naming entry (rename callback for the interactive/startup selector)—
+    /// "The user gives a session a display name so the next list can be searched by name."
+    /// `name` is normalized by CR/LF→space + trim (matching pi `name.replace(/[\r\n]+/g, " ").trim()`),
+    /// Empty after cleanup → None (clear naming, matching pi empty-name semantics); returns the new entry id.
+    pub fn append_session_info(&self, name: Option<&str>) -> String {
+        let sanitized = name
+            .map(|n| n.replace(['\r', '\n'], " ").trim().to_string())
+            .filter(|n| !n.is_empty());
+        // 1. Inside the lock: pure in-memory operations (ID generation + tree append)
+        let (entry_id, entry_to_persist, session_file) = {
+            let mut inner = self.inner.lock().unwrap();
+            let entry_id = inner.tree.generate_entry_id();
+            let parent_id = inner.tree.leaf_id().map(|s| s.to_string());
+            let entry = SessionTreeEntry::SessionInfo {
+                id: entry_id.clone(),
+                parent_id,
+                timestamp: create_timestamp(),
+                name: sanitized,
+            };
+            inner.tree.append(entry.clone());
+            let file = if self.persist {
+                inner.session_file.clone()
+            } else {
+                None
+            };
+            (entry_id, entry, file)
+        }; // ← lock released
+
+        // 2. Outside the lock: file I/O (doesn't block other threads)
+        if let Some(path) = session_file {
+            if let Err(e) = append_entry(&path, &entry_to_persist) {
+                tracing::warn!("JSONL append failed (entry in memory only): {e}");
+            }
+        }
+
+        entry_id
+    }
+    // Consumer: T-AP-08-5 (session selector rename callback; /name command later)
+
+    /// Add/remove a label on an entry (tree selector label edit callback)—
+    /// "The user names checkpoints in the session tree so they can later filter/locate by label."
+    /// `label` is None or an empty string after cleanup → delete the label (matching pi passing undefined/empty to clear);
+    /// Target entry does not exist → `SessionManagerError::EntryNotFound` (pi throws "Entry not found").
+    /// Returns the new entry id.
+    pub fn append_label_change(
+        &self,
+        target_id: &str,
+        label: Option<&str>,
+    ) -> Result<String, SessionManagerError> {
+        let label = label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // 1. Inside lock: validation + pure in-memory operations
+        let (entry_id, entry_to_persist, session_file) = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.tree.entries().iter().any(|e| e.id() == target_id) {
+                return Err(SessionManagerError::EntryNotFound(target_id.to_string()));
+            }
+            let entry_id = inner.tree.generate_entry_id();
+            let parent_id = inner.tree.leaf_id().map(|s| s.to_string());
+            let entry = SessionTreeEntry::Label {
+                id: entry_id.clone(),
+                parent_id,
+                timestamp: create_timestamp(),
+                target_id: target_id.to_string(),
+                label,
+            };
+            inner.tree.append(entry.clone());
+            let file = if self.persist {
+                inner.session_file.clone()
+            } else {
+                None
+            };
+            (entry_id, entry, file)
+        }; // ← lock released
+
+        // 2. Outside the lock: file I/O (doesn't block other threads)
+        if let Some(path) = session_file {
+            if let Err(e) = append_entry(&path, &entry_to_persist) {
+                tracing::warn!("JSONL append failed (entry in memory only): {e}");
+            }
+        }
+
+        Ok(entry_id)
+    }
+    // Consumer: T-AP-08-5 (tree selector on_label_change callback)
+
+    /// Tree navigation wrap-up: write the branch summary entry into the session tree and move the leaf pointer to the target position—
+    /// "Before leaving an exploration branch, summarize this path in one sentence and attach it at the target position, so it can be returned to and understood."
+    /// Matches pi `branchWithSummary(branchFromId, ...)`:
+    /// ① The leaf is first redirected to `new_leaf_id` (None = root, `reset_leaf`; missing entry → EntryNotFound);
+    /// ② Append a BranchSummary entry (parent_id = target position, from_id = target position or "root") and advance the leaf.
+    /// `result` is the output of `generate_branch_summary` (details serialization contract camelCase
+    /// readFiles/modifiedFiles, following the append_compaction precedent); `from_hook` is always false
+    /// (zen has no hook summaries). Returns the BranchSummary entry id.
+    pub fn append_branch_summary(
+        &self,
+        result: &zen_core::compaction::branch::BranchSummaryResult,
+        new_leaf_id: Option<&str>,
+        from_hook: bool,
+    ) -> Result<String, SessionManagerError> {
+        // 1. Inside the lock: leaf redirection + pure in-memory operation
+        let (entry_id, entry_to_persist, session_file) = {
+            let mut inner = self.inner.lock().unwrap();
+            match new_leaf_id {
+                Some(id) => inner.tree.branch(id)?, // EntryNotFound → propagate up
+                None => inner.tree.reset_leaf(),
+            }
+            let entry_id = inner.tree.generate_entry_id();
+            let entry = SessionTreeEntry::BranchSummary {
+                id: entry_id.clone(),
+                parent_id: new_leaf_id.map(|s| s.to_string()),
+                timestamp: create_timestamp(),
+                from_id: new_leaf_id.unwrap_or("root").to_string(),
+                summary: result.summary.clone(),
+                details: Some(branch_summary_details_to_json(result)),
+                usage: result.usage.clone(),
+                from_hook: Some(from_hook),
+            };
+            inner.tree.append(entry.clone());
+            let file = if self.persist {
+                inner.session_file.clone()
+            } else {
+                None
+            };
+            (entry_id, entry, file)
+        }; // ← lock released
+
+        // 2. Outside the lock: file I/O (doesn't block other threads)
+        if let Some(path) = session_file {
+            if let Err(e) = append_entry(&path, &entry_to_persist) {
+                tracing::warn!("JSONL append failed (entry in memory only): {e}");
+            }
+        }
+
+        Ok(entry_id)
+    }
+    // Consumer: T-AP-08-5 (navigation.rs navigate_tree orchestration)
+
     // ── Navigation / read-only access ───────────────────────────────────────────
 
     /// Current session ID (clone; returns owned String after the SessionStore revision).
@@ -575,6 +715,18 @@ fn compaction_details_to_json(details: &CompactionDetails) -> serde_json::Value 
     })
 }
 
+/// Branch summary details serialization (T-AP-08-5) — **key-name contract camelCase `readFiles`/`modifiedFiles`**
+/// (same shape as pi JSONL): the consumer `zen_core::compaction::seed_file_ops_from_details` seeds by these keys
+/// File operation buckets, isomorphic to `compaction_details_to_json` (compaction/branch share the same seeding helper).
+fn branch_summary_details_to_json(
+    result: &zen_core::compaction::branch::BranchSummaryResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "readFiles": result.read_files,
+        "modifiedFiles": result.modified_files,
+    })
+}
+
 impl SessionStore for SessionManager {
     /// Append a message. Called via AgentSession's resident subscription (persisted to disk in real time).
     fn append_message(&self, _message: &Message) {
@@ -603,6 +755,51 @@ impl SessionStore for SessionManager {
     /// Write a compaction entry and redirect the leaf (T-AP-04-3). Delegates to the inherent method, returning the entry id.
     fn append_compaction(&self, result: &CompactionResult, from_hook: bool) -> String {
         self.append_compaction(result, from_hook)
+    }
+    /// Full entry snapshot (T-AP-08-5: data source for the tree selector/fork). Delegates to `get_entries`.
+    fn entries(&self) -> Vec<SessionTreeEntry> {
+        self.get_entries()
+    }
+    /// Current leaf entry id (T-AP-08-5: old-leaf determination for tree navigation). Delegates to the inherent method.
+    fn get_leaf_id(&self) -> Option<String> {
+        self.get_leaf_id()
+    }
+    /// Write a BranchSummary entry and redirect the leaf (T-AP-08-5: navigate_tree finalization).
+    /// Delegates to the inherent method (with leaf-redirect EntryNotFound validation), returns the entry id.
+    fn append_branch_summary(
+        &self,
+        result: &zen_core::compaction::branch::BranchSummaryResult,
+        new_leaf_id: Option<&str>,
+        from_hook: bool,
+    ) -> Result<String, SessionManagerError> {
+        self.append_branch_summary(result, new_leaf_id, from_hook)
+    }
+    /// Move the leaf pointer to the specified entry (T-AP-08-5: navigation without summary). Delegates to the inherent method (inherent takes precedence over trait resolution).
+    fn branch(&self, branch_from_id: &str) -> Result<(), SessionManagerError> {
+        self.branch(branch_from_id)
+    }
+    /// Reset the leaf pointer to None (T-AP-08-5: navigate to root). Delegates to the inherent method.
+    fn reset_leaf(&self) {
+        self.reset_leaf()
+    }
+    /// Set/unset a label (T-AP-08-5: tree selector label callback). Delegates to the inherent method.
+    fn append_label_change(
+        &self,
+        target_id: &str,
+        label: Option<&str>,
+    ) -> Result<String, SessionManagerError> {
+        self.append_label_change(target_id, label)
+    }
+    /// Append a session name (T-AP-08-5: selector rename callback). Delegates to the inherent method.
+    fn append_session_info(&self, name: Option<&str>) -> String {
+        self.append_session_info(name)
+    }
+    /// Extract the root→leaf path into a new session file (T-AP-08-5: /fork//clone). Delegates to the inherent method.
+    fn create_branched_session(
+        &self,
+        leaf_id: &str,
+    ) -> Result<Option<std::path::PathBuf>, SessionManagerError> {
+        self.create_branched_session(leaf_id)
     }
 }
 
@@ -1219,6 +1416,186 @@ mod tests {
             assert!(details.as_ref().unwrap().get("readFiles").is_some());
         } else {
             panic!("expected compaction entry");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── append_session_info / append_label_change / append_branch_summary（T-AP-08-5）───
+
+    #[test]
+    fn test_append_session_info_sets_name_and_clears() {
+        let mgr = SessionManager::in_memory("/proj");
+        mgr.append_message(&user_message("hi"));
+        let id = mgr.append_session_info(Some("  my name  \n"));
+        assert!(!id.is_empty());
+        let entries = mgr.get_entries();
+        if let SessionTreeEntry::SessionInfo { name, .. } = entries.last().unwrap() {
+            // Normalize CR/LF→space + trim
+            assert_eq!(name.as_deref(), Some("my name"));
+        } else {
+            panic!("expected session_info entry");
+        }
+        // Clear: empty name → None
+        mgr.append_session_info(Some("   "));
+        if let SessionTreeEntry::SessionInfo { name, .. } = mgr.get_entries().last().unwrap() {
+            assert!(name.is_none(), "empty name should clear naming");
+        } else {
+            panic!("expected session_info entry");
+        }
+    }
+
+    #[test]
+    fn test_append_label_change_set_and_clear() {
+        let mgr = SessionManager::in_memory("/proj");
+        let m1 = mgr.append_message(&user_message("hi"));
+        let _id = mgr
+            .append_label_change(&m1, Some("checkpoint"))
+            .expect("set label");
+        let entries = mgr.get_entries();
+        if let SessionTreeEntry::Label {
+            target_id, label, ..
+        } = entries.last().unwrap()
+        {
+            assert_eq!(target_id, &m1);
+            assert_eq!(label.as_deref(), Some("checkpoint"));
+        } else {
+            panic!("expected label entry");
+        }
+        // Empty string clears
+        mgr.append_label_change(&m1, Some(""))
+            .expect("clear with empty");
+        if let SessionTreeEntry::Label { label, .. } = mgr.get_entries().last().unwrap() {
+            assert!(label.is_none(), "empty string should clear label");
+        } else {
+            panic!("expected label entry");
+        }
+        // Note: id length is not asserted — generate_entry_id's short id is a UUIDv7 timestamp prefix, same millisecond
+        // consecutive generation triggers 100 retries then falls back to a full UUID (existing zen-core quirk, unrelated to this task)
+    }
+
+    #[test]
+    fn test_append_label_change_missing_target_errors() {
+        let mgr = SessionManager::in_memory("/proj");
+        let err = mgr
+            .append_label_change("nope", Some("x"))
+            .expect_err("missing target should error");
+        assert!(matches!(err, SessionManagerError::EntryNotFound(_)));
+    }
+
+    /// Construct a branch summary result (fixed details list, for append_branch_summary tests).
+    fn branch_summary_result(summary: &str) -> zen_core::compaction::branch::BranchSummaryResult {
+        zen_core::compaction::branch::BranchSummaryResult {
+            summary: summary.to_string(),
+            usage: None,
+            read_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            modified_files: vec!["src/c.rs".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_append_branch_summary_redirects_leaf_and_writes_camelcase_details() {
+        let root = test_dir("branch_summary");
+        let mgr = create_in(&root, "/proj", None);
+        let m1 = mgr.append_message(&user_message("one"));
+        let _m2 = mgr.append_message(&user_message("two"));
+
+        // Fork from m1 (redirect the leaf to m1, then attach the summary entry)
+        let id = mgr
+            .append_branch_summary(&branch_summary_result("explored"), Some(&m1), false)
+            .expect("append branch summary");
+        let entries = mgr.get_entries();
+        assert_eq!(entries.len(), 3);
+        let last = entries.last().unwrap();
+        if let SessionTreeEntry::BranchSummary {
+            from_id,
+            summary,
+            parent_id,
+            details,
+            from_hook,
+            ..
+        } = last
+        {
+            assert_eq!(summary, "explored");
+            assert_eq!(from_id, &m1);
+            assert_eq!(parent_id.as_deref(), Some(m1.as_str()));
+            assert_eq!(*from_hook, Some(false));
+            let details = details.as_ref().unwrap();
+            assert!(
+                details.get("readFiles").is_some(),
+                "readFiles key must be camelCase"
+            );
+            assert!(details.get("modifiedFiles").is_some());
+            assert!(
+                details.get("read_files").is_none(),
+                "Must not contain snake_case keys"
+            );
+        } else {
+            panic!("expected branch_summary entry");
+        }
+        // Leaf advances to the summary entry
+        assert_eq!(mgr.get_leaf_id().as_deref(), Some(id.as_str()));
+        // The next append branches from the summary entry (parent = summary entry)
+        let m3 = mgr.append_message(&user_message("three"));
+        assert_eq!(mgr.get_entry(&m3).unwrap().parent_id(), Some(id.as_str()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_append_branch_summary_none_target_resets_leaf_to_root() {
+        let mgr = SessionManager::in_memory("/proj");
+        mgr.append_message(&user_message("one"));
+        let id = mgr
+            .append_branch_summary(&branch_summary_result("s"), None, false)
+            .expect("append to root");
+        if let SessionTreeEntry::BranchSummary {
+            parent_id, from_id, ..
+        } = mgr.get_entry(&id).unwrap()
+        {
+            assert_eq!(parent_id, None, "None target → parent is root");
+            assert_eq!(
+                from_id, "root",
+                "None target → from_id is root (pi branchWithSummary(null))"
+            );
+        } else {
+            panic!("expected branch_summary entry");
+        }
+    }
+
+    #[test]
+    fn test_append_branch_summary_missing_target_errors() {
+        let mgr = SessionManager::in_memory("/proj");
+        let err = mgr
+            .append_branch_summary(&branch_summary_result("s"), Some("nope"), false)
+            .expect_err("missing target should error");
+        assert!(matches!(
+            err,
+            SessionManagerError::Tree(SessionTreeError::EntryNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_append_branch_summary_roundtrip_persists_details() {
+        // Persist → reopen: BranchSummary entry fields and details camelCase keys are preserved
+        let root = test_dir("branch_summary_roundtrip");
+        let mgr = create_in(&root, "/proj", None);
+        mgr.append_message(&user_message("one"));
+        mgr.append_branch_summary(&branch_summary_result("explored"), None, false)
+            .expect("append");
+        let file = mgr.get_session_file().unwrap();
+        drop(mgr);
+
+        let reopened = SessionManager::open(&file, None, &root).expect("reopen");
+        let entries = reopened.get_entries();
+        assert_eq!(entries.len(), 2);
+        if let SessionTreeEntry::BranchSummary {
+            summary, details, ..
+        } = entries.last().unwrap()
+        {
+            assert_eq!(summary, "explored");
+            let d = details.as_ref().unwrap();
+            assert_eq!(d.get("readFiles").unwrap().as_array().unwrap().len(), 2);
+        } else {
+            panic!("expected branch_summary entry");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -144,6 +144,44 @@ mod tests {
         ) -> String {
             "mock-compaction-id".to_string()
         }
+        fn entries(&self) -> Vec<zen_core::session::tree::SessionTreeEntry> {
+            Vec::new()
+        }
+        fn get_leaf_id(&self) -> Option<String> {
+            None
+        }
+        fn append_branch_summary(
+            &self,
+            _result: &zen_core::compaction::branch::BranchSummaryResult,
+            _new_leaf_id: Option<&str>,
+            _from_hook: bool,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-branch-summary-id".to_string())
+        }
+        fn branch(
+            &self,
+            _branch_from_id: &str,
+        ) -> Result<(), crate::session::session_manager::SessionManagerError> {
+            Ok(())
+        }
+        fn reset_leaf(&self) {}
+        fn append_label_change(
+            &self,
+            _target_id: &str,
+            _label: Option<&str>,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-label-id".to_string())
+        }
+        fn append_session_info(&self, _name: Option<&str>) -> String {
+            "mock-session-info-id".to_string()
+        }
+        fn create_branched_session(
+            &self,
+            _leaf_id: &str,
+        ) -> Result<Option<std::path::PathBuf>, crate::session::session_manager::SessionManagerError>
+        {
+            Ok(None)
+        }
     }
 
     struct MockHooks;

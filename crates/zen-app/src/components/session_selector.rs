@@ -77,12 +77,12 @@ fn shorten_path(path: &str, home: Option<&str>) -> String {
 ///
 /// Scope switch (current/all) triggers a reload; Esc cancels, Enter confirms and returns the path.
 #[allow(clippy::type_complexity)] // Callback fields (Box<dyn FnMut> composition)
-pub struct SessionSelectorComponent<'a> {
+pub struct SessionSelectorComponent {
     current_loader: SessionListLoader,
     all_loader: SessionListLoader,
     current_session_path: Option<String>,
-    theme: &'a Theme,
-    app_kb: &'a KeybindingsManager<AppAction>,
+    theme: Theme,
+    app_kb: KeybindingsManager<AppAction>,
     rename_session: Option<Box<dyn FnMut(String, Option<&str>)>>,
     on_delete: Option<Box<dyn FnMut(String)>>,
     on_select: Box<dyn FnMut(String)>,
@@ -110,21 +110,24 @@ pub struct SessionSelectorComponent<'a> {
     bottom_border: DynamicBorder,
 }
 
-impl<'a> SessionSelectorComponent<'a> {
+impl SessionSelectorComponent {
     /// Construct the selector: pass in current/all loaders, current session path, theme, app keymap, and callbacks.
     /// The corresponding UI behavior is disabled when `rename_session`/`on_delete` is None.
+    /// **Owned (T-AP-08-5)**: theme and app keybinding map are held by value (cloned by the constructor),
+    /// Allows the component to be stored in `InteractiveUi` mount fields (avoids self-referential borrow, following the SettingsSelectorComponent precedent).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn new(
         current_loader: SessionListLoader,
         all_loader: SessionListLoader,
         current_session_path: Option<String>,
-        theme: &'a Theme,
-        app_kb: &'a KeybindingsManager<AppAction>,
+        theme: Theme,
+        app_kb: KeybindingsManager<AppAction>,
         on_select: Box<dyn FnMut(String)>,
         on_cancel: Box<dyn FnMut()>,
         rename_session: Option<Box<dyn FnMut(String, Option<&str>)>>,
         on_delete: Option<Box<dyn FnMut(String)>>,
     ) -> Self {
+        let accent = Style::fg(theme.fg(ColorToken::Accent));
         let mut comp = SessionSelectorComponent {
             current_loader,
             all_loader,
@@ -154,8 +157,8 @@ impl<'a> SessionSelectorComponent<'a> {
             rename_target_path: None,
             focused: true,
             search: Input::new(),
-            top_border: DynamicBorder::new(Style::fg(theme.fg(ColorToken::Accent))),
-            bottom_border: DynamicBorder::new(Style::fg(theme.fg(ColorToken::Accent))),
+            top_border: DynamicBorder::new(accent.clone()),
+            bottom_border: DynamicBorder::new(accent),
         };
         comp.reload();
         comp
@@ -354,9 +357,9 @@ fn filter_and_sort_sessions_raw<'x>(
         .collect()
 }
 
-impl Component for SessionSelectorComponent<'_> {
+impl Component for SessionSelectorComponent {
     fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
-        let theme = self.theme;
+        let theme = &self.theme;
         let mut painted = 0u16;
         // Row advancement macro: remaining always equals height - painted (avoids manual bookkeeping; the macro only advances painted)
         macro_rules! take {
@@ -632,8 +635,8 @@ mod tests {
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
 
-    fn theme() -> &'static Theme {
-        zen_tui::theme::builtin_dark_theme()
+    fn theme() -> Theme {
+        zen_tui::theme::builtin_dark_theme().clone()
     }
 
     fn kb() -> KeybindingsManager<AppAction> {
@@ -682,7 +685,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(move |p| *selected_captured.borrow_mut() = Some(p)),
             Box::new(|| {}),
             None,
@@ -702,7 +705,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(move || *cancelled_captured.borrow_mut() += 1),
             None,
@@ -723,7 +726,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             None,
@@ -743,7 +746,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             None,
@@ -770,7 +773,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             None,
@@ -799,7 +802,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             None,
@@ -830,7 +833,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             None,
@@ -857,7 +860,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             Some(Box::new(move |path, name| {
@@ -884,7 +887,7 @@ mod tests {
             loader(vec![]),
             None,
             theme(),
-            &kb,
+            kb.clone(),
             Box::new(|_| {}),
             Box::new(|| {}),
             None,

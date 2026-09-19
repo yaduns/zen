@@ -1,6 +1,7 @@
 use crate::commands::expand_prompt_input;
 use crate::config::settings::SettingsManager;
 use crate::prompt_templates::LoadedPromptTemplate;
+use crate::session::session_manager::SessionManagerError;
 use crate::skills::LoadedSkill;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -57,8 +58,54 @@ pub trait SessionStore: Send + Sync {
         result: &zen_core::compaction::CompactionResult,
         from_hook: bool,
     ) -> String;
+
+    /// Full entry snapshot (T-AP-08-5) — tree selector display / fork start point collection needs **all** entries
+    /// (`branch_entries` only gives the current branch path). Corresponds to pi `getEntries()`.
+    fn entries(&self) -> Vec<SessionTreeEntry>;
+
+    /// Current leaf entry id (T-AP-08-5) — stale-leaf check for tree navigation and the /clone start point. Corresponds to pi `getLeafId()`.
+    fn get_leaf_id(&self) -> Option<String>;
+
+    /// Tree navigation wrap-up: write a BranchSummary entry and redirect the leaf (T-AP-08-5) —
+    /// after navigate_tree decides to generate a summary for the abandoned segment, attach the summary at the target position.
+    /// Parameter/detail contract see `SessionManager::append_branch_summary` (camelCase readFiles/modifiedFiles);
+    /// missing entry for leaf redirect → `SessionManagerError::EntryNotFound` (pi branchWithSummary throws).
+    /// Returns: new entry id. Corresponds to pi `branchWithSummary`.
+    fn append_branch_summary(
+        &self,
+        result: &zen_core::compaction::branch::BranchSummaryResult,
+        new_leaf_id: Option<&str>,
+        from_hook: bool,
+    ) -> Result<String, SessionManagerError>;
+
+    /// Move the leaf pointer to an existing entry (T-AP-08-5: navigation without summary). Corresponds to pi `branch()`.
+    fn branch(&self, branch_from_id: &str) -> Result<(), SessionManagerError>;
+
+    /// Reset the leaf pointer to None (T-AP-08-5: navigate to root). Corresponds to pi `resetLeaf()`.
+    fn reset_leaf(&self);
+
+    /// Add/remove a label on an entry (T-AP-08-5: tree selector label-edit callback).
+    /// `label` None/empty string clears; missing target → `SessionManagerError::EntryNotFound`.
+    /// Returns the new entry id. Corresponds to pi `appendLabelChange`.
+    fn append_label_change(
+        &self,
+        target_id: &str,
+        label: Option<&str>,
+    ) -> Result<String, SessionManagerError>;
+
+    /// Append a session name (T-AP-08-5: selector rename callback and /name command).
+    /// `name` None/empty after cleanup → clear the name. Returns the new entry id. Corresponds to pi `appendSessionInfo`.
+    fn append_session_info(&self, name: Option<&str>) -> String;
+
+    /// Extract the "root → leaf" path into a new standalone session file (T-AP-08-5: /fork//clone).
+    /// Returns the new session file path (non-persistent session → None). Corresponds to pi `createBranchedSession`.
+    fn create_branched_session(
+        &self,
+        leaf_id: &str,
+    ) -> Result<Option<PathBuf>, SessionManagerError>;
 }
-// Consumers: T-AP-01-1 (subscription closure invoked inside AgentSession), T-AP-01-4 (SessionManager implements this trait)
+// Consumers: T-AP-01-1 (subscription closure inside AgentSession calls it), T-AP-01-4 (SessionManager implements this trait),
+//        T-AP-08-5 (navigation.rs tree navigation orchestration + interactive session switching accessed via Arc<dyn SessionStore>)
 
 /// Higher-level session abstraction shared across modes.
 ///
@@ -521,6 +568,14 @@ pub enum AgentSessionError {
     /// Compaction flow error (summary LLM failure/abort, T-AP-04-3; passes through zen-core `CompactionError`)
     #[error("compaction error: {0}")]
     Compaction(#[from] CompactionError),
+
+    /// Tree navigation target entry does not exist (T-AP-08-5; aligned with pi "Entry not found")
+    #[error("entry not found: {0}")]
+    EntryNotFound(String),
+
+    /// Session tree / persistence operation error (T-AP-08-5 tree navigation write-side: append_branch_summary/branch, etc.)
+    #[error(transparent)]
+    Session(#[from] SessionManagerError),
 }
 
 /// Result snapshot of a one-shot user `!`/`!!` bash execution (T-AP-04-2-fix), for the UI to backfill `ChatRow::Bash`.
@@ -642,6 +697,40 @@ mod tests {
             _from_hook: bool,
         ) -> String {
             "mock-compaction-id".to_string()
+        }
+        fn entries(&self) -> Vec<SessionTreeEntry> {
+            Vec::new()
+        }
+        fn get_leaf_id(&self) -> Option<String> {
+            None
+        }
+        fn append_branch_summary(
+            &self,
+            _result: &zen_core::compaction::branch::BranchSummaryResult,
+            _new_leaf_id: Option<&str>,
+            _from_hook: bool,
+        ) -> Result<String, SessionManagerError> {
+            Ok("mock-branch-summary-id".to_string())
+        }
+        fn branch(&self, _branch_from_id: &str) -> Result<(), SessionManagerError> {
+            Ok(())
+        }
+        fn reset_leaf(&self) {}
+        fn append_label_change(
+            &self,
+            _target_id: &str,
+            _label: Option<&str>,
+        ) -> Result<String, SessionManagerError> {
+            Ok("mock-label-id".to_string())
+        }
+        fn append_session_info(&self, _name: Option<&str>) -> String {
+            "mock-session-info-id".to_string()
+        }
+        fn create_branched_session(
+            &self,
+            _leaf_id: &str,
+        ) -> Result<Option<std::path::PathBuf>, SessionManagerError> {
+            Ok(None)
         }
     }
 

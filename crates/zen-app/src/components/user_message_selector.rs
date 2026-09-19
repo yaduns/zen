@@ -10,6 +10,7 @@ use zen_tui::theme::{ColorToken, Theme};
 use zen_tui::wrap::truncate_to_width;
 
 /// List item of user-message-selector (contains entry id and single-line text). Plain data, same subject.
+#[derive(Debug, Clone)]
 pub struct UserMessageListItem {
     /// Session entry id (selected callback payload).
     pub id: String,
@@ -19,22 +20,22 @@ pub struct UserMessageListItem {
 
 /// Fork start-point selection overlay: list of historical user messages + cursor/scroll + "Message n of m" metadata line —
 /// T-AP-11-1 select a message when forking/continuing; Enter returns the entry id, Esc cancels.
-pub struct UserMessageSelectorComponent<'a> {
+pub struct UserMessageSelectorComponent {
     messages: Vec<UserMessageListItem>,
     selected_index: usize,
     max_visible: usize,
-    theme: &'a Theme,
+    theme: Theme,
     on_select: Option<Box<dyn FnMut(String)>>,
     on_cancel: Option<Box<dyn FnMut()>>,
     top_border: DynamicBorder,
     bottom_border: DynamicBorder,
 }
 
-impl<'a> UserMessageSelectorComponent<'a> {
+impl UserMessageSelectorComponent {
     /// Constructed from the message list, theme, and callback; preselects when `initial_selected_id` matches, otherwise selects the most recent one.
     pub fn new(
         messages: Vec<UserMessageListItem>,
-        theme: &'a Theme,
+        theme: Theme,
         on_select: Option<Box<dyn FnMut(String)>>,
         on_cancel: Option<Box<dyn FnMut()>>,
         initial_selected_id: Option<String>,
@@ -46,6 +47,7 @@ impl<'a> UserMessageSelectorComponent<'a> {
                 .unwrap_or_else(|| messages.len().saturating_sub(1)),
             None => messages.len().saturating_sub(1),
         };
+        let border = Style::fg(theme.fg(ColorToken::Border));
         UserMessageSelectorComponent {
             messages,
             selected_index,
@@ -53,8 +55,8 @@ impl<'a> UserMessageSelectorComponent<'a> {
             theme,
             on_select,
             on_cancel,
-            top_border: DynamicBorder::new(Style::fg(theme.fg(ColorToken::Border))),
-            bottom_border: DynamicBorder::new(Style::fg(theme.fg(ColorToken::Border))),
+            top_border: DynamicBorder::new(border.clone()),
+            bottom_border: DynamicBorder::new(border),
         }
     }
 
@@ -73,9 +75,9 @@ impl<'a> UserMessageSelectorComponent<'a> {
     }
 }
 
-impl Component for UserMessageSelectorComponent<'_> {
+impl Component for UserMessageSelectorComponent {
     fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
-        let theme = self.theme;
+        let theme = &self.theme;
         let accent = Style::fg(theme.fg(ColorToken::Accent));
         let muted = Style::fg(theme.fg(ColorToken::Muted));
         let mut painted = 0u16;
@@ -223,8 +225,8 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn theme() -> &'static Theme {
-        zen_tui::theme::builtin_dark_theme()
+    fn theme() -> Theme {
+        zen_tui::theme::builtin_dark_theme().clone()
     }
 
     fn items() -> Vec<UserMessageListItem> {

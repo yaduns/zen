@@ -20,23 +20,27 @@ use crate::components::footer::FooterData;
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::status_indicator::CompactionStatusReason;
 use crate::components::tree_selector::FilterMode;
+use crate::components::user_message_selector::UserMessageListItem;
 use crate::config;
 use crate::config::defaults::{SettingsEffective, DEFAULT_THINKING_LEVEL};
-use crate::config::settings::{
-    DoubleEscapeAction as PersistedDoubleEscape, SettingsData, SettingsManager,
-};
+use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
 use crate::modes::interactive::ui::{InteractiveUi, UiPrefs};
 use crate::modes::print_mode::stop_error_message;
 use crate::output::footer_data::FooterDataProvider;
 use crate::output::usage_totals::{add_usage_to_totals, UsageTotals};
 use crate::session::agent_session::{AgentSession, AgentSessionError};
-use crate::session::runtime::AgentSessionRuntime;
-use crate::session::session_manager::SessionManagerError;
+use crate::session::jsonl::CreateSessionOptions;
+use crate::session::navigation::NavigateTreeOptions;
+use crate::session::runtime::{AgentSessionRuntime, SessionStartReason};
+use crate::session::services::assemble_runtime_from_session_manager;
+use crate::session::session_listing::{build_all_session_listings, build_session_listings};
+use crate::session::session_manager::{SessionManager, SessionManagerError};
+use crate::session::{format_missing_session_cwd_prompt, get_missing_session_cwd_issue};
 use crate::theme::{ControllerError, ThemeController};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionResult;
 use zen_ai::types::{ImageContent, Message, ThinkingLevel};
 use zen_core::harness::types::AgentEvent;
+use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop, WakeOutcome};
 use zen_tui::keybindings::{editor_default_bindings, select_default_bindings, KeybindingsManager};
 use zen_tui::keys::{
@@ -145,6 +150,37 @@ pub(crate) enum UiEvent {
     TerminalTitle(String),
     /// Editor content restore (follow-up queue return / batch restore / clear).
     EditorSetText(String),
+    /// Mount session selector (/resume): preloads list snapshots for the current/all paths.
+    OpenSessionSelector {
+        current: Vec<crate::session::session_listing::SessionListing>,
+        all: Vec<crate::session::session_listing::SessionListing>,
+    },
+    /// Mount tree selector (/tree and double Esc): full entry snapshot + current leaf + initial selection + filter mode.
+    OpenTreeSelector {
+        entries: Vec<SessionTreeEntry>,
+        leaf_id: Option<String>,
+        initial_selected_id: Option<String>,
+        filter_mode: FilterMode,
+    },
+    /// Mount user message selector (/fork): user message list snapshot.
+    OpenUserMessageSelector {
+        messages: Vec<UserMessageListItem>,
+        initial_selected_id: Option<String>,
+    },
+    /// Generic option popup (summary question / cwd-missing Continue-Cancel): option list display, Enter to select.
+    OpenChoice { title: String, options: Vec<String> },
+    /// Custom summary instruction input popup (zen-tui Input, Enter to submit / Esc to cancel).
+    OpenCustomInput { prompt: String },
+    /// Close the current selector/popup (main task sends after select/cancel/orchestration completes).
+    CloseSelector,
+    /// Append branch summary line after tree navigation completes (text source = `NavigateTreeResult.summary`).
+    BranchSummaryRow { summary: String },
+    /// Clear chat and streaming state after session switch (/new//fork//clone//resume).
+    ChatReset,
+    /// Restore session history as chat lines (after startup/switch the main task sends an `agent.messages()` snapshot) —
+    /// Aligned with pi `renderInitialMessages`: restored user/assistant messages render as final lines,
+    /// ToolResult skipped (history has no ToolStart events, tool results not shown; logged deviation).
+    RestoreHistory { messages: Vec<Message> },
 }
 
 /// status line spec: `InteractiveUi::apply` (`apply_status`) maintains a persistent `StatusIndicator`
@@ -164,8 +200,10 @@ pub(crate) enum StatusSpec {
     /// Context compaction in progress (reason mapped from the compaction event payload; status text varies by Manual/Threshold/Overflow).
     Compaction { reason: CompactionStatusReason },
     /// Branch summary generation in progress.
-    #[allow(dead_code)] // v1 has no fork/branch digest (wire up after T-AP-08-5 lands)
     BranchSummary,
+    /// Static status line (no spinner; terminal hints such as "Navigated to selected point" — aligned with pi
+    /// `showStatus` no-spinner semantics; spinner belongs to Working/Retry/Compaction/BranchSummary busy states).
+    Info(String),
     /// Error hint line (semantic colors drawn directly).
     Error(String),
     /// Warning hint line (semantic colors drawn directly).
@@ -204,6 +242,19 @@ pub(crate) enum InputCommand {
     CtrlC,
     /// Ctrl+D: exit when the editor is empty.
     CtrlD,
+    /// Selector selected (payload = selected path/entry id; router discriminates source by `active_selector`).
+    SelectorSelected(String),
+    /// Selector/popup dismissed (top-level Esc).
+    SelectorCancelled,
+    /// Tree selector label edit (persistence via `session_store.append_label_change`).
+    LabelChange {
+        target_id: String,
+        label: Option<String>,
+    },
+    /// Generic choice popup selection (index refers to `OpenChoice.options`; router discriminates by `pending_choice`).
+    ChoiceSelected(usize),
+    /// Custom summary instruction submitted (Enter in OpenCustomInput).
+    CustomInput(String),
 }
 
 /// Runtime settings panel change categories (T-AP-02-3-fix): persistence is handled by the UI-side callback,
@@ -233,7 +284,7 @@ pub enum InteractiveModeError {
     /// Theme controller errors (`ThemeController::new` / watcher).
     #[error(transparent)]
     Theme(#[from] ControllerError),
-    /// Session management error (resume hints on shutdown paths; seam reserved for T-AP-08-5).
+    /// Session management error (resume prompt and other shutdown paths; T-AP-08-5 closed: /resume selector and switch orchestration consume it).
     #[error(transparent)]
     Session(#[from] SessionManagerError),
     /// Signal registration errors (`tokio::signal` failure, `register_signal_handlers`).
@@ -299,6 +350,34 @@ pub struct InteractiveMode {
     signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Exit code written by the signal task (0 = no signal received; SIGTERM→143 / SIGHUP→129).
     signal_exit_code: Arc<AtomicI32>,
+    /// Category of the currently mounted selector (/resume→Session, /tree→Tree, /fork→UserMessage),
+    /// used to route the source of `SelectorSelected` payloads (T-AP-08-5).
+    active_selector: Option<ActiveSelector>,
+    /// Pending intent of the generic choice popup (summary question / missing-cwd Continue-Cancel / custom instruction input),
+    /// routes `ChoiceSelected`/`CustomInput` (T-AP-08-5).
+    pending_choice: Option<PendingChoice>,
+}
+
+/// Source category of the mounted selector (`active_selector`; T-AP-08-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSelector {
+    /// Session selector (/resume): selected payload = session file path.
+    Session,
+    /// Tree selector (/tree, double-Esc tree): selected payload = entry id.
+    Tree,
+    /// User message selector (/fork, double-Esc fork): selected payload = entry id.
+    UserMessage,
+}
+
+/// Pending intent of the generic choice popup (`pending_choice`; T-AP-08-5).
+#[derive(Debug, Clone)]
+enum PendingChoice {
+    /// Summary question in tree navigation (options: No summary / Summarize / Summarize with custom prompt).
+    Summarize { target_id: String },
+    /// Custom summary instruction input active (OpenCustomInput mounted; Enter submits the text, then navigates).
+    CustomSummary { target_id: String },
+    /// Continue/Cancel for missing cwd (options: Continue / Cancel); Continue reopens with a fallback.
+    MissingCwd { path: String, fallback: String },
 }
 
 impl InteractiveMode {
@@ -339,6 +418,8 @@ impl InteractiveMode {
             usage_totals: Arc::new(Mutex::new(UsageTurnState::default())),
             signal_task: None,
             signal_exit_code: Arc::new(AtomicI32::new(0)),
+            active_selector: None,
+            pending_choice: None,
         }
     }
 
@@ -566,6 +647,17 @@ impl InteractiveMode {
             );
         }
 
+        // 5.5 Restore history rendering (T-AP-08-5 fix): render the session history fed back by `set_messages` as chat rows —
+        //    aligned with pi `renderInitialMessages`; chat_rows starts empty, restored user/assistant
+        //    Messages must be explicitly populated (previously, after --continue/--resume/--session recovery, the UI was blank,
+        //    only when the LLM context is complete).
+        let history = self.runtime.session.agent.messages();
+        if !history.is_empty() {
+            let _ = self
+                .ui_event_tx
+                .send(UiEvent::RestoreHistory { messages: history });
+        }
+
         self.is_initialized = true;
         Ok(())
     }
@@ -666,6 +758,20 @@ impl InteractiveMode {
                                 self.exit_requested = true;
                             }
                         }
+                        // T-AP-08-5: Selector/overlay result routing
+                        Some(InputCommand::SelectorSelected(id)) => {
+                            self.handle_selector_selected(id).await;
+                        }
+                        Some(InputCommand::SelectorCancelled) => self.handle_selector_cancelled(),
+                        Some(InputCommand::LabelChange { target_id, label }) => {
+                            self.handle_label_change(&target_id, label);
+                        }
+                        Some(InputCommand::ChoiceSelected(idx)) => {
+                            self.handle_choice_selected(idx).await;
+                        }
+                        Some(InputCommand::CustomInput(text)) => {
+                            self.handle_custom_input(text).await;
+                        }
                         None => break, // UI task has already ended (channel closed)
                     }
                     if self.exit_requested {
@@ -750,7 +856,7 @@ impl InteractiveMode {
         }
 
         // 4. Resume hint (not printed on the signal path, aligned with pi shutdown's fromSignal branch; wording aligned with
-        //    `--resume` semantics — the path for `--session <path>` requires T-AP-08-5's session tree to land before it can be assembled).
+        //    `--resume` semantics — the path hint for `--session <path>` is handled by the T-AP-08-5 selector interaction).
         if !from_signal {
             eprintln!("To resume this session, run: zen --resume");
         }
@@ -869,13 +975,14 @@ impl InteractiveMode {
             AppAction::MessageDequeue => {
                 self.show_warning("No queued messages to restore (queue pop pending)")
             }
-            // Session selector/tree actions: activate after T-AP-08-5 lands
-            _ => self.show_warning("Not available in v1 (session selectors land in T-AP-08-5)"),
+            // Session/tree selector internal actions (session.*/tree.*) are routed via app_kb within the component (T-AP-08-5);
+            //    Theoretically unreachable here (the editor does not bind these keys); a fallback hint avoids silently swallowing keys.
+            _ => self.show_warning("Action not available here (use /tree /fork /resume)"),
         }
     }
 
-    /// Esc context-sensitive handling (pi onEscape): abort while streaming; idle records double-click window
-    /// (500ms, no tree/fork selector in v1; double-click shows a hint).
+    /// Double-press Esc: read settings gate (T-AP-02-3-fix). tree → tree selector; fork → user message selector
+    /// (real wiring for T-AP-08-5); settings being none (unset) defaults to pi's tree.
     fn handle_escape(&mut self) {
         let now = Instant::now();
         let is_double = self
@@ -886,11 +993,11 @@ impl InteractiveMode {
             self.runtime.session.abort();
             self.show_status("Aborting...");
         } else if is_double {
-            // Double Esc: read settings gate (T-AP-02-3-fix). v1 has no session tree/fork UI;
-            // tree/fork target action existence falls under T-AP-08-5; settings none (unset) defaults to tree per pi.
             match self.double_escape_action {
                 Some(PersistedDoubleEscape::None) => {}
-                _ => self.show_warning("Double-Esc (tree/fork) is not available in v1"),
+                Some(PersistedDoubleEscape::Tree) => self.handle_tree_command(None),
+                Some(PersistedDoubleEscape::Fork) => self.handle_fork_command(),
+                None => self.handle_tree_command(None), // Unset defaults to pi's tree
             }
         }
     }
@@ -997,17 +1104,460 @@ impl InteractiveMode {
                 let custom = (!instructions.is_empty()).then(|| instructions.to_string());
                 let _ = self.runtime.session.compact(custom.as_deref()).await;
             }
-            "new" => self.show_warning("New session pending (T-AP-08-5)"),
-            "tree" => self.show_warning("Session tree pending (T-AP-08-5)"),
-            "fork" => self.show_warning("Fork pending (T-AP-08-5)"),
-            "clone" => self.show_warning("Clone pending (T-AP-08-5)"),
-            "resume" => self.show_warning("Resume pending (T-AP-08-5)"),
+            "new" => self.handle_new_command().await,
+            "tree" => self.handle_tree_command(None),
+            "fork" => self.handle_fork_command(),
+            "clone" => self.handle_clone_command().await,
+            "resume" => self.handle_resume_command().await,
             "model" => self.show_warning("Model selection pending (v2); use --model flag"),
             "name" => self.show_warning("Session name pending"),
             "session" => self.show_warning("Session info pending"),
             "hotkeys" => self.show_warning("Hotkeys pending"),
             _ => self.show_warning(format!("Unknown command: /{}", command.name)), // Unreachable under registry-driven dispatch
         }
+    }
+
+    // ── T-AP-08-5: Session selection / tree navigation / switching orchestration ──────────────────────────
+
+    /// /tree command and double-press Esc (double_escape_action=tree) entry: take a full entry snapshot →
+    /// mount TreeSelectorComponent via UiEvent — "the user clicks an earlier fork point while viewing the session tree".
+    /// No entries → "No entries in session"; `initial_selected` re-shows the position after a summary abort.
+    fn handle_tree_command(&mut self, initial_selected: Option<String>) {
+        let entries = self.runtime.session.session_store.entries();
+        if entries.is_empty() {
+            self.show_status("No entries in session");
+            return;
+        }
+        let leaf_id = self.runtime.session.session_store.get_leaf_id();
+        let filter_mode = self.settings.tree_filter_mode;
+        let _ = self.ui_event_tx.send(UiEvent::OpenTreeSelector {
+            entries,
+            leaf_id,
+            initial_selected_id: initial_selected,
+            filter_mode,
+        });
+        self.active_selector = Some(ActiveSelector::Tree);
+    }
+
+    /// /fork and double-press Esc (double_escape_action=fork) entry: `user_messages_for_forking`
+    /// empty → "No messages to fork from"; otherwise mount UserMessageSelector—
+    /// "The user wants to open a new branch based on some historical user message; first look at what options exist."
+    fn handle_fork_command(&mut self) {
+        let messages = self.runtime.session.user_messages_for_forking();
+        if messages.is_empty() {
+            self.show_status("No messages to fork from");
+            return;
+        }
+        let items: Vec<UserMessageListItem> = messages
+            .into_iter()
+            .map(|(id, text)| UserMessageListItem { id, text })
+            .collect();
+        let initial_selected_id = items.last().map(|m| m.id.clone());
+        let _ = self.ui_event_tx.send(UiEvent::OpenUserMessageSelector {
+            messages: items,
+            initial_selected_id,
+        });
+        self.active_selector = Some(ActiveSelector::UserMessage);
+    }
+
+    /// /clone entry: copy from the current leaf into a new session file (pi handleCloneCommand:
+    /// leafId missing → "Nothing to clone yet"; otherwise `create_branched_session(leaf_id)`)
+    /// → switch runtime → clear editor + "Cloned to new session".
+    async fn handle_clone_command(&mut self) {
+        let Some(leaf) = self.runtime.session.session_store.get_leaf_id() else {
+            self.show_status("Nothing to clone yet");
+            return;
+        };
+        match self
+            .runtime
+            .session
+            .session_store
+            .create_branched_session(&leaf)
+        {
+            Ok(Some(path)) => {
+                if self.switch_to_session_file(path).await {
+                    let _ = self.ui_event_tx.send(UiEvent::EditorSetText(String::new()));
+                    self.show_status("Cloned to new session");
+                }
+            }
+            Ok(None) => self.show_warning("Clone unavailable (in-memory session)"),
+            Err(e) => self.show_error(format!("Clone failed: {e}")),
+        }
+    }
+
+    /// /new entry: create an empty session at the current cwd (pi handleClearCommand → newSession)
+    /// → switch runtime → status line "New session started" (chat already cleared by ChatReset).
+    async fn handle_new_command(&mut self) {
+        let cwd = self.runtime.session.cwd().to_string();
+        let Ok(root) = self.sessions_root() else {
+            self.show_error("Sessions directory unavailable");
+            return;
+        };
+        match SessionManager::create(
+            &cwd,
+            &root,
+            CreateSessionOptions {
+                session_id: None,
+                parent_session_path: None,
+                metadata: None,
+            },
+        ) {
+            Ok(manager) => {
+                if self.switch_runtime(manager, SessionStartReason::New).await {
+                    self.show_status("New session started");
+                }
+            }
+            Err(e) => self.show_error(format!("Failed to create session: {e}")),
+        }
+    }
+
+    /// /resume entry: preload current/all lists → mount SessionSelector—
+    /// "Switch to another project/session to continue chatting".
+    async fn handle_resume_command(&mut self) {
+        let cwd = self.runtime.session.cwd().to_string();
+        let Ok(root) = self.sessions_root() else {
+            self.show_error("Sessions directory unavailable");
+            return;
+        };
+        let current = build_session_listings(&cwd, &root);
+        let all = build_all_session_listings(&root);
+        let _ = self
+            .ui_event_tx
+            .send(UiEvent::OpenSessionSelector { current, all });
+        self.active_selector = Some(ActiveSelector::Session);
+    }
+
+    /// Selector selected route: determine source via `active_selector` (session path / tree entry / fork entry).
+    async fn handle_selector_selected(&mut self, id: String) {
+        match self.active_selector.take() {
+            Some(ActiveSelector::Session) => {
+                let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+                self.handle_resume_path(PathBuf::from(&id)).await;
+            }
+            Some(ActiveSelector::Tree) => {
+                let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+                // Summary prompt (skipped via settings.branch_summary.skip_prompt, aligned with pi)
+                let skip = self
+                    .settings_manager
+                    .as_ref()
+                    .is_some_and(|s| s.effective().branch_summary.skip_prompt);
+                if skip {
+                    self.run_tree_navigation(id, false, None).await;
+                } else {
+                    self.pending_choice = Some(PendingChoice::Summarize { target_id: id });
+                    let _ = self.ui_event_tx.send(UiEvent::OpenChoice {
+                        title: "Summarize branch?".to_string(),
+                        options: vec![
+                            "No summary".to_string(),
+                            "Summarize".to_string(),
+                            "Summarize with custom prompt".to_string(),
+                        ],
+                    });
+                }
+            }
+            Some(ActiveSelector::UserMessage) => {
+                let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+                self.handle_fork_selected(&id).await;
+            }
+            None => {}
+        }
+    }
+
+    /// Selector/overlay cancel: clear pending state and unmount overlay (aligned with pi selector Esc → done + render).
+    fn handle_selector_cancelled(&mut self) {
+        self.active_selector = None;
+        self.pending_choice = None;
+        let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+    }
+
+    /// Tree selector label editing: persist Label entry (`append_label_change`); error → status line.
+    fn handle_label_change(&mut self, target_id: &str, label: Option<String>) {
+        match self
+            .runtime
+            .session
+            .session_store
+            .append_label_change(target_id, label.as_deref())
+        {
+            Ok(_) => {}
+            Err(e) => self.show_error(format!("Failed to update label: {e}")),
+        }
+    }
+
+    /// Generic options overlay selection: determine via `pending_choice` (summary three options / cwd Continue-Cancel).
+    /// **Overlay closes on the main task side** (ChoiceOverlay selection only sends a command, does not unmount itself): entering this function
+    /// sends `CloseSelector` immediately—no matter which item is chosen (the custom-command branch closes first, then mounts the input overlay),
+    /// otherwise the full-screen overlay lingers forever and all navigation/errors are obscured (fix: defect after T-AP-08-5 implementation).
+    async fn handle_choice_selected(&mut self, idx: usize) {
+        let choice = self.pending_choice.take();
+        let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+        match choice {
+            Some(PendingChoice::Summarize { target_id }) => match idx {
+                0 => self.run_tree_navigation(target_id, false, None).await,
+                1 => self.run_tree_navigation(target_id, true, None).await,
+                _ => {
+                    // Custom command → input overlay (navigate after Enter submits)
+                    self.pending_choice = Some(PendingChoice::CustomSummary { target_id });
+                    let _ = self.ui_event_tx.send(UiEvent::OpenCustomInput {
+                        prompt: "Custom summarization instructions".to_string(),
+                    });
+                }
+            },
+            Some(PendingChoice::MissingCwd { path, fallback }) if idx == 0 => {
+                // Continue → reopen with fallback (current session cwd), aligned with T-AP-01-5 seam semantics
+                self.reopen_with_cwd(&path, &fallback).await;
+            }
+            Some(PendingChoice::MissingCwd { .. }) => {}
+            _ => {}
+        }
+    }
+
+    /// Custom summary command submitted (OpenCustomInput Enter): non-empty → summary navigation; empty → cancel navigation.
+    /// Overlay closes on the main task side (same as `handle_choice_selected`; the input overlay does not unmount itself).
+    async fn handle_custom_input(&mut self, text: String) {
+        let Some(PendingChoice::CustomSummary { target_id }) = self.pending_choice.take() else {
+            return;
+        };
+        let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            self.show_status("Summary cancelled");
+            return;
+        }
+        self.run_tree_navigation(target_id, true, Some(trimmed))
+            .await;
+    }
+
+    /// Tree navigation orchestration execution: navigate_tree (status line during summary) → result handling—
+    /// aborted → re-show tree selector (aligned with pi loop); success → append summary line + backfill editor + footer.
+    async fn run_tree_navigation(
+        &mut self,
+        target_id: String,
+        summarize: bool,
+        custom_instructions: Option<String>,
+    ) {
+        if summarize {
+            let _ = self
+                .ui_event_tx
+                .send(UiEvent::Status(StatusSpec::BranchSummary));
+        }
+        let options = NavigateTreeOptions {
+            summarize,
+            custom_instructions,
+            replace_instructions: false,
+            label: None,
+        };
+        let cancel = self.cancel.child_token();
+        match self
+            .runtime
+            .session
+            .navigate_tree(&target_id, &options, &cancel)
+            .await
+        {
+            Ok(result) => {
+                let _ = self.ui_event_tx.send(UiEvent::ClearStatus);
+                if result.aborted {
+                    self.show_status("Branch summarization cancelled");
+                    self.handle_tree_command(Some(target_id)); // Re-show tree (aligned with pi)
+                    return;
+                }
+                if result.cancelled {
+                    self.show_status("Navigation cancelled");
+                    return;
+                }
+                if let Some(summary) = &result.summary {
+                    let _ = self.ui_event_tx.send(UiEvent::BranchSummaryRow {
+                        summary: summary.clone(),
+                    });
+                }
+                // Editor backfills selected message (deviation registered: pi backfills only when the editor is empty, zen always backfills—
+                // the main task does not know the editor's live content, v1 accepts the overwrite)
+                if let Some(text) = &result.editor_text {
+                    let _ = self.ui_event_tx.send(UiEvent::EditorSetText(text.clone()));
+                }
+                self.show_status("Navigated to selected point");
+                self.push_footer();
+            }
+            Err(e) => {
+                let _ = self.ui_event_tx.send(UiEvent::ClearStatus);
+                self.show_error(format!("{e}"));
+            }
+        }
+    }
+
+    /// Fork selected: `create_branched_session(entry_id)` → switch runtime → editor backfills selected message text
+    /// (`content_text`, aligned with pi `editor.setText(result.selectedText)`) + "Forked to new session".
+    async fn handle_fork_selected(&mut self, entry_id: &str) {
+        // Selected message text (fetched from the old session before switching)
+        let text = self
+            .runtime
+            .session
+            .user_messages_for_forking()
+            .into_iter()
+            .find(|(id, _)| id == entry_id)
+            .map(|(_, t)| t);
+        match self
+            .runtime
+            .session
+            .session_store
+            .create_branched_session(entry_id)
+        {
+            Ok(Some(path)) => {
+                if self.switch_to_session_file(path).await {
+                    if let Some(t) = text {
+                        let _ = self.ui_event_tx.send(UiEvent::EditorSetText(t));
+                    }
+                    self.show_status("Forked to new session");
+                }
+            }
+            Ok(None) => self.show_warning("Fork unavailable (in-memory session)"),
+            Err(e) => self.show_error(format!("Fork failed: {e}")),
+        }
+    }
+
+    /// /resume selected path: `open(path)` → cwd missing check (T-AP-01-5 seam) →
+    /// Continue/Cancel popup; normal → switch runtime + "Resumed session".
+    async fn handle_resume_path(&mut self, path: PathBuf) {
+        let Ok(root) = self.sessions_root() else {
+            self.show_error("Sessions directory unavailable");
+            return;
+        };
+        // Fallback value follows call-site semantics: resume = current session cwd (T-AP-01-5 seam note)
+        let fallback = self.runtime.session.cwd().to_string();
+        match SessionManager::open(&path, None, &root) {
+            Ok(manager) => {
+                if let Some(issue) = get_missing_session_cwd_issue(&manager, &fallback) {
+                    self.pending_choice = Some(PendingChoice::MissingCwd {
+                        path: path.display().to_string(),
+                        fallback,
+                    });
+                    let _ = self.ui_event_tx.send(UiEvent::OpenChoice {
+                        title: format_missing_session_cwd_prompt(&issue),
+                        options: vec!["Continue".to_string(), "Cancel".to_string()],
+                    });
+                    return;
+                }
+                if self
+                    .switch_runtime(manager, SessionStartReason::Resume(path.clone()))
+                    .await
+                {
+                    self.show_status("Resumed session");
+                }
+            }
+            Err(e) => self.show_error(format!("Failed to resume session: {e}")),
+        }
+    }
+
+    /// Continue with missing cwd: reopen the session file using the fallback (current session cwd) (`open(path, Some(cwd))`).
+    async fn reopen_with_cwd(&mut self, path: &str, fallback: &str) {
+        let Ok(root) = self.sessions_root() else {
+            self.show_error("Sessions directory unavailable");
+            return;
+        };
+        match SessionManager::open(Path::new(path), Some(fallback), &root) {
+            Ok(manager) => {
+                if self
+                    .switch_runtime(manager, SessionStartReason::Resume(PathBuf::from(path)))
+                    .await
+                {
+                    self.show_status("Resumed session in current cwd");
+                }
+            }
+            Err(e) => self.show_error(format!("Failed to resume session: {e}")),
+        }
+    }
+
+    /// Switch runtime for fork/clone artifacts (new session file): open the file → `switch_runtime`.
+    async fn switch_to_session_file(&mut self, path: PathBuf) -> bool {
+        let Ok(root) = self.sessions_root() else {
+            self.show_error("Sessions directory unavailable");
+            return false;
+        };
+        match SessionManager::open(&path, None, &root) {
+            Ok(manager) => {
+                self.switch_runtime(
+                    manager,
+                    SessionStartReason::Fork(path.display().to_string()),
+                )
+                .await
+            }
+            Err(e) => {
+                self.show_error(format!("Failed to open forked session: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Unified entry point for session switching (landing point for /resume//new//fork//clone):
+    /// "The user switches to another session (or creates a new one) within the current session; the entire current conversation context is replaced."
+    /// Stop the current run → `assemble_runtime_from_session_manager` to assemble the new runtime →
+    /// Unsubscribe old agent + replace + resubscribe → push ChatReset/title/footer; footer branch provider
+    /// is rebuilt with the new cwd (T-AP-06-3). Returns whether the switch succeeded (failure already show_error).
+    async fn switch_runtime(
+        &mut self,
+        session_manager: SessionManager,
+        reason: SessionStartReason,
+    ) -> bool {
+        // 1. Stop the current run (a command can be issued mid-run; must be quiesced before switching sessions)
+        if self.runtime.session.is_run() {
+            self.runtime.session.abort();
+        }
+        if let Some(h) = self.run_task.take() {
+            let _ = h.await;
+        }
+
+        // 2. Assemble the new runtime (reuse the settings manager; load on demand when agent_dir is absent)
+        let cwd = PathBuf::from(session_manager.get_cwd());
+        let settings = match &self.settings_manager {
+            Some(s) => Arc::clone(s),
+            None => {
+                let agent_dir = config::get_agent_dir().unwrap_or_default();
+                Arc::new(SettingsManager::load(&cwd, &agent_dir))
+            }
+        };
+        let new_runtime =
+            match assemble_runtime_from_session_manager(&cwd, session_manager, settings, reason)
+                .await
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    self.show_error(format!("Failed to switch session: {e}"));
+                    return false;
+                }
+            };
+
+        // 3. Unsubscribe old agent + replace runtime (old session drop teardown) + resubscribe
+        if let Some(sub) = self.subscription.take() {
+            sub();
+        }
+        let old = std::mem::replace(&mut self.runtime, new_runtime);
+        drop(old);
+        self.subscription = Some(self.subscribe_to_agent());
+
+        // 3.5 Rebuild the footer branch provider with the new cwd (dispose old watcher + create new)
+        if let Some(mut fd) = self.footer_data.take() {
+            fd.dispose();
+        }
+        self.footer_data = Some(FooterDataProvider::new(Path::new(
+            self.runtime.session.cwd(),
+        )));
+
+        // 4. UI: clear the chat + render the new session history + title + footer
+        let _ = self.ui_event_tx.send(UiEvent::ChatReset);
+        let history = self.runtime.session.agent.messages();
+        if !history.is_empty() {
+            let _ = self
+                .ui_event_tx
+                .send(UiEvent::RestoreHistory { messages: history });
+        }
+        let title = format!("zen · {}", self.runtime.session.cwd());
+        let _ = self.ui_event_tx.send(UiEvent::TerminalTitle(title));
+        self.push_footer();
+        true
+    }
+
+    /// Session root directory (`--session-dir` override or default `get_sessions_dir()`, closing the T-AP-02-3 seam).
+    fn sessions_root(&self) -> Result<PathBuf, String> {
+        config::get_sessions_dir().map_err(|e| e.to_string())
     }
 
     /// `!`/`!!` bash mode: executes the command and renders the `bash_execution` line (T-AP-04-2-fix wiring).
@@ -1063,12 +1613,13 @@ impl InteractiveMode {
         Ok(())
     }
 
-    /// Status line shortcuts: `show_status`/`show_error`/`show_warning` three states
-    /// (`UiEvent::Status(StatusSpec)`; Working carries a spinner; Error/Warning drawn directly with semantic colors).
+    /// Status bar shortcuts: `show_status`/`show_error`/`show_warning` three states.
+    /// `show_status` uses `StatusSpec::Info` (static, no spinner, aligned with pi showStatus);
+    /// Busy state (spinner) is handled by AgentStart's Working / BranchSummary / Compaction / Retry.
     fn show_status(&mut self, message: impl Into<String>) {
-        let _ = self.ui_event_tx.send(UiEvent::Status(StatusSpec::Working {
-            message: message.into(),
-        }));
+        let _ = self
+            .ui_event_tx
+            .send(UiEvent::Status(StatusSpec::Info(message.into())));
     }
 
     /// Error status line (`StatusSpec::Error`).
@@ -1488,6 +2039,7 @@ fn is_tool_result(message: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::SettingsData;
     use crate::session::agent_session::SessionStore;
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
@@ -1526,6 +2078,44 @@ mod tests {
             _from_hook: bool,
         ) -> String {
             "mock-compaction-id".to_string()
+        }
+        fn entries(&self) -> Vec<SessionTreeEntry> {
+            Vec::new()
+        }
+        fn get_leaf_id(&self) -> Option<String> {
+            None
+        }
+        fn append_branch_summary(
+            &self,
+            _result: &zen_core::compaction::branch::BranchSummaryResult,
+            _new_leaf_id: Option<&str>,
+            _from_hook: bool,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-branch-summary-id".to_string())
+        }
+        fn branch(
+            &self,
+            _branch_from_id: &str,
+        ) -> Result<(), crate::session::session_manager::SessionManagerError> {
+            Ok(())
+        }
+        fn reset_leaf(&self) {}
+        fn append_label_change(
+            &self,
+            _target_id: &str,
+            _label: Option<&str>,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-label-id".to_string())
+        }
+        fn append_session_info(&self, _name: Option<&str>) -> String {
+            "mock-session-info-id".to_string()
+        }
+        fn create_branched_session(
+            &self,
+            _leaf_id: &str,
+        ) -> Result<Option<std::path::PathBuf>, crate::session::session_manager::SessionManagerError>
+        {
+            Ok(None)
         }
     }
 
@@ -1984,6 +2574,44 @@ mod tests {
             _from_hook: bool,
         ) -> String {
             "mock-compaction-id".to_string()
+        }
+        fn entries(&self) -> Vec<SessionTreeEntry> {
+            Vec::new()
+        }
+        fn get_leaf_id(&self) -> Option<String> {
+            None
+        }
+        fn append_branch_summary(
+            &self,
+            _result: &zen_core::compaction::branch::BranchSummaryResult,
+            _new_leaf_id: Option<&str>,
+            _from_hook: bool,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-branch-summary-id".to_string())
+        }
+        fn branch(
+            &self,
+            _branch_from_id: &str,
+        ) -> Result<(), crate::session::session_manager::SessionManagerError> {
+            Ok(())
+        }
+        fn reset_leaf(&self) {}
+        fn append_label_change(
+            &self,
+            _target_id: &str,
+            _label: Option<&str>,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-label-id".to_string())
+        }
+        fn append_session_info(&self, _name: Option<&str>) -> String {
+            "mock-session-info-id".to_string()
+        }
+        fn create_branched_session(
+            &self,
+            _leaf_id: &str,
+        ) -> Result<Option<std::path::PathBuf>, crate::session::session_manager::SessionManagerError>
+        {
+            Ok(None)
         }
     }
 

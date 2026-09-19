@@ -44,6 +44,18 @@ pub struct JsonlSessionMetadata {
     pub(crate) metadata: Option<serde_json::Value>,
 }
 
+impl JsonlSessionMetadata {
+    /// Session ID (read by the bin target via an accessor; the field is pub(crate) and invisible to bin).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Absolute path of the JSONL file (read by the bin target via an accessor).
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
 /// Error types that can occur during JSONL persistence operations. Derived via thiserror, covering file I/O errors, format errors, entry parsing errors, etc.
 #[derive(Debug, thiserror::Error)]
 pub enum JsonlError {

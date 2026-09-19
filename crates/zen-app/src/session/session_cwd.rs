@@ -118,10 +118,12 @@ pub fn format_missing_session_cwd_prompt(issue: &SessionCwdIssue) -> String {
 /// # Errors
 /// `MissingSessionCwdError` (carries the issue snapshot). It can be captured by type on the anyhow aggregate chain via
 /// `err.downcast_ref::<MissingSessionCwdError>()` ,
-/// After the interactive prompt, reopen the session with `cwd_override = fallback` — this retry pattern is reserved for T-AP-08-5.
+/// After the interactive prompt, reopen the session with `cwd_override = fallback`—
+/// this retry mode has been consumed by T-AP-08-5 (interactive /resume missing cwd Continue dialog) (closed).
 ///
 /// # Consumers
-/// `services.rs::create_initial_runtime_from_cli` (this task); T-AP-08-5 (reserved).
+/// `services.rs::create_initial_runtime_from_cli` (this task); T-AP-08-5 (closed:
+/// `interactive/mod.rs handle_resume_path`'s `get_missing_session_cwd_issue` + Continue reopen).
 pub fn assert_session_cwd_exists(
     session_manager: &SessionManager,
     fallback_cwd: &str,

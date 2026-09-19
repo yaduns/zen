@@ -15,7 +15,7 @@
 use crate::session::assert_session_cwd_exists;
 use anyhow::Context;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::cli::{parse_thinking_level, CliArgs};
@@ -23,7 +23,7 @@ use crate::config::defaults::DEFAULT_THINKING_LEVEL;
 use crate::config::get_agent_dir;
 use crate::config::settings::{SettingsData, SettingsManager};
 use crate::prompt_templates::LoadedPromptTemplate;
-use crate::resources::{load_resources, LoadResourcesOptions};
+use crate::resources::{load_resources, LoadResourcesOptions, LoadResourcesResult};
 use crate::session::agent_session::{AgentSession, SessionStore};
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
@@ -248,13 +248,6 @@ pub async fn create_initial_runtime_from_cli(
         std::env::current_dir().context("failed to resolve process working directory")?;
     assert_session_cwd_exists(&session_manager, &process_cwd.to_string_lossy())?;
 
-    // 0. Restore context from session (model/thinking/history). New session (empty tree) → messages empty, model None, naturally unified.
-    let ctx = session_manager.build_context();
-
-    // 1. Resolve model and thinking: CLI flags take precedence, otherwise restore from session ctx, then defaults
-    let (mut model, mut thinking_level) = resolve_model(args);
-    apply_session_restore(args, &ctx, &mut model, &mut thinking_level);
-
     // 2. Agent config directory (needed for AGENTS.md loading and default paths)
     let agent_dir = get_agent_dir()?;
 
@@ -262,6 +255,13 @@ pub async fn create_initial_runtime_from_cli(
     //     fill-in (priority: CLI > session restore > settings > built-in defaults) and shell override config.
     //     A corrupt file degrades to empty + is recorded in the manager error queue (not surfaced at this assembly point; the interactive side's drain_errors handles that).
     let settings = Arc::new(SettingsManager::load(&cwd, &agent_dir));
+
+    // 0. Restore context from session (model/thinking/history). New session (empty tree) → messages empty, model None, naturally unified.
+    let ctx = session_manager.build_context();
+
+    // 1. Resolve model and thinking: CLI flags take precedence, otherwise restore from session ctx, then defaults
+    let (mut model, mut thinking_level) = resolve_model(args);
+    apply_session_restore(args, &ctx, &mut model, &mut thinking_level);
     let merged = settings.merged();
     // settings fill-in (priority: CLI > session restore > settings > env/default): default_provider
     // Known provider matched → rebuild the model by provider (provider side); default_model only changes the id,
@@ -311,21 +311,122 @@ pub async fn create_initial_runtime_from_cli(
         append_system_prompt: args.append_system_prompt.clone(),
     })
     .await;
-    let skills: Vec<LoadedSkill> = resources.skills;
-    let templates: Vec<LoadedPromptTemplate> = resources.prompts;
-    // The theme-loading output currently has no consumer (interactive /theme registration belongs to T-AP-11-1, a reserved seam); diagnostics only
-    for d in &resources.diagnostics {
-        tracing::warn!(target: "zen::resources", "resource load: {d:?}");
-    }
 
-    // 3. Session ID (supplied by a manager chosen by the caller; the session_id of the persisted/forked session)
+    // 4. Tool selection: CLI flags (--tools/--exclude-tools/--no-tools/--no-builtin-tools,
+    //    cli-tools-flags-fix — default builtin group [read, bash, edit, write]; `--tools read` yields a read-only session)
+    let selection = ToolSelection {
+        tools: args.tools.clone(),
+        exclude_tools: args.exclude_tools.clone(),
+        no_tools: args.no_tools,
+        no_builtin_tools: args.no_builtin_tools,
+    };
+
+    assemble_runtime(
+        cwd,
+        session_manager,
+        settings,
+        model,
+        thinking_level,
+        resources,
+        &selection,
+        SessionStartReason::Startup,
+    )
+    .await
+}
+
+/// Interactive session switch assembly (rebuild runtime after /resume//new//fork) —
+/// "After the user switches sessions, the new session must have the same model, tools, and system prompt capabilities."
+/// No CLI arguments: model/thinking restored from the target session ctx + settings (`resolve_model_from_session`),
+/// resources take only the settings path (no CLI override bits), tools take the default builtin group (`ToolSelection::default()`,
+/// Known deviation: CLI `--tools` selections are not retained after an interactive switch — the runtime does not hold CLI args).
+/// `settings` reuses the current session's settings manager; `start_reason` is provided by the caller per scenario
+/// （/resume → Resume(path)、/new → New、/fork//clone → Fork(entry_id)）。
+/// Returns a runtime ready for direct `replace_runtime`.
+/// # Consumers
+/// Interactive main task (`handle_session_switch`).
+pub(crate) async fn assemble_runtime_from_session_manager(
+    cwd: &Path,
+    session_manager: SessionManager,
+    settings: Arc<SettingsManager>,
+    start_reason: SessionStartReason,
+) -> anyhow::Result<AgentSessionRuntime> {
+    // 0. Restore context from the target session
+    let ctx = session_manager.build_context();
+
+    // 1. model/thinking: session ctx restoration takes priority, settings as fallback, no CLI overrides
+    let (model, thinking_level) = resolve_model_from_session(&ctx, &settings);
+
+    // 2. Resource loading: settings path + default dirs (no_* always false, system prompt has no CLI value → file discovery)
+    let agent_dir = get_agent_dir()?;
+    let merged = settings.merged();
+    let skill_paths: Vec<PathBuf> = merged
+        .skills
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let prompt_paths: Vec<PathBuf> = merged
+        .prompts
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let theme_paths: Vec<PathBuf> = merged
+        .themes
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let resources = load_resources(&LoadResourcesOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir,
+        skill_paths,
+        prompt_paths,
+        theme_paths,
+        no_skills: false,
+        no_prompt_templates: false,
+        no_themes: false,
+        no_context_files: false,
+        system_prompt: None,
+        append_system_prompt: Vec::new(),
+    })
+    .await;
+
+    assemble_runtime(
+        cwd.to_path_buf(),
+        session_manager,
+        settings,
+        model,
+        thinking_level,
+        resources,
+        &ToolSelection::default(),
+        start_reason,
+    )
+    .await
+}
+
+/// Shared assembly core (used by both the CLI factory and interactive switching): tool factory / system prompt / protocol stream / common assembly / context injection / runtime construction.
+/// All inputs are already resolved (model/thinking/resources/tool_selection/start_reason); this function only does assembly.
+#[allow(clippy::too_many_arguments)] // Assembly-surface parameters are all session-assembly inputs; grouping would only hurt readability
+async fn assemble_runtime(
+    cwd: PathBuf,
+    session_manager: SessionManager,
+    settings: Arc<SettingsManager>,
+    model: Model,
+    thinking_level: ThinkingLevel,
+    resources: LoadResourcesResult,
+    tool_selection: &ToolSelection,
+    start_reason: SessionStartReason,
+) -> anyhow::Result<AgentSessionRuntime> {
+    // Session ID (provided by the manager chosen by the caller; session_id of the persisted/forked session)
     let cwd_str = cwd.to_string_lossy().into_owned();
     let session_id = session_manager.session_id();
 
-    // 4. Tool factory: binds cwd + session_id; selection by CLI flags (--tools/--exclude-tools/
-    //    --no-tools/--no-builtin-tools, cli-tools-flags-fix — tool selection not landed in T-AP-08-3
-    //    injection; pi's `createAgentSession` counterparts for tools/excludeTools/noTools.
-    //    Default builtin group is [read, bash, edit, write]; `--tools read` yields a read-only session.
+    // 4. Tool factory: binds cwd + session_id; assembles according to selection params (CLI flags or the default built-in set).
+    let merged = settings.merged();
     let tool_context = ToolContext::new(cwd.clone(), Some(session_id.clone()), None);
     // Shell override config (T-AP-02-3-fix, Seam B): shell_path is normalized via paths (`~` expansion,
     // relative paths absolutized against cwd; on parse failure falls back to None = system default shell), command_prefix passed through as-is.
@@ -337,13 +438,7 @@ pub async fn create_initial_runtime_from_cli(
         command_prefix: merged.shell_command_prefix.clone(),
     };
     let factory = ToolFactory::with_shell(tool_context, shell.clone());
-    let selection = ToolSelection {
-        tools: args.tools.clone(),
-        exclude_tools: args.exclude_tools.clone(),
-        no_tools: args.no_tools,
-        no_builtin_tools: args.no_builtin_tools,
-    };
-    let tools = factory.create_with_selection(&selection).tools;
+    let tools = factory.create_with_selection(tool_selection).tools;
 
     // 5. System prompt: AGENTS.md context + CLI overrides + skills (assembled and injected per T-AP-03-2, honoring
     //    the "Phase 1 does not inject skills (append here once T-AP-03-3 lands)" note)
@@ -362,7 +457,11 @@ pub async fn create_initial_runtime_from_cli(
         },
         cwd: cwd_str,
         // T-AP-05-4: session side keeps the Loaded form (source end-to-end); the system prompt only needs domain data → clone once at assembly phase
-        skills: skills.iter().map(|loaded| loaded.skill.clone()).collect(),
+        skills: resources
+            .skills
+            .iter()
+            .map(|loaded| loaded.skill.clone())
+            .collect(),
         context_files: resources.context_files,
     });
 
@@ -371,6 +470,14 @@ pub async fn create_initial_runtime_from_cli(
     let stream_fn = stream_for(model_api).expect(
         "Protocol referenced by model.api not implemented: currently supports OpenAiCompletions, see T-AI-02-8 stream_for binding table",
     );
+
+    // Diagnostic logging (topic-loading artifacts currently have no consumers; log for diagnostics only)
+    for d in &resources.diagnostics {
+        tracing::warn!(target: "zen::resources", "resource load: {d:?}");
+    }
+
+    // Context reinjection (aligned with pi; ctx.messages is empty for new sessions) — called on the owned session before Arc::new
+    let ctx = session_manager.build_context();
 
     let session_store: Arc<dyn SessionStore> = Arc::new(session_manager);
     let session = create_agent_session(
@@ -383,24 +490,66 @@ pub async fn create_initial_runtime_from_cli(
         session_store.clone(),
         shell,
         Arc::clone(&settings),
-        skills,
-        templates,
+        resources.skills,
+        resources.prompts,
     );
-    // Replay session history (aligned with pi; new session ctx.messages is empty) — call on owned session before Arc::new
     session.set_messages(ctx.messages);
 
     // 7. Runtime assembly
+    let agent_dir = get_agent_dir()?;
     let services = AgentSessionServices {
         cwd,
         agent_dir,
         session_store,
         registry: zen_core::process::ProcessRegistry::new(),
     };
-    Ok(create_initial_runtime(
-        session,
-        services,
-        SessionStartReason::Startup,
-    ))
+    Ok(create_initial_runtime(session, services, start_reason))
+}
+
+/// Model/thinking-level resolution without CLI (for interactive session switching): session ctx restore takes priority, settings fill in the gaps.
+/// Equivalent to the CLI factory's `resolve_model+apply_session_restore+apply_settings_defaults`,
+/// just without CLI override flags (priority = session restore > settings > env/built-in defaults).
+/// # Consumers
+/// Called only internally by `assemble_runtime_from_session_manager` (same file).
+fn resolve_model_from_session(
+    ctx: &SessionContext,
+    settings: &SettingsManager,
+) -> (Model, ThinkingLevel) {
+    // model: session restore takes priority, otherwise env default
+    let mut model = match &ctx.model {
+        Some(SessionModel { provider, model_id }) => match resolve_provider(provider) {
+            Some(p) => {
+                let mut restored = Model::from_provider(p.as_ref());
+                restored.id = model_id.clone();
+                restored
+            }
+            None => Model::from_env(),
+        },
+        None => Model::from_env(),
+    };
+    // thinking: session restore takes priority, otherwise default
+    let mut thinking = match parse_thinking_level(&ctx.thinking_level) {
+        Ok(level) => level,
+        Err(_) => DEFAULT_THINKING_LEVEL,
+    };
+    // Settings fill in the gaps (no CLI: takes effect when session restore doesn't hit)
+    let merged = settings.merged();
+    if ctx.model.is_none() {
+        if let Some(provider_name) = merged.default_provider.as_deref() {
+            if let Some(provider) = resolve_provider(provider_name) {
+                model = Model::from_provider(provider.as_ref());
+            }
+        }
+        if let Some(default_model) = &merged.default_model {
+            model.id = default_model.clone();
+        }
+    }
+    if ctx.thinking_level.trim().is_empty() {
+        if let Some(level) = merged.default_thinking_level {
+            thinking = level;
+        }
+    }
+    (model, thinking)
 }
 
 /// Apply the fill-in from settings' default_provider/default_model/default_thinking_level.
@@ -1065,5 +1214,53 @@ mod tests {
         let msgs = vec![tool_result_msg.clone()];
         // empty exclusion set always passes through (filter_excluded guarantee)
         assert_eq!(hooks.filter_messages(msgs.clone()).await, msgs);
+    }
+
+    // ── resolve_model_from_session (T-AP-08-5: CLI-less resolution for interactive switching) ──
+
+    #[test]
+    fn resolve_model_from_session_restores_ctx_model_and_thinking() {
+        let settings = SettingsManager::empty();
+        let ctx = SessionContext {
+            messages: vec![],
+            thinking_level: "medium".to_string(),
+            model: Some(SessionModel {
+                provider: "huoshan".to_string(),
+                model_id: "deepseek-v4-flash".to_string(),
+            }),
+            active_tool_names: None,
+        };
+        let (model, thinking) = resolve_model_from_session(&ctx, &settings);
+        // Session ctx restore takes priority (no CLI override flags); provider name rebuilds the model via resolve_provider
+        assert_eq!(model.provider, "huoshan");
+        assert_eq!(model.id, "deepseek-v4-flash");
+        assert_eq!(thinking, ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn resolve_model_from_session_settings_defaults_when_ctx_empty() {
+        let settings = SettingsManager::empty();
+        settings.update_global(|s| {
+            s.default_thinking_level = Some(ThinkingLevel::High);
+        });
+        let ctx = empty_ctx(); // thinking_level = ""、model = None
+        let (_, thinking) = resolve_model_from_session(&ctx, &settings);
+        assert_eq!(
+            thinking,
+            ThinkingLevel::High,
+            "ctx no thinking → settings fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_model_from_session_empty_ctx_falls_back_to_env_default() {
+        // env isolation: default provider (opencode-go)
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::remove("ZEN_PROVIDER");
+        let settings = SettingsManager::empty();
+        let ctx = empty_ctx();
+        let (model, thinking) = resolve_model_from_session(&ctx, &settings);
+        assert_eq!(model.provider, "opencode-go", "no resume/fallback → env default");
+        assert_eq!(thinking, DEFAULT_THINKING_LEVEL);
     }
 }

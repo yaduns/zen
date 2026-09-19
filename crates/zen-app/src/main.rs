@@ -6,8 +6,8 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use zen_app::cli::{
-    build_initial_message, process_file_arguments, read_piped_stdin, stdin_is_terminal, CliArgs,
-    Mode,
+    build_initial_message, process_file_arguments, read_piped_stdin, select_session,
+    stdin_is_terminal, CliArgs, Mode,
 };
 use zen_app::config::{get_sessions_dir, VERSION};
 use zen_app::migrations::run_migrations;
@@ -15,6 +15,7 @@ use zen_app::modes::interactive::run_interactive_mode;
 use zen_app::modes::print_mode::run_print_mode;
 use zen_app::session::jsonl::CreateSessionOptions;
 use zen_app::session::services::create_initial_runtime_from_cli;
+use zen_app::session::session_listing::{build_all_session_listings, build_session_listings};
 use zen_app::session::session_manager::SessionManager;
 use zen_app::session::{
     format_missing_session_cwd_error, get_missing_session_cwd_issue, SessionCwdIssue,
@@ -121,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Layer 3: assembly factory (refactoring point 3 — assembly logic extracted to services.rs; session chosen by main)
-    let session_manager = select_session_manager(&args, &process_cwd)?;
+    let session_manager = select_session_manager(&args, &process_cwd).await?;
 
     // T-AP-01-5 gate: after select_session_manager, before assembly (same location as pi)
     let process_cwd_lossy = process_cwd.to_string_lossy();
@@ -238,17 +239,21 @@ fn resolve_app_mode(args: &CliArgs, stdin_is_tty: bool) -> AppMode {
 
 /// Select `SessionManager` based on CLI session flags (reuse `SessionManager`'s existing constructor, don't roll your own).
 ///
-/// # Mapping
+/// # Mapping (aligned with pi `selectSessionManager`, T-AP-08-5 semantic fixes)
 /// - `--no-session` → `in_memory` (ephemeral, not persisted)
-/// - `--fork <source>` → `fork_from` (fork from source session)
-/// - `--resume` / `--continue` → `continue_recent` (resume most recent session, create new if none)
-/// - `--session <file>` / `--session-id` → `open` (full path; partial UUID resolution assigned to T-AP-08-5)
+/// - `--fork <source>` → `fork_from`; combined with `--session-id` when the target id already exists → error exit
+/// - `--resume` → TUI session selector (`select_session`); cancel → "No session selected" + exit(0);
+///   non-TTY stdin falls back to `continue_recent` (v1 decision: TUI requires a terminal)
+/// - `--continue` → `continue_recent` (no longer conflated with resume)
+/// - `--session-id` → exact lookup by id (`SessionManager::list` match) → hit opens /
+///   miss → warning + `create` (session_id injected, aligned with pi's yellow warning)
+/// - `--session <file>` → `open` (full path)
 /// - default → `create` (new file-backed session, **persisted**, aligned with pi)
 /// - `--session-dir <dir>` overrides the session root directory, affecting all the `*_root` values above
 ///
 /// # Consumers
-/// Called internally by `main` (this file) only. (Decision: persist/restore model+thinking by default; session by full path only)
-fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionManager> {
+/// Called only internally within `main` (this file).
+async fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionManager> {
     let cwd_str = cwd.to_string_lossy();
     let root = match &args.session_dir {
         Some(dir) => dir.clone(),
@@ -263,7 +268,25 @@ fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionM
     if args.no_session {
         return Ok(SessionManager::in_memory(&cwd_str));
     }
+
+    // --fork: when combined with --session-id, verify the target id is not a duplicate (aligned with pi forkSessionOrExit)
     if let Some(fork_src) = &args.fork {
+        if let Some(session_id) = &args.session_id {
+            let sessions = SessionManager::list(&cwd_str, &root)?;
+            if sessions.iter().any(|s| s.id() == session_id.as_str()) {
+                anyhow::bail!("Session already exists with id '{session_id}'");
+            }
+            return Ok(SessionManager::fork_from(
+                Path::new(fork_src),
+                &cwd_str,
+                &root,
+                CreateSessionOptions {
+                    session_id: Some(session_id.clone()),
+                    parent_session_path: None,
+                    metadata: None,
+                },
+            )?);
+        }
         return Ok(SessionManager::fork_from(
             Path::new(fork_src),
             &cwd_str,
@@ -271,13 +294,55 @@ fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionM
             default_opts,
         )?);
     }
-    if args.resume || args.continue_flag {
+
+    // --resume: TUI session selector (pi selectSession)
+    if args.resume {
+        if !stdin_is_terminal() {
+            return Ok(SessionManager::continue_recent(&cwd_str, &root)?);
+        }
+        let current = build_session_listings(&cwd_str, &root);
+        let all = build_all_session_listings(&root);
+        let selected = select_session(current, all, &root).await?;
+        return match selected {
+            Some(path) => Ok(SessionManager::open(Path::new(&path), None, &root)?),
+            None => {
+                // Aligned with pi: console.log(chalk.dim("No session selected")) + exit(0)
+                eprintln!("No session selected");
+                std::process::exit(0);
+            }
+        };
+    }
+
+    // --continue: resume the most recent session (create if none), no longer conflated with --resume
+    if args.continue_flag {
         return Ok(SessionManager::continue_recent(&cwd_str, &root)?);
     }
-    if let Some(session) = args.session.as_ref().or(args.session_id.as_ref()) {
-        // // T-AP-01-5: Remove the Phase 1 simplification—the header cwd takes effect, and session restoration returns to its original directory
+
+    // --session-id: exact lookup by id (partial UUID resolution; T-AP-08-5 fixes the original "open by path" deviation)
+    if let Some(session_id) = &args.session_id {
+        let sessions = SessionManager::list(&cwd_str, &root)?;
+        if let Some(found) = sessions.into_iter().find(|s| s.id() == session_id.as_str()) {
+            return Ok(SessionManager::open(found.path(), None, &root)?);
+        }
+        eprintln!(
+            "Warning: No project session found with id '{session_id}'; creating a new session with that id."
+        );
+        return Ok(SessionManager::create(
+            &cwd_str,
+            &root,
+            CreateSessionOptions {
+                session_id: Some(session_id.clone()),
+                parent_session_path: None,
+                metadata: None,
+            },
+        )?);
+    }
+
+    // --session <file>: open by full path
+    if let Some(session) = &args.session {
         return Ok(SessionManager::open(Path::new(session), None, &root)?);
     }
+
     Ok(SessionManager::create(&cwd_str, &root, default_opts)?)
 }
 
@@ -370,5 +435,132 @@ mod tests {
             "interim: interactive exits with the same error as print (before T-AP-08-6 takes over)"
         );
         assert!(msg.contains("does not exist"), "disposition message should contain the error text");
+    }
+
+    // ── select_session_manager (T-AP-08-5: resume/continue/session-id semantics) ────────
+
+    /// Test helper: temp directory (std-only, following the session_manager test precedent).
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zen_main_ssm_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn create_session(root: &Path, cwd: &str, id: &str) -> PathBuf {
+        let mgr = SessionManager::create(
+            cwd,
+            root,
+            CreateSessionOptions {
+                session_id: Some(id.to_string()),
+                parent_session_path: None,
+                metadata: None,
+            },
+        )
+        .unwrap();
+        mgr.get_session_file().unwrap()
+    }
+
+    #[tokio::test]
+    async fn ssm_continue_opens_latest_or_creates() {
+        let root = test_dir("continue");
+        let args = parse(&["--continue", "--session-dir", root.to_str().unwrap()]);
+        let sm = select_session_manager(&args, Path::new("/proj"))
+            .await
+            .unwrap();
+        // No session → create new
+        assert!(!sm.get_session_id().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ssm_resume_non_tty_falls_back_to_continue_recent() {
+        // Under cargo test, stdin is not a TTY → --resume falls back to continue_recent (v1 decision)
+        let root = test_dir("resume_nontty");
+        create_session(&root, "/proj", "older");
+        create_session(&root, "/proj", "newer");
+        let args = parse(&["--resume", "--session-dir", root.to_str().unwrap()]);
+        let sm = select_session_manager(&args, Path::new("/proj"))
+            .await
+            .unwrap();
+        assert_eq!(sm.get_session_id(), "newer", "non-TTY falls back to resuming the most recent session");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ssm_session_id_hit_opens_existing() {
+        let root = test_dir("sessid_hit");
+        create_session(&root, "/proj", "abc123");
+        let args = parse(&[
+            "--session-id",
+            "abc123",
+            "--session-dir",
+            root.to_str().unwrap(),
+        ]);
+        let sm = select_session_manager(&args, Path::new("/proj"))
+            .await
+            .unwrap();
+        assert_eq!(sm.get_session_id(), "abc123", "open by id on hit");
+        assert!(sm.get_session_file().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ssm_session_id_miss_creates_with_id() {
+        let root = test_dir("sessid_miss");
+        let args = parse(&[
+            "--session-id",
+            "newname",
+            "--session-dir",
+            root.to_str().unwrap(),
+        ]);
+        let sm = select_session_manager(&args, Path::new("/proj"))
+            .await
+            .unwrap();
+        assert_eq!(sm.get_session_id(), "newname", "on miss → create injects id");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ssm_fork_with_existing_session_id_errors() {
+        let root = test_dir("fork_conflict");
+        let src = create_session(&root, "/src", "src1");
+        create_session(&root, "/proj", "abc123");
+        let args = parse(&[
+            "--fork",
+            src.to_str().unwrap(),
+            "--session-id",
+            "abc123",
+            "--session-dir",
+            root.to_str().unwrap(),
+        ]);
+        let err = match select_session_manager(&args, Path::new("/proj")).await {
+            Err(e) => e,
+            Ok(_) => panic!("should error if the target id already exists"),
+        };
+        assert!(
+            err.to_string().contains("Session already exists"),
+            "Actual: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ssm_session_path_opens_and_no_session_in_memory() {
+        let root = test_dir("misc");
+        let path = create_session(&root, "/proj", "s1");
+        let args = parse(&["--session", path.to_str().unwrap()]);
+        let sm = select_session_manager(&args, Path::new("/proj"))
+            .await
+            .unwrap();
+        assert_eq!(sm.get_session_id(), "s1", "open by full path");
+
+        let args = parse(&["--no-session"]);
+        let sm = select_session_manager(&args, Path::new("/proj"))
+            .await
+            .unwrap();
+        assert!(sm.get_session_file().is_none(), "no-session in-memory session");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
