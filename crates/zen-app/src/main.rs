@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 use zen_app::cli::{
     build_initial_message, process_file_arguments, read_piped_stdin, select_session,
-    stdin_is_terminal, CliArgs, Mode,
+    should_run_first_time_setup, show_first_time_setup, show_startup_selector, stdin_is_terminal,
+    CliArgs, Mode,
 };
-use zen_app::config::{get_sessions_dir, VERSION};
+use zen_app::config::settings::SettingsManager;
+use zen_app::config::{get_agent_dir, get_sessions_dir, get_settings_path, VERSION};
 use zen_app::migrations::run_migrations;
 use zen_app::modes::interactive::run_interactive_mode;
 use zen_app::modes::print_mode::run_print_mode;
@@ -18,7 +20,8 @@ use zen_app::session::services::create_initial_runtime_from_cli;
 use zen_app::session::session_listing::{build_all_session_listings, build_session_listings};
 use zen_app::session::session_manager::SessionManager;
 use zen_app::session::{
-    format_missing_session_cwd_error, get_missing_session_cwd_issue, SessionCwdIssue,
+    format_missing_session_cwd_error, format_missing_session_cwd_prompt,
+    get_missing_session_cwd_issue, SessionCwdIssue,
 };
 
 /// Application run mode.
@@ -99,6 +102,20 @@ async fn main() -> anyhow::Result<()> {
     // pi counterpart: after resolveAppMode, before session selection — migration first relocates sessions scattered in the root directory,
     // so that node 4's select_session_manager can see them (aligned with pi main.ts runMigrations(cwd)).
     run_migrations(&process_cwd);
+
+    // first-time setup (T-AP-08-6): interactive mode on first run (settings.json does not exist) pops the theme picker
+    // choose the dialog and persist — aligned with pi main.ts "before session selection and runtime assembly, make the selected
+    // settings apply to the whole flow". get_settings_path failure (no home) → silently skipped (cannot persist
+    // i.e. no dialog pops up; a more explicit missing-home error surfaces during later assembly).
+    if app_mode == AppMode::Interactive {
+        if let Ok(settings_path) = get_settings_path() {
+            if should_run_first_time_setup(&settings_path) {
+                let startup_settings = SettingsManager::load(&process_cwd, &get_agent_dir()?);
+                show_first_time_setup(&startup_settings).await?;
+                info!("[main] node 2.5: first-time setup complete (theme persisted)");
+            }
+        }
+    }
     let stdin_content = read_piped_stdin().await?;
     let messages: Vec<&str> = args.messages();
     let file_args = args.file_args();
@@ -122,16 +139,40 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Layer 3: assembly factory (refactoring point 3 — assembly logic extracted to services.rs; session chosen by main)
-    let session_manager = select_session_manager(&args, &process_cwd).await?;
+    let mut session_manager = select_session_manager(&args, &process_cwd).await?;
 
-    // T-AP-01-5 gate: after select_session_manager, before assembly (same location as pi)
+    // T-AP-01-5 gate: after select_session_manager, before assembly (pi in the same position).
+    // print: error message + exit 1; interactive: launch the Continue/Cancel selector (T-AP-08-6),
+    // Continue → reopen with fallback cwd, Cancel/Esc → exit(0).
     let process_cwd_lossy = process_cwd.to_string_lossy();
-    let issue = get_missing_session_cwd_issue(&session_manager, &process_cwd_lossy);
-
-    // session's cwd directory does not exist; exit directly
-    if let Some((message, code)) = missing_cwd_disposition(issue.as_ref(), &app_mode) {
-        eprintln!("{message}");
-        std::process::exit(code);
+    if let Some(issue) = get_missing_session_cwd_issue(&session_manager, &process_cwd_lossy) {
+        match app_mode {
+            AppMode::Print(_) => {
+                let (message, code) = missing_cwd_print_disposition(&issue);
+                eprintln!("{message}");
+                std::process::exit(code);
+            }
+            AppMode::Interactive => {
+                let root = resolve_sessions_root(&args)?;
+                let choice = show_startup_selector(
+                    &format_missing_session_cwd_prompt(&issue),
+                    vec![
+                        ("Continue", Some(issue.fallback_cwd.clone())),
+                        ("Cancel", None),
+                    ],
+                )
+                .await?;
+                match choice {
+                    // Continue → reopen with fallback cwd (mirrors pi promptForMissingSessionCwd)
+                    Some(Some(fallback)) => {
+                        session_manager =
+                            SessionManager::open(&issue.session_file, Some(&fallback), &root)?;
+                    }
+                    // Cancel / Esc → exit (mirrors pi process.exit(0))
+                    _ => std::process::exit(0),
+                }
+            }
+        }
     }
 
     // Assembled cwd = session cwd (drives settings/skills/AGENTS.md/tool base dir to migrate with the session)
@@ -182,24 +223,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Startup disposition decision for the missing-cwd issue (testable pure function: no IO, no exit).
-///
-/// Return `Some((stderr message, exit code))` to indicate startup should terminate; `None` to allow it to proceed.
-/// During the interim phase, print and interactive both use "error message + exit 1";
-/// After T-AP-08-6 goes live, the interactive branch switches to a Continue/Cancel selector flow
-/// (Continue → reopen with the fallback); the print branch remains unchanged.
+/// Missing-cwd handling in print mode (testable pure function: no IO, no exit)——
+/// "session cwd is invalid and there is no interactive chance (print): render error message + exit 1";
+/// The interactive branch is handled by the T-AP-08-6 startup selector (see the main gate).
 ///
 /// # Consumers
 /// Called only internally within `main` (this file).
-fn missing_cwd_disposition(
-    issue: Option<&SessionCwdIssue>,
-    app_mode: &AppMode,
-) -> Option<(String, i32)> {
-    let issue = issue?;
-    match app_mode {
-        AppMode::Print(_) | AppMode::Interactive => {
-            Some((format_missing_session_cwd_error(issue), 1))
-        }
+fn missing_cwd_print_disposition(issue: &SessionCwdIssue) -> (String, i32) {
+    (format_missing_session_cwd_error(issue), 1)
+}
+
+/// Session root resolution: `--session-dir` override or default `get_sessions_dir()`——
+/// Shared by `select_session_manager` and the missing-cwd Continue reopen (T-AP-08-6).
+///
+/// # Consumers
+/// Called only internally within `main` (this file).
+fn resolve_sessions_root(args: &CliArgs) -> anyhow::Result<PathBuf> {
+    match &args.session_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => Ok(get_sessions_dir()?),
     }
 }
 
@@ -255,10 +297,7 @@ fn resolve_app_mode(args: &CliArgs, stdin_is_tty: bool) -> AppMode {
 /// Called only internally within `main` (this file).
 async fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionManager> {
     let cwd_str = cwd.to_string_lossy();
-    let root = match &args.session_dir {
-        Some(dir) => dir.clone(),
-        None => get_sessions_dir()?,
-    };
+    let root = resolve_sessions_root(args)?;
     let default_opts = CreateSessionOptions {
         session_id: None,
         parent_session_path: None,
@@ -388,32 +427,23 @@ mod tests {
         assert_eq!(resolve_app_mode(&args, true), AppMode::Interactive);
     }
 
-    // ── missing_cwd_disposition (T-AP-01-5 gate) ──────────────────
+    // ── missing-cwd gate (T-AP-01-5 detection + T-AP-08-6 handling) ────────────
 
     #[test]
     fn missing_cwd_gate_passes_in_memory_session() {
-        // In-memory sessions are exempt (guard 1): get_missing_session_cwd_issue → None → allow through, no exit code produced
+        // In-memory sessions skip the check (guard 1): get_missing_session_cwd_issue → None → gate passes
         let sm = SessionManager::in_memory("/current");
-        let issue = get_missing_session_cwd_issue(&sm, "/current");
-        assert_eq!(
-            missing_cwd_disposition(issue.as_ref(), &AppMode::Print(Mode::Text)),
-            None
-        );
-        assert_eq!(
-            missing_cwd_disposition(issue.as_ref(), &AppMode::Interactive),
-            None
-        );
+        assert!(get_missing_session_cwd_issue(&sm, "/current").is_none());
     }
 
     #[test]
-    fn missing_cwd_disposition_print_error_exit_1_mentions_session_cwd() {
+    fn missing_cwd_print_disposition_error_exit_1_mentions_session_cwd() {
         let issue = SessionCwdIssue {
             session_file: PathBuf::from("/sessions/abc.jsonl"),
             session_cwd: "/project/ghost".to_string(),
             fallback_cwd: "/current".to_string(),
         };
-        let (msg, code) =
-            missing_cwd_disposition(Some(&issue), &AppMode::Print(Mode::Text)).expect("should be handled");
+        let (msg, code) = missing_cwd_print_disposition(&issue);
         assert_eq!(code, 1, "print branch error exit code aligned with pi exit(1)");
         assert!(
             msg.contains("/project/ghost"),
@@ -421,20 +451,27 @@ mod tests {
         );
     }
 
+    // ── resolve_sessions_root（T-AP-08-6）─────────────────────────
+
     #[test]
-    fn missing_cwd_disposition_interim_interactive_error_exit_1() {
-        let issue = SessionCwdIssue {
-            session_file: PathBuf::from("/sessions/abc.jsonl"),
-            session_cwd: "/project/ghost".to_string(),
-            fallback_cwd: "/current".to_string(),
-        };
-        let (msg, code) =
-            missing_cwd_disposition(Some(&issue), &AppMode::Interactive).expect("should be handled");
+    fn resolve_sessions_root_prefers_session_dir_override() {
+        let args = parse(&["--session-dir", "/custom/root"]);
         assert_eq!(
-            code, 1,
-            "interim: interactive exits with the same error as print (before T-AP-08-6 takes over)"
+            resolve_sessions_root(&args).unwrap(),
+            PathBuf::from("/custom/root")
         );
-        assert!(msg.contains("does not exist"), "disposition message should contain the error text");
+    }
+
+    #[test]
+    fn resolve_sessions_root_defaults_to_agent_sessions_dir() {
+        // Default branch = get_sessions_dir() (<agentDir>/sessions; env/ENV_AGENT_DIR and
+        // home are both irrelevant—assertions only match the trailing `sessions` segment, immune to parallel env races).
+        let args = parse(&[]);
+        let root = resolve_sessions_root(&args).unwrap();
+        assert!(
+            root.ends_with("sessions"),
+            "default session root = <agentDir>/sessions (actual {root:?})"
+        );
     }
 
     // ── select_session_manager (T-AP-08-5: resume/continue/session-id semantics) ────────

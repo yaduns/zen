@@ -4,18 +4,19 @@
 // Implementation notes: see tasks/T-AP-08-5-implemented.md.
 //
 // Differences from pi:
-// - pi depends on pi-335 `createStartupTui` (startup UI framework, T-AP-08-6); zen delivers in this task
-//   a minimal startup TUI shell (no scrollback, single-content TuiLoop); T-AP-08-6 uses this as the extension point;
+// - pi depends on pi-335 `createStartupTui` (startup UI framework); zen startup TUI shell has already been handled by T-AP-08-6
+//   extracted to `cli/startup_ui.rs` (`startup_theme`/`run_startup_tui`); this module delegates to it;
 // - Lazy loader + progress callback → preload `Vec<SessionListing>` before mounting (the component loader is
 //   synchronous callback; T-AP-11-2 notes "async preload completes before construction"), progress display semantics preserved
 //   (`SessionListProgress` field still exists), data source becomes a one-time snapshot—recorded as an accepted deviation.
 
+use crate::cli::startup_ui::{run_startup_tui, startup_theme};
 use crate::components::session_selector::{SessionListLoader, SessionSelectorComponent};
 use crate::keybindings::app_default_bindings;
 use crate::session::jsonl::delete_session;
 use crate::session::session_listing::{SessionListProgress, SessionListing};
 use crate::session::session_manager::SessionManager;
-use crate::theme::{ControllerError, ThemeController};
+use crate::theme::ControllerError;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,7 +24,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop};
+use zen_tui::app_loop::{EventOutcome, TuiError};
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::screen::ScreenBuffer;
@@ -73,9 +74,8 @@ async fn run_picker_inner(
     all: Vec<SessionListing>,
     sessions_root: &Path,
 ) -> Result<Option<String>, SessionPickerError> {
-    // 1. theme + keybinding table assembly
-    let controller = ThemeController::new(None, None, None)?;
-    let theme = controller.current().clone();
+    // 1. Theme assembly (T-AP-08-6 shared shell: settings theme preference + terminal detection fallback)
+    let theme = startup_theme(None)?;
     let kb = KeybindingsManager::new(app_default_bindings(), HashMap::new());
 
     // 2. List snapshot cell (delete callback removes entries from the cell → loader rereads)
@@ -147,42 +147,32 @@ async fn run_picker_inner(
         on_delete,
     )));
 
-    // 6. start TUI shell (no scrollback, single content; T-AP-08-6 extension point)
-    let mut tui = TuiLoop::new()?;
-    tui.start()?;
-
-    let run_result = {
-        let on_event_cell = Rc::clone(&selector_cell);
-        let draw_cell = Rc::clone(&selector_cell);
-        let cancel = cancel.clone();
-        tui.run(
-            &cancel,
-            move |event| {
-                match event {
-                    crossterm::event::Event::Key(key) => {
-                        // Defensive filtering of Release events (always Press when enhanced protocol REPORT_EVENT_TYPES is not enabled)
-                        if key.kind == crossterm::event::KeyEventKind::Release {
-                            return EventOutcome::Continue;
-                        }
-                        let mut comp = on_event_cell.borrow_mut();
-                        comp.handle_key(&key);
-                        EventOutcome::Continue
+    // 6. Start TUI shell (T-AP-08-6 `run_startup_tui` shared runner: TuiLoop lifecycle + restore terminal)
+    let on_event_cell = Rc::clone(&selector_cell);
+    let draw_cell = Rc::clone(&selector_cell);
+    run_startup_tui(
+        &cancel,
+        move |event| {
+            match event {
+                crossterm::event::Event::Key(key) => {
+                    // Defensive filtering of Release events (always Press when enhanced protocol REPORT_EVENT_TYPES is not enabled)
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        return EventOutcome::Continue;
                     }
-                    _ => EventOutcome::Continue,
+                    let mut comp = on_event_cell.borrow_mut();
+                    comp.handle_key(&key);
+                    EventOutcome::Continue
                 }
-            },
-            move |buf: &mut ScreenBuffer| {
-                let (w, h) = buf.size();
-                let mut comp = draw_cell.borrow_mut();
-                let _ = comp.render(buf, 0, 0, w, h);
-            },
-        )
-        .await
-    };
-    // Both run and stop are executed (restore the terminal first even if run errors, then propagate the error)
-    let stop_result = tui.stop();
-    run_result?;
-    stop_result?;
+                _ => EventOutcome::Continue,
+            }
+        },
+        move |buf: &mut ScreenBuffer| {
+            let (w, h) = buf.size();
+            let mut comp = draw_cell.borrow_mut();
+            let _ = comp.render(buf, 0, 0, w, h);
+        },
+    )
+    .await?;
 
     // 7. Result (on_select/on_cancel already wrote to shared cell; callbacks happen before run returns)
     let result = result_cell.lock().unwrap().take();

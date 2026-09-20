@@ -90,9 +90,8 @@ pub fn format_missing_session_cwd_error(issue: &SessionCwdIssue) -> String {
 /// or reopening the session) or cancel—the text itself explains the options; the consequence of choosing Continue is stated in 「continue in current cwd」.
 ///
 /// # Consumers
-/// **pub but currently has no consumers; reserved for T-AP-08-6 (startup UI Continue/Cancel selector) and
-/// T-AP-08-5 (/resume restore-flow confirmation overlay)**; in the interim, interactive goes through
-/// the same error exit as `format_missing_session_cwd_error` (see "Integration with existing code").
+/// main.rs startup gate interactive branch (T-AP-08-6, via `show_startup_selector`) and
+/// `interactive/mod.rs` /resume recovery flow confirmation popup (T-AP-08-5) — both are implemented.
 pub fn format_missing_session_cwd_prompt(issue: &SessionCwdIssue) -> String {
     format!(
         "cwd from session file does not exist\n{}\n\ncontinue in current cwd\n{}",
