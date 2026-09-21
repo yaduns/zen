@@ -17,6 +17,7 @@ use zen_ai::types::{
     AssistantMessage, ContentBlock, Context, Message, TextContent, ToolCall, ToolResultMessage,
     Usage,
 };
+use zen_ai::utils::validation::validate_tool_arguments;
 
 /// Fixed behavioral policies for the agent loop.
 ///
@@ -201,6 +202,11 @@ pub(crate) async fn prepare_tool_call(
     let args = tool
         .prepare_arguments(&tool_call.arguments)
         .map_err(|err| error_tool_result(tool_call, format!("Invalid arguments: {}", err)))?;
+
+    // 2.5 Argument schema validation (jsonschema + type coercion)—aligned with pi validateToolArguments(tool, preparedToolCall)
+    // Input is prepared arguments (the output of prepare_arguments); the Ok value (after coerce + validation) replaces args and the flow continues
+    let args = validate_tool_arguments(tool.as_ref(), &args)
+        .map_err(|e| error_tool_result(tool_call, e.to_string()))?;
 
     // 3. Check cancellation signal
     if cancel.is_cancelled() {
@@ -546,6 +552,11 @@ mod tests {
             self.fail_prepare = fail;
             self
         }
+
+        fn with_params(mut self, params: serde_json::Value) -> Self {
+            self.params = params;
+            self
+        }
     }
 
     #[async_trait]
@@ -833,6 +844,65 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(block_text(&err.message.content[0]).contains("Invalid arguments"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_tool_call_schema_validation_fails() {
+        // Tool argument Schema missing a required field → Schema validation failure → error tool result (aligned with pi
+        // validateToolArguments throws; caught and converted to createErrorToolResult)
+        let tool: Arc<dyn Tool> = Arc::new(MockTool::new("bash").with_params(json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })));
+        let tools = [tool];
+        let hooks = MockHooks::new();
+        let cancel = CancellationToken::new();
+
+        let result = prepare_tool_call(
+            &dummy_context_with_tools(tools.to_vec()),
+            &dummy_assistant_message(),
+            &dummy_tool_call("bash"),
+            &hooks,
+            &cancel,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(block_text(&err.message.content[0]).contains("Validation failed for tool \"bash\""));
+        assert!(block_text(&err.message.content[0]).contains("- command:"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_tool_call_schema_coerces_args() {
+        // Stringified arguments are type-coerced during Schema validation ("42" → 42); the Ok value replaces args and the flow continues
+        let tool: Arc<dyn Tool> = Arc::new(MockTool::new("bash").with_params(json!({
+            "type": "object",
+            "properties": { "timeout": { "type": "number" } },
+            "required": ["timeout"]
+        })));
+        let tools = [tool];
+        let hooks = MockHooks::new();
+        let cancel = CancellationToken::new();
+        let tool_call = ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: json!({ "timeout": "42" }),
+            thought_signature: None,
+        };
+
+        let result = prepare_tool_call(
+            &dummy_context_with_tools(tools.to_vec()),
+            &dummy_assistant_message(),
+            &tool_call,
+            &hooks,
+            &cancel,
+        )
+        .await;
+
+        let prepared = result.expect("coerces and validates");
+        assert_eq!(prepared.args, json!({ "timeout": 42 }));
     }
 
     #[tokio::test]
