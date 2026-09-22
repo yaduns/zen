@@ -732,6 +732,7 @@ mod tests {
             zen_ai::tool::ToolExecutionMode::Parallel,
             Arc::new(MockHooks),
             summary_stream_fn("compacted summary"),
+            None, // T-AI-02-6: test does not carry session affinity key
         );
         let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);

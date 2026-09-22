@@ -152,6 +152,7 @@ async fn run_turn_with_history(
         ToolExecutionMode::Sequential,
         Arc::new(MockHooks::new().with_max_turns(3)),
         real_stream_fn(),
+        None, // T-AI-02-6: integration tests do not carry the session affinity key
     );
     agent.prompt(prompt).await
 }

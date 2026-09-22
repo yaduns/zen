@@ -207,7 +207,8 @@ pub(crate) async fn stream_assistant_response(
     // 4. Call stream_fn
     let stream_config = StreamConfig {
         reasoning_effort: config.reasoning, // ← from AgentLoopConfig (new field added by fix item 3)
-        ..Default::default()                // ← remaining 5 fields keep defaults
+        session_id: config.session_id.clone(), // ← T-AI-02-6: session affinity cache key → request body prompt_cache_key
+        ..Default::default()                   // ← the remaining 6 fields keep defaults
     };
     let mut receiver = match stream_fn(
         &config.model,

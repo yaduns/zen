@@ -87,6 +87,13 @@ struct Request {
     /// Not sent in openai format (opencode-go).
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingParam>,
+    /// Session affinity cache key (OpenAI `prompt_cache_key` request field); omitted entirely when None.
+    /// Value = `StreamConfig.session_id` truncated by `clamp_openai_prompt_cache_key` (≤64 code points),
+    /// so the server routes requests for the same session to the same cache shard (aligns with pi buildParams parameter).
+    /// Note: struct-level `rename_all = "camelCase"` produces `promptCacheKey`, so an explicit rename is required
+    /// to the API-required snake_case (see `reasoning_effort` in the same struct for precedent).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "prompt_cache_key")]
+    prompt_cache_key: Option<String>,
 }
 
 /// Internal structure of the `thinking` toggle parameter (DeepSeek-family endpoints): `{type: "enabled"}` or `{type: "disabled"}`.
@@ -498,6 +505,13 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
     });
 
     let reasoning_effort = cfg.reasoning_effort.and_then(thinking_level_to_api_value);
+    // Session affinity cache key: sent whenever `session_id` is present (pi's baseUrl whitelist condition gate
+    // `baseUrl.includes("api.openai.com") || cacheRetention=="long"` dropped alongside multi-provider quirks—
+    // zen's default endpoint is not openai.com; mechanical copying = never sends = dead code; endpoint's parameter acceptance has been verified on real hardware
+    // tolerated for 200, see tasks/T-AI-02-6-implemented.md "Implementation prerequisites"). When None, the whole thing is not serialized,
+    // zero change to the default-path request body.
+    let prompt_cache_key =
+        crate::api::prompt_cache::clamp_openai_prompt_cache_key(cfg.session_id.as_deref());
     // Append thinking toggle per provider thinking format family: DeepSeek-family (huoshan)
     // On → {type:"enabled"}, Off → {type:"disabled"} (avoids "can't turn Off a session that was enabled",
     // aligns with the pi deepseek branch; openai-format providers like opencode-go don't send it).
@@ -527,6 +541,7 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
         stop: None,
         reasoning_effort,
         thinking,
+        prompt_cache_key,
     };
 
     req
@@ -748,12 +763,19 @@ fn parse_chunk(chunk: &serde_json::Value, provider: &str) -> Vec<StreamEvent> {
 }
 
 /// Extract raw token counts from the `usage` JSON of the API's final chunk; does not compute cost.
+///
+/// `cache_read` dual-field fallback (aligned with pi's `parseChunkUsage`, openai-completions.ts:1191):
+/// OpenAI shape `prompt_tokens_details.cached_tokens` takes priority, DeepSeek official shape's top-level
+/// `prompt_cache_hit_tokens` as fallback. **Nullish semantics: explicit 0 does not fall back** — when `cached_tokens` is 0,
+/// do not read `prompt_cache_hit_tokens`; Rust uses a `.or_else` chain (`.as_u64()` returns None for missing,
+/// Some(0) for explicit 0, naturally matching pi's `??`), **forbidden** to write as two chained short-circuiting `.unwrap_or(0)`.
 fn parse_usage(usage: &serde_json::Value) -> (u64, u64, u64, u64, Option<u64>) {
     let input = usage["prompt_tokens"].as_u64().unwrap_or(0);
     let output = usage["completion_tokens"].as_u64().unwrap_or(0);
     let total = usage["total_tokens"].as_u64().unwrap_or(0);
     let cache_read = usage["prompt_tokens_details"]["cached_tokens"]
         .as_u64()
+        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
         .unwrap_or(0);
     let reasoning = usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
     (input, output, cache_read, total, reasoning)
@@ -1526,6 +1548,44 @@ mod tests {
         assert_eq!(reasoning, Some(30));
     }
 
+    #[test]
+    fn test_parse_usage_deepseek_shape_fallback() {
+        // DeepSeek official shape: top-level prompt_cache_hit_tokens (no prompt_tokens_details)
+        let json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+            "prompt_cache_hit_tokens": 20
+        });
+        let (_, _, cache_read, _, _) = parse_usage(&json);
+        assert_eq!(
+            cache_read, 20,
+            "DeepSeek shape should fall back to prompt_cache_hit_tokens"
+        );
+    }
+
+    #[test]
+    fn test_parse_usage_explicit_zero_no_fallback() {
+        // nullish semantics: when cached_tokens is explicitly 0, do not fall back to prompt_cache_hit_tokens (same as pi's `??`)
+        let json = serde_json::json!({
+            "prompt_tokens_details": { "cached_tokens": 0 },
+            "prompt_cache_hit_tokens": 999
+        });
+        let (_, _, cache_read, _, _) = parse_usage(&json);
+        assert_eq!(cache_read, 0, "Explicit 0 does not fall back");
+    }
+
+    #[test]
+    fn test_parse_usage_openai_shape_precedence() {
+        // both shapes present: OpenAI shape takes priority (pi `cached_tokens ?? hit` chain order)
+        let json = serde_json::json!({
+            "prompt_tokens_details": { "cached_tokens": 20 },
+            "prompt_cache_hit_tokens": 999
+        });
+        let (_, _, cache_read, _, _) = parse_usage(&json);
+        assert_eq!(cache_read, 20, "OpenAI shape takes precedence over DeepSeek shape");
+    }
+
     // ═════════════════════════════════════════════════════════════
     //  convert_content_block
     // ═════════════════════════════════════════════════════════════
@@ -1898,6 +1958,63 @@ mod tests {
         };
         let req = build_request_body(&model, &ctx, &StreamConfig::default());
         assert_eq!(req.messages.len(), 0);
+    }
+
+    // ── prompt_cache_key（T-AI-02-6，pi-102）──
+
+    #[test]
+    fn test_build_request_body_prompt_cache_key_absent_by_default() {
+        // default config (session_id = None) → parameter not sent, zero change to default-path request body
+        let req = build_request_body(&sample_model(), &sample_context(), &StreamConfig::default());
+        assert!(req.prompt_cache_key.is_none());
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("prompt_cache_key").is_none(),
+            "When session_id is omitted, prompt_cache_key must not be serialized (serialized key name must be snake_case)"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_prompt_cache_key_from_session_id() {
+        let cfg = StreamConfig {
+            session_id: Some("session-123".into()),
+            ..Default::default()
+        };
+        let req = build_request_body(&sample_model(), &sample_context(), &cfg);
+        assert_eq!(req.prompt_cache_key.as_deref(), Some("session-123"));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["prompt_cache_key"], "session-123");
+    }
+
+    #[test]
+    fn test_build_request_body_prompt_cache_key_truncated() {
+        // over-long session_id → truncated to 64 code points then sent
+        let long_id = "s".repeat(100);
+        let cfg = StreamConfig {
+            session_id: Some(long_id.clone()),
+            ..Default::default()
+        };
+        let req = build_request_body(&sample_model(), &sample_context(), &cfg);
+        let key = req
+            .prompt_cache_key
+            .as_deref()
+            .expect("Send when session_id exists");
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, "s".repeat(64));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["prompt_cache_key"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn test_build_request_body_prompt_cache_key_multibyte_truncation() {
+        // multi-byte session_id: truncate by code point, never split a surrogate pair
+        let cfg = StreamConfig {
+            session_id: Some("😀".repeat(70)),
+            ..Default::default()
+        };
+        let req = build_request_body(&sample_model(), &sample_context(), &cfg);
+        let key = req.prompt_cache_key.expect("Send when session_id exists");
+        assert_eq!(key, "😀".repeat(64));
     }
 
     // ── thinking toggle (T-thinking-invisible-fix defect B: appended per provider format family) ──

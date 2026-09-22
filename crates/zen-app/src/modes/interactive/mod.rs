@@ -2177,6 +2177,7 @@ mod tests {
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             mock_stream_fn(),
+            None, // T-AI-02-6: test does not carry session affinity key
         )
     }
 
@@ -2685,6 +2686,7 @@ mod tests {
                 ToolExecutionMode::Sequential,
                 Arc::new(MockHooks),
                 completable_stream_fn(),
+                None, // T-AI-02-6: test does not carry session affinity key
             ),
             Arc::clone(&store_dyn),
         ));

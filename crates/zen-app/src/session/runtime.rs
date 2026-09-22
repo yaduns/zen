@@ -240,6 +240,7 @@ mod tests {
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             mock_stream_fn(),
+            None, // T-AI-02-6: test does not carry session affinity key
         )
     }
 

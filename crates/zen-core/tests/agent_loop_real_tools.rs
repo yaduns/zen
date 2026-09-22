@@ -185,6 +185,7 @@ async fn real_test_multi_tool_chain() {
         api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
         reasoning: None,
+        session_id: None, // T-AI-02-6: test does not carry session affinity key
     };
 
     let stream_fn = real_stream_fn();
@@ -438,6 +439,7 @@ async fn real_test_tools_list_directory() {
         api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
         reasoning: None,
+        session_id: None, // T-AI-02-6: test does not carry session affinity key
     };
 
     let stream_fn = real_stream_fn();

@@ -795,6 +795,7 @@ mod tests {
             ToolExecutionMode::Sequential,
             std::sync::Arc::new(MockHooks),
             mock_stream_fn(),
+            None, // T-AI-02-6: test does not carry session affinity key
         )
     }
 

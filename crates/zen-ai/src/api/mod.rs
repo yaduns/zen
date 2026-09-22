@@ -1,4 +1,5 @@
 pub mod openai_stream;
+pub mod prompt_cache;
 
 use crate::provider::Api;
 use crate::types::StreamFn;

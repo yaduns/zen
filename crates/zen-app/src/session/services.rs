@@ -195,7 +195,16 @@ pub fn create_agent_session(
         inner: hooks,
         excluded: excluded.clone(),
     });
-    let agent = Agent::new(state, ToolExecutionMode::Parallel, session_hooks, stream_fn);
+    // T-AI-02-6: store constructed before agent; session_id readable before Agent::new → threaded through the whole chain
+    // (Agent.session_id → AgentLoopConfig → StreamConfig → request body prompt_cache_key)
+    let session_id = session_store.session_id();
+    let agent = Agent::new(
+        state,
+        ToolExecutionMode::Parallel,
+        session_hooks,
+        stream_fn,
+        Some(session_id),
+    );
     AgentSession::new_with_exclusions(
         agent,
         session_store,

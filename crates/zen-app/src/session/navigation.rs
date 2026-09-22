@@ -393,6 +393,7 @@ mod tests {
                 ToolExecutionMode::Sequential,
                 Arc::new(MockHooks),
                 fake_stream_fn("summary text", Arc::new(Mutex::new(0))),
+                None, // T-AI-02-6: test does not carry session affinity key
             ),
             sm.clone(),
         );

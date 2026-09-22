@@ -295,6 +295,10 @@ pub struct AgentLoopConfig {
     /// Tool execution mode: parallel (default) or sequential
     pub tool_execution: ToolExecutionMode,
     pub reasoning: Option<ThinkingLevel>,
+    /// Session-affinity cache key, passed through to the stream fn with each round's `StreamConfig` (aligned with pi
+    /// `SimpleStreamOptions.sessionId`, entering loop config via `AgentLoopConfig extends SimpleStreamOptions`).
+    /// None = do not send `prompt_cache_key` (this is the form for compaction/branch-summary calls, aligned with pi compaction having no sessionId).
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]

@@ -302,6 +302,7 @@ fn default_config() -> AgentLoopConfig {
         api_key: Some("test-key".into()),
         tool_execution: ToolExecutionMode::Sequential,
         reasoning: None,
+        session_id: None, // T-AI-02-6: test does not carry session affinity key
     }
 }
 
@@ -585,6 +586,7 @@ async fn real_test_agent_loop_simple_chat() {
         api_key: None,
         tool_execution: ToolExecutionMode::Sequential,
         reasoning: None,
+        session_id: None, // T-AI-02-6: test does not carry session affinity key
     };
 
     let stream_fn = real_stream_fn();

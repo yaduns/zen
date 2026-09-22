@@ -39,6 +39,11 @@ pub struct Agent {
     hooks: Arc<dyn AgentLoopHooks>,
     /// Each prompt passes self.stream_fn.clone() to the lower layer
     stream_fn: StreamFn,
+    /// Session affinity cache key (aligned with pi `Agent.sessionId`: "Session identifier forwarded to
+    /// providers for cache-aware backends"). Injected once during construction and read-only thereafter; passed via `make_config`
+    /// threaded through to each turn `AgentLoopConfig.session_id` → `StreamConfig.session_id` → request body
+    /// `prompt_cache_key`（T-AI-02-6）。
+    session_id: Option<String>,
     /// D4: cancellation token for the current run (replaced on every run); abort() targets it (idle = old token no-op).
     cancel: Mutex<CancellationToken>,
     /// Consumed by the Agent's own impl AgentLoopHooks
@@ -169,12 +174,14 @@ impl Agent {
         tool_execution: ToolExecutionMode,
         hooks: Arc<dyn AgentLoopHooks>,
         stream_fn: StreamFn,
+        session_id: Option<String>,
     ) -> Self {
         Self {
             state: Mutex::new(state),
             tool_execution,
             hooks,
             stream_fn,
+            session_id,
             cancel: Mutex::new(CancellationToken::new()), // placeholder; replaced on the first run (D4)
             // Both queues are created in new and kept as engine fields (aligns with the comment's edge cases).
             steer_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -191,8 +198,13 @@ impl Agent {
     /// **Pure function: no locking, no touching `self`** (avoids re-entering the lock while holding the state guard; std Mutex is not reentrant).
     /// `state` is held by the caller under the lock; `tool_execution` is Copy, so the caller reads fields directly under the lock
     /// (field-level shared borrow, no conflict with the state lock).
-    /// `reasoning` is derived from `state.thinking_level`: `Off` → `None`, otherwise `Some(level)`.
-    fn make_config(state: &AgentState, tool_execution: ToolExecutionMode) -> AgentLoopConfig {
+    /// `reasoning` is derived from `state.thinking_level`: `Off` → `None`; otherwise `Some(level)`;
+    /// `session_id` is passed in by the caller reading `self.session_id` under the lock (field-level shared borrow; does not conflict with the state lock).
+    fn make_config(
+        state: &AgentState,
+        tool_execution: ToolExecutionMode,
+        session_id: Option<String>,
+    ) -> AgentLoopConfig {
         AgentLoopConfig {
             model: state.model.clone(), // ← single source of truth: state
             api_key: None,              // Low level goes through hooks.get_api_key
@@ -201,6 +213,7 @@ impl Agent {
                 ThinkingLevel::Off => None, // Off → don't send reasoning_effort
                 level => Some(level),       // Pass other levels through unchanged
             },
+            session_id, // ← Session affinity cache key (read from the self field under the lock and passed in, T-AI-02-6)
         }
     }
 
@@ -226,7 +239,7 @@ impl Agent {
             *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = token.clone(); // D4: refresh
             let tool_execution = self.tool_execution; // Copy-read fields under lock (not reentrant, harmless), consumed in place (not added to the tuple)
             let ctx = create_context(s.system_prompt.clone(), s.messages.clone(), &s.tools);
-            let cfg = Self::make_config(&s, tool_execution); // Pure function, no re-entry
+            let cfg = Self::make_config(&s, tool_execution, self.session_id.clone()); // Pure function, no re-entry
             let _guard = RunGuard(&self.state); // Attach RAII after start_run succeeds (P1-2)
             (ctx, cfg, _guard)
         }; // Release lock (guard drop); _guard borrows &self.state (shared) and outlives the function
@@ -715,6 +728,7 @@ mod tests {
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             mock_stream_fn(),
+            None, // T-AI-02-6: the test engine carries no session affinity key
         )
     }
 
@@ -725,6 +739,7 @@ mod tests {
             ToolExecutionMode::Sequential,
             Arc::new(MockHooks),
             controllable_stream_fn(block),
+            None, // T-AI-02-6: the test engine carries no session affinity key
         )
     }
 
@@ -1007,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_make_config_reasoning_off_is_none() {
-        let cfg = Agent::make_config(&agent_state(), ToolExecutionMode::Sequential);
+        let cfg = Agent::make_config(&agent_state(), ToolExecutionMode::Sequential, None);
         assert_eq!(cfg.reasoning, None, "Off → do not send reasoning_effort");
         assert_eq!(cfg.api_key, None, "api_key fixed to None, uses hooks.get_api_key");
     }
@@ -1016,15 +1031,29 @@ mod tests {
     fn test_make_config_reasoning_level_passthrough() {
         let mut st = agent_state();
         st.thinking_level = ThinkingLevel::Low;
-        let cfg = Agent::make_config(&st, ToolExecutionMode::Sequential);
+        let cfg = Agent::make_config(&st, ToolExecutionMode::Sequential, None);
         assert_eq!(cfg.reasoning, Some(ThinkingLevel::Low));
     }
 
     #[test]
     fn test_make_config_derives_model_and_tool_execution() {
         let st = agent_state();
-        let cfg = Agent::make_config(&st, ToolExecutionMode::Parallel);
+        let cfg = Agent::make_config(&st, ToolExecutionMode::Parallel, None);
         assert_eq!(cfg.model, st.model);
         assert_eq!(cfg.tool_execution, ToolExecutionMode::Parallel);
+    }
+
+    #[test]
+    fn test_make_config_session_id_passthrough() {
+        // T-AI-02-6: session_id is passed through unchanged (both None and Some are passed to AgentLoopConfig as-is)
+        let st = agent_state();
+        let cfg = Agent::make_config(&st, ToolExecutionMode::Sequential, None);
+        assert_eq!(cfg.session_id, None);
+        let cfg2 = Agent::make_config(
+            &st,
+            ToolExecutionMode::Sequential,
+            Some("session-abc".into()),
+        );
+        assert_eq!(cfg2.session_id.as_deref(), Some("session-abc"));
     }
 }

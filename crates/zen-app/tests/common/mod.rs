@@ -84,6 +84,7 @@ pub fn new_agent(base_prompt: &str, history: Vec<Message>) -> Agent {
         ToolExecutionMode::Sequential,
         Arc::new(MockHooks::new().with_max_turns(3)),
         real_stream_fn(),
+        None, // T-AI-02-6: integration tests do not carry the session affinity key
     )
 }
 
