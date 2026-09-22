@@ -1,19 +1,16 @@
 // REQ-APP-08 (pi-331): @file argument handling
 // See reference/pi-original/packages/coding-agent/src/cli/file-processor.ts
-// image byte sniffing (sniff_supported_image_mime_type and byte helpers) reference
-// reference/pi-original/packages/coding-agent/src/utils/mime.ts（pi-342）；
-// migrate to the canonical MIME module when T-AP-09-6 lands and expose detect_supported_image_mime_type_from_file.
-// implementation notes: tasks/T-AP-08-4-implemented.md
+// Image byte sniffing has moved to zen_core::mime (T-AP-09-6, canonical module pi-342 semantics); this file consumes its public API
+// detect_supported_image_mime_type (byte-level — read the whole content once, then sniff; eliminates TOCTOU).
+// Implementation notes in tasks/T-AP-09-6-implemented.md
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use zen_ai::types::ImageContent;
+use zen_core::mime::detect_supported_image_mime_type;
 use zen_core::tools::path_utils::resolve_read_path_async;
-
-/// PNG file signature (`89 50 4E 47 0D 0A 1A 0A`), used for image byte sniffing.
-const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// Full artifacts of `@file` batch processing (handling of all `@file` references in one CLI run).
 ///
@@ -54,7 +51,7 @@ pub enum FileProcessError {
 ///   `access()` single message); empty files (`len() == 0`) are **silently skipped**.
 /// - **Read full content once**: sniffing and branching share the same byte buffer, eliminating pi's TOCTOU window between
 ///   "sniffing 4100 bytes" and "reading the full content"; read failure → `ReadFailed` (shared mapping for text/image branches).
-/// - image sniffing (private `sniff_supported_image_mime_type`, pi-342 semantics; migrate when T-AP-09-6 lands):
+/// - Image sniffing (`zen_core::mime::detect_supported_image_mime_type`, pi-342 canonical module, T-AP-09-6):
 ///   - on png/jpeg/gif/webp hit → pass through base64 as `ImageContent`, append `<file name="{abs}"></file>\n` to text
 ///     (hints always empty; **no decode validation** — corrupted bytes are attached as-is; pi would hit a decode failure on resize and take the `!ok`
 ///     branch to omit the message; this divergence is explicitly registered, v1 accepts provider-side rejection);
@@ -95,8 +92,8 @@ pub async fn process_file_arguments(
             .await
             .map_err(|e| FileProcessError::ReadFailed(resolved.clone(), e))?;
 
-        // 4. image sniffing classification (pi-342 semantics)
-        match sniff_supported_image_mime_type(&bytes) {
+        // 4. Image sniffing classification (pi-342 semantics, via the zen_core::mime canonical module)
+        match detect_supported_image_mime_type(&bytes) {
             // Sniff hit but not inlinable (BMP only, no conversion pipeline) → pi `!ok` branch omission message
             Some("image/bmp") => {
                 push_file_ref(
@@ -132,145 +129,6 @@ fn push_file_ref(text: &mut String, abs: &str, inner: &str) {
     text.push_str("</file>\n");
 }
 
-/// Sniff the supported image MIME type from the byte prefix (JPEG/PNG/GIF/WebP/BMP); returns `None` on no match.
-///
-/// Corresponds to pi-342 `detectSupportedImageMimeType` (byte-level detection, not by extension):
-/// - JPEG: `FF D8 FF` prefix and 4th byte not `F7` (JFIF magic) → `image/jpeg`
-/// - PNG: full signature + IHDR first chunk (length=13) + non-animated (no `acTL` chunk) → `image/png`
-/// - GIF: `GIF` prefix → `image/gif`
-/// - WebP: `RIFF` prefix + `WEBP` at offset 8 → `image/webp`
-/// - BMP: `BM` prefix + `is_bmp` structural check → `image/bmp`
-///
-/// migrate to the canonical MIME module when T-AP-09-6 lands (precedent: T-AP-09-1 absorbed path_utils.rs); at that point
-/// `process_file_arguments` will consume its public surface `detect_supported_image_mime_type_from_file`.
-fn sniff_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
-    if starts_with_bytes(buffer, &[0xFF, 0xD8, 0xFF]) {
-        return if buffer.get(3) == Some(&0xF7) {
-            None
-        } else {
-            Some("image/jpeg")
-        };
-    }
-    if starts_with_bytes(buffer, &PNG_SIGNATURE) {
-        return if is_png(buffer) && !is_animated_png(buffer) {
-            Some("image/png")
-        } else {
-            None
-        };
-    }
-    if starts_with_ascii(buffer, 0, "GIF") {
-        return Some("image/gif");
-    }
-    if starts_with_ascii(buffer, 0, "RIFF") && starts_with_ascii(buffer, 8, "WEBP") {
-        return Some("image/webp");
-    }
-    if starts_with_ascii(buffer, 0, "BM") && is_bmp(buffer) {
-        return Some("image/bmp");
-    }
-    None
-}
-
-/// Whether the PNG has a valid first IHDR chunk (8 bytes after the signature are chunk length=13 + `IHDR` type).
-fn is_png(buffer: &[u8]) -> bool {
-    buffer.len() >= 16
-        && read_u32_be(buffer, PNG_SIGNATURE.len()) == 13
-        && starts_with_ascii(buffer, 12, "IHDR")
-}
-
-/// Whether the PNG contains an `acTL` animation control chunk (walks the chunk chain; treats `IDAT` as static and returns early).
-fn is_animated_png(buffer: &[u8]) -> bool {
-    let mut offset = PNG_SIGNATURE.len();
-    while offset + 8 <= buffer.len() {
-        let chunk_length = read_u32_be(buffer, offset) as usize;
-        let chunk_type_offset = offset + 4;
-        if starts_with_ascii(buffer, chunk_type_offset, "acTL") {
-            return true;
-        }
-        if starts_with_ascii(buffer, chunk_type_offset, "IDAT") {
-            return false;
-        }
-        let next_offset = offset + 8 + chunk_length + 4;
-        if next_offset <= offset || next_offset > buffer.len() {
-            return false;
-        }
-        offset = next_offset;
-    }
-    false
-}
-
-/// BMP structure validation (field consistency for BITMAPCOREHEADER=12 / BITMAPINFOHEADER=40..=124).
-fn is_bmp(buffer: &[u8]) -> bool {
-    if buffer.len() < 26 {
-        return false;
-    }
-    let declared_file_size = read_u32_le(buffer, 2);
-    let pixel_data_offset = read_u32_le(buffer, 10);
-    let dib_header_size = read_u32_le(buffer, 14);
-    if declared_file_size != 0 && declared_file_size < 26 {
-        return false;
-    }
-    if pixel_data_offset < 14 + dib_header_size {
-        return false;
-    }
-    if declared_file_size != 0 && pixel_data_offset >= declared_file_size {
-        return false;
-    }
-
-    let (color_planes, bits_per_pixel) = if dib_header_size == 12 {
-        (read_u16_le(buffer, 22), read_u16_le(buffer, 24))
-    } else if (40..=124).contains(&dib_header_size) {
-        if buffer.len() < 30 {
-            return false;
-        }
-        (read_u16_le(buffer, 26), read_u16_le(buffer, 28))
-    } else {
-        return false;
-    };
-
-    color_planes == 1 && matches!(bits_per_pixel, 1 | 4 | 8 | 16 | 24 | 32)
-}
-
-/// Byte-prefix match (false on out-of-bounds).
-fn starts_with_bytes(buffer: &[u8], prefix: &[u8]) -> bool {
-    buffer.len() >= prefix.len() && &buffer[..prefix.len()] == prefix
-}
-
-/// Match ASCII text starting at `offset` (false on out-of-bounds).
-fn starts_with_ascii(buffer: &[u8], offset: usize, text: &str) -> bool {
-    if buffer.len() < offset + text.len() {
-        return false;
-    }
-    text.as_bytes()
-        .iter()
-        .enumerate()
-        .all(|(i, &b)| buffer[offset + i] == b)
-}
-
-/// Little-endian u16 (out-of-bounds bytes treated as 0, matching pi `buffer[offset] ?? 0`).
-fn read_u16_le(buffer: &[u8], offset: usize) -> u16 {
-    let b0 = buffer.get(offset).copied().unwrap_or(0) as u16;
-    let b1 = buffer.get(offset + 1).copied().unwrap_or(0) as u16;
-    b0 | (b1 << 8)
-}
-
-/// Big-endian u32 (out-of-bounds bytes treated as 0).
-fn read_u32_be(buffer: &[u8], offset: usize) -> u32 {
-    let mut value = 0u32;
-    for i in 0..4 {
-        value = (value << 8) | buffer.get(offset + i).copied().unwrap_or(0) as u32;
-    }
-    value
-}
-
-/// Little-endian u32 (out-of-bounds bytes treated as 0).
-fn read_u32_le(buffer: &[u8], offset: usize) -> u32 {
-    let mut value = 0u32;
-    for i in 0..4 {
-        value |= (buffer.get(offset + i).copied().unwrap_or(0) as u32) << (8 * i);
-    }
-    value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,26 +149,6 @@ mod tests {
         vec![0xFF, 0xD8, 0xFF, 0x00, 0xAA, 0xBB, 0xCC, 0xDD]
     }
 
-    fn static_png_bytes() -> Vec<u8> {
-        // Real PNG chunk structure: length(4) + type(4) + data + CRC(4)—chunk traversal (is_animated_png)
-        // Advance by `offset + 8 + chunk_length + 4`; missing CRC shifts traversal by 4 bytes
-        let mut png = PNG_SIGNATURE.to_vec();
-        png.extend_from_slice(&13u32.to_be_bytes()); // IHDR chunk length
-        png.extend_from_slice(b"IHDR");
-        png.extend_from_slice(&[0u8; 13]); // IHDR data
-        png.extend_from_slice(&[0u8; 4]); // CRC
-        png
-    }
-
-    fn animated_png_bytes() -> Vec<u8> {
-        let mut png = static_png_bytes();
-        png.extend_from_slice(&8u32.to_be_bytes()); // acTL chunk length
-        png.extend_from_slice(b"acTL");
-        png.extend_from_slice(&[0u8; 8]); // acTL data
-        png.extend_from_slice(&[0u8; 4]); // CRC
-        png
-    }
-
     fn minimal_bmp_bytes() -> Vec<u8> {
         // BITMAPCOREHEADER(12) minimal valid structure: BM + declaredFileSize=0 + pixelDataOffset=26 + dibHeaderSize=12
         // + colorPlanes=1 + bitsPerPixel=24
@@ -321,12 +159,6 @@ mod tests {
         b[14] = 12; // dibHeaderSize（LE）
         b[22] = 1; // colorPlanes（LE u16）
         b[24] = 24; // bitsPerPixel（LE u16）
-        b
-    }
-
-    fn invalid_bmp_bytes() -> Vec<u8> {
-        let mut b = minimal_bmp_bytes();
-        b[22] = 2; // colorPlanes != 1 → reject
         b
     }
 
@@ -493,67 +325,5 @@ mod tests {
         assert!(r.text.contains(
             "[Image omitted: could not be converted to a supported inline image format.]"
         ));
-    }
-
-    // ── sniff_supported_image_mime_type pure function ───────────────────
-
-    #[test]
-    fn test_sniff_jpeg() {
-        assert_eq!(
-            sniff_supported_image_mime_type(&jpeg_bytes()),
-            Some("image/jpeg")
-        );
-        // 4th byte is 0xF7 → reject (pi: buffer[3] === 0xf7 → null)
-        assert_eq!(
-            sniff_supported_image_mime_type(&[0xFF, 0xD8, 0xFF, 0xF7, 0x00, 0x00]),
-            None
-        );
-        // Prefix too short
-        assert_eq!(sniff_supported_image_mime_type(&[0xFF, 0xD8]), None);
-    }
-
-    #[test]
-    fn test_sniff_png_static_and_animated() {
-        assert_eq!(
-            sniff_supported_image_mime_type(&static_png_bytes()),
-            Some("image/png")
-        );
-        // Animated PNG (acTL chunk) → reject (pi does not inline animated PNGs)
-        assert_eq!(sniff_supported_image_mime_type(&animated_png_bytes()), None);
-    }
-
-    #[test]
-    fn test_sniff_gif() {
-        assert_eq!(
-            sniff_supported_image_mime_type(b"GIF89a\x00\x00\x00"),
-            Some("image/gif")
-        );
-    }
-
-    #[test]
-    fn test_sniff_webp() {
-        let mut webp = b"RIFF".to_vec();
-        webp.extend_from_slice(&[0u8; 4]);
-        webp.extend_from_slice(b"WEBP");
-        assert_eq!(sniff_supported_image_mime_type(&webp), Some("image/webp"));
-        // RIFF but not WEBP
-        let mut riff_only = b"RIFF".to_vec();
-        riff_only.extend_from_slice(&[0u8; 8]);
-        assert_eq!(sniff_supported_image_mime_type(&riff_only), None);
-    }
-
-    #[test]
-    fn test_sniff_bmp_valid_and_invalid() {
-        assert_eq!(
-            sniff_supported_image_mime_type(&minimal_bmp_bytes()),
-            Some("image/bmp")
-        );
-        assert_eq!(sniff_supported_image_mime_type(&invalid_bmp_bytes()), None);
-    }
-
-    #[test]
-    fn test_sniff_unknown_returns_none() {
-        assert_eq!(sniff_supported_image_mime_type(b"hello world"), None);
-        assert_eq!(sniff_supported_image_mime_type(&[]), None);
     }
 }

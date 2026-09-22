@@ -2,6 +2,7 @@ pub mod compaction;
 pub mod env;
 pub mod frontmatter;
 pub mod harness;
+pub mod mime;
 pub mod paths;
 pub mod process;
 pub mod prompt_templates;
