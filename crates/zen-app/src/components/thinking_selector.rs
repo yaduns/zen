@@ -220,7 +220,7 @@ mod tests {
         assert!(painted >= 2, "border + list + border");
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("low"));
     }
 

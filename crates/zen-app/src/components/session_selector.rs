@@ -844,7 +844,7 @@ mod tests {
         assert!(painted >= 6);
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("current sessions"));
         assert!(text.contains("first")); // s1 has a name → show the name
         assert!(text.contains("s2")); // s2 has no name → show the id

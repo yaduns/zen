@@ -357,7 +357,7 @@ mod tests {
     fn flush_text(buf: &mut ScreenBuffer) -> String {
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        crate::components::strip_ansi(&String::from_utf8_lossy(&out))
+        zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out))
             .chars()
             .filter(|c| !c.is_control())
             .collect()

@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(painted, 2);
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("/tmp/proj"));
         assert!(text.contains("main"));
         assert!(text.contains("(opencode-go) deepseek-v4-flash"));
@@ -394,7 +394,7 @@ mod tests {
         comp.render(&mut buf, 0, 0, 140, 3);
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("deepseek-v4-flash"));
         assert!(!text.contains("()"));
     }

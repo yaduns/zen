@@ -88,7 +88,7 @@ impl<'a> BashExecutionComponent<'a> {
 
     /// Append streaming output block: strip ANSI + CRLF normalization + continuation-line joining, re-layout for display (pi appendOutput).
     pub fn append_output(&mut self, chunk: &str) {
-        let clean = crate::components::strip_ansi(chunk)
+        let clean = zen_core::ansi::strip_ansi(chunk)
             .replace("\r\n", "\n")
             .replace('\r', "\n");
         let new_lines: Vec<&str> = clean.split('\n').collect();
@@ -402,17 +402,10 @@ mod tests {
         // here control bytes are stripped to restore "visible text" (printable chars, order preserved) for contains assertions
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        crate::components::strip_ansi(&String::from_utf8_lossy(&out))
+        zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out))
             .chars()
             .filter(|c| !c.is_control())
             .collect()
-    }
-
-    #[test]
-    fn strip_ansi_removes_sequences() {
-        assert_eq!(crate::components::strip_ansi("a\x1b[31mb\x1b[0mc"), "abc");
-        assert_eq!(crate::components::strip_ansi("\x1b]0;title\x07x"), "x");
-        assert_eq!(crate::components::strip_ansi("plain"), "plain");
     }
 
     #[test]

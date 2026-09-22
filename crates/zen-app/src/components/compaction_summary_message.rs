@@ -134,7 +134,7 @@ mod tests {
         // here control bytes are stripped to restore "visible text" (printable chars, order preserved) for contains assertions
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        crate::components::strip_ansi(&String::from_utf8_lossy(&out))
+        zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out))
             .chars()
             .filter(|c| !c.is_control())
             .collect()

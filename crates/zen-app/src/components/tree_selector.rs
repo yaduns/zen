@@ -1420,7 +1420,7 @@ mod tests {
         let _ = comp.render(&mut buf, 0, 0, 120, 20);
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("[mytag]"), "line should contain a label: {text}");
         assert!(
             text.contains("hello world"),
@@ -1688,7 +1688,7 @@ mod tests {
         assert!(painted >= 6);
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("Session Tree"));
         assert!(text.contains("hello tree"));
     }

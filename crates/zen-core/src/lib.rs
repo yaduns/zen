@@ -1,3 +1,4 @@
+pub mod ansi;
 pub mod compaction;
 pub mod env;
 pub mod frontmatter;

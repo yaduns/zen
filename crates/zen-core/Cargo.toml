@@ -26,5 +26,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
+strip-ansi-escapes = { workspace = true }
 
 [dev-dependencies]

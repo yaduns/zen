@@ -238,7 +238,7 @@ mod tests {
         assert!(painted >= 10);
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
-        let text = crate::components::strip_ansi(&String::from_utf8_lossy(&out));
+        let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
         assert!(text.contains("Zen"));
         assert!(text.contains("Dark"));
         assert!(text.contains("Light"));

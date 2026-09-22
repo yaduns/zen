@@ -238,7 +238,10 @@ pub async fn execute_shell_with_capture(
         };
         st.total_bytes += chunk.len();
         let text = if sanitize {
-            sanitize_binary_output(chunk).replace('\r', "")
+            // pi bash-executor sanitization chain: stripAnsi → sanitizeBinaryOutput → \r stripping (order must not be reversed—
+            // Strip ANSI before C0 filtering; reversing the order removes ESC bytes first, leaving incomplete sequences that cannot be stripped). ANSI stripping is provided by
+            // Integrated by T-AP-09-8 (crate::ansi::strip_ansi, canonical module zen-core/src/ansi.rs).
+            sanitize_binary_output(&crate::ansi::strip_ansi(chunk)).replace('\r', "")
         } else {
             chunk.to_string()
         };
@@ -649,6 +652,32 @@ mod tests {
                 .await
                 .expect("capture ok");
         assert_eq!(sanitized.output, "ab\n");
+    }
+
+    #[tokio::test]
+    async fn test_execute_capture_sanitize_strips_ansi_sequences() {
+        // T-AP-09-8 regression: the pi bash-executor sanitization chain includes stripAnsi (pi-336); zen previously only did C0 filtering
+        // (ESC bytes were removed but the `[31m` parameters remained). After integrating crate::ansi::strip_ansi, the whole sequence is stripped.
+        let env = ExecutionEnv::new(PathBuf::from("/"), None, None, None);
+        let raw_opts = ShellCaptureOptions {
+            sanitize: false,
+            ..default_options()
+        };
+        // Raw path (bash tool) preserves the original text: ANSI is kept as-is
+        let res = execute_shell_with_capture(&env, "printf '\\033[31mred\\033[0m\\n'", &raw_opts)
+            .await
+            .expect("capture ok");
+        assert_eq!(res.output, "\x1b[31mred\x1b[0m\n");
+
+        // Sanitize path (`!/!!` and execute_bash) strips the whole sequence: no `[31m` residue
+        let sanitized = execute_shell_with_capture(
+            &env,
+            "printf '\\033[31mred\\033[0m\\n'",
+            &default_options(),
+        )
+        .await
+        .expect("capture ok");
+        assert_eq!(sanitized.output, "red\n");
     }
 
     // ── throttled snapshot callback (T-AP-04-7: on_snapshot + snapshot_interval) ──────

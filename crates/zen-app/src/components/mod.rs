@@ -59,36 +59,10 @@ fn write_segments_row(
     }
 }
 
-/// Strip ANSI escape sequences (CSI/OSC, etc.). Used to clean streamed output from bash-execution,
-/// And flush text restoration for each component test (preserving printable character order). Shared module implementation.
-pub(crate) fn strip_ansi(text: &str) -> String {
-    let mut out = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        // ESC sequence: first skip the introducer characters ([ ] ^ _ P X, etc.), then consume parameter bytes (0x30-0x3F),
-        // Stop at the final byte (0x40-0x7E) or a control character; OSC (starting with ]) continues until BEL/control character.
-        let ostyle = chars.next();
-        let osc = matches!(ostyle, Some(']'));
-        for next in chars.by_ref() {
-            if next.is_control() {
-                break;
-            }
-            let b = next as u32;
-            if osc {
-                continue;
-            }
-            if (0x30..=0x3F).contains(&b) {
-                continue; // Parameters
-            }
-            break; // Final byte
-        }
-    }
-    out
-}
+// strip_ansi has been migrated into the canonical zen-core module (T-AP-09-8, `zen_core::ansi::strip_ansi`, vte parser),
+// this file no longer maintains an inline implementation; the behavior differences from the old inline one (C1 0x9B half-strip, dangling ESC dropped) are known-gap fixes,
+// locked by zen-core ansi.rs unit tests. Components consume it via `zen_core::ansi::strip_ansi` (bash-execution streaming cleanup,
+// flush text restoration in component tests).
 
 /// Row-planning unit for fold message boxes (equivalent of pi's addChild sequence).
 ///
