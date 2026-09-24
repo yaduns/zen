@@ -5,6 +5,7 @@ pub mod config;
 pub mod keybindings;
 pub mod migrations;
 pub mod modes;
+pub mod observability;
 pub mod output;
 pub mod prompt_templates;
 pub mod resources;

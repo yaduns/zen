@@ -74,6 +74,7 @@ async fn real_test_session_agent_runtime_fork() {
             registry: zen_core::process::ProcessRegistry::new(),
         },
         SessionStartReason::Startup,
+        Vec::new(),
     );
 
     // 2) Round one: remember ORANGE (via runtime entry)

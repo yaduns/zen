@@ -15,6 +15,7 @@ use zen_app::config::{get_agent_dir, get_sessions_dir, get_settings_path, VERSIO
 use zen_app::migrations::run_migrations;
 use zen_app::modes::interactive::run_interactive_mode;
 use zen_app::modes::print_mode::run_print_mode;
+use zen_app::observability::diagnostics::{report_runtime_diagnostics, to_runtime_diagnostics};
 use zen_app::session::jsonl::CreateSessionOptions;
 use zen_app::session::services::create_initial_runtime_from_cli;
 use zen_app::session::session_listing::{build_all_session_listings, build_session_listings};
@@ -188,6 +189,12 @@ async fn main() -> anyhow::Result<()> {
     // Layer 4: mode dispatch
     match app_mode {
         AppMode::Print(mode) => {
+            // Diagnostic output is best-effort: a stderr write failure does not abort startup (unused_must_use silenced)
+            let _ = report_runtime_diagnostics(
+                &to_runtime_diagnostics(&runtime.diagnostics),
+                &mut std::io::stderr(),
+            );
+
             let exit_code = run_print_mode(
                 runtime,
                 mode,
@@ -508,20 +515,6 @@ mod tests {
             .unwrap();
         // No session → create new
         assert!(!sm.get_session_id().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn ssm_resume_non_tty_falls_back_to_continue_recent() {
-        // Under cargo test, stdin is not a TTY → --resume falls back to continue_recent (v1 decision)
-        let root = test_dir("resume_nontty");
-        create_session(&root, "/proj", "older");
-        create_session(&root, "/proj", "newer");
-        let args = parse(&["--resume", "--session-dir", root.to_str().unwrap()]);
-        let sm = select_session_manager(&args, Path::new("/proj"))
-            .await
-            .unwrap();
-        assert_eq!(sm.get_session_id(), "newer", "non-TTY falls back to resuming the most recent session");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1,3 +1,4 @@
+use crate::resources::ResourceLoadDiagnostic;
 use crate::session::agent_session::{AgentSession, SessionStore};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +42,11 @@ pub struct AgentSessionRuntime {
     pub services: AgentSessionServices,
     /// Reason for this runtime creation (for diagnostics/logging)
     pub start_reason: SessionStartReason,
+    /// Resource-loading diagnostics collected during assembly (skill/template/theme load warnings and same-name collisions; output of `load_resources`).
+    /// Display policy is decided by the mode layer (print → stderr report / interactive → init warning stream);
+    /// Lifetime is per-assembly: each assembly (including session switch) produces fresh diagnostics, discarded with the old runtime,
+    /// so they live in runtime rather than in services that survive switches.
+    pub diagnostics: Vec<ResourceLoadDiagnostic>,
 }
 
 /// Create the initial runtime.
@@ -65,11 +71,13 @@ pub fn create_initial_runtime(
     session: AgentSession,
     services: AgentSessionServices,
     start_reason: SessionStartReason,
+    diagnostics: Vec<ResourceLoadDiagnostic>,
 ) -> AgentSessionRuntime {
     AgentSessionRuntime {
         session: Arc::new(session),
         services,
         start_reason,
+        diagnostics,
     }
 }
 
@@ -102,6 +110,10 @@ where
         session: Arc::new(session),
         services,
         start_reason,
+        // the closure contract only rebuilds session (services are reused as-is), does not perform resource assembly → no new diagnostics;
+        // session switches that need resource re-assembly go through assemble_runtime_from_session_manager
+        // (via create_initial_runtime carrying new diagnostics), not this path.
+        diagnostics: Vec::new(),
     })
 }
 
@@ -271,8 +283,9 @@ mod tests {
         let session = test_session("sid", "/tmp/cwd");
         let services = test_services("/tmp/cwd", "/tmp/agent");
         let reason = SessionStartReason::Startup;
+        let diagnostics = Vec::new();
 
-        let rt = create_initial_runtime(session, services, reason);
+        let rt = create_initial_runtime(session, services, reason, diagnostics);
 
         // Session is validated via session_store (cwd accessible)
         assert_eq!(rt.session.cwd(), "/tmp/cwd");
@@ -286,8 +299,9 @@ mod tests {
         let session = test_session("s2", "/work");
         let services = test_services("/work", "/agent");
         let reason = SessionStartReason::Resume("/sessions/abc.jsonl".into());
+        let diagnostics = Vec::new();
 
-        let rt = create_initial_runtime(session, services, reason);
+        let rt = create_initial_runtime(session, services, reason, diagnostics);
 
         match &rt.start_reason {
             SessionStartReason::Resume(path) => {
@@ -302,8 +316,9 @@ mod tests {
         let session = test_session("s3", "/work");
         let services = test_services("/work", "/agent");
         let reason = SessionStartReason::Fork("entry-42".into());
+        let diagnostics = Vec::new();
 
-        let rt = create_initial_runtime(session, services, reason);
+        let rt = create_initial_runtime(session, services, reason, diagnostics);
 
         match &rt.start_reason {
             SessionStartReason::Fork(id) => assert_eq!(id, "entry-42"),
@@ -319,6 +334,7 @@ mod tests {
             test_session("old", "/old/cwd"),
             test_services("/old/cwd", "/old/agent"),
             SessionStartReason::Startup,
+            Vec::new(),
         );
 
         let captured_cwd = Arc::new(std::sync::Mutex::new(PathBuf::new()));
@@ -347,6 +363,7 @@ mod tests {
             test_session("old", "/work"),
             test_services("/work", "/agent"),
             SessionStartReason::Startup,
+            Vec::new(),
         );
 
         let result = replace_runtime::<fn(AgentSessionServices) -> _>(old_rt, |_services| {
@@ -370,6 +387,7 @@ mod tests {
             test_session("old-sid", "/work"),
             test_services("/work", "/agent"),
             SessionStartReason::Startup,
+            Vec::new(),
         );
 
         let new_rt = replace_runtime(old_rt, |services| {
@@ -392,6 +410,7 @@ mod tests {
             test_session("s1", "/old/cwd"),
             test_services("/old/cwd", "/old/agent"),
             SessionStartReason::Startup,
+            Vec::new(),
         );
 
         let new_rt = replace_runtime(old_rt, |_old_services| {

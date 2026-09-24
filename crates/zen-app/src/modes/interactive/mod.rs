@@ -12,6 +12,7 @@ pub(crate) use crate::keybindings::{
     app_default_bindings, load_user_keybindings, AppAction, KeybindingLoadDiagnostic,
     UserKeybindings,
 };
+use crate::observability::diagnostics::format_resource_diagnostics;
 
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
@@ -474,6 +475,12 @@ impl InteractiveMode {
         }
         for warning in settings_warnings {
             self.show_warning(format!("Settings: {warning}"));
+        }
+        // Resource diagnostics (T-OB-01-2): assembly-time skill/template/theme warnings and same-name collisions, collisions grouped into blocks by name;
+        // Per the init contract, placed after the settings warning stream and before the kb warning stream; empty diagnostics = zero output (sibling loop,
+        // not nested inside the settings loop — otherwise resource diagnostics are hidden when settings is empty and duplicated when there are multiple).
+        for line in format_resource_diagnostics(&self.runtime.diagnostics) {
+            self.show_warning(line);
         }
         if let Some(config) = refreshed_config {
             self.settings = config;
@@ -2197,6 +2204,7 @@ mod tests {
             session,
             services,
             crate::session::runtime::SessionStartReason::Startup,
+            Vec::new(),
         )
     }
 
@@ -2699,6 +2707,7 @@ mod tests {
                 registry: zen_core::process::ProcessRegistry::new(),
             },
             start_reason: crate::session::runtime::SessionStartReason::Startup,
+            diagnostics: Vec::new(),
         };
         let mut mode = InteractiveMode::new(runtime, options(), None);
         // T-AP-06-3: init constructs footer_data (dispatch_loop depends on its branch_rx);

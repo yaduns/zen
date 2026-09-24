@@ -512,7 +512,12 @@ async fn assemble_runtime(
         session_store,
         registry: zen_core::process::ProcessRegistry::new(),
     };
-    Ok(create_initial_runtime(session, services, start_reason))
+    Ok(create_initial_runtime(
+        session,
+        services,
+        start_reason,
+        resources.diagnostics,
+    ))
 }
 
 /// Model/thinking-level resolution without CLI (for interactive session switching): session ctx restore takes priority, settings fill in the gaps.
