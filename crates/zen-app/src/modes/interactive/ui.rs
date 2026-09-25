@@ -1422,7 +1422,18 @@ impl InteractiveUi {
                 self.status = None;
                 self.status_indicator = None;
             }
-            UiEvent::RestoreHistory { messages } => self.apply_restore_history(messages),
+            UiEvent::RestoreHistory {
+                messages,
+                cache_miss_notices,
+            } => self.apply_restore_history(messages, cache_miss_notices),
+            UiEvent::CacheMissNotice { text } => {
+                // T-OB-01-3: cache miss notice lines (producer = bridge MessageEnd / resume stream re-injection;
+                // Warning semantic color drawn directly, aligned with pi addCacheMissNotice's theme warning coloring).
+                self.chat_rows.push(ChatRow::Info {
+                    text,
+                    kind: InfoKind::Warning,
+                });
+            }
         }
     }
 
@@ -1549,8 +1560,15 @@ impl InteractiveUi {
     /// Restore session history rendering (T-AP-08-5 fix; aligned with pi renderInitialMessages):
     /// User → user line (`extract_user_text`), Assistant → final line (non-streaming), ToolResult skipped
     /// (history has no ToolStart events; tool results are not displayed; deviation recorded). Does not touch streaming indices.
-    fn apply_restore_history(&mut self, messages: Vec<Message>) {
-        for msg in messages {
+    /// `cache_miss_notices` (T-OB-01-3) is a list of `(message flat index, notice text)` — the index points to a message,
+    /// and a `ChatRow::Info { kind: Warning }` notice line is inserted **after** it (aligned with pi renderSessionItems'
+    /// per-paying-message re-injection); empty Vec when the gate is closed.
+    fn apply_restore_history(
+        &mut self,
+        messages: Vec<Message>,
+        cache_miss_notices: Vec<(usize, String)>,
+    ) {
+        for (i, msg) in messages.into_iter().enumerate() {
             match msg {
                 Message::User(user) => {
                     let text = extract_user_text(&user);
@@ -1560,6 +1578,15 @@ impl InteractiveUi {
                     self.chat_rows.push(ChatRow::Assistant(a));
                 }
                 Message::ToolResult(_) => {}
+            }
+            if let Some(text) = cache_miss_notices
+                .iter()
+                .find_map(|(idx, t)| (*idx == i).then(|| t.clone()))
+            {
+                self.chat_rows.push(ChatRow::Info {
+                    text,
+                    kind: InfoKind::Warning,
+                });
             }
         }
     }
@@ -2214,7 +2241,7 @@ pub(crate) enum ChatRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InfoKind {
     Error,
-    #[allow(dead_code)]
+    // Has a producer since T-OB-01-3 (`UiEvent::CacheMissNotice` + resume stream notice re-injection).
     Warning,
     #[allow(dead_code)]
     Status,
@@ -3466,6 +3493,7 @@ mod tests {
                     timestamp: 0,
                 }),
             ],
+            cache_miss_notices: vec![],
         });
         // user + assistant two rows; ToolResult skipped
         assert_eq!(u.chat_rows.len(), 2);
@@ -3495,11 +3523,61 @@ mod tests {
         assert!(u.chat_rows.is_empty());
         u.apply(UiEvent::RestoreHistory {
             messages: vec![zen_ai::types::Message::User(user_message("new"))],
+            cache_miss_notices: vec![],
         });
         assert_eq!(u.chat_rows.len(), 1);
         match &u.chat_rows[0] {
             ChatRow::User { text } => assert_eq!(text, "new"),
             _ => panic!("Should be new session user line"),
         }
+    }
+
+    #[test]
+    fn cache_miss_notice_appends_warning_info_row() {
+        // T-OB-01-3: bridge MessageEnd notice → Warning-semantic-color Info line (immediately after the assistant message line)
+        let mut u = ui();
+        u.apply(UiEvent::CacheMissNotice {
+            text: "Cache miss: 105k tokens re-billed".into(),
+        });
+        assert_eq!(u.chat_rows.len(), 1);
+        match &u.chat_rows[0] {
+            ChatRow::Info { text, kind } => {
+                assert_eq!(text, "Cache miss: 105k tokens re-billed");
+                assert!(matches!(kind, InfoKind::Warning));
+            }
+            _ => panic!("Should be Info warning line"),
+        }
+    }
+
+    #[test]
+    fn restore_history_interleaves_cache_miss_notices_at_positions() {
+        // T-OB-01-3: notice re-injection inserted after the message flat index (aligned with pi renderSessionItems per-paying-message re-injection)
+        let mut u = ui();
+        u.apply(UiEvent::RestoreHistory {
+            messages: vec![
+                zen_ai::types::Message::User(user_message("q")),
+                zen_ai::types::Message::Assistant(assistant(
+                    vec![text_block("a1")],
+                    StopReason::Stop,
+                )),
+                zen_ai::types::Message::Assistant(assistant(
+                    vec![text_block("a2")],
+                    StopReason::Stop,
+                )),
+            ],
+            cache_miss_notices: vec![(1, "Cache miss: 105k tokens re-billed".into())],
+        });
+        assert_eq!(u.chat_rows.len(), 4);
+        // Line order: user, assistant(a1), Info(notice), assistant(a2)
+        assert!(matches!(&u.chat_rows[0], ChatRow::User { .. }));
+        assert!(matches!(&u.chat_rows[1], ChatRow::Assistant(_)));
+        match &u.chat_rows[2] {
+            ChatRow::Info { text, kind } => {
+                assert_eq!(text, "Cache miss: 105k tokens re-billed");
+                assert!(matches!(kind, InfoKind::Warning));
+            }
+            _ => panic!("After index 1 should be Info hint line"),
+        }
+        assert!(matches!(&u.chat_rows[3], ChatRow::Assistant(_)));
     }
 }

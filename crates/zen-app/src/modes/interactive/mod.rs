@@ -12,6 +12,9 @@ pub(crate) use crate::keybindings::{
     app_default_bindings, load_user_keybindings, AppAction, KeybindingLoadDiagnostic,
     UserKeybindings,
 };
+use crate::observability::cache_stats::{
+    cache_miss_notice_text, collect_cache_misses, detect_cache_miss,
+};
 use crate::observability::diagnostics::format_resource_diagnostics;
 
 use crate::commands::{
@@ -51,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionResult;
 use zen_ai::types::{ImageContent, Message, ThinkingLevel};
 use zen_core::harness::types::AgentEvent;
+use zen_core::session::context::{build_context_entries, session_entry_to_context_messages};
 use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop, WakeOutcome};
 use zen_tui::keybindings::{editor_default_bindings, select_default_bindings, KeybindingsManager};
@@ -181,7 +185,15 @@ pub(crate) enum UiEvent {
     /// Restore session history as chat lines (after startup/switch the main task sends an `agent.messages()` snapshot) —
     /// Aligned with pi `renderInitialMessages`: restored user/assistant messages render as final lines,
     /// ToolResult skipped (history has no ToolStart events, tool results not shown; logged deviation).
-    RestoreHistory { messages: Vec<Message> },
+    /// `cache_miss_notices` is the T-OB-01-3 prompt re-injection: a list of `(flat message index, prompt text)`,
+    /// the index points at a message in `messages`, and the prompt line is inserted **after** it (empty Vec when the gate is closed).
+    RestoreHistory {
+        messages: Vec<Message>,
+        cache_miss_notices: Vec<(usize, String)>,
+    },
+    /// chat prompt line shown when the just-completed assistant message has a significant cache miss (T-OB-01-3 producer:
+    /// bridge `AgentEvent::MessageEnd` branch, gate = `show_cache_miss_notices` + not Error/Aborted).
+    CacheMissNotice { text: String },
 }
 
 /// status line spec: `InteractiveUi::apply` (`apply_status`) maintains a persistent `StatusIndicator`
@@ -657,12 +669,14 @@ impl InteractiveMode {
         // 5.5 Restore history rendering (T-AP-08-5 fix): render the session history fed back by `set_messages` as chat rows —
         //    aligned with pi `renderInitialMessages`; chat_rows starts empty, restored user/assistant
         //    Messages must be explicitly populated (previously, after --continue/--resume/--session recovery, the UI was blank,
-        //    only when the LLM context is complete).
-        let history = self.runtime.session.agent.messages();
-        if !history.is_empty() {
-            let _ = self
-                .ui_event_tx
-                .send(UiEvent::RestoreHistory { messages: history });
+        //    only the LLM context is fully complete). T-OB-01-3: payload also carries the cache miss prompt position (when the gate is open).
+        let (messages, cache_miss_notices) =
+            restore_history_payload(&self.runtime.session, self.settings.show_cache_miss_notices);
+        if !messages.is_empty() {
+            let _ = self.ui_event_tx.send(UiEvent::RestoreHistory {
+                messages,
+                cache_miss_notices,
+            });
         }
 
         self.is_initialized = true;
@@ -934,10 +948,15 @@ impl InteractiveMode {
             .expect("init idempotent guard ensures footer_data is constructed")
             .branch_rx();
         let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings, branch_rx);
+        // T-OB-01-3: cache miss prompt context (gate = settings snapshot; session reference used to read entries/model)
+        let cache = CacheMissContext {
+            enabled: self.settings.show_cache_miss_notices,
+            session: Some(Arc::clone(&self.runtime.session)),
+        };
         self.runtime
             .session
             .subscribe(Box::new(move |event: &AgentEvent| {
-                bridge_agent_event(event, &tx, &usage, &ctx);
+                bridge_agent_event(event, &tx, &usage, &ctx, &cache);
             }))
     }
 
@@ -1548,13 +1567,16 @@ impl InteractiveMode {
             self.runtime.session.cwd(),
         )));
 
-        // 4. UI: clear the chat + render the new session history + title + footer
+        // 4. UI: clear chat + render new session history + title + footer (T-OB-01-3: payload carries cache miss
+        //    notice position, re-injected when the gate is open)
         let _ = self.ui_event_tx.send(UiEvent::ChatReset);
-        let history = self.runtime.session.agent.messages();
-        if !history.is_empty() {
-            let _ = self
-                .ui_event_tx
-                .send(UiEvent::RestoreHistory { messages: history });
+        let (messages, cache_miss_notices) =
+            restore_history_payload(&self.runtime.session, self.settings.show_cache_miss_notices);
+        if !messages.is_empty() {
+            let _ = self.ui_event_tx.send(UiEvent::RestoreHistory {
+                messages,
+                cache_miss_notices,
+            });
         }
         let title = format!("zen · {}", self.runtime.session.cwd());
         let _ = self.ui_event_tx.send(UiEvent::TerminalTitle(title));
@@ -1893,16 +1915,40 @@ impl FooterCtx {
     }
 }
 
+/// Bridge cache-miss notice context (T-OB-01-3): gate + session reference. Private — built by `subscribe_to_agent`,
+/// read-only in `bridge_agent_event`. Gate = `settings.show_cache_miss_notices` snapshot (captured at subscription); toggling
+/// in the settings panel at runtime requires re-subscription (session switch) to take effect; deviation registered in the task doc's open questions.
+struct CacheMissContext {
+    /// Notification switch (`SettingsConfig.show_cache_miss_notices` snapshot; no detection at all when false).
+    enabled: bool,
+    /// Session reference (reads `session_store.branch_entries()` + `model()`, both synchronous methods);
+    /// None = no session available (placeholder for tests / gate closed).
+    session: Option<Arc<AgentSession>>,
+}
+
+impl CacheMissContext {
+    /// Gate-closed placeholder (only used in tests at the `bridge_agent_event` call site; production side is built with real values by `subscribe_to_agent`).
+    #[cfg(test)]
+    fn disabled() -> Self {
+        CacheMissContext {
+            enabled: false,
+            session: None,
+        }
+    }
+}
+
 /// Agent event bridge: maps `AgentEvent` to `UiEvent` and delivers them to the UI task via `ui_event_tx`.
 /// No awaiting inside the sync callback — `UnboundedSender` never blocks when full. Each event carries footer invalidation
 /// (pi `footer.invalidate()`); `AgentStart` → Working status line + animation, `AgentEnd` → clear +
 /// stop animation; `MessageEnd` error/abort → error text via `print_mode::stop_error_message`
-/// Delivered with `MessageEnd.error_text` (rendered as an Info line on the UI side).
+/// Delivered with `MessageEnd.error_text` (UI side renders an Info line); when `MessageEnd` is not an error/abort and the gate is open →
+/// the cache miss notice is delivered via `UiEvent::CacheMissNotice` (T-OB-01-3, immediately after the message line).
 fn bridge_agent_event(
     event: &AgentEvent,
     tx: &mpsc::UnboundedSender<UiEvent>,
     usage: &Mutex<UsageTurnState>,
     ctx: &FooterCtx,
+    cache: &CacheMissContext,
 ) {
     match event {
         AgentEvent::AgentStart => {
@@ -1958,6 +2004,28 @@ fn bridge_agent_event(
                     message: message.clone(),
                     error_text,
                 });
+            }
+            // T-OB-01-3: cache miss notice (right after MessageEnd; UI side renders an Info line after the assistant message).
+            // Gating aligns with pi's `maybeShowCacheMissNotice` (interactive-mode.ts:2953-2969 calls it only in the non-
+            // aborted/error else branch) — aborted/error turns may carry partial usage (input>0,
+            // cacheRead=0 while prev has a value) and compute a real miss; showing the notice would mislead; same branch check as the existing error_text.
+            if let Message::Assistant(a) = message {
+                if cache.enabled
+                    && !matches!(
+                        a.stop_reason,
+                        zen_ai::types::StopReason::Error | zen_ai::types::StopReason::Aborted
+                    )
+                {
+                    if let Some(session) = &cache.session {
+                        let entries = session.session_store.branch_entries();
+                        let prices = session.model();
+                        if let Some(miss) = detect_cache_miss(&entries, a, &prices) {
+                            if let Some(text) = cache_miss_notice_text(&miss) {
+                                let _ = tx.send(UiEvent::CacheMissNotice { text });
+                            }
+                        }
+                    }
+                }
             }
             // Footer invalidation per event (pi footer.invalidate())
             let totals = usage.lock().unwrap_or_else(|e| e.into_inner());
@@ -2041,6 +2109,56 @@ fn bridge_agent_event(
 /// ToolResult messages do not go through the message line (rendered by Tool* events).
 fn is_tool_result(message: &Message) -> bool {
     matches!(message, Message::ToolResult(_))
+}
+
+/// Resume-stream private helper (T-OB-01-3): builds the `RestoreHistory` payload (messages + cache miss notice position).
+/// Contract: `agent.messages()` ≡ per-entry flattening of `build_context_entries(branch_entries())` — holds at both
+/// resume points (init and session switch) (just assembled, `state.messages` is the flattened context; `steer`/`follow_up` use a separate
+// queue and don't enter `state.messages`, engine.rs:88-97); `debug_assert!` locks this invariant to prevent index misalignment.
+/// Notices are injected only on assistant entries that remain **visible** after transformation (compressed entries produce no position, so the notice is naturally dropped, aligning with pi
+/// message-reference keying semantics: "not injected unless present in visible items"); when the gate is closed return an empty hint list (aligned with pi gate closed
+/// `new Map()`）。
+fn restore_history_payload(
+    session: &AgentSession,
+    enabled: bool,
+) -> (Vec<Message>, Vec<(usize, String)>) {
+    let messages = session.agent.messages();
+    if !enabled {
+        return (messages, Vec::new());
+    }
+    // branch = the context lineage actually sent to the LLM (includes compressed-out historical ancestors; prev chain complete)
+    let branch = session.session_store.branch_entries();
+    let visible = build_context_entries(&branch);
+    let prices = session.model();
+    let misses = collect_cache_misses(&branch, &prices);
+    if misses.is_empty() {
+        return (messages, Vec::new());
+    }
+    let mut notices = Vec::new();
+    let mut offset = 0usize;
+    for entry in &visible {
+        let produced = session_entry_to_context_messages(entry, offset, &visible).len();
+        if let SessionTreeEntry::Message {
+            id,
+            message: Message::Assistant(_),
+            ..
+        } = entry
+        {
+            if let Some(miss) = misses.get(id) {
+                if let Some(text) = cache_miss_notice_text(miss) {
+                    // insert after the last message produced by this entry (an assistant entry always produces 1 message → right after itself)
+                    notices.push((offset + produced.saturating_sub(1), text));
+                }
+            }
+        }
+        offset += produced;
+    }
+    debug_assert_eq!(
+        offset,
+        messages.len(),
+        "RestoreHistory invariant: agent.messages() ≡ flattened build_context_entries(branch)"
+    );
+    (messages, notices)
 }
 
 #[cfg(test)]
@@ -2360,7 +2478,13 @@ mod tests {
     fn test_bridge_agent_start_sets_working_and_animation() {
         let (tx, mut rx) = channel();
         let usage = StdMutex::new(UsageTurnState::default());
-        bridge_agent_event(&AgentEvent::AgentStart, &tx, &usage, &test_footer_ctx());
+        bridge_agent_event(
+            &AgentEvent::AgentStart,
+            &tx,
+            &usage,
+            &test_footer_ctx(),
+            &CacheMissContext::disabled(),
+        );
         assert!(matches!(
             rx.try_recv(),
             Ok(UiEvent::Status(StatusSpec::Working { .. }))
@@ -2379,6 +2503,7 @@ mod tests {
             &tx,
             &usage,
             &test_footer_ctx(),
+            &CacheMissContext::disabled(),
         );
         // MessageEnd delivered
         assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
@@ -2405,6 +2530,7 @@ mod tests {
             &tx,
             &usage,
             &test_footer_ctx(),
+            &CacheMissContext::disabled(),
         );
         assert!(matches!(
             rx.try_recv(),
@@ -2427,6 +2553,7 @@ mod tests {
             &tx,
             &usage,
             &test_footer_ctx(),
+            &CacheMissContext::disabled(),
         );
         assert!(matches!(
             rx.try_recv(),
@@ -2435,6 +2562,334 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ── T-OB-01-3: cache miss hint bridge line + resume stream payload ─────────────────
+
+    /// Fixed entry storage (for cache miss bridge / resume stream tests): `branch_entries`/`entries` return fixtures.
+    struct CacheEntriesStore {
+        branch: Vec<SessionTreeEntry>,
+    }
+
+    impl SessionStore for CacheEntriesStore {
+        fn append_message(&self, _message: &Message) {}
+        fn append_model_change(&self, _provider: &str, _model_id: &str) {}
+        fn append_thinking_level_change(&self, _level: &str) {}
+        fn session_id(&self) -> String {
+            "s1".into()
+        }
+        fn cwd(&self) -> &str {
+            "/work"
+        }
+        fn branch_entries(&self) -> Vec<SessionTreeEntry> {
+            self.branch.clone()
+        }
+        fn append_compaction(
+            &self,
+            _result: &zen_core::compaction::CompactionResult,
+            _from_hook: bool,
+        ) -> String {
+            "mock-compaction-id".to_string()
+        }
+        fn entries(&self) -> Vec<SessionTreeEntry> {
+            self.branch.clone()
+        }
+        fn get_leaf_id(&self) -> Option<String> {
+            None
+        }
+        fn append_branch_summary(
+            &self,
+            _result: &zen_core::compaction::branch::BranchSummaryResult,
+            _new_leaf_id: Option<&str>,
+            _from_hook: bool,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-branch-summary-id".to_string())
+        }
+        fn branch(
+            &self,
+            _branch_from_id: &str,
+        ) -> Result<(), crate::session::session_manager::SessionManagerError> {
+            Ok(())
+        }
+        fn reset_leaf(&self) {}
+        fn append_label_change(
+            &self,
+            _target_id: &str,
+            _label: Option<&str>,
+        ) -> Result<String, crate::session::session_manager::SessionManagerError> {
+            Ok("mock-label-id".to_string())
+        }
+        fn append_session_info(&self, _name: Option<&str>) -> String {
+            "mock-session-info-id".to_string()
+        }
+        fn create_branched_session(
+            &self,
+            _leaf_id: &str,
+        ) -> Result<Option<std::path::PathBuf>, crate::session::session_manager::SessionManagerError>
+        {
+            Ok(None)
+        }
+    }
+
+    /// Cache turn messages (provider "test", model "test-model", aligned with the `test_model` pricing surface).
+    fn cache_turn(
+        input: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: zen_ai::types::Cost,
+        timestamp: i64,
+    ) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent {
+                text: String::new(),
+                text_signature: None,
+            })],
+            api: "openai-completions".into(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage {
+                input,
+                output: 10,
+                cache_read,
+                cache_write,
+                cache_write_1h: None,
+                reasoning: None,
+                total_tokens: input + cache_read + cache_write,
+                cost,
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp,
+        }
+    }
+
+    fn cache_entry(id: &str, msg: AssistantMessage) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: None,
+            timestamp: String::new(),
+            message: Message::Assistant(msg),
+        }
+    }
+
+    /// Two prior turns where a miss can be detected: t1 = fresh 100k cache write; t2 = healthy cache readback.
+    fn cache_miss_fixture_entries() -> Vec<SessionTreeEntry> {
+        vec![
+            cache_entry(
+                "t1",
+                cache_turn(
+                    0,
+                    0,
+                    100_000,
+                    zen_ai::types::Cost {
+                        cache_write: 0.375,
+                        ..zen_ai::types::Cost::default()
+                    },
+                    0,
+                ),
+            ),
+            cache_entry(
+                "t2",
+                cache_turn(
+                    0,
+                    100_000,
+                    5_000,
+                    zen_ai::types::Cost {
+                        cache_read: 0.03,
+                        cache_write: 0.019,
+                        ..zen_ai::types::Cost::default()
+                    },
+                    60_000,
+                ),
+            ),
+        ]
+    }
+
+    /// Gate open + MessageEnd with non-error/aborted status → emit `CacheMissNotice` when a miss is detected (right after the message line).
+    #[test]
+    fn test_bridge_cache_miss_notice_on_eligible_stop() {
+        let store: Arc<dyn SessionStore> = Arc::new(CacheEntriesStore {
+            branch: cache_miss_fixture_entries(),
+        });
+        let session = Arc::new(AgentSession::new(test_agent(), store));
+        let cache = CacheMissContext {
+            enabled: true,
+            session: Some(session),
+        };
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTurnState::default());
+        let msg = Message::Assistant(cache_turn(
+            0,
+            0,
+            110_000,
+            zen_ai::types::Cost {
+                cache_write: 0.4125,
+                ..zen_ai::types::Cost::default()
+            },
+            600_000,
+        ));
+        bridge_agent_event(
+            &AgentEvent::MessageEnd { message: msg },
+            &tx,
+            &usage,
+            &test_footer_ctx(),
+            &cache,
+        );
+        // Event sequence: MessageEnd → CacheMissNotice → Footer
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::CacheMissNotice { text }) if text.starts_with("Cache miss after 9m idle: 105k tokens re-billed")
+        ));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
+    }
+
+    /// Gate open but stop_reason is Error/Aborted → skip detection (error turns may carry partial usage producing a false miss).
+    #[test]
+    fn test_bridge_cache_miss_notice_skipped_on_error_and_aborted() {
+        for stop in [StopReason::Error, StopReason::Aborted] {
+            let store: Arc<dyn SessionStore> = Arc::new(CacheEntriesStore {
+                branch: cache_miss_fixture_entries(),
+            });
+            let session = Arc::new(AgentSession::new(test_agent(), store));
+            let cache = CacheMissContext {
+                enabled: true,
+                session: Some(session),
+            };
+            let (tx, mut rx) = channel();
+            let usage = StdMutex::new(UsageTurnState::default());
+            let mut m = cache_turn(
+                0,
+                0,
+                110_000,
+                zen_ai::types::Cost {
+                    cache_write: 0.4125,
+                    ..zen_ai::types::Cost::default()
+                },
+                600_000,
+            );
+            m.stop_reason = stop;
+            bridge_agent_event(
+                &AgentEvent::MessageEnd {
+                    message: Message::Assistant(m),
+                },
+                &tx,
+                &usage,
+                &test_footer_ctx(),
+                &cache,
+            );
+            assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
+            // No CacheMissNotice (Error/Aborted gated out) → next item is directly Footer
+            assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
+            assert!(rx.try_recv().is_err(), "no extra events expected");
+        }
+    }
+
+    /// Gate closed (disabled) → no detection at all, no CacheMissNotice.
+    #[test]
+    fn test_bridge_cache_miss_notice_skipped_when_disabled() {
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTurnState::default());
+        let msg = Message::Assistant(cache_turn(
+            0,
+            0,
+            110_000,
+            zen_ai::types::Cost {
+                cache_write: 0.4125,
+                ..zen_ai::types::Cost::default()
+            },
+            600_000,
+        ));
+        bridge_agent_event(
+            &AgentEvent::MessageEnd { message: msg },
+            &tx,
+            &usage,
+            &test_footer_ctx(),
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
+        assert!(rx.try_recv().is_err(), "no CacheMissNotice when the gate is closed");
+    }
+
+    /// Resume stream payload: hint inserted after the payment message (flat index); `debug_assert` invariants hold.
+    #[test]
+    fn test_restore_history_payload_positions_notices_after_paying_message() {
+        let store: Arc<dyn SessionStore> = Arc::new(CacheEntriesStore {
+            branch: vec![
+                cache_entry(
+                    "t1",
+                    cache_turn(
+                        0,
+                        0,
+                        100_000,
+                        zen_ai::types::Cost {
+                            cache_write: 0.375,
+                            ..zen_ai::types::Cost::default()
+                        },
+                        0,
+                    ),
+                ),
+                cache_entry(
+                    "m",
+                    cache_turn(
+                        0,
+                        0,
+                        110_000,
+                        zen_ai::types::Cost {
+                            cache_write: 0.4125,
+                            ..zen_ai::types::Cost::default()
+                        },
+                        120_000,
+                    ),
+                ),
+            ],
+        });
+        let session = AgentSession::new(test_agent(), store);
+        // Aligned with assembly set_messages: agent.messages() = flatten(build_context_entries(branch))
+        session.set_messages(vec![
+            Message::Assistant(cache_turn(
+                0,
+                0,
+                100_000,
+                zen_ai::types::Cost {
+                    cache_write: 0.375,
+                    ..zen_ai::types::Cost::default()
+                },
+                0,
+            )),
+            Message::Assistant(cache_turn(
+                0,
+                0,
+                110_000,
+                zen_ai::types::Cost {
+                    cache_write: 0.4125,
+                    ..zen_ai::types::Cost::default()
+                },
+                120_000,
+            )),
+        ]);
+        let (messages, notices) = restore_history_payload(&session, true);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0, 1, "hint is inserted after the payment message (flat index 1)");
+        assert!(notices[0]
+            .1
+            .starts_with("Cache miss: 100k tokens re-billed"));
+    }
+
+    /// Gate closed → resume stream payload with empty hint list (aligned with pi gate closed new Map()).
+    #[test]
+    fn test_restore_history_payload_empty_when_disabled() {
+        let store: Arc<dyn SessionStore> = Arc::new(CacheEntriesStore {
+            branch: cache_miss_fixture_entries(),
+        });
+        let session = AgentSession::new(test_agent(), store);
+        let (messages, notices) = restore_history_payload(&session, false);
+        assert!(notices.is_empty());
+        assert!(messages.is_empty()); // Fixture agent has no messages
     }
 
     #[test]
@@ -2450,6 +2905,7 @@ mod tests {
             &tx,
             &usage,
             &test_footer_ctx(),
+            &CacheMissContext::disabled(),
         );
         assert!(matches!(
             rx.try_recv(),
@@ -2482,6 +2938,7 @@ mod tests {
             &tx,
             &usage,
             &test_footer_ctx(),
+            &CacheMissContext::disabled(),
         );
         assert!(matches!(
             rx.try_recv(),
@@ -2509,6 +2966,7 @@ mod tests {
             &tx,
             &usage,
             &test_footer_ctx(),
+            &CacheMissContext::disabled(),
         );
         // ToolResult does not go through message lines (no MessageStart event)
         assert!(rx.try_recv().is_err());
