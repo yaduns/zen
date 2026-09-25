@@ -3,6 +3,7 @@
 // cursor_visual_col / build_visual_line_map / find_current_visual_line are only used within this module and stay private.
 // Undo (T-TU-03-5): Each movement function sets last_action = None (matching lastAction = null throughout pi),
 // Make the next insertion after movement start a new undo unit; do not put the reset in set_cursor_col (it will be overwritten when reused by insert_char).
+use super::word_navigation::{find_word_backward, find_word_forward};
 use super::{Editor, VisualLine};
 use crate::wrap::word_wrap_line;
 use unicode_segmentation::UnicodeSegmentation;
@@ -70,7 +71,8 @@ impl Editor {
     }
 
     /// Move cursor by word boundaries (forward/backward; line start/end crossing aligns with pi moveWordBackwards/Forwards).
-    /// Word boundary detection currently uses an inline minimal implementation (unicode-segmentation word boundaries); to be replaced once T-TU-03-8 lands.
+    /// Word-boundary detection delegates to `word_navigation::find_word_*` (T-TU-03-8, pi-407 semantics:
+    /// UAX#29 word segmentation + intra-word ASCII punctuation breakpoints).
     pub(super) fn move_word(&mut self, forward: bool) {
         if forward {
             self.move_word_forward();
@@ -79,98 +81,50 @@ impl Editor {
         }
     }
 
-    /// Jump forward by word: skip past current word end → skip whitespace → stop at the start of the next word. Wraps across lines.
+    /// Move forward by word: lands at the current word end (before punctuation) or the next word end (pi `findWordForward` semantics,
+    /// e.g. `hello world` from 0 moves to 5, not the next word start 6); when the cursor is at line end, cross to the next line start
+    /// (matches pi `moveWordForwards` line-boundary check; do not continue finding words after crossing lines).
     /// Consumed by text::delete_word_forward to get the deletion boundary, hence `pub(super)`.
     /// Reset last_action (aligned with pi moveWordForwards).
     pub(super) fn move_word_forward(&mut self) {
         self.last_action = None;
         let line = &self.state.lines[self.state.cursor_line];
-        let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
-        let g_count = graphemes.len();
+        let line_len = line.len();
 
-        // Current grapheme index
-        let mut g_idx = graphemes
-            .iter()
-            .position(|(bo, _)| *bo == self.state.cursor_col)
-            .unwrap_or(g_count);
-
-        // Step 1: skip remaining graphemes of the current word (non-whitespace)
-        while g_idx < g_count {
-            let g = graphemes[g_idx].1;
-            if g.chars().all(|c| c.is_whitespace()) {
-                break;
-            }
-            g_idx += 1;
-        }
-
-        // Step 2: skip whitespace
-        while g_idx < g_count {
-            let g = graphemes[g_idx].1;
-            if !g.chars().all(|c| c.is_whitespace()) {
-                break;
-            }
-            g_idx += 1;
-        }
-
-        if g_idx < g_count {
-            // Stop at the start of the next word on the same line
-            self.set_cursor_col(graphemes[g_idx].0);
-        } else {
-            // Reached end of line → wrap to start of next line, keep searching for a word
+        // Line end → cross to next line start (matches pi moveWordForwards line-boundary branch; no movement at last line end)
+        if self.state.cursor_col >= line_len {
             if self.state.cursor_line + 1 < self.state.lines.len() {
                 self.state.cursor_line += 1;
                 self.set_cursor_col(0);
-                // Recursion: the next line may be entirely whitespace
-                self.move_word_forward();
-            } else {
-                // End of last line: stop at line end
-                self.set_cursor_col(line.len());
             }
+            return;
         }
+
+        let new_col = find_word_forward(line, self.state.cursor_col);
+        self.set_cursor_col(new_col);
     }
 
-    /// Jump backward by word: skip whitespace backward → skip the previous word → stop at that word's start. Wraps across lines.
+    /// Move backward by word: lands at the previous word start or after intra-word punctuation (pi `findWordBackward` semantics,
+    /// `foo.bar` from word end moves back to `bar` start, then to `.`); when the cursor is at line start, cross to the previous line end
+    /// (matches pi `moveWordBackwards` line-boundary check; do not continue finding words after crossing lines).
     /// Consumed by text::delete_word_backward to get the deletion boundary, hence `pub(super)`.
     /// Reset last_action (aligned with pi moveWordBackwards).
     pub(super) fn move_word_backward(&mut self) {
         self.last_action = None;
         let line = &self.state.lines[self.state.cursor_line];
-        let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
 
-        // Current grapheme index
-        let mut g_idx = graphemes
-            .iter()
-            .position(|(bo, _)| *bo == self.state.cursor_col)
-            .unwrap_or(graphemes.len());
-
-        // Step 1: skip whitespace backward
-        while g_idx > 0 {
-            let g = graphemes[g_idx - 1].1;
-            if !g.chars().all(|c| c.is_whitespace()) {
-                break;
+        // Line start → cross to previous line end (matches pi moveWordBackwards line-boundary branch; no movement at first line start)
+        if self.state.cursor_col == 0 {
+            if self.state.cursor_line > 0 {
+                self.state.cursor_line -= 1;
+                let prev_len = self.state.lines[self.state.cursor_line].len();
+                self.set_cursor_col(prev_len);
             }
-            g_idx -= 1;
+            return;
         }
 
-        // Step 2: skip the previous word backward
-        while g_idx > 0 {
-            let g = graphemes[g_idx - 1].1;
-            if g.chars().all(|c| c.is_whitespace()) {
-                break;
-            }
-            g_idx -= 1;
-        }
-
-        if g_idx > 0 || self.state.cursor_line == 0 {
-            // Stop at word start (or start of first line)
-            self.set_cursor_col(graphemes.get(g_idx).map(|(bo, _)| *bo).unwrap_or(0));
-        } else {
-            // Reached start of line → wrap to end of previous line, keep searching for a word
-            self.state.cursor_line -= 1;
-            let prev_len = self.state.lines[self.state.cursor_line].len();
-            self.set_cursor_col(prev_len);
-            self.move_word_backward();
-        }
+        let new_col = find_word_backward(line, self.state.cursor_col);
+        self.set_cursor_col(new_col);
     }
 
     /// Move cursor to logical line start/end (explicit set_cursor_col, resets sticky state).
@@ -466,26 +420,26 @@ mod tests {
     // ── move_word / move_word_forward / move_word_backward ──
 
     #[test]
-    fn test_move_word_forward_skips_word_and_space() {
+    fn test_move_word_forward_lands_at_word_end() {
         let mut e = editor_with(&["hello world foo"], 0, 0, 0, 0);
         e.move_word(true);
-        assert_eq!(e.cursor(), (0, 6)); // start of "world"
+        assert_eq!(e.cursor(), (0, 5)); // "hello" word end (before punctuation/whitespace, pi landing semantics)
         e.move_word(true);
-        assert_eq!(e.cursor(), (0, 12)); // Start of the word "foo"
+        assert_eq!(e.cursor(), (0, 11)); // "world" word end (skip whitespace)
     }
 
     #[test]
     fn test_move_word_forward_with_leading_space_before_word() {
         let mut e = editor_with(&["  ab cd"], 0, 2, 0, 0); // Cursor at the start of the word "ab"
         e.move_word(true);
-        assert_eq!(e.cursor(), (0, 5)); // word start of "cd"
+        assert_eq!(e.cursor(), (0, 4)); // "ab" word end
     }
 
     #[test]
     fn test_move_word_forward_at_doc_end_stays() {
         let mut e = editor_with(&["hello"], 0, 0, 0, 0);
         e.move_word(true);
-        assert_eq!(e.cursor(), (0, 5)); // end of last line
+        assert_eq!(e.cursor(), (0, 5)); // Last line end (for a single-word line, landing at word end is line end)
         e.move_word(true);
         assert_eq!(e.cursor(), (0, 5)); // Already at the end, no movement
     }
@@ -494,7 +448,21 @@ mod tests {
     fn test_move_word_forward_wraps_to_next_line() {
         let mut e = editor_with(&["hello", "world"], 0, 0, 0, 0);
         e.move_word(true);
-        assert_eq!(e.cursor(), (1, 5)); // multi-line wrap: end of second line
+        assert_eq!(e.cursor(), (0, 5)); // On the first line, landing at word end is line end (in-line navigation, no line crossing)
+        e.move_word(true);
+        assert_eq!(e.cursor(), (1, 0)); // Line end → cross to next line start (matches pi moveWordForwards)
+    }
+
+    #[test]
+    fn test_move_word_forward_stops_at_in_word_punctuation() {
+        // pi-407 intra-word ASCII punctuation breakpoints: foo.bar splits into foo / . / bar
+        let mut e = editor_with(&["foo.bar"], 0, 0, 0, 0);
+        e.move_word(true);
+        assert_eq!(e.cursor(), (0, 3)); // "foo" word end (before '.')
+        e.move_word(true);
+        assert_eq!(e.cursor(), (0, 4)); // '.' segment
+        e.move_word(true);
+        assert_eq!(e.cursor(), (0, 7)); // "bar" word end
     }
 
     #[test]
@@ -515,7 +483,19 @@ mod tests {
     fn test_move_word_backward_wraps_to_prev_line() {
         let mut e = editor_with(&["hello", "world"], 1, 0, 0, 0);
         e.move_word(false);
-        assert_eq!(e.cursor(), (0, 0)); // multi-line wrap: word start of previous line
+        assert_eq!(e.cursor(), (0, 5)); // Line start → cross to previous line end (matches pi moveWordBackwards)
+    }
+
+    #[test]
+    fn test_move_word_backward_stops_at_in_word_punctuation() {
+        // pi-407 intra-word punctuation breakpoints: from "bar" word end move back to "bar" start, then '.', then "foo" start
+        let mut e = editor_with(&["foo.bar"], 0, 7, 0, 0);
+        e.move_word(false);
+        assert_eq!(e.cursor(), (0, 4)); // "bar" word start
+        e.move_word(false);
+        assert_eq!(e.cursor(), (0, 3)); // '.' segment
+        e.move_word(false);
+        assert_eq!(e.cursor(), (0, 0)); // Start of the word "foo"
     }
 
     // ── move_to_line_start / move_to_line_end ──

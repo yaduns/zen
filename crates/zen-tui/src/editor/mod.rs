@@ -14,6 +14,7 @@ mod input;
 mod render;
 mod text;
 mod undo;
+mod word_navigation;
 
 use undo::LastAction;
 

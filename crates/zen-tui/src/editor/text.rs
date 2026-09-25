@@ -755,7 +755,38 @@ mod tests {
         e.insert_text_at_cursor("hello world");
         e.set_cursor_col(0);
         e.delete_word_forward();
-        assert_eq!(e.text(), "world");
+        // pi landing semantics: delete the current word up to its end (excluding trailing whitespace), leaving the leading space
+        assert_eq!(e.text(), " world");
+        assert_eq!(e.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn test_delete_word_forward_punctuation_boundary() {
+        // cursor at the start of the word "bar" (after '.'): pi boundary stops at word end → deletes only "bar"
+        let mut e = e(0);
+        e.insert_text_at_cursor("foo.bar");
+        e.set_cursor_col(4);
+        e.delete_word_forward();
+        assert_eq!(e.text(), "foo.");
+        assert_eq!(e.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn test_delete_word_backward_punctuation_boundary() {
+        // cursor at the end of "bar": pi boundary stops at the start of 'bar' (after '.'), deletes only "bar"
+        let mut e = e(0);
+        e.insert_text_at_cursor("foo.bar");
+        e.delete_word_backward(); // cursor at line end 7
+        assert_eq!(e.text(), "foo.");
+        assert_eq!(e.cursor(), (0, 4));
+        // delete again: boundary lands on the '.' segment → deletes "."
+        e.delete_word_backward();
+        assert_eq!(e.text(), "foo");
+        assert_eq!(e.cursor(), (0, 3));
+        // delete again: whole word removed → empty
+        e.delete_word_backward();
+        assert_eq!(e.text(), "");
+        assert_eq!(e.cursor(), (0, 0));
     }
 
     #[test]
