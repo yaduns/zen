@@ -83,9 +83,9 @@ pub enum EditorAction {
     DeleteToLineStart,
     /// Delete the entire segment from cursor to line end (default `Ctrl+K`).
     DeleteToLineEnd,
-    /// Paste back the most recent cut text from the kill ring (default `Ctrl+Y`; behavior hooked up by T-TU-03-7).
+    /// Paste back the most recently cut text from the kill ring (default `Ctrl+Y`; v1 has no kill ring (T-TU-03-7 Drop), remains a no-op).
     Yank,
-    /// Rotate the kill ring (only valid immediately after yank/yank-pop) (default `Alt+Y`; T-TU-03-7).
+    /// Rotate the kill ring (only valid immediately after yank/yank-pop) (default `Alt+Y`; v1 has no kill ring (T-TU-03-7 Drop), remains a no-op).
     YankPop,
     /// Undo the most recent edit: pop the stack and restore the text + cursor from before the last edit (default `Ctrl+-`).
     Undo,
@@ -116,7 +116,7 @@ pub struct Editor {
     preferred_visual_col: Option<usize>, // Sticky column; only valid during vertical movement (e.g. 9th character in the current row, cursor moves down to 6th character in row 2, then 16th in row 3: cursor should end at the last character of row 2, i.e. the 9th character of row 3)
     snapped_from_cursor_col: Option<usize>, // Original cursor column before snapping to an atomic segment (unbreakable atomic rows break the snapped_from_cursor_col memory; in that case snapped_from_cursor_col takes precedence)
     undo_stack: Vec<EditorState>, // Undo stack (T-TU-03-5, pi-406): before an edit operation mutates state, push a clone of EditorState; Undo pops to restore; submit clears. Snapshots exclude view state (scroll/sticky etc.), which is rebuilt per pi semantics on undo
-    last_action: Option<LastAction>, // Last input action category (aligned with pi lastAction; T-TU-03-5 only uses TypeWord to decide word/char insertion merging; kill/yank extended by T-TU-03-7)
+    last_action: Option<LastAction>, // Last input action category (matches pi lastAction; T-TU-03-5 uses only TypeWord for word-character insertion merge detection; kill/yank variants are not implemented due to T-TU-03-7 Drop)
     on_submit: Option<Box<dyn FnMut(&str)>>, // Submit callback; receives the expanded text after trim (no marker in this task, i.e. trim of the full text)
     on_change: Option<Box<dyn FnMut(&str)>>, // Called on every text change
     disable_submit: bool,                    // When set, Submit is not triggered

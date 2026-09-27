@@ -7,9 +7,9 @@
 use super::Editor;
 
 /// Previous input action category (aligned with the semantics of the pi `lastAction` union).
-/// T-TU-03-5 uses only `TypeWord` for the word-character insertion merge check; the `kill`/`yank` variants are extended by T-TU-03-7.
+/// T-TU-03-5 uses only `TypeWord` for word-character insertion merge detection; `kill`/`yank` variants are not implemented due to T-TU-03-7 Drop.
 /// Merge detection only cares whether it is a word-character insertion, so all non-insertion paths in this round set `None`
-/// (fully equivalent to pi setting `"kill"` on delete operations for undo behavior; the merge logic needs no change when T-TU-03-7 is wired in).
+/// (Setting `"kill"` for delete operations is fully equivalent to pi for undo behavior; with no kill ring (T-TU-03-7 Drop), no extension is needed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LastAction {
     /// The previous action was a word-character insertion (`insert_char` set): consecutive word characters are merged into one undo unit.

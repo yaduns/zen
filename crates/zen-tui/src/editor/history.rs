@@ -7,7 +7,7 @@ use super::{Editor, EditorState};
 
 impl Editor {
     /// Submit: take full text trim(), clear state and history browsing state, call on_change("") then on_submit(text).
-    /// (no paste marker, so the expansion step is skipped; the undo stack is cleared on submit — new input starts from an empty stack; kill ring is wired in by T-TU-03-7.)
+    /// (no paste marker, expansion step omitted; undo stack is cleared on commit—new input starts from an empty stack; v1 has no kill ring (T-TU-03-7 Drop).)
     pub(super) fn submit(&mut self) {
         let text = self.text().trim().to_string();
 

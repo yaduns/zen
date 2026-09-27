@@ -48,8 +48,8 @@ impl Input {
 
     /// Key entry point: insert printable characters (no Ctrl/Alt); backspace/delete before the cursor; ←→/line start/end;
     /// Enter submits (on_submit); Esc/Ctrl+C cancels (on_escape); Ctrl+W/K/U (delete word/line)
-    /// Along with Ctrl+Y (yank) and Ctrl+Z (undo), a no-op — kill-ring/word navigation/undo are respectively
-    /// owned by T-TU-03-7/-8/-5 and will be hooked up here then. Returns whether the key was consumed (printable characters and navigation-type consumption,
+    /// Ctrl+Y (yank) and Ctrl+Z (undo) are no-op fall-through — kill-ring (T-TU-03-7 Drop, absent in v1) / word navigation / undo
+    /// Not hooked up in the search box (not needed for the v1 search box). Returns whether consumed (printable characters and navigation-type consumption,
     /// no-op keys are not consumed). paste uses a separate handle_paste entry point.
     pub fn handle_key(&mut self, key: &KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
@@ -127,7 +127,7 @@ impl Input {
                 self.cursor += c.len_utf8();
                 true
             }
-            // Ctrl+W/K/U/Y/Z — no-op (to be hooked up in T-TU-03-7/-8/-5)
+            // Ctrl+W/K/U/Y/Z — no-op (kill-ring T-TU-03-7 Drop; word navigation/undo not hooked up in the search box)
             (
                 KeyCode::Char('w' | 'k' | 'u' | 'y' | 'z' | 'a' | 'e' | 'b' | 'f'),
                 KeyModifiers::CONTROL,

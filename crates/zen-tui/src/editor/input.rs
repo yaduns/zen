@@ -190,7 +190,7 @@ impl Editor {
                 }
             }
 
-            // ── Not implemented (reserved for T-TU-03-7/-3) ──
+            // ── Not implemented (Yank/YankPop: v1 has no kill ring, T-TU-03-7 Drop; Tab: T-TU-03-3 assembly) ──
             EditorAction::Yank => { /* no-op */ }
             EditorAction::YankPop => { /* no-op */ }
             EditorAction::Tab => { /* no-op */ }

@@ -210,7 +210,7 @@ impl Editor {
     }
 
     /// Delete from cursor to line start (everything before the cursor); at line start, merge into the previous line (aligns with pi deleteToStartOfLine's col==0 cross-line branch).
-    /// Trigger on_change. Undo: push a snapshot before actual deletion; a no-op (at the start of the first line) does not push; the kill ring is integrated by T-TU-03-7.
+    /// Trigger on_change. Undo: push a snapshot before the actual deletion; no-op (at first line start) does not push; v1 has no kill ring (T-TU-03-7 Drop).
     pub(super) fn delete_to_line_start(&mut self) {
         self.exit_history_browsing();
         self.last_action = None;
@@ -223,7 +223,7 @@ impl Editor {
             line.replace_range(..col, "");
             self.set_cursor_col(0);
         } else if self.state.cursor_line > 0 {
-            // ── Start of line: merge into previous line (the deleted newline is recorded by the kill ring, T-TU-03-7) ──
+            // ── Line start: join to previous line (the deleted newline should normally be recorded by the kill ring; v1 has no kill ring, T-TU-03-7 Drop) ──
             self.push_undo_snapshot();
             let current_line = self.state.lines.remove(self.state.cursor_line);
             self.state.cursor_line -= 1;
@@ -265,7 +265,7 @@ impl Editor {
 
     /// Delete one word backward (before the cursor); at line start, merge into the previous line. Word boundary reuses `move_word_backward`
     /// (aligns with pi structure: deleteWordBackwards calls moveWordBackwards to get the boundary); deletion and movement
-    /// Always uses the same word-boundary semantics. Triggers on_change. Undo: push snapshot before actual deletion; kill ring hooked up in T-TU-03-7.
+    /// Always uses the same word-boundary semantics. Triggers on_change. Undo: snapshot pushed before the actual delete; v1 has no kill ring (T-TU-03-7 Drop).
     pub(super) fn delete_word_backward(&mut self) {
         self.exit_history_browsing();
         self.last_action = None;
@@ -309,7 +309,7 @@ impl Editor {
 
     /// Delete one word forward (after the cursor); at line end, merge into the next line. Word boundary reuses `move_word_forward`
     /// (aligns with pi structure: deleteWordForward calls moveWordForwards for the boundary) delete and move
-    /// Always uses the same word-boundary semantics. Triggers on_change. Undo: push snapshot before actual deletion; kill ring hooked up in T-TU-03-7.
+    /// Always uses the same word-boundary semantics. Triggers on_change. Undo: snapshot pushed before the actual delete; v1 has no kill ring (T-TU-03-7 Drop).
     pub(super) fn delete_word_forward(&mut self) {
         self.exit_history_browsing();
         self.last_action = None;
