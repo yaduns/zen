@@ -17,6 +17,7 @@ use crate::observability::cache_stats::{
 };
 use crate::observability::diagnostics::format_resource_diagnostics;
 
+use crate::cli::expand_at_references;
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
 };
@@ -758,7 +759,13 @@ impl InteractiveMode {
                         }
                         Some(InputCommand::FollowUp(text)) => {
                             if self.runtime.session.is_run() || self.run_task.is_some() {
-                                self.runtime.session.follow_up(&text);
+                                // at-attachment-wiring-fix: FollowUp during run also expands @path (does not silently drop images)
+                                let cwd = self.runtime.session.cwd().to_string();
+                                let processed =
+                                    expand_at_references(&text, std::path::Path::new(&cwd)).await;
+                                self.runtime
+                                    .session
+                                    .follow_up(&processed.text, &processed.images);
                                 self.push_pending();
                             } else {
                                 // Alt+Enter is equivalent to Enter when idle (aligned with pi handleFollowUp's non-streaming branch)
@@ -1094,17 +1101,25 @@ impl InteractiveMode {
 
     /// Submit a regular message: if a run is active → steer (queued injection before the next LLM turn); if idle → spawn a run task (Plan D).
     /// Expansion of `/skill:` and `/template-name` is handled on the session side by `expand_prompt_input` (T-AP-03-2),
-    /// This function does not perform classification.
+    /// This function does no classification. **at-attachment-wiring-fix**: before submitting, `expand_at_references` first expands the message's
+    /// `@path` references into `<file>` blocks + image attachments (text expanded into the body, images passed via attachment parameters;
+    /// missing paths are silently left as-is without interrupting submission; expansion happens before in-session skill/template expansion).
     async fn submit_message(&mut self, text: String) -> Result<(), InteractiveModeError> {
+        let cwd = self.runtime.session.cwd().to_string();
+        let processed = expand_at_references(&text, std::path::Path::new(&cwd)).await;
         if self.runtime.session.is_run() || self.run_task.is_some() {
-            self.runtime.session.steer(&text);
+            self.runtime
+                .session
+                .steer(&processed.text, &processed.images);
             return Ok(());
         }
         self.push_footer();
         let session = Arc::clone(&self.runtime.session);
         let tx = self.ui_event_tx.clone(); // can't borrow &self inside async move
+        let expanded_text = processed.text;
+        let expanded_images = processed.images;
         self.run_task = Some(tokio::task::spawn_local(async move {
-            if let Err(e) = session.prompt(&text).await {
+            if let Err(e) = session.prompt(&expanded_text, &expanded_images).await {
                 // P1-1: errors inside run are degraded to a UI status line (session not interrupted; the initial message is degraded the same way, see known deviation #3)
                 let _ = tx.send(UiEvent::Status(StatusSpec::Error(e.to_string())));
             }

@@ -154,7 +154,7 @@ async fn run_turn_with_history(
         real_stream_fn(),
         None, // T-AI-02-6: integration tests do not carry the session affinity key
     );
-    agent.prompt(prompt).await
+    agent.prompt(prompt, &[]).await
 }
 
 /// Run one round with a real LLM on empty history.

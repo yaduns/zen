@@ -5,7 +5,9 @@ pub mod session_picker;
 pub mod startup_ui;
 
 pub use args::{parse_thinking_level, CliArgs, Mode};
-pub use file_processor::{process_file_arguments, FileProcessError, ProcessedFiles};
+pub use file_processor::{
+    expand_at_references, process_file_arguments, FileProcessError, ProcessedFiles,
+};
 pub use initial_message::{
     build_initial_message, read_piped_stdin, stdin_is_terminal, InitialMessageResult,
 };

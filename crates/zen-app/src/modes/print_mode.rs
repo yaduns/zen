@@ -47,10 +47,8 @@ pub async fn run_print_mode(
     initial_message: Option<String>,
     initial_images: Vec<ImageContent>,
 ) -> anyhow::Result<i32> {
-    // Phase 1: The ability to attach images to the initial message requires first extending `AgentSession::prompt` (Phase 2 @file images),
-    // The current caller always passes an empty Vec, so this is not handled yet; retain the parameter to preserve the wiring contract with main.rs.
-    let _ = &initial_images;
-
+    // at-attachment-wiring-fix: initial message carries image attachment (closes leftover T-AP-08-2/T-AP-08-4
+    // "Phase 2 @file image" deferred seam — `AgentSession::prompt` has extended the images slot).
     let writer = Arc::new(RawStdout::new());
 
     // JSON mode: write to stdout via subscription as events occur; no post-processing needed
@@ -66,7 +64,7 @@ pub async fn run_print_mode(
     // Send prompts
     let send_prompts = async {
         if let Some(ref text) = initial_message {
-            let msgs = runtime.session.prompt(text).await?;
+            let msgs = runtime.session.prompt(text, &initial_images).await?;
             // Record the last assistant
             for msg in msgs.iter().rev() {
                 if let Message::Assistant(a) = msg {
@@ -76,7 +74,7 @@ pub async fn run_print_mode(
             }
         }
         for msg in &messages {
-            let msgs = runtime.session.prompt(msg).await?;
+            let msgs = runtime.session.prompt(msg, &[]).await?;
             for msg in msgs.iter().rev() {
                 if let Message::Assistant(a) = msg {
                     last_assistant = Some(a.clone());

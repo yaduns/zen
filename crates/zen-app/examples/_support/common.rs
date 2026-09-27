@@ -62,7 +62,7 @@ pub fn make_session(
 
 /// Run one real LLM prompt and print all of the assistant's text blocks.
 pub async fn run_and_print(session: &mut AgentSession, prompt: &str) -> anyhow::Result<()> {
-    let replies = session.prompt(prompt).await?;
+    let replies = session.prompt(prompt, &[]).await?;
     for msg in replies {
         if let Message::Assistant(assistant) = msg {
             for block in assistant.content {

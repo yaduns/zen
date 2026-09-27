@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 3. Real LLM call: send one round of prompt, print the assistant's text reply
-    let replies = session.prompt(&prompt).await?;
+    let replies = session.prompt(&prompt, &[]).await?;
     for msg in replies {
         if let Message::Assistant(assistant) = msg {
             for block in assistant.content {

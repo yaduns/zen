@@ -80,7 +80,10 @@ async fn real_test_session_agent_runtime_fork() {
     // 2) Round one: remember ORANGE (via runtime entry)
     let turn1 = rt
         .session
-        .prompt("Remember the codeword ORANGE. Reply with only the word 'remembered'.")
+        .prompt(
+            "Remember the codeword ORANGE. Reply with only the word 'remembered'.",
+            &[],
+        )
         .await
         .expect("prompt");
     common::print_messages("turn1", &turn1);
@@ -96,7 +99,10 @@ async fn real_test_session_agent_runtime_fork() {
     // 3) Round two: continue in the same session, remember PURPLE
     let turn2 = rt
         .session
-        .prompt("Now also remember the codeword PURPLE. Reply with only the word 'remembered'.")
+        .prompt(
+            "Now also remember the codeword PURPLE. Reply with only the word 'remembered'.",
+            &[],
+        )
         .await
         .expect("prompt 2");
     common::print_messages("turn2", &turn2);
@@ -160,7 +166,10 @@ async fn real_test_session_agent_runtime_fork() {
     // 7) Round three: follow-up question on the fork branch → retains pre-fork context (ORANGE), no PURPLE leakage
     let turn3 = rt2
         .session
-        .prompt("Which codeword do you remember? Reply with only one word.")
+        .prompt(
+            "Which codeword do you remember? Reply with only one word.",
+            &[],
+        )
         .await
         .expect("prompt 3");
     common::print_messages("turn3 (fork branch)", &turn3);

@@ -41,7 +41,8 @@ use tokio_util::sync::CancellationToken;
 use zen_ai::types::{AssistantMessage, ContentBlock, ContentBlockList, Message, UserMessage};
 use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::autocomplete::{
-    AutocompleteProvider, AutocompleteSuggestions, CombinedAutocompleteProvider, SlashCommand,
+    is_at_attachment_context, AutocompleteProvider, AutocompleteSuggestions,
+    CombinedAutocompleteProvider, SlashCommand,
 };
 use zen_tui::components::input::Input;
 use zen_tui::components::select_list::SelectAction;
@@ -112,7 +113,8 @@ pub struct InteractiveUi {
     /// Panel requests to close (top-level Esc via on_cancel).
     panel_close: Rc<RefCell<bool>>,
     /// Completion providers (autocomplete-wiring-fix): command data (T-AP-03-2 `build_slash_command_list`)
-    /// Construct with + cwd, `CombinedAutocompleteProvider` (fuzzy_walk_enabled=false aligns with pi fdPath:null);
+    /// Constructed with + cwd, `CombinedAutocompleteProvider` (fuzzy_walk_enabled=true, at-attachment-wiring-fix correction:
+    /// in-process walkdir is the fd equivalent; non-blocking guaranteed by spawn_blocking + ct cancellation);
     /// used for triggering (get_suggestions) and applying on selection (apply_completion); the overlay holds a clone.
     provider: Arc<dyn AutocompleteProvider>,
     /// Budget for visible completion items (settings `autocomplete_max_visible`, constructor already clamps to 3..=20).
@@ -348,6 +350,9 @@ struct AutocompleteOverlay {
     selected: usize,
     /// `spawn_local` task for `get_suggestions` (draw-frame polls `is_finished`); aborted on close.
     pending: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation signal for this query (at-attachment-wiring-fix): cancel on close/poll with no candidates —
+    /// stops an in-flight spawn_blocking blocking walk (aborting the JoinHandle only stops the async task, not the blocking thread).
+    ct: CancellationToken,
     /// Task writes to the result slot (`spawn_local` task holds the clone; drained by `poll_autocomplete` on completion).
     pending_result: Rc<RefCell<Option<AutocompleteSuggestions>>>,
     /// Max visible dropdown items (settings `autocomplete_max_visible`, clamped 3..=20).
@@ -387,11 +392,12 @@ impl InteractiveUi {
         max_visible: usize,
     ) -> Self {
         // 0. Completion provider (autocomplete-wiring-fix): command data (produced by T-AP-03-2 `build_slash_command_list`)
-        //    + cwd base; fuzzy_walk_enabled=false aligns with pi fdPath:null (`@` attachment fuzzy autocomplete disabled).
+        //    + cwd based; fuzzy_walk_enabled=true (corrected per at-attachment-wiring-fix: in-process walkdir is the fd equivalent,
+        //    T-TU-03-3 docs default true; non-blocking guaranteed by spawn_blocking + ct cancellation inside get_fuzzy_file_suggestions).
         let provider: Arc<dyn AutocompleteProvider> = Arc::new(CombinedAutocompleteProvider::new(
             commands,
             PathBuf::from(cwd.clone()),
-            false,
+            true,
         ));
         // 1. Editor: carries a copy of the app keymap + editor-domain keymap (T-AP-06-2 user override injection) +
         //    the left-pad injected from settings (default 0).
@@ -549,7 +555,7 @@ impl InteractiveUi {
             // Non-completion (editing) keys: the overlay was already closed in handle_autocomplete_key; continue with the normal editor flow.
         } else if key.code == KeyCode::Tab {
             // Tab triggers completion (editor Tab is a no-op anchor; with no candidates, the poll finishes and closes automatically, silently).
-            self.trigger_autocomplete();
+            self.trigger_autocomplete(false);
             return None;
         }
         // 1. Editor first: internal app keybinding match -> trigger registered callbacks (commands write to route; pure editing actions have no command)
@@ -693,14 +699,15 @@ impl InteractiveUi {
         }
     }
 
-    /// Called on Tab press or when `/` appears at line start (via `maybe_trigger_autocomplete` after on_change): snapshot current line/cursor
-    /// → `spawn_local` starts the `get_suggestions` async task (result written to `pending_result` slot) → set pending —
-    /// "press Tab once, candidates computed in the background, draw frame `poll_autocomplete` finalizes". Returns whether an autocomplete session was started
-    /// (pending counts as started; if there are no candidates, poll finalization auto-closes without showing the overlay).
+    /// Called on Tab or natural trigger (`/`/`@` context): snapshot current line/cursor → `spawn_local` starts `get_suggestions`
+    /// async task (`@` context sleeps 20ms first for debounce, aligned with pi's `ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS`; if ct is
+    /// already cancelled after the sleep, the query is dropped) → results written to the `pending_result` slot — "press Tab/type @, candidates computed in background, finalized on the draw frame".
+    /// Returns whether a completion session has been opened (pending counts as open; with no candidates, poll finalizes and auto-closes without showing a popup).
     ///
+    /// Parameter `debounce`: the `@` branch passes true (20ms debounce, pi debounces only `@`/`#` context); the Tab/`/` branch passes false (pi does not debounce slash commands).
     /// Edge case: overlay already active or editor empty → don't trigger (return false); `get_suggestions` returning None
-    /// (no prefix hit) → close the overlay during `poll_autocomplete` finalization.
-    fn trigger_autocomplete(&mut self) -> bool {
+    /// (no prefix match) → when `poll_autocomplete` finalizes, it closes the overlay and cancels ct.
+    fn trigger_autocomplete(&mut self, debounce: bool) -> bool {
         if self.autocomplete.is_some() {
             return false;
         }
@@ -715,10 +722,17 @@ impl InteractiveUi {
         let pending_result: Rc<RefCell<Option<AutocompleteSuggestions>>> =
             Rc::new(RefCell::new(None));
         let cell = Rc::clone(&pending_result);
-        let ct = CancellationToken::new(); // Per-query independent token (with fuzzy_walk off, queries actually complete synchronously; await returns immediately)
+        let ct = CancellationToken::new(); // Per-query token: close/poll cancels it when there are no candidates (stops the blocking walk)
+        let ct_task = ct.clone();
         let handle = tokio::task::spawn_local(async move {
+            if debounce {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if ct_task.is_cancelled() {
+                    return; // Closed/replaced during debounce → drop the query
+                }
+            }
             let result = provider_task
-                .get_suggestions(&lines_task, cursor.0, cursor.1, false, &ct)
+                .get_suggestions(&lines_task, cursor.0, cursor.1, false, &ct_task)
                 .await;
             *cell.borrow_mut() = result;
         });
@@ -727,6 +741,7 @@ impl InteractiveUi {
             suggestions: None,
             selected: 0,
             pending: Some(handle),
+            ct,
             pending_result,
             max_visible: self.autocomplete_max_visible,
             lines,
@@ -762,15 +777,19 @@ impl InteractiveUi {
                 overlay.pending = None;
                 self.autocomplete = Some(overlay);
             }
-            // No candidates: overlay dropped (closed), stay silent to avoid disturbing
-            None => {}
+            // No candidates: overlay dropped (closed), silent; cancel ct first to stop the in-flight blocking walk
+            None => {
+                overlay.ct.cancel();
+            }
         }
         true
     }
 
-    /// Close the overlay: drop it and abort in-flight query tasks (tasks hold a clone of the result slot; they are naturally discarded after abort).
+    /// Close the overlay: drop the overlay and cancel the in-flight query — cancel ct first (stops the spawn_blocking blocking walk,
+    /// aborting the JoinHandle only stops the async task), then abort the task handle (the task holds a clone of the result slot and discards it naturally after abort).
     fn close_autocomplete(&mut self) {
         if let Some(mut overlay) = self.autocomplete.take() {
+            overlay.ct.cancel();
             if let Some(handle) = overlay.pending.take() {
                 handle.abort();
             }
@@ -830,15 +849,32 @@ impl InteractiveUi {
     }
 
     /// Natural trigger detection (called after the editor handles the keypress): starts with `/` at line start, within the command-name segment (no whitespace), and completion not active
-    /// → triggered. `/cmd ` (with trailing space) after backfill does not trigger, avoiding pointless re-queries;
+    /// → trigger; `@` attachment context (provider declares `@` trigger char + text before cursor is in an `@`/`@\"` token) → trigger
+    /// (20ms debounce). A backfilled `/cmd ` (with trailing space) no longer triggers, avoiding pointless re-queries;
     /// After the overlay is dismissed by an editing key, this re-queries to enable per-character refinement.
     fn maybe_trigger_autocomplete(&mut self) {
         if self.autocomplete.is_some() {
             return;
         }
         let text = self.editor.text();
+        // `/` command context (existing): leading slash at line start and no whitespace in the command-name segment → trigger (no debounce, pi slash commands are immediate)
         if text.starts_with('/') && !text[1..].contains(char::is_whitespace) {
-            self.trigger_autocomplete();
+            self.trigger_autocomplete(false);
+            return;
+        }
+        // `@` attachment context (at-attachment-wiring-fix): provider declares the `@` trigger char and text before the cursor is inside
+        // `@`/`@\"` token (is_at_attachment_context, reusing zen-tui extract_at_prefix semantics) → trigger (debounced).
+        if self.provider.trigger_characters().contains(&'@') {
+            let (line, col) = self.editor.cursor();
+            let text_before_cursor: String = self
+                .editor
+                .lines()
+                .get(line)
+                .map(|l| l.chars().take(col).collect())
+                .unwrap_or_default();
+            if is_at_attachment_context(&text_before_cursor) {
+                self.trigger_autocomplete(true);
+            }
         }
     }
 
@@ -3100,11 +3136,12 @@ mod tests {
             provider: Arc::new(CombinedAutocompleteProvider::new(
                 Vec::new(),
                 PathBuf::from("/tmp"),
-                false,
+                true,
             )),
             suggestions: Some(AutocompleteSuggestions::new(items, "/")),
             selected: 0,
             pending: None,
+            ct: CancellationToken::new(),
             pending_result: Rc::new(RefCell::new(None)),
             max_visible: 5,
             lines: vec!["/".to_string()],
@@ -3320,6 +3357,50 @@ mod tests {
                 let overlay = u.autocomplete.as_ref().unwrap();
                 let sugg = overlay.suggestions.as_ref().expect("empty prefix = all command candidates");
                 assert!(!sugg.items().is_empty(), "/ prefix yields the full command list");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_at_typing_naturally_triggers_fuzzy_candidates() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("hello.txt"), "hi").unwrap();
+                let mut u = InteractiveUi::new(
+                    theme().clone(),
+                    kb(),
+                    editor_kb(),
+                    select_kb(),
+                    tmp.path().display().to_string(),
+                    UiPrefs::default(),
+                    None,
+                    crate::commands::build_slash_command_list(&[], &[]),
+                    5,
+                );
+                // First `@` keystroke triggers naturally (pending, 20ms debounce in progress)
+                let _ = u.handle_key(&press(KeyCode::Char('@')));
+                assert!(u.autocomplete.is_some(), "first key @ naturally triggers completion (pending)");
+                // Continue typing `h`: the editing key closes the pending overlay → falls back to the editor → maybe_trigger re-queries with `@h`
+                let _ = u.handle_key(&press(KeyCode::Char('h')));
+                assert!(
+                    u.autocomplete.is_some(),
+                    "typing on after @h retriggers (refined per character)"
+                );
+                // wait for debounce (20ms) + walkdir candidates in place (fuzzy_walk_enabled=true)
+                for _ in 0..8 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    if u.poll_autocomplete() {
+                        break;
+                    }
+                }
+                let overlay = u.autocomplete.as_ref().expect("Overlay remains when candidates exist");
+                let sugg = overlay.suggestions.as_ref().expect("Candidates in place");
+                let values: Vec<&str> = sugg.items().iter().map(|i| i.value()).collect();
+                assert!(
+                    values.contains(&"@hello.txt"),
+                    "@ attachment candidates include hello.txt (fuzzy_walk_enabled=true): {values:?}"
+                );
             })
             .await;
     }

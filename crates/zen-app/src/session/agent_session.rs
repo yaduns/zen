@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
-use zen_ai::types::{ContentBlockList, Message, Model, StopReason, ThinkingLevel, UserMessage};
+use zen_ai::types::{
+    ContentBlockList, ImageContent, Message, Model, StopReason, ThinkingLevel, UserMessage,
+};
 use zen_core::compaction::CompactionError;
 use zen_core::env::shell_output::{execute_shell_with_capture, ShellCaptureOptions};
 use zen_core::env::{ExecutionEnv, ExecutionError, ShellConfig};
@@ -254,7 +256,9 @@ impl AgentSession {
         &self.templates
     }
 
-    /// Send a prompt to the agent and wait for completion.
+    /// Send the prompt to the agent and wait for completion (at-attachment-wiring-fix extends the images parameter to align with pi
+    /// `prompt(text, options.images)`: image attachments expanded from interactive `@path` are passed into the first user message here
+    /// (Engine `build_user_message`: an empty images list uses the existing Text form and does not change the wire format).
     ///
     /// # Behavior
     /// 1. Before submission, expand `/skill:` and `/template_name` via `expand_prompt_input` (T-AP-03-2;
@@ -266,10 +270,14 @@ impl AgentSession {
     ///      does not block submission (the error is already delivered via the `CompactionEnd` event; pi ignores the return value semantics)
     ///    - Post-run check (aligned with pi :1094 agent_end handling): threshold compaction / overflow
     ///      recovery retry / deliver queued messages — return true → `continue_turn` for another round, its output merged into the return value
-    /// 3. Call `self.agent.prompt(&expanded)` (engine refreshes tokens inside run; pi has no-arg surface, D2/D4)
+    /// 3. Call `self.agent.prompt(&expanded, images)` (the engine refreshes the run token internally; pi exposes no parameter surface; D2/D4)
     /// 4. A persistent subscription runs during execution to persist in real time (message_end → append_message); consumers
     ///    Events subscribed via `subscribe` are delivered synchronously
     /// 4. Return all messages newly added this round
+    ///
+    /// # Parameters
+    /// - `text`: user prompt text (interactive `@path` already expanded into `<file>` blocks by `expand_at_references`)
+    /// - `images`: Supports inline image attachments (empty slice = plain text, with behavior exactly matching the old signature)
     ///
     /// # Errors
     /// - `AgentSessionError::Agent`: agent loop error (underlying `AgentLoopError`; the `prompt` path is always Ok — legacy quirk, out of scope here)
@@ -277,7 +285,15 @@ impl AgentSession {
     /// # Edge Cases
     /// - `&self`: this struct is a lock-free Facade (store/excluded are already Arc-shared), callable concurrently by the run task and the main task
     ///   (&self after the engine is shared; see interactive cancellation fix plan D)
-    pub async fn prompt(&self, text: &str) -> Result<Vec<Message>, AgentSessionError> {
+    ///
+    /// # Consumers
+    /// `crates/zen-app/src/modes/print_mode.rs` (initial passes `&initial_images`, append passes `&[]`),
+    /// `crates/zen-app/src/modes/interactive/mod.rs` (`submit_message`, passes the expanded images).
+    pub async fn prompt(
+        &self,
+        text: &str,
+        images: &[ImageContent],
+    ) -> Result<Vec<Message>, AgentSessionError> {
         let expanded = expand_prompt_input(text, &self.skills, &self.templates);
         // Reset overflow recovery budget (aligned with pi :597 message_start-user reset: new user input = new recovery budget)
         self.overflow_recovery_attempted
@@ -287,7 +303,7 @@ impl AgentSession {
         if let Some(last) = super::compaction::last_assistant_message(&self.agent.messages()) {
             let _ = self.check_compaction(last, false).await;
         }
-        let mut msgs = self.agent.prompt(&expanded).await;
+        let mut msgs = self.agent.prompt(&expanded, images).await;
         // Post-run check (aligned with pi :1094 agent_end handling): return true → continue_turn (overflow
         // recovery retry / deliver queued messages), continued-round output merged into the return value
         let should_continue =
@@ -514,24 +530,32 @@ impl AgentSession {
 
     // ── Queue operations (agent engine queue + read-only UI snapshot) ──────────────
 
-    /// Queue a steer message (injected after tool execution, before the next LLM call).
+    /// Queue a steer message (injected after tool execution and before the next LLM call; at-attachment-wiring-fix extends the images slot,
+    /// Aligns with pi `steer(text, images)`—submitting an @ image during a run is not silently dropped).
     /// Expand before submission via `expand_prompt_input` (T-AP-03-2, aligned with pi steer's expansion chain).
     ///
     /// # Edge Cases
     /// - `&self`: enqueues only via `Agent::steer`, does not block the prompt
-    pub fn steer(&self, text: &str) {
+    ///
+    /// # Consumers
+    /// `crates/zen-app/src/modes/interactive/mod.rs` (`submit_message` run branch).
+    pub fn steer(&self, text: &str, images: &[ImageContent]) {
         let expanded = expand_prompt_input(text, &self.skills, &self.templates);
-        self.agent.steer(&expanded);
+        self.agent.steer(&expanded, images);
     }
 
-    /// Queue a follow-up message (injected after the agent goes idle).
+    /// Queue a follow-up message (injected after the agent becomes idle; at-attachment-wiring-fix extends the images slot,
+    /// Aligns with pi `followUp(text, images)`).
     /// Expanded via `expand_prompt_input` before submission (T-AP-03-2, aligned with the pi followUp expansion chain).
     ///
     /// # Edge Cases
     /// - `&self`: enqueues only via `Agent::follow_up`, does not block the prompt
-    pub fn follow_up(&self, text: &str) {
+    ///
+    /// # Consumers
+    /// `crates/zen-app/src/modes/interactive/mod.rs` (`FollowUp` command branch).
+    pub fn follow_up(&self, text: &str, images: &[ImageContent]) {
         let expanded = expand_prompt_input(text, &self.skills, &self.templates);
-        self.agent.follow_up(&expanded);
+        self.agent.follow_up(&expanded, images);
     }
 
     /// Get a snapshot of the current steer queue (read-only, delegated via engine `steering_messages()`).
@@ -895,8 +919,8 @@ mod tests {
     fn test_steer_and_snapshot() {
         let store = Arc::new(MockStore::default());
         let session = test_session(store);
-        session.steer("hello");
-        session.steer("world");
+        session.steer("hello", &[]);
+        session.steer("world", &[]);
         assert_eq!(
             session.steering_messages(),
             vec!["hello".to_string(), "world".to_string()]
@@ -907,7 +931,7 @@ mod tests {
     fn test_follow_up_and_snapshot() {
         let store = Arc::new(MockStore::default());
         let session = test_session(store);
-        session.follow_up("continue");
+        session.follow_up("continue", &[]);
         assert_eq!(session.follow_up_messages(), vec!["continue".to_string()]);
     }
 

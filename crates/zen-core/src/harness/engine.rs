@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::{Tool, ToolExecutionMode};
 use zen_ai::types::StreamFn;
-use zen_ai::types::{ContentBlock, ContentBlockList, Message, Model, ThinkingLevel, UserMessage};
+use zen_ai::types::{
+    ContentBlock, ContentBlockList, ImageContent, Message, Model, ThinkingLevel, UserMessage,
+};
 
 /// Stateful, session-level agent engine. Holds AgentState (accumulated across turns) and two message queues: steer and follow-up,
 /// exposing prompt/continue_turn/steer/follow_up/set_model/set_tools/abort/wait_for_idle/reset etc. externally;
@@ -80,6 +82,29 @@ impl Drop for RunGuard<'_> {
 enum RunBody {
     Prompt(Vec<Message>),
     Continue,
+}
+
+/// Build user message content from text and optional image attachments (at-attachment-wiring-fix): images empty →
+/// `ContentBlockList::Text` (keeps existing wire shape); non-empty → `Blocks(vec![Text, ...Image])`.
+/// **Accepted deviation**: pi `_queueSteer`/`_queueFollowUp` always send the `[{type:"text",text}]` array form,
+/// zen with empty images uses the string Text form (zero regression; Blocks only when ImageContent is non-empty).
+fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
+    if images.is_empty() {
+        Message::User(UserMessage {
+            content: ContentBlockList::Text(text.to_string()),
+            timestamp: now_millis(),
+        })
+    } else {
+        let mut blocks = vec![ContentBlock::Text(zen_ai::types::TextContent {
+            text: text.to_string(),
+            text_signature: None,
+        })];
+        blocks.extend(images.iter().cloned().map(ContentBlock::Image));
+        Message::User(UserMessage {
+            content: ContentBlockList::Blocks(blocks),
+            timestamp: now_millis(),
+        })
+    }
 }
 
 #[async_trait]
@@ -304,11 +329,8 @@ impl Agent {
     ///   `state`**—it must write the replacement `ctx` (messages / system_prompt / tools) back over `state` in full**,
     ///   otherwise the "rewrite the whole session" operation is silently dropped, and the canonical copy diverges from what the model actually saw.
     ///   v1 has no compaction and this hook usually returns `None`, but the write-back convention must be agreed upon from the start.
-    pub async fn prompt(&self, text: &str) -> Vec<Message> {
-        let user_msg = Message::User(UserMessage {
-            content: ContentBlockList::Text(text.to_string()),
-            timestamp: now_millis(),
-        });
+    pub async fn prompt(&self, text: &str, images: &[ImageContent]) -> Vec<Message> {
+        let user_msg = build_user_message(text, images);
         self.run_with_lifecycle(RunBody::Prompt(vec![user_msg]))
             .await
     }
@@ -348,12 +370,9 @@ impl Agent {
     /// # Edge Cases
     /// - `&self`: only locks the `Arc<Mutex>`; safe to call while running (leaves room for future concurrent TUI steering).
     /// - Messages in the queue are injected on the **next** loop iteration; they do not interrupt the current streaming LLM response.
-    pub fn steer(&self, text: &str) {
+    pub fn steer(&self, text: &str, images: &[ImageContent]) {
         // Construct user message (aligned with the Message::User construction pattern used across the zen codebase)
-        let message = Message::User(UserMessage {
-            content: ContentBlockList::Text(text.to_string()),
-            timestamp: now_millis(),
-        });
+        let message = build_user_message(text, images);
         // Push into steer_queue (&self: lock only, safe to call while running)
         if let Ok(mut queue) = self.steer_queue.lock() {
             queue.push_back(message);
@@ -364,12 +383,9 @@ impl Agent {
     ///
     /// Similar to [`Agent::steer`], but injected after the agent has no more tool calls
     /// (drained via `get_follow_up_messages`), used to continue the conversation.
-    pub fn follow_up(&self, text: &str) {
+    pub fn follow_up(&self, text: &str, images: &[ImageContent]) {
         // Construct user message (aligned with the Message::User construction pattern used across the zen codebase)
-        let message = Message::User(UserMessage {
-            content: ContentBlockList::Text(text.to_string()),
-            timestamp: now_millis(),
-        });
+        let message = build_user_message(text, images);
         // Push into steer_queue (&self: lock only, safe to call while running)
         if let Ok(mut queue) = self.follow_up_queue.lock() {
             queue.push_back(message);
@@ -824,8 +840,8 @@ mod tests {
     #[test]
     fn test_steer_enqueues_and_snapshot() {
         let agent = test_agent();
-        agent.steer("hello");
-        agent.steer("world");
+        agent.steer("hello", &[]);
+        agent.steer("world", &[]);
         assert_eq!(
             agent.steering_messages(),
             vec!["hello".to_string(), "world".to_string()]
@@ -835,7 +851,7 @@ mod tests {
     #[test]
     fn test_follow_up_enqueues_and_snapshot() {
         let agent = test_agent();
-        agent.follow_up("please continue");
+        agent.follow_up("please continue", &[]);
         assert_eq!(
             agent.follow_up_messages(),
             vec!["please continue".to_string()]
@@ -845,8 +861,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_steering_messages_drains_one() {
         let agent = test_agent();
-        agent.steer("a");
-        agent.steer("b");
+        agent.steer("a", &[]);
+        agent.steer("b", &[]);
 
         let drained = agent.get_steering_messages().await;
         assert_eq!(drained.len(), 1, "each round drains one");
@@ -932,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn test_reset_clears_queue_but_preserves_config() {
         let agent = test_agent();
-        agent.steer("queued");
+        agent.steer("queued", &[]);
         let m = test_model();
         agent.set_model(m.clone());
 
@@ -966,7 +982,7 @@ mod tests {
         // First round: abort mid-run → this round is cancelled (controllable_stream_fn emits Error{Aborted} for a cancelled token)
         let task_agent = Arc::clone(&agent);
         let spawn1 = tokio::spawn(async move {
-            let _ = task_agent.prompt("first").await;
+            let _ = task_agent.prompt("first", &[]).await;
         });
         // Abort after the first round enters running (is_run set, run hangs because block=true)
         let mut entered = false;
@@ -984,7 +1000,7 @@ mod tests {
 
         // Second round: unblock + engine's fresh internal token (not cancelled) → should complete normally (returns an assistant message)
         block.store(false, Ordering::SeqCst);
-        let msgs = agent.prompt("second").await;
+        let msgs = agent.prompt("second", &[]).await;
         assert!(!msgs.is_empty(), "second round should produce message (normal completion)");
         assert!(agent
             .messages()
@@ -1001,7 +1017,7 @@ mod tests {
         assert!(!agent.is_run());
         let task_agent = Arc::clone(&agent);
         let spawned = tokio::spawn(async move {
-            let _ = task_agent.prompt("hi").await;
+            let _ = task_agent.prompt("hi", &[]).await;
         });
         let mut saw_run = false;
         for _ in 0..200 {

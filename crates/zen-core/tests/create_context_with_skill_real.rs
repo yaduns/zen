@@ -188,7 +188,7 @@ async fn real_test_skills_loaded_and_followed_by_llm() {
         real_stream_fn(),
         None, // T-AI-02-6: test does not carry session affinity key
     );
-    let all_messages = agent.prompt("Hello! What is 2 + 2?").await;
+    let all_messages = agent.prompt("Hello! What is 2 + 2?", &[]).await;
 
     // 5) Assert: the skill end token appears in the final answer
     let final_text = last_assistant_text(&all_messages);
@@ -228,7 +228,7 @@ async fn real_test_system_prompt_constraint_honored() {
         real_stream_fn(),
         None, // T-AI-02-6: test does not carry session affinity key
     );
-    let all_messages = agent.prompt("Say hello.").await;
+    let all_messages = agent.prompt("Say hello.", &[]).await;
 
     // Assert: the answer contains BANANA (tolerating case/punctuation variants)
     let final_text = last_assistant_text(&all_messages);

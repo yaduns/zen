@@ -49,7 +49,10 @@ async fn real_test_agent_session_persist_and_resume_continuity() {
 
     // 3) Real prompt: remember the passphrase
     let turn1 = session
-        .prompt("Remember the codeword ORANGE. Reply with only the word 'remembered'.")
+        .prompt(
+            "Remember the codeword ORANGE. Reply with only the word 'remembered'.",
+            &[],
+        )
         .await
         .expect("prompt");
     common::print_messages("turn1", &turn1);
@@ -80,7 +83,7 @@ async fn real_test_agent_session_persist_and_resume_continuity() {
     let mut session2 =
         AgentSession::new(common::new_agent(BASE_PROMPT, history), Arc::new(reopened));
     let turn2 = session2
-        .prompt("What is the codeword? Reply with only the word.")
+        .prompt("What is the codeword? Reply with only the word.", &[])
         .await
         .expect("prompt 2");
     common::print_messages("turn2 (resumed)", &turn2);
@@ -121,7 +124,10 @@ async fn real_test_agent_session_continue_recent_continuity() {
         let store: Arc<dyn SessionStore> = manager.clone();
         let mut session = AgentSession::new(common::new_agent(BASE_PROMPT, vec![]), store);
         let turn1 = session
-            .prompt("Remember the codeword BLUE. Reply with only the word 'remembered'.")
+            .prompt(
+                "Remember the codeword BLUE. Reply with only the word 'remembered'.",
+                &[],
+            )
             .await
             .expect("prompt");
         common::print_messages("turn1", &turn1);
@@ -141,7 +147,7 @@ async fn real_test_agent_session_continue_recent_continuity() {
     let store: Arc<dyn SessionStore> = resumed.clone();
     let mut session2 = AgentSession::new(common::new_agent(BASE_PROMPT, history), store);
     let turn2 = session2
-        .prompt("What is the codeword? Reply with only the word.")
+        .prompt("What is the codeword? Reply with only the word.", &[])
         .await
         .expect("prompt 2");
     common::print_messages("turn2 (continue_recent)", &turn2);
