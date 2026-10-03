@@ -1,4 +1,4 @@
-use crate::provider::{thinking_format_for_provider, ThinkingFormat};
+use crate::provider::{resolve_provider, thinking_format_for_provider, ThinkingFormat};
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, StreamFn, TextContent,
@@ -382,11 +382,9 @@ pub async fn stream(
         .header("Content-Type", "application/json")
         .json(&body);
 
-    // Merge extra request headers
-    if let Some(headers) = &cfg.headers {
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
+    // Merge provider self-declared headers + caller-explicit headers (same-name: the latter wins; single-value headers, see merge_request_headers)
+    for (k, v) in &merge_request_headers(model, &cfg) {
+        req = req.header(k.as_str(), v.as_str());
     }
 
     // Timeout
@@ -545,6 +543,23 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
     };
 
     req
+}
+
+/// Merge the HTTP headers to add to this request: first ask the provider whether it has any to include (provider-owned, such as the opencode session header),
+/// Then overlay the caller's explicit headers—**later values with the same name override** (matching pi `mergeProviderAttributionHeaders`'s object-spread, last-write-wins override
+/// semantics). Why merge into a map first instead of calling `.header()` twice: reqwest `RequestBuilder::header()` uses
+/// `HeaderMap::append`; setting the same header twice sends **multiple values** instead of overriding; after merging into a map, each key is set only once, so override semantics hold.
+/// Returns an empty map = no additional headers.
+fn merge_request_headers(model: &Model, cfg: &StreamConfig) -> HashMap<String, String> {
+    let mut merged = resolve_provider(&model.provider)
+        .and_then(|provider| provider.request_headers(model, cfg.session_id.as_deref()))
+        .unwrap_or_default();
+    if let Some(headers) = &cfg.headers {
+        for (key, value) in headers {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    merged
 }
 
 /// Converts a `Message` into an OpenAI API message object.
@@ -2015,6 +2030,78 @@ mod tests {
         let req = build_request_body(&sample_model(), &sample_context(), &cfg);
         let key = req.prompt_cache_key.expect("Send when session_id exists");
         assert_eq!(key, "😀".repeat(64));
+    }
+
+    // ── Header merging (opencode-session-header-fix)──
+
+    #[test]
+    fn test_merge_request_headers_opencode_session() {
+        let model = Model {
+            provider: "opencode-go".into(),
+            ..sample_model()
+        };
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            ..Default::default()
+        };
+        let merged = merge_request_headers(&model, &cfg);
+        assert_eq!(merged.len(), 2, "session header plus client identifier header");
+        assert_eq!(
+            merged.get("x-opencode-session").map(String::as_str),
+            Some("s-1")
+        );
+        assert_eq!(
+            merged.get("x-opencode-client").map(String::as_str),
+            Some("zen")
+        );
+    }
+
+    #[test]
+    fn test_merge_request_headers_caller_overrides_provider_same_key() {
+        let model = Model {
+            provider: "opencode-go".into(),
+            ..sample_model()
+        };
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            headers: Some(HashMap::from([(
+                "x-opencode-session".to_string(),
+                "caller".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let merged = merge_request_headers(&model, &cfg);
+        // Same-name overrides become a single value (not appended as dual values) — this is the reason this helper exists
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.get("x-opencode-session").map(String::as_str),
+            Some("caller")
+        );
+    }
+
+    #[test]
+    fn test_merge_request_headers_opencode_without_session_is_empty() {
+        let model = Model {
+            provider: "opencode-go".into(),
+            ..sample_model()
+        };
+        assert!(
+            merge_request_headers(&model, &StreamConfig::default()).is_empty(),
+            "no session context (compaction/branch summary) -> do not fabricate session headers"
+        );
+    }
+
+    #[test]
+    fn test_merge_request_headers_unknown_provider_keeps_caller_headers() {
+        // sample_model.provider = "deepseek" → resolve_provider returns None → no provider header
+        let cfg = StreamConfig {
+            headers: Some(HashMap::from([("X-Test".to_string(), "1".to_string())])),
+            ..Default::default()
+        };
+        let merged = merge_request_headers(&sample_model(), &cfg);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("X-Test").map(String::as_str), Some("1"));
+        assert!(merge_request_headers(&sample_model(), &StreamConfig::default()).is_empty());
     }
 
     // ── thinking toggle (T-thinking-invisible-fix defect B: appended per provider format family) ──

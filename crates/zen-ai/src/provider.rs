@@ -15,8 +15,11 @@
 //!
 //! Traceability: `pi-120` (models.ts) / `pi-118` (provider-env) → REQ-AI-02 → this module + `Model::from_provider`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::types::Model;
 use crate::utils::provider_env::get_provider_env_value;
 
 /// Protocol type. Aligned with pi's `Api` (types.ts KnownApi). zen currently only supports
@@ -79,6 +82,29 @@ pub trait Provider: Send + Sync {
     fn base_url(&self) -> String;
     /// Resolve the API key (read from the provider's own env var)
     fn resolve_api_key(&self) -> Option<String>;
+
+    /// HTTP headers this provider requires to be attached to **every request** (provider-owned: the request-building layer only merges them).
+    ///
+    /// # Parameters
+    /// - `model`: the model for this request (so the implementation can read the effective `base_url` and other config).
+    /// - `session_id`: session id; `None`/empty string means this call has no session context (compression / branch summary),
+    ///   implementations **must not** fabricate a session id themselves
+    ///
+    /// # Return Value
+    /// `None` = no extra headers (default implementation; no impact on existing or future providers). Returned headers are
+    /// merged **before** `StreamConfig.headers`; for duplicate names the **latter overrides the former** (caller-explicit headers take priority) —
+    /// merging is done by `api/openai_stream.rs::merge_request_headers`, which first merges into a map and then sets each value once (reqwest
+    /// `.header()` appends, so setting the same name twice in two passes would send multiple values).
+    ///
+    /// Evolution convention: a new provider that needs headers only overrides this method in its own `impl Provider`;
+    /// `api/openai_stream.rs` needs no changes.
+    fn request_headers(
+        &self,
+        _model: &Model,
+        _session_id: Option<&str>,
+    ) -> Option<HashMap<String, String>> {
+        None
+    }
 }
 
 /// Default provider name: env `ZEN_PROVIDER` overrides, default `opencode-go`.
@@ -95,6 +121,13 @@ pub fn resolve_provider(name: &str) -> Option<Box<dyn Provider>> {
         _ => None,
     }
 }
+
+/// opencode session header name (required by the gateway; missing → 400 `MissingSessionID`).
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+/// client identifier header name (for gateway attribution, not required).
+const OPENCODE_CLIENT_HEADER: &str = "x-opencode-client";
+/// `x-opencode-client` value: pi passes `"pi"`; zen is a separate implementation and passes `"zen"`.
+const ZEN_CLIENT_ID: &str = "zen";
 
 /// OpenCode Go (default provider). Key: `OPENCODE_API_KEY`; endpoint: `https://opencode.ai/zen/go/v1`
 /// (overridable via `OPENCODE_BASE_URL`).
@@ -116,6 +149,27 @@ impl Provider for OpenCodeGoProvider {
 
     fn resolve_api_key(&self) -> Option<String> {
         get_provider_env_value("OPENCODE_API_KEY", None)
+    }
+
+    /// The opencode gateway requires a session header; if missing, returns 400 `MissingSessionID`.
+    /// Aligns with pi `provider-attribution.ts:getSessionHeaders` (`if (!sessionId) return undefined`;
+    /// empty string is also falsy → not sent).
+    /// **Registered deviation**: pi also checks `provider === "opencode"` (old name) and `baseUrl.hostname === "opencode.ai"`
+    /// Two branches—the zen registry is closed and has no old-name alias, so judging by provider name (this impl) is already equivalent; neither branch is implemented;
+    /// The branding/telemetry headers from `getDefaultAttributionHeaders` belong to multi-provider attribution and remain omitted per the scope.md omission table.
+    fn request_headers(
+        &self,
+        _model: &Model,
+        session_id: Option<&str>,
+    ) -> Option<HashMap<String, String>> {
+        let session_id = session_id.filter(|id| !id.is_empty())?;
+        Some(HashMap::from([
+            (OPENCODE_SESSION_HEADER.to_string(), session_id.to_string()),
+            (
+                OPENCODE_CLIENT_HEADER.to_string(),
+                ZEN_CLIENT_ID.to_string(),
+            ),
+        ]))
     }
 }
 
@@ -204,5 +258,44 @@ mod tests {
             thinking_format_for_provider("nonexistent"),
             ThinkingFormat::OpenAi
         );
+    }
+
+    // ── request_headers (opencode session header, opencode-session-header-fix) ──
+
+    #[test]
+    fn test_request_headers_opencode_with_session() {
+        let provider = OpenCodeGoProvider;
+        let model = Model::from_provider(&provider);
+        let headers = provider
+            .request_headers(&model, Some("session-abc"))
+            .expect("Should return both headers when session exists");
+        assert_eq!(
+            headers.get(OPENCODE_SESSION_HEADER).map(String::as_str),
+            Some("session-abc")
+        );
+        assert_eq!(
+            headers.get(OPENCODE_CLIENT_HEADER).map(String::as_str),
+            Some(ZEN_CLIENT_ID)
+        );
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn test_request_headers_opencode_without_or_empty_session() {
+        let provider = OpenCodeGoProvider;
+        let model = Model::from_provider(&provider);
+        // No session context / empty string (pi falsy semantics) → do not fabricate; return None
+        assert!(provider.request_headers(&model, None).is_none());
+        assert!(provider.request_headers(&model, Some("")).is_none());
+    }
+
+    #[test]
+    fn test_request_headers_huoshan_walks_default_none() {
+        let provider = HuoshanProvider;
+        let model = Model::from_provider(&provider);
+        // Not overridden → default implementation returns None (huoshan needs no extra headers)
+        assert!(provider
+            .request_headers(&model, Some("session-abc"))
+            .is_none());
     }
 }
