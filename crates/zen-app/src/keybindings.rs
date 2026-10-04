@@ -2,9 +2,9 @@
 // Boundary convention: this module defines the action enum and default key table (T-AP-11-2's custom-editor / keybinding-hints need it immediately);
 // T-AP-06-2 (configurable keybindings) lands "user override loading (keybindings.json) + injection" in this module, reusing the
 // zen-tui registry (KeybindingsManager) instead of redefining it.
-// pi canonical ids not included in v1 (app.model.* / app.models.* / app.session.new|tree|fork|resume /
-// app.suspend / app.editor.external, etc.) are represented as None entries in the id tables (reserved items; silently skipped if present in user config),
-// see the *_ID_TABLE entries below and tasks/T-AP-06-2-implemented.md for the full list and ownership.
+// pi canonical ids not included in v1 (app.session.new|tree|fork|resume / app.suspend / app.editor.external)
+// represented as None entries in the id tables (reserved; silently skipped if present in user config); model-selection ids (app.model.* / app.models.*)
+// are included as Some by T-V2-02-4; see the *_ID_TABLE below and tasks/T-AP-06-2-implemented.md / T-V2-02-4-implemented.md.
 // Reference: reference/pi-original/packages/coding-agent/src/core/keybindings.ts (defaultKeys comparison,
 // Config loading/type validation aligned with pi toKeybindingsConfig; the legacy key-name migration table is delivered by T-AP-08-7 — the pure function lives in
 // this module + the file IO shell in migrations.rs; reload/disk-write ordering dropped in v1, see task doc).
@@ -80,6 +80,24 @@ pub enum AppAction {
     MessageDequeue,
     /// Paste clipboard image (Ctrl+V, Windows Alt+V). No images in v1, reserved for T-AP-11-1 to decide.
     ClipboardPasteImage,
+    /// Model selection: switch to the next model in the Ctrl+P cycle set (Ctrl+P). Consumer T-V2-02-4.
+    ModelCycleForward,
+    /// Model selection: switch to the previous model in the cycle set (Shift+Ctrl+P). Consumer T-V2-02-4.
+    ModelCycleBackward,
+    /// Model selection: open the `/model` picker (Ctrl+L). Consumer T-V2-02-4.
+    ModelOpenSelector,
+    /// scoped-models panel: save selection to settings (Ctrl+S). Consumer T-V2-02-4.
+    ScopedModelsSave,
+    /// scoped-models panel: select all (Ctrl+A). Consumer T-V2-02-4.
+    ScopedModelsEnableAll,
+    /// scoped-models panel: clear all (Ctrl+X). Consumer T-V2-02-4.
+    ScopedModelsClearAll,
+    /// scoped-models panel: bulk toggle by provider (Ctrl+P). Consumer T-V2-02-4.
+    ScopedModelsToggleProvider,
+    /// scoped-models panel: move selected item up (Alt+Up). Consumer T-V2-02-4.
+    ScopedModelsReorderUp,
+    /// scoped-models panel: move selected item down (Alt+Down). Consumer T-V2-02-4.
+    ScopedModelsReorderDown,
 }
 
 /// Build a single keybinding definition (action + default key string + description).
@@ -212,6 +230,52 @@ pub fn app_default_bindings() -> Vec<KeybindingDefinition<AppAction>> {
             &["ctrl+v"],
             "Paste image from clipboard",
         ),
+        // Model selection (T-V2-02-4: verbatim alignment with pi core/keybindings.ts defaultKeys)
+        keybind(
+            AppAction::ModelCycleForward,
+            &["ctrl+p"],
+            "Cycle to next model",
+        ),
+        keybind(
+            AppAction::ModelCycleBackward,
+            &["shift+ctrl+p"],
+            "Cycle to previous model",
+        ),
+        keybind(
+            AppAction::ModelOpenSelector,
+            &["ctrl+l"],
+            "Open model selector",
+        ),
+        keybind(
+            AppAction::ScopedModelsSave,
+            &["ctrl+s"],
+            "Save model selection",
+        ),
+        keybind(
+            AppAction::ScopedModelsEnableAll,
+            &["ctrl+a"],
+            "Enable all models",
+        ),
+        keybind(
+            AppAction::ScopedModelsClearAll,
+            &["ctrl+x"],
+            "Clear all models",
+        ),
+        keybind(
+            AppAction::ScopedModelsToggleProvider,
+            &["ctrl+p"],
+            "Toggle all models for provider",
+        ),
+        keybind(
+            AppAction::ScopedModelsReorderUp,
+            &["alt+up"],
+            "Move model up in order",
+        ),
+        keybind(
+            AppAction::ScopedModelsReorderDown,
+            &["alt+down"],
+            "Move model down in order",
+        ),
     ]
 }
 
@@ -279,22 +343,38 @@ const APP_ID_TABLE: &[(&str, Option<AppAction>)] = &[
         "app.clipboard.pasteImage",
         Some(AppAction::ClipboardPasteImage),
     ),
-    // ── Reserved items (None, not included in v1; consumers T-AP-11-1 / T-AP-11-4 will switch to Some later) ──
+    // ── Included by T-V2-02-4 (model selection/cycle set; formerly None reserved entries) ──
+    ("app.model.cycleForward", Some(AppAction::ModelCycleForward)),
+    (
+        "app.model.cycleBackward",
+        Some(AppAction::ModelCycleBackward),
+    ),
+    ("app.model.select", Some(AppAction::ModelOpenSelector)),
+    ("app.models.save", Some(AppAction::ScopedModelsSave)),
+    (
+        "app.models.enableAll",
+        Some(AppAction::ScopedModelsEnableAll),
+    ),
+    ("app.models.clearAll", Some(AppAction::ScopedModelsClearAll)),
+    (
+        "app.models.toggleProvider",
+        Some(AppAction::ScopedModelsToggleProvider),
+    ),
+    (
+        "app.models.reorderUp",
+        Some(AppAction::ScopedModelsReorderUp),
+    ),
+    (
+        "app.models.reorderDown",
+        Some(AppAction::ScopedModelsReorderDown),
+    ),
+    // ── Reserved entries (None, not included in v1/v2; consumers T-AP-11-1 / T-AP-11-4 will switch to Some at that time) ──
     ("app.suspend", None),
-    ("app.model.cycleForward", None),
-    ("app.model.cycleBackward", None),
-    ("app.model.select", None),
     ("app.editor.external", None),
     ("app.session.new", None),
     ("app.session.tree", None),
     ("app.session.fork", None),
     ("app.session.resume", None),
-    ("app.models.save", None),
-    ("app.models.enableAll", None),
-    ("app.models.clearAll", None),
-    ("app.models.toggleProvider", None),
-    ("app.models.reorderUp", None),
-    ("app.models.reorderDown", None),
 ];
 
 /// `tui.editor.*` / `tui.input.*` domain id table (EditorAction). Only placeholder is `tui.input.copy`
@@ -725,7 +805,46 @@ mod tests {
             MessageFollowUp,
             MessageDequeue,
             ClipboardPasteImage,
+            ModelCycleForward,
+            ModelCycleBackward,
+            ModelOpenSelector,
+            ScopedModelsSave,
+            ScopedModelsEnableAll,
+            ScopedModelsClearAll,
+            ScopedModelsToggleProvider,
+            ScopedModelsReorderUp,
+            ScopedModelsReorderDown,
         ]
+    }
+
+    #[test]
+    fn global_actions_have_unique_default_keys() {
+        // Global action domain (not through a picker overlay, directly reachable by the main task's handle_app_action) keybindings must be unique —
+        // session.*/tree.* and scoped panel actions are routed only within their own overlays and may share keys with global actions (context
+        // separated, pi-aligned); but silent key grabbing between global actions is unacceptable (T-V2-02-4 default key ruling).
+        let global = [
+            AppAction::Interrupt,
+            AppAction::Clear,
+            AppAction::Exit,
+            AppAction::ThinkingCycle,
+            AppAction::ThinkingToggle,
+            AppAction::ToolsExpand,
+            AppAction::ModelCycleForward,
+            AppAction::ModelCycleBackward,
+            AppAction::ModelOpenSelector,
+        ];
+        let mut seen: std::collections::HashMap<KeyId, AppAction> =
+            std::collections::HashMap::new();
+        for d in app_default_bindings() {
+            if !global.contains(&d.action) {
+                continue;
+            }
+            for k in &d.default_keys {
+                if let Some(prev) = seen.insert(*k, d.action) {
+                    panic!("global action default key conflict: {prev:?} and {:?} both bound to {k}", d.action);
+                }
+            }
+        }
     }
 
     #[test]
@@ -812,6 +931,15 @@ mod tests {
             MessageFollowUp,
             MessageDequeue,
             ClipboardPasteImage,
+            ModelCycleForward,
+            ModelCycleBackward,
+            ModelOpenSelector,
+            ScopedModelsSave,
+            ScopedModelsEnableAll,
+            ScopedModelsClearAll,
+            ScopedModelsToggleProvider,
+            ScopedModelsReorderUp,
+            ScopedModelsReorderDown,
         ];
         for variant in all {
             let hits: Vec<_> = APP_ID_TABLE
@@ -821,7 +949,7 @@ mod tests {
             assert_eq!(hits.len(), 1, "{variant:?} should appear exactly once in APP_ID_TABLE");
         }
         let some = APP_ID_TABLE.iter().filter(|(_, a)| a.is_some()).count();
-        assert_eq!(some, 27);
+        assert_eq!(some, 36);
     }
 
     #[test]
@@ -879,10 +1007,10 @@ mod tests {
 
     #[test]
     fn reserved_entries_match_pi_only_id_manifest() {
-        // Reserved item list: app 15 + editor 1 + select 2 = 18 (matches the task doc's "reserved item list")
+        // Reserved list: app 6 + editor 1 + select 2 = 9 (after T-V2-02-4 includes the 9 app.model.*/app.models.* entries)
         let reserved =
             |t: &[(&str, Option<AppAction>)]| t.iter().filter(|(_, a)| a.is_none()).count();
-        assert_eq!(reserved(APP_ID_TABLE), 15);
+        assert_eq!(reserved(APP_ID_TABLE), 6);
         // editor/select table element types differ, assert separately
         assert_eq!(
             EDITOR_ID_TABLE.iter().filter(|(_, a)| a.is_none()).count(),
@@ -893,7 +1021,9 @@ mod tests {
             2
         );
         assert!(is_reserved_pi_id("app.session.fork"));
-        assert!(is_reserved_pi_id("app.models.toggleProvider"));
+        // T-V2-02-4: model/cycle-set ids are included and no longer reserved
+        assert!(!is_reserved_pi_id("app.models.toggleProvider"));
+        assert!(!is_reserved_pi_id("app.model.select"));
         assert!(is_reserved_pi_id("tui.input.copy"));
         assert!(is_reserved_pi_id("tui.select.pageUp"));
         assert!(!is_reserved_pi_id("app.interrupt"));
@@ -917,6 +1047,15 @@ mod tests {
         assert_eq!(
             select_action_from_id("tui.select.cancel"),
             Some(SelectAction::Cancel)
+        );
+        // T-V2-02-4: model/cycle-set ids are mapped
+        assert_eq!(
+            app_action_from_id("app.model.select"),
+            Some(AppAction::ModelOpenSelector)
+        );
+        assert_eq!(
+            app_action_from_id("app.models.save"),
+            Some(AppAction::ScopedModelsSave)
         );
         assert_eq!(app_action_from_id("app.nope"), None);
         // reserved entries produce no action

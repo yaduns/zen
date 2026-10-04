@@ -13,6 +13,10 @@ use crate::components::custom_editor::CustomEditor;
 use crate::components::custom_entry::CustomEntryComponent;
 use crate::components::custom_message::CustomMessageComponent;
 use crate::components::footer::{FooterComponent, FooterData};
+use crate::components::model_selector::ModelSelectorComponent;
+use crate::components::scoped_models_selector::{
+    EnabledModelIds, ScopedModelsCallbacks, ScopedModelsSelectorComponent,
+};
 use crate::components::session_selector::{SessionListLoader, SessionSelectorComponent};
 use crate::components::settings_selector::{
     DoubleEscapeAction, SettingsCallbacks, SettingsConfig, SettingsSelectorComponent,
@@ -38,7 +42,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zen_ai::types::{AssistantMessage, ContentBlock, ContentBlockList, Message, UserMessage};
+use zen_ai::types::{
+    AssistantMessage, ContentBlock, ContentBlockList, Message, Model, UserMessage,
+};
 use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::autocomplete::{
     is_at_attachment_context, AutocompleteProvider, AutocompleteSuggestions,
@@ -139,6 +145,10 @@ enum SelectorOverlay {
     Choice(ChoiceOverlay),
     /// Custom summary command input popup (zen-tui Input).
     CustomInput(CustomInputOverlay),
+    /// /model model selector (T-V2-02-4).
+    Model(ModelSelectorComponent),
+    /// /scoped-models cycling-set configuration panel (T-V2-02-4).
+    ScopedModels(ScopedModelsSelectorComponent),
 }
 
 impl SelectorOverlay {
@@ -150,6 +160,8 @@ impl SelectorOverlay {
             SelectorOverlay::UserMessage(c) => c.handle_key(key),
             SelectorOverlay::Choice(c) => c.handle_key(key),
             SelectorOverlay::CustomInput(c) => c.handle_key(key),
+            SelectorOverlay::Model(c) => c.handle_key(key),
+            SelectorOverlay::ScopedModels(c) => c.handle_key(key),
         }
     }
 
@@ -161,6 +173,8 @@ impl SelectorOverlay {
             SelectorOverlay::UserMessage(c) => c.render(buf, x, y, width, height),
             SelectorOverlay::Choice(c) => c.render(buf, x, y, width, height),
             SelectorOverlay::CustomInput(c) => c.render(buf, x, y, width, height),
+            SelectorOverlay::Model(c) => c.render(buf, x, y, width, height),
+            SelectorOverlay::ScopedModels(c) => c.render(buf, x, y, width, height),
         }
     }
 }
@@ -461,6 +475,10 @@ impl InteractiveUi {
             AppAction::MessageCopy,
             AppAction::MessageFollowUp,
             AppAction::MessageDequeue,
+            // Model selection (T-V2-02-4): Ctrl+P/Shift+Ctrl+P cycles, Ctrl+L opens the selector.
+            AppAction::ModelCycleForward,
+            AppAction::ModelCycleBackward,
+            AppAction::ModelOpenSelector,
         ] {
             let r = Rc::clone(&route);
             editor.on_action(
@@ -1173,6 +1191,95 @@ impl InteractiveUi {
         )));
     }
 
+    /// Mount the model selector (/model, T-V2-02-4): model collection + scoped subsets + current model + initial search term;
+    /// Selection is reported back to the main task via `SelectorSelected("provider/id")` (reusing the selector state machine); cancellation via `SelectorCancelled`.
+    fn open_model_selector(
+        &mut self,
+        models: Vec<Model>,
+        scoped_ids: EnabledModelIds,
+        current: Option<Model>,
+        initial_search: Option<String>,
+    ) {
+        let commands = Rc::clone(&self.route);
+        let on_select = {
+            let commands = Rc::clone(&commands);
+            Box::new(move |m: Model| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorSelected(
+                        crate::model_catalog::full_id(&m),
+                    ));
+            })
+        };
+        let on_cancel = {
+            let commands = Rc::clone(&commands);
+            Box::new(move || {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorCancelled);
+            })
+        };
+        self.selector = Some(SelectorOverlay::Model(ModelSelectorComponent::new(
+            models,
+            scoped_ids,
+            current,
+            &self.theme,
+            self.select_kb.clone(),
+            initial_search.as_deref(),
+            on_select,
+            on_cancel,
+        )));
+    }
+
+    /// Mount the scoped-models panel (/scoped-models, T-V2-02-4): model collection + currently enabled set;
+    /// onChange sends up `ScopedModelsChanged` (session-only), onPersist sends up `ScopedModelsPersist`.
+    fn open_scoped_models_selector(&mut self, models: Vec<Model>, enabled: EnabledModelIds) {
+        let commands = Rc::clone(&self.route);
+        let on_change = {
+            let commands = Rc::clone(&commands);
+            Box::new(move |e: EnabledModelIds| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::ScopedModelsChanged(e));
+            })
+        };
+        let on_persist = {
+            let commands = Rc::clone(&commands);
+            Box::new(move |e: EnabledModelIds| {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::ScopedModelsPersist(e));
+            })
+        };
+        let on_cancel = {
+            let commands = Rc::clone(&commands);
+            Box::new(move || {
+                commands
+                    .borrow_mut()
+                    .commands
+                    .push(InputCommand::SelectorCancelled);
+            })
+        };
+        self.selector = Some(SelectorOverlay::ScopedModels(
+            ScopedModelsSelectorComponent::new(
+                models,
+                enabled,
+                &self.theme,
+                self.select_kb.clone(),
+                self.kb.clone(),
+                ScopedModelsCallbacks {
+                    on_change,
+                    on_persist,
+                    on_cancel,
+                },
+            ),
+        ));
+    }
+
     /// Terminal height hint for the tree selector (for the component's visible budget; under scrollback use the current canvas height).
     fn selector_height_hint(&self) -> u16 {
         24
@@ -1442,6 +1549,15 @@ impl InteractiveUi {
             } => self.open_user_message_selector(messages, initial_selected_id),
             UiEvent::OpenChoice { title, options } => self.open_choice(title, options),
             UiEvent::OpenCustomInput { prompt } => self.open_custom_input(prompt),
+            UiEvent::OpenModelSelector {
+                models,
+                scoped_ids,
+                current,
+                initial_search,
+            } => self.open_model_selector(models, scoped_ids, current, initial_search),
+            UiEvent::OpenScopedModelsSelector { models, enabled } => {
+                self.open_scoped_models_selector(models, enabled)
+            }
             UiEvent::CloseSelector => {
                 self.selector = None;
             }

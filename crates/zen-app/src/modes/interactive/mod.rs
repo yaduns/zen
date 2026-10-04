@@ -22,6 +22,7 @@ use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
 };
 use crate::components::footer::FooterData;
+use crate::components::scoped_models_selector::EnabledModelIds;
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::status_indicator::CompactionStatusReason;
 use crate::components::tree_selector::FilterMode;
@@ -53,7 +54,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use zen_ai::tool::ToolExecutionResult;
-use zen_ai::types::{ImageContent, Message, ThinkingLevel};
+use zen_ai::types::{ImageContent, Message, Model, ThinkingLevel};
 use zen_core::harness::types::AgentEvent;
 use zen_core::session::context::{build_context_entries, session_entry_to_context_messages};
 use zen_core::session::tree::SessionTreeEntry;
@@ -177,6 +178,19 @@ pub(crate) enum UiEvent {
     OpenChoice { title: String, options: Vec<String> },
     /// Custom summary instruction input popup (zen-tui Input, Enter to submit / Esc to cancel).
     OpenCustomInput { prompt: String },
+    /// Mount the model selector (/model, `app.model.select`): model collection + scoped subset + current model +
+    /// initial search term (when `/model <term>` has no exact match, T-V2-02-4).
+    OpenModelSelector {
+        models: Vec<Model>,
+        scoped_ids: EnabledModelIds,
+        current: Option<Model>,
+        initial_search: Option<String>,
+    },
+    /// Mount the scoped-models panel (/scoped-models): model collection + currently enabled set (T-V2-02-4).
+    OpenScopedModelsSelector {
+        models: Vec<Model>,
+        enabled: EnabledModelIds,
+    },
     /// Close the current selector/popup (main task sends after select/cancel/orchestration completes).
     CloseSelector,
     /// Append branch summary line after tree navigation completes (text source = `NavigateTreeResult.summary`).
@@ -269,6 +283,10 @@ pub(crate) enum InputCommand {
     ChoiceSelected(usize),
     /// Custom summary instruction submitted (Enter in OpenCustomInput).
     CustomInput(String),
+    /// scoped-models panel change (session-only, T-V2-02-4): update `scoped_models` in place.
+    ScopedModelsChanged(EnabledModelIds),
+    /// scoped-models panel save (T-V2-02-4): write settings `enabled_models`.
+    ScopedModelsPersist(EnabledModelIds),
 }
 
 /// Runtime settings panel change categories (T-AP-02-3-fix): persistence is handled by the UI-side callback,
@@ -370,6 +388,9 @@ pub struct InteractiveMode {
     /// Pending intent of the generic choice popup (summary question / missing-cwd Continue-Cancel / custom instruction input),
     /// routes `ChoiceSelected`/`CustomInput` (T-AP-08-5).
     pending_choice: Option<PendingChoice>,
+    /// Ctrl+P cycles the model set (T-V2-02-4); None = all enabled. In-session changes (panel onChange) update in place;
+    /// persistence (onPersist) writes back to settings`enabled_models`.
+    scoped_models: EnabledModelIds,
 }
 
 /// Source category of the mounted selector (`active_selector`; T-AP-08-5).
@@ -381,6 +402,8 @@ enum ActiveSelector {
     Tree,
     /// User message selector (/fork, double-Esc fork): selected payload = entry id.
     UserMessage,
+    /// Model selector (`/model`, `app.model.select`): selected payload = `"provider/id"` (T-V2-02-4).
+    Model,
 }
 
 /// Pending intent of the generic choice popup (`pending_choice`; T-AP-08-5).
@@ -408,6 +431,9 @@ impl InteractiveMode {
         let double_escape_action = settings_manager
             .as_ref()
             .and_then(|s| s.merged().double_escape_action);
+        let scoped_models = settings_manager
+            .as_ref()
+            .and_then(|s| s.merged().enabled_models);
         InteractiveMode {
             runtime,
             options,
@@ -434,6 +460,7 @@ impl InteractiveMode {
             signal_exit_code: Arc::new(AtomicI32::new(0)),
             active_selector: None,
             pending_choice: None,
+            scoped_models,
         }
     }
 
@@ -800,6 +827,12 @@ impl InteractiveMode {
                         Some(InputCommand::CustomInput(text)) => {
                             self.handle_custom_input(text).await;
                         }
+                        Some(InputCommand::ScopedModelsChanged(enabled)) => {
+                            self.handle_scoped_models_changed(enabled);
+                        }
+                        Some(InputCommand::ScopedModelsPersist(enabled)) => {
+                            self.handle_scoped_models_persist(enabled);
+                        }
                         None => break, // UI task has already ended (channel closed)
                     }
                     if self.exit_requested {
@@ -1008,6 +1041,17 @@ impl InteractiveMode {
             AppAction::MessageDequeue => {
                 self.show_warning("No queued messages to restore (queue pop pending)")
             }
+            // Model selection (T-V2-02-4): cycling/opening the selector is handled by the main task;
+            // scoped-models panel actions (app.models.*) are routed via app_kb inside the panel and are unreachable here.
+            AppAction::ModelCycleForward => self.cycle_scoped_model(true),
+            AppAction::ModelCycleBackward => self.cycle_scoped_model(false),
+            AppAction::ModelOpenSelector => self.handle_model_command(None),
+            AppAction::ScopedModelsSave
+            | AppAction::ScopedModelsEnableAll
+            | AppAction::ScopedModelsClearAll
+            | AppAction::ScopedModelsToggleProvider
+            | AppAction::ScopedModelsReorderUp
+            | AppAction::ScopedModelsReorderDown => {}
             // Session/tree selector internal actions (session.*/tree.*) are routed via app_kb within the component (T-AP-08-5);
             //    Theoretically unreachable here (the editor does not bind these keys); a fallback hint avoids silently swallowing keys.
             _ => self.show_warning("Action not available here (use /tree /fork /resume)"),
@@ -1150,7 +1194,11 @@ impl InteractiveMode {
             "fork" => self.handle_fork_command(),
             "clone" => self.handle_clone_command().await,
             "resume" => self.handle_resume_command().await,
-            "model" => self.show_warning("Model selection pending (v2); use --model flag"),
+            "model" => {
+                let term = args.trim();
+                self.handle_model_command((!term.is_empty()).then_some(term));
+            }
+            "scoped-models" => self.handle_scoped_models_command(),
             "name" => self.show_warning("Session name pending"),
             "session" => self.show_warning("Session info pending"),
             "hotkeys" => self.show_warning("Hotkeys pending"),
@@ -1300,6 +1348,10 @@ impl InteractiveMode {
                 let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
                 self.handle_fork_selected(&id).await;
             }
+            Some(ActiveSelector::Model) => {
+                let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+                self.handle_model_selected(&id);
+            }
             None => {}
         }
     }
@@ -1309,6 +1361,135 @@ impl InteractiveMode {
         self.active_selector = None;
         self.pending_choice = None;
         let _ = self.ui_event_tx.send(UiEvent::CloseSelector);
+    }
+
+    // ── T-V2-02-4: model selection (`/model`, `/scoped-models`, Ctrl+P cycling) ──
+
+    /// `/model [term]` entry (T-V2-02-4): candidates from the built-in model catalog; `term` first tries an exact match —
+    /// "`/model huoshan/deepseek-v4-flash` switches directly, no selector needed"; if no match, mount
+    /// ModelSelector with term prefilled as the search query. Empty-catalog hint.
+    fn handle_model_command(&mut self, search: Option<&str>) {
+        let models = crate::model_catalog::built_in_models();
+        if models.is_empty() {
+            self.show_warning("No models available");
+            return;
+        }
+        let term = search.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(term) = term {
+            if let Some(model) = crate::model_catalog::find_exact_model_reference(&models, term) {
+                let full = crate::model_catalog::full_id(&model);
+                self.handle_model_selected(&full);
+                return;
+            }
+        }
+        let current = Some(self.runtime.session.model());
+        let scoped_ids = self.scoped_models.clone();
+        let initial_search = term.map(|s| s.to_string());
+        let _ = self.ui_event_tx.send(UiEvent::OpenModelSelector {
+            models,
+            scoped_ids,
+            current,
+            initial_search,
+        });
+        self.active_selector = Some(ActiveSelector::Model);
+    }
+
+    /// `/scoped-models` entry (T-V2-02-4): mount the cycling-set config panel, initial enabled set = session value.
+    fn handle_scoped_models_command(&mut self) {
+        let models = crate::model_catalog::built_in_models();
+        if models.is_empty() {
+            self.show_warning("No models available");
+            return;
+        }
+        let enabled = self.scoped_models.clone();
+        let _ = self
+            .ui_event_tx
+            .send(UiEvent::OpenScopedModelsSelector { models, enabled });
+        // Scoped panel changes go through ScopedModelsChanged/Persist (not SelectorSelected),
+        // so active_selector is not set; Esc cancel still unmounts the overlay via SelectorCancelled.
+        self.active_selector = None;
+    }
+
+    // Model selected (`ActiveSelector::Model` branch, T-V2-02-4): resolve `"provider/id"` → hot-swap +
+    /// update settings default model. Rejected while running (`AgentSession::set_model` requires idle).
+    fn handle_model_selected(&mut self, full_id: &str) {
+        if self.runtime.session.is_run() {
+            self.show_warning("Cannot switch model while running");
+            return;
+        }
+        let Some((provider, id)) = full_id.split_once('/') else {
+            self.show_warning(format!("Invalid model reference: {full_id}"));
+            return;
+        };
+        let models = crate::model_catalog::built_in_models();
+        let Some(model) = crate::model_catalog::find_model(&models, provider, id) else {
+            self.show_warning(format!("Model not found: {full_id}"));
+            return;
+        };
+        if let Some(mgr) = &self.settings_manager {
+            let id = id.to_string();
+            let provider = provider.to_string();
+            mgr.update_global(move |s| {
+                s.default_model = Some(id);
+                s.default_provider = Some(provider);
+            });
+        }
+        self.runtime.session.set_model(model);
+        self.push_footer();
+        self.show_status(format!("Model: {full_id}"));
+    }
+
+    /// Cycle models via the scoped set (`app.model.cycleForward`/`cycleBackward`, T-V2-02-4).
+    /// `None` = full catalog; `Some` = enabled ordered subset. Rejected while running; empty set hint.
+    fn cycle_scoped_model(&mut self, forward: bool) {
+        if self.runtime.session.is_run() {
+            self.show_warning("Cannot switch model while running");
+            return;
+        }
+        let models = crate::model_catalog::built_in_models();
+        let pool: Vec<Model> = match &self.scoped_models {
+            None => models,
+            Some(ids) => ids
+                .iter()
+                .filter_map(|fid| {
+                    let (p, i) = fid.split_once('/')?;
+                    crate::model_catalog::find_model(&models, p, i)
+                })
+                .collect(),
+        };
+        if pool.is_empty() {
+            self.show_status("No models in cycle set");
+            return;
+        }
+        let current = self.runtime.session.model();
+        let idx = pool
+            .iter()
+            .position(|m| m.provider == current.provider && m.id == current.id)
+            .unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % pool.len()
+        } else {
+            (idx + pool.len() - 1) % pool.len()
+        };
+        let model = pool[next].clone();
+        let label = crate::model_catalog::full_id(&model);
+        self.runtime.session.set_model(model);
+        self.push_footer();
+        self.show_status(format!("Model: {label}"));
+    }
+
+    /// Scoped-models panel change (session-only): update the cycling set in place (no disk write).
+    fn handle_scoped_models_changed(&mut self, enabled: EnabledModelIds) {
+        self.scoped_models = enabled;
+    }
+
+    /// Scoped-models panel save: write back settings `enabled_models`.
+    fn handle_scoped_models_persist(&mut self, enabled: EnabledModelIds) {
+        self.scoped_models = enabled.clone();
+        if let Some(mgr) = &self.settings_manager {
+            mgr.update_global(move |s| s.enabled_models = enabled);
+        }
+        self.show_status("Model selection saved to settings");
     }
 
     /// Tree selector label editing: persist Label entry (`append_label_change`); error → status line.

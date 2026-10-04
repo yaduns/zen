@@ -201,6 +201,10 @@ pub struct SettingsData {
     /// Extra directories for local themes (consumer T-AP-05-3 directory discovery)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub themes: Option<Vec<String>>,
+    /// Ctrl+P model cycle set (`None`=all enabled; `Some`=ordered subset, elements are `"provider/id"`).
+    /// Consumer T-V2-02-4 (`/scoped-models` panel persistence + `app.model.cycle*` cycling).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_models: Option<Vec<String>>,
 }
 
 /// Scope discriminator for settings (pure discriminator, not serialized; not part of the settings.json key space).
@@ -451,6 +455,7 @@ fn merge_settings(base: &SettingsData, over: &SettingsData) -> SettingsData {
         skills: over.skills.clone().or(base.skills.clone()),
         prompts: over.prompts.clone().or(base.prompts.clone()),
         themes: over.themes.clone().or(base.themes.clone()),
+        enabled_models: over.enabled_models.clone().or(base.enabled_models.clone()),
     }
 }
 
@@ -1378,6 +1383,30 @@ mod tests {
         let compaction = merged.compaction.unwrap();
         assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.reserve_tokens, Some(16384));
+    }
+
+    #[test]
+    fn test_enabled_models_merge_project_over_global() {
+        // T-V2-02-4: enabled_models has the same "whole-array replacement" semantics as skills/prompts/themes —
+        // Project-level overrides global; if over is absent, fall back to base.
+        let base = SettingsData {
+            enabled_models: Some(vec!["a/x".to_string()]),
+            ..Default::default()
+        };
+        let over = SettingsData {
+            enabled_models: Some(vec!["b/y".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_settings(&base, &over).enabled_models.as_deref(),
+            Some(["b/y".to_string()].as_slice())
+        );
+        assert_eq!(
+            merge_settings(&base, &SettingsData::default())
+                .enabled_models
+                .as_deref(),
+            Some(["a/x".to_string()].as_slice())
+        );
     }
 
     #[test]

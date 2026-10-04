@@ -4,6 +4,7 @@ pub mod components;
 pub mod config;
 pub mod keybindings;
 pub mod migrations;
+pub mod model_catalog;
 pub mod modes;
 pub mod observability;
 pub mod output;

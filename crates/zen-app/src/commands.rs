@@ -28,9 +28,9 @@ pub struct BuiltinSlashCommand {
 }
 
 /// v1 built-in command registry — the **single source of truth** for dispatch and completion (interactive mode no longer hardcodes command strings).
-/// 12 entries = the v1 subset of pi's 22; dropped entries (login/logout/trust/share/changelog/
-/// scoped-models/export/import/copy/reload, etc.) are not registered, not completed, not recognized by dispatch; for their fate see
-/// See the internal design notes for the BUILTIN_SLASH_COMMANDS data model.
+/// 13 entries = retained set for v1/v2 scenarios out of pi's 22 total; discarded entries (login/logout/trust/share/changelog/
+/// export/import/copy/reload, etc.) are not registered, not completed, and not recognized by dispatch; their status is documented in
+/// tasks/T-AP-03-2-implemented.md 'Data Model · BUILTIN_SLASH_COMMANDS' (`scoped-models` is already included by T-V2-02-4).
 pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand {
         name: "settings",
@@ -41,6 +41,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
         name: "model",
         description: "Select model (opens selector UI)",
         argument_hint: Some("<provider/model>"),
+    },
+    BuiltinSlashCommand {
+        name: "scoped-models",
+        description: "Enable/disable models for Ctrl+P cycling",
+        argument_hint: None,
     },
     BuiltinSlashCommand {
         name: "name",
