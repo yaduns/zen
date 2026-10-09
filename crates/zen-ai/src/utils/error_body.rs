@@ -34,6 +34,30 @@ pub fn extract_openai_error_message(body: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Extracts a "readable message" from an error body, for `StreamError::ApiError`'s Display—
+/// "when the gateway returns 400, don't dump the entire JSON to the terminal; if `error.message` can be extracted, show it".
+/// Prefers OpenAI `error.message`; some gateways stuff upstream JSON verbatim into the message string, in which case parse one more layer;
+/// if unavailable/empty, falls back to the raw body (prefer noise over losing information).
+/// Consumer: `openai_stream` constructs `StreamError::ApiError` (the full body is also retained in debug logs).
+pub fn extract_readable_error_message(body: &str) -> String {
+    let fallback = || body.trim().to_string();
+    let Some(message) = extract_openai_error_message(body) else {
+        return fallback();
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return fallback();
+    }
+    // Nested JSON: when message itself has the form `{"error":{"message":"..."}}`, parse one more layer
+    if let Some(inner) = extract_openai_error_message(message) {
+        let inner = inner.trim();
+        if !inner.is_empty() {
+            return inner.to_string();
+        }
+    }
+    message.to_string()
+}
+
 /// Formats HTTP error information into a readable string.
 /// # Format
 /// - With `body`: `"<status>: <body>"` (or with prefix `"<prefix> (<status>): <body>"`)
@@ -157,6 +181,33 @@ mod tests {
             extract_openai_error_message(body),
             Some("Rate limit reached".to_string())
         );
+    }
+
+    // ── extract_readable_error_message ──
+
+    #[test]
+    fn readable_prefers_error_message() {
+        let body = r#"{"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Ups... bad model"}}"#;
+        assert_eq!(extract_readable_error_message(body), "Ups... bad model");
+    }
+
+    #[test]
+    fn readable_unwraps_nested_json_message() {
+        // Gateway stuffs upstream JSON into the message string: parse one more layer
+        let inner = r#"{"error":{"message":"upstream rejected field X"}}"#;
+        let body = serde_json::json!({ "error": { "message": inner } }).to_string();
+        assert_eq!(
+            extract_readable_error_message(&body),
+            "upstream rejected field X"
+        );
+    }
+
+    #[test]
+    fn readable_falls_back_to_trimmed_body() {
+        assert_eq!(extract_readable_error_message("  not json  "), "not json");
+        // error.message is an empty string → fall back to body
+        let body = r#"{"error":{"message":"   "}}"#;
+        assert_eq!(extract_readable_error_message(body), body);
     }
 
     // ── format_error_message ──

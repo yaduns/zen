@@ -4,7 +4,7 @@ use crate::types::{
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, StreamFn, TextContent,
     ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
 };
-use crate::utils::error_body::extract_error_body;
+use crate::utils::error_body::{extract_error_body, extract_readable_error_message};
 use crate::utils::provider_env::get_provider_env_value;
 use eventsource_stream::Eventsource;
 use serde::{Deserialize, Serialize};
@@ -36,8 +36,12 @@ pub enum StreamError {
     #[error("HTTP request failed: {0}")]
     HttpRequest(#[source] reqwest::Error),
 
-    #[error("API error: status {status}, body: {body}")]
-    ApiError { status: u16, body: String },
+    #[error("API error: status {status}: {message}")]
+    ApiError {
+        status: u16,
+        /// Human-readable error summary (prefers the provider's `error.message`, falls back to the raw body).
+        message: String,
+    },
 
     #[error("SSE parse error: {0}")]
     SSEError(String),
@@ -401,7 +405,11 @@ pub async fn stream(
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let body = extract_error_body(response, 4000).await.unwrap_or_default();
-        return Err(StreamError::ApiError { status, body });
+        // Log the full raw body at debug level (visible with RUST_LOG=debug); Display only gives the readable summary,
+        // to avoid printing the entire JSON to the terminal (a single TUI line would be truncated; see the wrapping fix in assistant_message/ui).
+        tracing::debug!(status, body = %body, "[zen-ai] HTTP error response body");
+        let message = extract_readable_error_message(&body);
+        return Err(StreamError::ApiError { status, message });
     }
 
     // 6. Create channel and start background task

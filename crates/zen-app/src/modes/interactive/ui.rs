@@ -2009,7 +2009,11 @@ impl InteractiveUi {
                     InfoKind::Status => ColorToken::Muted,
                 };
                 let style = Style::fg(theme.fg(token));
-                canvas.push_text(text.clone(), style);
+                // Long messages (e.g. full API error bodies) are wrapped to the visible width, then streamed line by line,
+                let content_width = width.max(1) as usize;
+                for chunk in zen_tui::wrap::word_wrap_line(text, content_width) {
+                    canvas.push_text(chunk.text, style.clone());
+                }
                 continue;
             }
             // Measure-as-render (same temporary buffer), then extract per row into style segments for streaming.
@@ -2951,6 +2955,22 @@ mod tests {
         assert!(
             canvas.content_height() >= 6,
             "fixed area should have at least 6-7 non-empty lines, actual {} lines",
+            canvas.content_height()
+        );
+    }
+
+    #[test]
+    fn test_render_scrollback_wraps_long_info_row() {
+        // Long Info lines (e.g. full API error bodies) should wrap into multiple lines when streamed, not be truncated as a single line
+        let mut u = ui();
+        let mut canvas = ScrollbackCanvas::new(40, 24);
+        let long = format!("API error: status 400: {}TAIL", "word ".repeat(40));
+        u.apply(UiEvent::CacheMissNotice { text: long });
+        u.render_scrollback(&mut canvas);
+        // Empty-session fixed area is about 7 lines; after long messages wrap, the total line count should be significantly more than "fixed area + 1 line"
+        assert!(
+            canvas.content_height() > 9,
+            "long Info lines should wrap into multiple lines, actual {} lines",
             canvas.content_height()
         );
     }

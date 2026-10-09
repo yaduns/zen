@@ -240,11 +240,23 @@ impl<'a> AssistantMessageComponent<'a> {
                     remaining -= 1;
                 }
                 Planned::Label { text, style } => {
-                    buf.fill(x, row, width, 1, &Style::default());
-                    buf.write(x + self.output_pad, row, style, text);
-                    painted += 1;
-                    row += 1;
-                    remaining -= 1;
+                    // Wrap long text (e.g., API error bodies) by display width to avoid single-line silent truncation by ScreenBuffer
+                    let content_width = width.saturating_sub(self.output_pad * 2).max(1) as usize;
+                    let chunks = zen_tui::wrap::word_wrap_line(text, content_width);
+                    let mut n = 0u16;
+                    for chunk in &chunks {
+                        if n >= remaining {
+                            break;
+                        }
+                        buf.fill(x, row + n, width, 1, &Style::default());
+                        if !chunk.text.is_empty() {
+                            buf.write(x + self.output_pad, row + n, style, &chunk.text);
+                        }
+                        n += 1;
+                        painted += 1;
+                    }
+                    row += n;
+                    remaining = remaining.saturating_sub(n);
                 }
                 Planned::Markdown { text, theme } | Planned::ThinkingMarkdown { text, theme } => {
                     let content_width = width.saturating_sub(self.output_pad * 2).max(1) as usize;
@@ -390,6 +402,26 @@ mod tests {
         // gap + 1 md line
         assert_eq!(painted, 2);
         assert!(flush_text(&mut buf).contains("hello world"));
+    }
+
+    #[test]
+    fn long_error_label_wraps_instead_of_clipping() {
+        // Render over-wide error text with wrapping (no lost characters): at 40 columns a long sentence should wrap to multiple lines, with trailing marker visible
+        let long = format!("API error: status 400: {}TAILMARK", "word ".repeat(40));
+        let mut comp = AssistantMessageComponent::new(
+            msg(vec![], StopReason::Error, Some(long.as_str())),
+            theme(),
+            false,
+            "Thinking...",
+            0,
+        );
+        let mut buf = ScreenBuffer::new(40, 20);
+        let painted = comp.render(&mut buf, 0, 0, 40, 20);
+        assert!(painted >= 3, "Long errors should wrap onto multiple lines, actual {painted}");
+        assert!(
+            flush_text(&mut buf).contains("TAILMARK"),
+            "Trailing marker should be visible (not truncated to a single line)"
+        );
     }
 
     #[test]
