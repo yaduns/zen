@@ -17,7 +17,6 @@ use crate::observability::cache_stats::{
 };
 use crate::observability::diagnostics::format_resource_diagnostics;
 
-use crate::cli::expand_at_references;
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
 };
@@ -147,6 +146,11 @@ pub(crate) enum UiEvent {
     /// Continuous animation toggle (true during the streaming loader → constant 16ms repaints; the render layer, via
     /// `WakeOutcome::Animate` takes effect).
     SetAnimation(bool),
+    /// Pure wake-up (no side effects, apply is a no-op): enqueued when autocomplete candidates become ready asynchronously (the `trigger_autocomplete`
+    /// spawn task sends back through the wake channel), and the render layer triggers the next frame via `WakeOutcome::Render`
+    /// — fixing the render gap where a pending task completes after an @ / Tab trigger but there is no frame to draw, so candidates never appear
+    /// (the counterpart of pi's applyAutocompleteSuggestions → requestRender after debounce ends).
+    AutocompleteReady,
     #[allow(dead_code)] // v1 has no file watcher wired up (sent via ThemeController on_change after T-AP-02-3 lands)
     /// Theme hot reload: replace the owned Theme wholesale and rebuild border colors (v1 seam; apply is implemented).
     ThemeChanged(Theme),
@@ -582,6 +586,12 @@ impl InteractiveMode {
             commands,
             autocomplete_max_visible,
         )));
+        // at-attachment trigger fix: inject the proactive wake-up sender used when autocomplete completes asynchronously (the `trigger_autocomplete`
+        // spawn task sends back UiEvent::AutocompleteReady on completion → next frame's poll_autocomplete has the candidates in place),
+        // otherwise after a natural @ trigger the pending task completes with no frame to draw and candidates never appear.
+        ui_cell
+            .borrow_mut()
+            .set_wake_tx(Some(self.ui_event_tx.clone()));
         // Suspend event queue: on_wake (Send closure) enqueues, draw (!Send closure) dequeues — accessed sequentially within the UI task.
         let pending: Arc<Mutex<VecDeque<UiEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let pending_wake = Arc::clone(&pending);
@@ -786,13 +796,8 @@ impl InteractiveMode {
                         }
                         Some(InputCommand::FollowUp(text)) => {
                             if self.runtime.session.is_run() || self.run_task.is_some() {
-                                // at-attachment-wiring-fix: FollowUp during run also expands @path (does not silently drop images)
-                                let cwd = self.runtime.session.cwd().to_string();
-                                let processed =
-                                    expand_at_references(&text, std::path::Path::new(&cwd)).await;
-                                self.runtime
-                                    .session
-                                    .follow_up(&processed.text, &processed.images);
+                                // pi alignment: interactive messages passed through verbatim (no @path expansion, at-attachment fallback)
+                                self.runtime.session.follow_up(&text, &[]);
                                 self.push_pending();
                             } else {
                                 // Alt+Enter is equivalent to Enter when idle (aligned with pi handleFollowUp's non-streaming branch)
@@ -1145,25 +1150,20 @@ impl InteractiveMode {
 
     /// Submit a regular message: if a run is active → steer (queued injection before the next LLM turn); if idle → spawn a run task (Plan D).
     /// Expansion of `/skill:` and `/template-name` is handled on the session side by `expand_prompt_input` (T-AP-03-2),
-    /// This function does no classification. **at-attachment-wiring-fix**: before submitting, `expand_at_references` first expands the message's
-    /// `@path` references into `<file>` blocks + image attachments (text expanded into the body, images passed via attachment parameters;
-    /// missing paths are silently left as-is without interrupting submission; expansion happens before in-session skill/template expansion).
+    /// This function does not perform classification.
+    /// **pi alignment (at-attachment fallback)**: interactive messages go to `session.prompt` verbatim (no `@path` expansion) —
+    /// pi-HEAD interactive mode has no message-level attachment expansion; `@` is editor completion only (inserts `@path` text), and after submit it is displayed as-is and
+    /// goes into the LLM context as-is; CLI `@file` initial attachments are injected via the print/interactive initial message (initial_images).
     async fn submit_message(&mut self, text: String) -> Result<(), InteractiveModeError> {
-        let cwd = self.runtime.session.cwd().to_string();
-        let processed = expand_at_references(&text, std::path::Path::new(&cwd)).await;
         if self.runtime.session.is_run() || self.run_task.is_some() {
-            self.runtime
-                .session
-                .steer(&processed.text, &processed.images);
+            self.runtime.session.steer(&text, &[]);
             return Ok(());
         }
         self.push_footer();
         let session = Arc::clone(&self.runtime.session);
         let tx = self.ui_event_tx.clone(); // can't borrow &self inside async move
-        let expanded_text = processed.text;
-        let expanded_images = processed.images;
         self.run_task = Some(tokio::task::spawn_local(async move {
-            if let Err(e) = session.prompt(&expanded_text, &expanded_images).await {
+            if let Err(e) = session.prompt(&text, &[]).await {
                 // P1-1: errors inside run are degraded to a UI status line (session not interrupted; the initial message is degraded the same way, see known deviation #3)
                 let _ = tx.send(UiEvent::Status(StatusSpec::Error(e.to_string())));
             }

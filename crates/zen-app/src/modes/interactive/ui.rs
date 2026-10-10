@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zen_ai::types::{
     AssistantMessage, ContentBlock, ContentBlockList, Message, Model, UserMessage,
@@ -127,6 +128,12 @@ pub struct InteractiveUi {
     autocomplete_max_visible: usize,
     /// Completion overlay (when active, keys first go through `handle_autocomplete_key`; None = not active).
     autocomplete: Option<AutocompleteOverlay>,
+    /// External wake-up sender (clone of the main task → UI task ui_event channel, injected when init wires things up):
+    /// once autocomplete candidates are ready asynchronously, the `trigger_autocomplete` spawn task sends back `UiEvent::AutocompleteReady` through it,
+    /// triggering the next frame (render layer WakeOutcome::Render → draw → poll_autocomplete) — otherwise the pending task completes
+    /// but no input event drives a frame and candidates never appear (fixing the issue where a natural @ trigger required Tab).
+    /// None in test environments (tests poll_autocomplete manually and need no wake-up).
+    wake_tx: Option<mpsc::UnboundedSender<UiEvent>>,
     /// Session/tree/fork selector and options popup overlay (T-AP-08-5): key presses are forwarded first on mount,
     /// rendering a full-screen overlay (aligned with the panel precedent). Selection/cancellation pushes `InputCommand` to the route via callback.
     selector: Option<SelectorOverlay>,
@@ -537,7 +544,15 @@ impl InteractiveUi {
             autocomplete_max_visible: max_visible,
             autocomplete: None,
             selector: None,
+            wake_tx: None,
         }
+    }
+
+    /// Inject the external wake-up sender (at-attachment trigger fix): when mod.rs init wires up the UI task, it passes in a clone of the main task's
+    /// `ui_event_tx`, so the `trigger_autocomplete` async task can send back `UiEvent::AutocompleteReady` on completion
+    /// Actively request next frame (render layer poll_autocomplete installs candidates). Tests do not inject (None, manual poll).
+    pub(crate) fn set_wake_tx(&mut self, tx: Option<mpsc::UnboundedSender<UiEvent>>) {
+        self.wake_tx = tx;
     }
 
     /// Key event routing: editor first (EditorAction keybindings) -> editor callback path; if no hit, resolve
@@ -720,6 +735,8 @@ impl InteractiveUi {
     /// Called on Tab or natural trigger (`/`/`@` context): snapshot current line/cursor → `spawn_local` starts `get_suggestions`
     /// async task (`@` context sleeps 20ms first for debounce, aligned with pi's `ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS`; if ct is
     /// already cancelled after the sleep, the query is dropped) → results written to the `pending_result` slot — "press Tab/type @, candidates computed in background, finalized on the draw frame".
+    /// On task completion, send `UiEvent::AutocompleteReady` back via `wake_tx` to actively request the next frame (otherwise after pending completes
+    /// no input event drives a frame, candidates do not appear, and natural @ trigger would incorrectly look like 'must press Tab to show candidates').
     /// Returns whether a completion session has been opened (pending counts as open; with no candidates, poll finalizes and auto-closes without showing a popup).
     ///
     /// Parameter `debounce`: the `@` branch passes true (20ms debounce, pi debounces only `@`/`#` context); the Tab/`/` branch passes false (pi does not debounce slash commands).
@@ -742,6 +759,7 @@ impl InteractiveUi {
         let cell = Rc::clone(&pending_result);
         let ct = CancellationToken::new(); // Per-query token: close/poll cancels it when there are no candidates (stops the blocking walk)
         let ct_task = ct.clone();
+        let wake_tx_task = self.wake_tx.clone(); // Actively request next frame after completion (None = test environment, no wake).
         let handle = tokio::task::spawn_local(async move {
             if debounce {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -753,6 +771,10 @@ impl InteractiveUi {
                 .get_suggestions(&lines_task, cursor.0, cursor.1, false, &ct_task)
                 .await;
             *cell.borrow_mut() = result;
+            // Result written to slot: send wake so next frame poll_autocomplete installs it (or silently close overlay when None).
+            if let Some(tx) = wake_tx_task {
+                let _ = tx.send(UiEvent::AutocompleteReady);
+            }
         });
         self.autocomplete = Some(AutocompleteOverlay {
             provider,
@@ -1506,6 +1528,10 @@ impl InteractiveUi {
             }
             UiEvent::SetAnimation(_) => {
                 // Takes effect in the render layer (WakeOutcome::Animate is handled by the on_wake closure); no local state here.
+            }
+            UiEvent::AutocompleteReady => {
+                // Pure wake no-op: only triggers next-frame render (render layer poll_autocomplete installs completion candidates),
+                // No local state change (producer for at-attachment trigger fix = trigger_autocomplete spawn task).
             }
             UiEvent::ThemeChanged(theme) => {
                 self.theme = theme;

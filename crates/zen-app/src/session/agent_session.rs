@@ -276,7 +276,8 @@ impl AgentSession {
     /// 4. Return all messages newly added this round
     ///
     /// # Parameters
-    /// - `text`: user prompt text (interactive `@path` already expanded into `<file>` blocks by `expand_at_references`)
+    /// - `text`: user prompt text (interactive mode matches pi: `@path` is not expanded, raw text passes through;
+    ///   CLI `@file` initial attachments are injected via initial_images)
     /// - `images`: Supports inline image attachments (empty slice = plain text, with behavior exactly matching the old signature)
     ///
     /// # Errors

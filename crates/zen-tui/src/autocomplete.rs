@@ -584,76 +584,6 @@ pub fn is_at_attachment_context(text_before_cursor: &str) -> bool {
     extract_at_prefix(text_before_cursor).is_some()
 }
 
-/// Splitting result for one `@path`/`@\"path\"` attachment reference in the user message (produced by `find_at_refs`):
-/// `raw` keeps the original token (including `@` and quotes, for locating/replacing during expansion and preserving as-is on error); `path` is the bare path with modifiers removed
-/// (for the classifier `resolve_read_path_async` to resolve). Pure parse state; not serialized, not sent across threads.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AtRef {
-    /// Full original token (`@foo`/`@\"my folder/x.rs\"`); used to locate and replace in the message during expansion
-    pub raw: String,
-    /// Bare path with `@`/quotes removed; empty string = bare `@` with no reference (`find_at_refs` does not produce it)
-    pub path: String,
-}
-
-/// Scan the full user message for all attachment reference tokens (consumed by zen-app `expand_at_references` before interactive submission):
-/// **Scan by line**—at each line start (including after `\n`; `\n` is not in PATH_DELIMITERS, so line splitting must be explicit) and
-/// after PATH_DELIMITER (space/Tab/quote/`'`/`=`) is a token start, begins with `@`, and extends to the next delimiter or **end of line**;
-/// Quoted form `@\"…\"` includes the closing quote (unclosed → **take to end of line**, do not swallow remaining message across lines).— "extract all @path
-/// line by line, missing none and not hitting @ inside words (e.g. emails)". Returns `Vec<AtRef>` (raw original text + path bare path);
-/// Bare `@` (empty path) is not produced; no references returns an empty Vec.
-/// **Accepted deviation (inherited from the existing completion `extract_at_prefix` semantics)**: zen's delimiter set includes `\"'/=` while pi's trigger
-/// pattern is only `[\\s]`—`foo=@bar` is recognized as a reference in zen but not in pi; registered as an existing boundary difference in zen completion, not aligned with pi separately.
-pub fn find_at_refs(text: &str) -> Vec<AtRef> {
-    let mut refs = Vec::new();
-    for line in text.split('\n') {
-        let len = line.len();
-        let mut i = 0usize;
-        let mut prev: Option<char> = None; // Previous character (token start check: line start or after a delimiter)
-        while i < len {
-            let ch = line[i..].chars().next().unwrap();
-            let at_token_start = prev.is_none_or(|c| PATH_DELIMITERS.contains(&c));
-            if ch == '@' && at_token_start {
-                if let Some(rest) = line[i..].strip_prefix("@\"") {
-                    // Quoted form: find closing quote; unclosed → take to end of line
-                    let close_rel = rest.find('"');
-                    let end = close_rel.map_or(len, |rel| i + 2 + rel + 1);
-                    let path = close_rel
-                        .map(|rel| rest[..rel].to_string())
-                        .unwrap_or_else(|| rest.to_string());
-                    if !path.is_empty() {
-                        refs.push(AtRef {
-                            raw: line[i..end].to_string(),
-                            path,
-                        });
-                    }
-                    i = end;
-                    prev = line[..i].chars().next_back();
-                    continue;
-                }
-                // Bare form: extend to next delimiter or end of line
-                let mut end = i + 1;
-                for (rel, c) in line[end..].char_indices() {
-                    if PATH_DELIMITERS.contains(&c) {
-                        break;
-                    }
-                    end = i + 1 + rel + c.len_utf8();
-                }
-                let raw = line[i..end].to_string();
-                let path = raw[1..].to_string(); // Remove `@` (raw is at least 1 byte)
-                if !path.is_empty() {
-                    refs.push(AtRef { raw, path });
-                }
-                i = end;
-                prev = line[..i].chars().next_back();
-                continue;
-            }
-            prev = Some(ch);
-            i += ch.len_utf8();
-        }
-    }
-    refs
-}
-
 /// Path-prefix detection: extract the "path segment being completed" (after the last separator; in a quoted context, the whole span inside the quotes).
 /// With `force=true` (Tab) any segment is returned (possibly an empty string; the caller then checks candidates); otherwise the segment must contain `/`,
 /// start with `.`/`~/`, or immediately follow a space to trigger. Aligns with pi `extractPathPrefix`.
@@ -1799,62 +1729,7 @@ mod tests {
         );
     }
 
-    // ── Attachment reference splitting and trigger predicates (at-attachment-wiring-fix) ──
-
-    #[test]
-    fn find_at_refs_basic_quoted_and_email() {
-        // bare references + quoted references + emails not falsely matched + bare @ without path produces nothing
-        let refs = find_at_refs("see @a.txt and @\"my folder/x.rs\" but email@example");
-        assert_eq!(
-            refs,
-            vec![
-                AtRef {
-                    raw: "@a.txt".into(),
-                    path: "a.txt".into(),
-                },
-                AtRef {
-                    raw: "@\"my folder/x.rs\"".into(),
-                    path: "my folder/x.rs".into(),
-                },
-            ]
-        );
-        // bare @ (no path) produces nothing
-        assert!(find_at_refs("just @ here").is_empty());
-        // empty string / no references
-        assert!(find_at_refs("").is_empty());
-        assert!(find_at_refs("no refs at all").is_empty());
-    }
-
-    #[test]
-    fn find_at_refs_line_and_delimiter_boundaries() {
-        // multi-line: @ at start of second line must be recognized (\n is a line boundary, not in PATH_DELIMITERS)
-        let refs = find_at_refs("first line\n@second.rs");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].raw, "@second.rs");
-
-        // delimiter = also serves as token start (accepted deviation: pi only [\s])
-        let refs = find_at_refs("foo=@bar.rs");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].raw, "@bar.rs");
-
-        // token stops at whitespace (next delimiter)
-        let refs = find_at_refs("@one @two");
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].path, "one");
-        assert_eq!(refs[1].path, "two");
-
-        // @ inside a word does not trigger
-        assert!(find_at_refs("a@b").is_empty());
-    }
-
-    #[test]
-    fn find_at_refs_unclosed_quote_takes_line_end() {
-        // unclosed quote → take to end of line (does not swallow the rest of the message across lines)
-        let refs = find_at_refs("see @\"my folder/x\nnext line");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].raw, "@\"my folder/x");
-        assert_eq!(refs[0].path, "my folder/x");
-    }
+    // ── @ trigger predicate and trigger_characters (at-attachment-wiring-fix)──
 
     #[test]
     fn is_at_attachment_context_predicate() {

@@ -3,8 +3,11 @@
 // Image byte sniffing has moved to zen_core::mime (T-AP-09-6, canonical module pi-342 semantics); this file consumes its public API
 // detect_supported_image_mime_type (byte-level — read the whole content once, then sniff; eliminates TOCTOU).
 // Implementation notes in tasks/T-AP-09-6-implemented.md
-// at-attachment-wiring-fix: extract private classify_file_arg (three-state) as a shared classifier for both CLI/interactive consumers,
-// Add expand_at_references (interactive submission @path expansion, a new zen capability; see tasks/at-attachment-wiring-fix-implemented.md).
+// at-attachment-wiring-fix (half ①) extracts private classify_file_arg as the CLI per-file classifier (three-state).
+// **at-attachment aligned with pi fallback (2026): half ② interactive-submit @path expansion has been reverted and removed** — pi-HEAD interactive mode
+// has no message-level @path expansion (@ only inserts text via completion; submitted text passes straight through to session.prompt). zen's previously added
+// expand_at_references/find_at_refs were removed to align with pi; interactive completion still triggers naturally (half ①) and is kept.
+// See tasks/at-attachment-wiring-fix-implemented.md "pi alignment fallback record" for details.
 
 use std::path::{Path, PathBuf};
 
@@ -12,14 +15,12 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use zen_ai::types::ImageContent;
 use zen_core::mime::detect_supported_image_mime_type;
 use zen_core::tools::path_utils::resolve_read_path_async;
-use zen_tui::autocomplete::find_at_refs;
 
 /// Full artifacts of `@file` batch processing (handling of all `@file` references in one CLI run).
 ///
 /// Corresponds to pi's `processFileArguments` return `{ text, images }`: `text` is the
-/// `<file name="...">` wrapper block (concatenated in file_args order); **since at-attachment-wiring-fix** it is also
-/// reused by `expand_at_references` as the return carrier—here `text` = full expanded text (complete message after in-place replacement).
-/// `images` is the list of inlineable image attachments. It does not cross API/JSONL boundaries, so no serde derive is needed.
+/// `<file name="...">` wrapper block (concatenated in file_args order); `images` is the list of inline image attachments.
+/// Does not cross API/JSONL boundaries; no serde derive needed.
 #[derive(Debug)]
 pub struct ProcessedFiles {
     /// `<file>` wrapped blocks of all files concatenated in file_args order; may be an empty string when there are no files / all empty / all images omitted
@@ -89,7 +90,7 @@ pub async fn process_file_arguments(
     Ok(ProcessedFiles { text, images })
 }
 
-/// Classification result for a single file reference (produced by `classify_file_arg`, shared by `process_file_arguments` and `expand_at_references`):
+/// Classification result for a single file reference (produced by `classify_file_arg`, consumed by `process_file_arguments`):
 /// `text_fragment` is a `<file name="...">…</file>\n` wrapper block (empty reference when an image matches); `image` is an inlineable attachment.
 #[derive(Debug)]
 struct ClassifiedFile {
@@ -97,11 +98,12 @@ struct ClassifiedFile {
     image: Option<ImageContent>,
 }
 
-/// Classify a single file reference (per-file classifier shared by `process_file_arguments` and `expand_at_references`,
-/// extracted by at-attachment-wiring-fix): resolve → existence/empty file → read full text once → four-way mime classification,
-/// produces the `<file>` wrapper fragment and inlineable attachments.
-/// **Three-state return**: `Ok(Some(f))` = classification succeeded; `Ok(None)` = empty file skipped (CLI: do not append / interactive: remove token);
-/// `Err(NotFound/ReadFailed)` = fatal and propagated in CLI / keep original token in interactive. Callers consume according to their own policy; do not swallow errors or lose state.
+/// Classify a single file reference (per-file classifier for `process_file_arguments`, extracted by at-attachment-wiring-fix):
+/// resolve → existence/empty file → single full read → mime classification four branches, producing a `<file>`-wrapped snippet and an inlineable attachment.
+/// **Three-state return**: `Ok(Some(f))` = classified successfully; `Ok(None)` = empty file skipped (CLI: not appended);
+/// `Err(NotFound/ReadFailed)` = fatal, propagated up by the CLI. Callers consume per their own policy; no error swallowing, no state loss.
+/// **pi alignment note (at-attachment fallback)**: was the classifier shared with interactive-submit `@path` expansion (half ②) —
+/// interactive expansion has been reverted and removed per pi behavior; the interactive consumption branches for `Ok(None)`/`Err` in the three-state semantics no longer exist.
 async fn classify_file_arg(
     file_arg: &str,
     cwd: &Path,
@@ -153,57 +155,6 @@ async fn classify_file_arg(
         text_fragment,
         image,
     }))
-}
-
-/// Before interactive submission, expand all `@path` references in the message body into attachment content (at-attachment-wiring-fix, **new zen capability**,
-/// not pi-HEAD behavior; oracle = CHANGELOG v0.11.0 "Unified Content References" semantics + this fix's requirements): text file →
-/// replace the token in place with a `<file name="...">` wrapper block (span = full `AtRef.raw` text); inlineable image → empty reference at the same position +
-/// collect image attachments (in token occurrence order); path missing/unreadable → keep the original `@path` token (do not error and interrupt submission);
-/// empty file → remove token (aligns with `processFileArguments` empty-file continue, **only at classifier semantics level**).
-/// — "before submission, turn @file into file content; leave bad references as-is so the whole message is not harmed".
-/// Parameters: `message` full user message; `cwd` session cwd (base for resolving relative @path). Reuses private `classify_file_arg`
-/// (same classifier as CLI `process_file_arguments`; single source for MIME sniffing/wrapper format).
-/// Returns `ProcessedFiles`: text = full expanded text (in-place replacement by span; parse first then concatenate to avoid shifting), images = all
-/// inlineable attachments (token order). With no `@` references, returns unchanged (text = message, images empty).
-/// **Ordering semantics note**: this function runs before the skill/template expansion inside `AgentSession::prompt`—so `@path` in template content
-/// is **not** expanded by this function (expansion applies only to the original user input).
-///
-/// # Consumers
-/// `crates/zen-app/src/modes/interactive/mod.rs` (`submit_message`/`FollowUp` branch, at-attachment-wiring-fix).
-pub async fn expand_at_references(message: &str, cwd: &Path) -> ProcessedFiles {
-    let refs = find_at_refs(message);
-    if refs.is_empty() {
-        return ProcessedFiles {
-            text: message.to_string(),
-            images: Vec::new(),
-        };
-    }
-
-    let mut text = String::new();
-    let mut images: Vec<ImageContent> = Vec::new();
-    let mut cursor = 0usize;
-    for r in &refs {
-        // Locate raw after the previous replacement end point (find_at_refs guarantees raw is in occurrence order and non-overlapping; if location fails, fall back to keeping the original text)
-        let Some(pos) = message[cursor..].find(&r.raw).map(|p| cursor + p) else {
-            text.push_str(&message[cursor..]);
-            break;
-        };
-        text.push_str(&message[cursor..pos]);
-        match classify_file_arg(&r.path, cwd).await {
-            Ok(Some(classified)) => {
-                text.push_str(&classified.text_fragment);
-                if let Some(image) = classified.image {
-                    images.push(image);
-                }
-            }
-            // Empty file → remove token (do not append content); error → keep original raw (silently, without interrupting submission)
-            Ok(None) => {}
-            Err(_) => text.push_str(&r.raw),
-        }
-        cursor = pos + r.raw.len();
-    }
-    text.push_str(&message[cursor..]);
-    ProcessedFiles { text, images }
 }
 
 /// Build a single-line `<file name="{abs}">{inner}</file>\n` wrapper reference (exact newline layout, matching pi's `text +=` concatenation in each branch).
@@ -407,82 +358,5 @@ mod tests {
         assert!(r.text.contains(
             "[Image omitted: could not be converted to a supported inline image format.]"
         ));
-    }
-
-    // ── expand_at_references: interactive @path expansion (at-attachment-wiring-fix, new zen capability) ──
-
-    #[tokio::test]
-    async fn test_expand_at_refs_text_in_place() {
-        let dir = tempdir().unwrap();
-        let file = write_file(dir.path(), "a.md", b"hello world");
-        let r = expand_at_references("see @a.md and done", dir.path()).await;
-        // Text file → replace token in place with a `<file>` block; context preserved
-        assert_eq!(
-            r.text,
-            format!(
-                "see <file name=\"{}\">\nhello world\n</file>\n and done",
-                file.display()
-            )
-        );
-        assert!(r.images.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_expand_at_refs_missing_path_keeps_raw() {
-        let dir = tempdir().unwrap();
-        let r = expand_at_references("see @missing.txt here", dir.path()).await;
-        // Path missing → keep original token (do not error and interrupt submission)
-        assert_eq!(r.text, "see @missing.txt here");
-        assert!(r.images.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_expand_at_refs_empty_file_removes_token() {
-        let dir = tempdir().unwrap();
-        write_file(dir.path(), "empty.txt", b"");
-        let r = expand_at_references("see @empty.txt done", dir.path()).await;
-        // Empty file skipped (only classifier semantics align with pi continue) → token removed
-        assert_eq!(r.text, "see  done");
-    }
-
-    #[tokio::test]
-    async fn test_expand_at_refs_image_attached_in_place() {
-        let dir = tempdir().unwrap();
-        let file = write_file(dir.path(), "pic.jpg", &jpeg_bytes());
-        let r = expand_at_references("look @pic.jpg end", dir.path()).await;
-        // Inlineable image → empty reference at same position + attachment collection
-        assert_eq!(r.images.len(), 1);
-        assert_eq!(r.images[0].mime_type, "image/jpeg");
-        assert_eq!(r.images[0].data, B64.encode(jpeg_bytes()));
-        assert_eq!(
-            r.text,
-            format!("look <file name=\"{}\"></file>\n end", file.display())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_expand_at_refs_no_refs_returns_original() {
-        let dir = tempdir().unwrap();
-        let r = expand_at_references("no refs here", dir.path()).await;
-        assert_eq!(r.text, "no refs here");
-        assert!(r.images.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_expand_at_refs_multiple_refs_order_preserved() {
-        let dir = tempdir().unwrap();
-        let a = write_file(dir.path(), "a.md", b"AAA");
-        let b = write_file(dir.path(), "b.md", b"BBB");
-        let r = expand_at_references("@a.md and @b.md", dir.path()).await;
-        // Multiple references expanded in occurrence order; image order matches token order
-        assert_eq!(
-            r.text,
-            format!(
-                "<file name=\"{}\">\nAAA\n</file>\n and <file name=\"{}\">\nBBB\n</file>\n",
-                a.display(),
-                b.display()
-            )
-        );
-        assert!(r.images.is_empty());
     }
 }
