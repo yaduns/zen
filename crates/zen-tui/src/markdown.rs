@@ -130,6 +130,134 @@ impl Default for MarkdownTheme {
 /// word-wrapped to `width` (quote/list prefixes count toward the width); empty input returns an empty Vec; callers then write line by line, segment by segment
 /// to a `ScreenBuffer` or convert to ANSI for piping. Supports headings/paragraphs/lists (including nesting, task items, ordered start numbers)/
 /// fenced code blocks (syntax highlighted)/blockquotes/tables/inline code/bold/italic/strikethrough/links (with URL annotation)/horizontal rules.
+/// Determines whether a line starts a block-level marker (used by `protect_prose_indentation` to decide whether to protect the line's leading whitespace):
+/// If the content after stripping leading whitespace starts with these → let pulldown parse it with existing CommonMark block semantics (no protection),
+/// avoiding corruption of real markdown structures such as nested lists/headings/blockquotes/fences/indented code. Aligned with marked (pi)'s
+/// paragraph rule boundary: marked excludes only hl/heading/blockquote/tag/table from paragraphs; zen here
+/// additionally excludes lists/fences/hr to protect nested structures (the difference is only "more conservatively not protecting"; display result matches marked).
+/// Parameter: `content` is the line content after stripping leading whitespace.
+fn is_block_marker(content: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    let c = content.chars().next().unwrap();
+    match c {
+        '#' | '>' | '|' => true,
+        '`' => content.starts_with("```"),
+        '~' => content.starts_with("~~~"),
+        '-' | '*' | '_' => {
+            // Bullet list marker without whitespace (- foo / * foo) + three or more identical chars (hr --- / *** / ___)
+            let rest = &content[1..];
+            (content.chars().count() >= 3 && rest.chars().all(|c2| c2 == c))
+                || rest.chars().next().is_some_and(|c2| c2.is_whitespace())
+        }
+        '0'..='9' => {
+            // Ordered list: `1. foo` / `1) foo` (digit string followed by . or ) then whitespace)
+            let digit_run: usize = content.chars().take_while(|c2| c2.is_ascii_digit()).count();
+            let after = &content[digit_run..];
+            matches!(after.chars().next(), Some('.') | Some(')'))
+                && after[1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c2| c2.is_whitespace())
+        }
+        _ => false,
+    }
+}
+
+/// Protects leading whitespace on pure prose lines (prose-indent-preserve-fix, pi-aligned): pulldown-cmark per CommonMark
+/// normalizes away leading whitespace on paragraph continuation/normal lines (`x\n   y` → `y` flush left), whereas pi's marked keeps the paragraph
+/// raw text (including leading spaces and single newlines) as a whole, then outputs line by line. Fix: for lines that start with whitespace and whose content does not start with a block marker
+/// (pure prose lines), replace leading whitespace with NBSP (pulldown treats it as normal text content and no longer strips it); during rendering
+/// `push_text`/`push_cell_text` restore NBSP to spaces.
+/// Skips fenced code blocks (``` / ~~~ variants paired by same character) and indented code blocks (block start & ≥4 spaces;
+/// indented code blocks continue across lines with ≥4 spaces, and continuation lines also skip protection)—their content is preserved verbatim by pulldown and needs no protection.
+/// Parameter: `text` is the original text after CRLF normalization; returns the protected text (line-break layout unchanged).
+/// Edge case: genuine NBSP (in the user's original text) is also restored to a space (extremely rare; accepted deviation, noted in push_text).
+fn protect_prose_indentation(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_fence: Option<char> = None; // Current fence delimiter character (` or ~)
+    let mut in_indented_code = false; // Inside an indented code block (lines with ≥4 spaces remain code and are not prose-protected)
+    let mut prev_blank = true; // First line is treated as block start (≥4 spaces = indented code block, no protection)
+    let mut first = true;
+
+    for line in text.split('\n') {
+        if line.is_empty() {
+            out.push('\n');
+            prev_blank = true;
+            first = false;
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+        let ws_count = line.len() - trimmed.len();
+        let content = trimmed;
+
+        // Indented code block continuation: lines with ≥4 spaces are kept as-is (CommonMark indented code continues across lines,
+        // not bounded by blank lines—see the handling below where blank lines do not reset in_indented_code)
+        if in_indented_code {
+            if ws_count >= 4 {
+                out.push_str(line);
+                out.push('\n');
+                prev_blank = false;
+                first = false;
+                continue;
+            }
+            in_indented_code = false; // Non-indented line → code block ends, handled as a new block
+        }
+
+        // Indented code block start (block start & ≥4 spaces)
+        if (first || prev_blank) && ws_count >= 4 {
+            in_indented_code = true;
+            out.push_str(line);
+            out.push('\n');
+            prev_blank = false;
+            first = false;
+            continue;
+        }
+
+        // Fence boundary (≤3 indent): a ``` / ~~~ line with the same character as the current fence toggles state;
+        // Opens when no fence is active, closes when a fence is active and the same character appears (a different character does not close; CommonMark semantics).
+        if ws_count <= 3
+            && ((content.starts_with("```") && in_fence != Some('~'))
+                || (content.starts_with("~~~") && in_fence != Some('`')))
+        {
+            let fence_char = if content.starts_with("```") { '`' } else { '~' };
+            in_fence = if in_fence == Some(fence_char) {
+                None
+            } else {
+                Some(fence_char)
+            };
+            out.push_str(line);
+            out.push('\n');
+            prev_blank = false;
+            first = false;
+            continue;
+        }
+
+        // Code content inside a fence: as-is (pulldown does not parse it as markdown; no protection needed)
+        if in_fence.is_some() {
+            out.push_str(line);
+            out.push('\n');
+            prev_blank = false;
+            first = false;
+            continue;
+        }
+
+        // Pure prose line (leading whitespace & not a block marker): leading whitespace → NBSP protection (restored during rendering)
+        if ws_count > 0 && !is_block_marker(content) {
+            out.push_str(&"\u{00A0}".repeat(ws_count));
+            out.push_str(content);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+        prev_blank = false;
+        first = false;
+    }
+    out
+}
+
 /// Purely synchronous function; no TUI loop dependency, no cross-frame caching.
 /// Current consumers: interactive message rendering (T-AP-11-2/assistant_message.rs), write_markdown
 /// (shared by user/custom/skill messages in render.rs), print-mode message output.
@@ -158,9 +286,16 @@ pub fn render_markdown_with_override(
         return Vec::new();
     }
 
+    // pi-aligned (prose-indent-preserve-fix): protect leading whitespace on pure prose lines as NBSP before parsing—
+    // pi's marked (breaks:false) paragraph token preserves the original line (including leading spaces and single newlines),
+    // pulldown-cmark per CommonMark normalizes away leading whitespace on paragraph continuation lines, causing user-pasted
+    // indented code/multiline prompts to lose indentation when displayed (see the softbreak-preserve-fix follow-up registered in tasks);
+    // After parsing, during rendering (push_text/push_cell_text), restore NBSP to spaces.
+    let protected = protect_prose_indentation(&normalized);
+
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let parser = Parser::new_ext(&normalized, options);
+    let parser = Parser::new_ext(&protected, options);
 
     let mut renderer = MarkdownRenderer::new(theme, width, style_override);
     for event in parser {
@@ -287,10 +422,16 @@ impl<'a, 'b> MarkdownRenderer<'a, 'b> {
             }
 
             Event::SoftBreak => {
+                // pi-aligned (softbreak-preserve-fix): a single newline within a paragraph becomes a **newline** rather than a space—
+                // pi's marked (breaks:false) leaves a single `\n` inside the paragraph text token, then via
+                // applyTextWithNewlines / wrapTextWithAnsi explicitly split by line and preserve it (including streaming assistant
+                // and user messages); zen previously folded SoftBreak into a space per CommonMark default, so pasted into the editor
+                // multiline code/prompts were mashed into one line. After alignment: `a\nb` displays as two lines (matching pi), `a  \nb` (two spaces)
+                // is still a hard break (HardBreak branch), and `a\n\nb` still yields a blank line between paragraphs (paragraph End).
                 if self.table.is_some() {
                     self.push_cell_text(" ");
                 } else {
-                    self.push_text(" ");
+                    self.flush_line();
                 }
             }
 
@@ -579,6 +720,8 @@ impl<'a, 'b> MarkdownRenderer<'a, 'b> {
 
     /// Emit a piece of text as a single style segment with the current inline styles; break lines at `\n`.
     /// The segment-level override is applied here (one of the text-stream entry points; see `apply_style_override`).
+    /// **prose-indent-preserve-fix**: NBSP used during protection is restored to a normal space here (protection happens before parsing,
+    /// so pulldown keeps paragraph continuation leading whitespace as text; restoring here yields the original indentation on pi's display side).
     fn push_text(&mut self, text: &str) {
         let style = self.apply_style_override(self.current_inline_style());
         for (i, part) in text.split('\n').enumerate() {
@@ -588,7 +731,11 @@ impl<'a, 'b> MarkdownRenderer<'a, 'b> {
             if !part.is_empty() {
                 self.current_line.push(StyledSegment {
                     style: style.clone(),
-                    text: part.to_string(),
+                    text: if part.contains('\u{00A0}') {
+                        part.replace('\u{00A0}', " ")
+                    } else {
+                        part.to_string()
+                    },
                 });
             }
         }
@@ -597,9 +744,10 @@ impl<'a, 'b> MarkdownRenderer<'a, 'b> {
     /// Text inside a table cell: collapse newlines to spaces, emit paragraphs into the current cell buffer.
     /// The segment-level override is applied here (the second text-stream entry point; as a result, cell content is grayed out along with thinking,
     /// Table borders/separators do not pass through here; preserve structural colors).
+    /// **prose-indent-preserve-fix**: restore NBSP (protection placeholder) to spaces (consistent with push_text).
     fn push_cell_text(&mut self, text: &str) {
         let style = self.apply_style_override(self.current_inline_style());
-        let cleaned = text.replace('\n', " ");
+        let cleaned = text.replace('\n', " ").replace('\u{00A0}', " ");
         if !cleaned.is_empty() {
             self.emit_segment(StyledSegment {
                 style,
@@ -1211,9 +1359,10 @@ mod tests {
 
     #[test]
     fn test_crlf_normalized() {
-        // A single newline = SoftBreak (Markdown semantics); after `\r` is normalized, it no longer leaves residual characters
+        // pi alignment (softbreak-preserve-fix): single newline = SoftBreak → **preserved as newline** (consistent with pi,
+        // marked paragraph text contains `\n`; wrapTextWithAnsi processes line by line); after `\r` is normalized, no residual characters remain.
         let lines = render("a\r\nb", 80);
-        assert_eq!(lines_text(&lines), vec!["a b".to_string()]);
+        assert_eq!(lines_text(&lines), vec!["a".to_string(), "b".to_string()]);
         // Two trailing spaces + newline = hard line break: produces two lines (pulldown swallows trailing spaces)
         let lines = render("a  \r\nb", 80);
         assert_eq!(lines_text(&lines), vec!["a".to_string(), "b".to_string()]);
@@ -1239,6 +1388,117 @@ mod tests {
         assert_eq!(
             lines_text(&lines),
             vec!["a".to_string(), "".to_string(), "b".to_string()]
+        );
+    }
+
+    // ── prose indentation preservation (prose-indent-preserve-fix, pi-aligned) ──
+
+    #[test]
+    fn test_softbreak_keeps_paragraph_continuation_indent() {
+        // pi (marked) paragraph preserves original line leading whitespace; zen is consistent after NBSP protection + render restoration
+        let lines = render("x\n   y", 80);
+        assert_eq!(
+            lines_text(&lines),
+            vec!["x".to_string(), "   y".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pasted_match_body_keeps_newline_and_indent() {
+        // User-tested scenario: multi-line indentation of pasted Rust code is preserved verbatim (consistent with pi)
+        let lines = render(
+            "文件 @apps/server/src/llm/mod.rs 中第415~418行的这段代码:\n let err = match outcome {\n                 Ok(value) => return Ok(value),\n                 Err(err) => err,\n             };",
+            240,
+        );
+        assert_eq!(
+            lines_text(&lines),
+            vec![
+                "文件 @apps/server/src/llm/mod.rs 中第415~418行的这段代码:".to_string(),
+                " let err = match outcome {".to_string(),
+                "                 Ok(value) => return Ok(value),".to_string(),
+                "                 Err(err) => err,".to_string(),
+                "             };".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pasted_comment_lines_keep_indent() {
+        // User-tested scenario: /// comment lines preserve 4-space indentation (no wrapping within width)
+        let lines = render(
+            "文件 @..llm/mod.rs 中第251~259行的这段代码：\nrust\n    /// 构建客户端：用配置超时装配 reqwest::Client。\n    /// 输入：config——LLM 路由配置。\n    pub fn new(config: LlmConfig) {\n        todo!()\n    }",
+            140,
+        );
+        assert_eq!(
+            lines_text(&lines),
+            vec![
+                "文件 @..llm/mod.rs 中第251~259行的这段代码：".to_string(),
+                "rust".to_string(),
+                "    /// 构建客户端：用配置超时装配 reqwest::Client。".to_string(),
+                "    /// 输入：config——LLM 路由配置。".to_string(),
+                "    pub fn new(config: LlmConfig) {".to_string(),
+                "        todo!()".to_string(),
+                "    }".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nested_list_untouched_by_indent_protection() {
+        // Nested lists (2/4-space indentation + list markers) are still parsed as lists, not polluted by prose protection
+        let lines = render("- a\n  - b\n    - c", 80);
+        assert_eq!(
+            lines_text(&lines),
+            vec![
+                "- a".to_string(),
+                "    - b".to_string(),
+                "        - c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fenced_code_indented_content_untouched() {
+        // Indented lines inside fenced code stay as-is (protection skips fences)
+        let lines = render("```rust\n    let x = 1;\n```", 80);
+        let text = lines_text(&lines);
+        assert!(
+            text.iter().any(|l| l.contains("let x = 1;")),
+            "code line: {text:?}"
+        );
+        assert_eq!(text[0], "```rust");
+        assert_eq!(*text.last().unwrap(), "```");
+    }
+
+    #[test]
+    fn test_indented_code_block_continuation_untouched() {
+        // Indented code blocks remain continuous across lines (a second line with ≥4 spaces still belongs to code, not split by prose protection)
+        let lines = render("text\n\n    indented code\n    第二行", 80);
+        let text = lines_text(&lines);
+        // Both lines are in the same code block (``` fence is continuous, no prose line in between)
+        let f0 = text.iter().position(|l| l == "```").expect("Opening fence");
+        let f1 = text.iter().rposition(|l| l == "```").expect("Closing fence");
+        assert_eq!(f1 - f0, 3, "Code block contains two lines: {text:?}");
+        assert!(text[f0 + 1].contains("indented code"));
+        assert!(text[f0 + 2].contains("第二行"));
+    }
+
+    #[test]
+    fn test_indented_heading_still_heading() {
+        // A heading line with 2-space indentation is still a heading (protection skips block markers)
+        let lines = render("para\n  # heading\nnext", 80);
+        let text = lines_text(&lines);
+        assert!(text.contains(&"heading".to_string()));
+        assert!(!text.contains(&"# heading".to_string()));
+    }
+
+    #[test]
+    fn test_indented_bold_prose_keeps_indent_and_format() {
+        // Bold prose with leading indentation: indentation preserved + inline formatting still applies
+        let lines = render("para\n  **加粗** 和 `code`", 80);
+        assert_eq!(
+            lines_text(&lines),
+            vec!["para".to_string(), "  加粗 和 code".to_string()]
         );
     }
 
