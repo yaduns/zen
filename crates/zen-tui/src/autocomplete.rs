@@ -1,7 +1,9 @@
 // REQ-TUI-03 (pi-401): Autocomplete — context detection, candidate generation, and text application for the input line (pure logic, no terminal interaction).
 // Corresponding original TS: reference/pi-original/packages/tui/src/autocomplete.ts.
 // Differences from pi:
-// - `fd` external binary → in-process recursive traversal with `walkdir` (does not respect .gitignore; excludes only `.git`; see the task document for v1 scope);
+// - `fd` external binary → `ignore` crate in-process recursive traversal (at-gitignore-fix: same source as fd/ripgrep,
+//   respects .gitignore/.ignore/.git/info/exclude + `--hidden` + `--follow`, matching pi fd default behavior;
+//   excludes the entire `.git` tree);
 // - `fuzzyFilter` (pi-402 / T-TU-03-4) is wired in: command-name filtering is implemented via `fuzzy::fuzzy_filter`
 //   (aligned with pi `fuzzyFilter(commandItems, prefix, i => i.name)`), pub API unchanged;
 // - `cursor_col` conventionally holds a character (char) index: the assembly layer (T-AP-11-2) converts the Editor's grapheme column to a character column before passing it in;
@@ -837,9 +839,11 @@ fn query_matches_path(query: &str, display_path: &str) -> bool {
     true
 }
 
-/// In-process directory traversal replaces external fd: recursively collect file and directory candidates from base_dir (hidden entries included, excluding the entire `.git` tree;
-/// follow symlinked directories, with built-in cycle protection), and when query is non-empty, filter by segments split on `/` and appearing in order.
-/// Align with pi `walkDirectoryWithFd` (fd's .gitignore support exceeds the v1 scope; see the task document decision).
+/// In-process directory traversal replaces external fd: recursively collect file and directory candidates from base_dir (hidden entries included as usual, respecting
+/// .gitignore/.ignore/.git/info/exclude and excluding the entire .git tree; symlink directories are followed, cycles handled by the walker's
+/// built-in protection); when query is non-empty, filter by `/`-segments appearing in order.
+/// Align with pi `walkDirectoryWithFd` (fd's `.gitignore` respect — at-gitignore-fix; v1 previously used
+/// walkdir without respect, causing ignored directories such as target/ to enter candidates; now uses the same `ignore` crate as fd/ripgrep).
 /// `max_results` is the early-stop limit; when `ct` is cancelled, returns the partial results collected so far immediately (the caller short-circuits to empty).
 /// Synchronous fs operations: async callers go through `tokio::task::spawn_blocking` or accept short blocking.
 fn walk_directory(
@@ -849,9 +853,24 @@ fn walk_directory(
     ct: &CancellationToken,
 ) -> Vec<FuzzyEntry> {
     let mut results = Vec::new();
-    let mut walker = walkdir::WalkDir::new(base_dir)
+    // Align with pi's fd arguments (`--type f --type d --follow --hidden --exclude .git …`):
+    // follow_links = `--follow`; hidden(true) = `--hidden` (hidden files/directories shown as usual);
+    // The rest (ignore/git_ignore/git_exclude/git_global) = fd's default .gitignore-family respect.
+    let mut builder = ignore::WalkBuilder::new(base_dir);
+    builder
         .follow_links(true)
-        .into_iter();
+        .hidden(false) // false = do not ignore hidden entries (align with fd `--hidden`: hidden files/directories shown as usual)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true);
+    // Explicitly exclude the entire .git tree (equivalent on the fd side via `--exclude .git/.git/*/.git/**`)
+    builder.filter_entry(|entry| {
+        !(entry.depth() > 0
+            && entry.file_name() == ".git"
+            && entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+    });
+    let mut walker = builder.build();
     // Skip base_dir itself (fd outputs relative to children, not the root)
     let _ = walker.next();
     while let Some(entry) = walker.next() {
@@ -859,11 +878,7 @@ fn walk_directory(
             break;
         }
         let Ok(entry) = entry else { continue };
-        let is_directory = entry.file_type().is_dir();
-        if is_directory && entry.file_name() == ".git" {
-            walker.skip_current_dir();
-            continue;
-        }
+        let is_directory = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let Some(relative) = entry.path().strip_prefix(base_dir).ok() else {
             continue;
         };
@@ -1393,6 +1408,85 @@ mod tests {
         assert!(entries
             .iter()
             .all(|e| !(e.path == ".git" || e.path.starts_with(".git/"))));
+    }
+
+    #[test]
+    fn walk_directory_respects_gitignore_excludes_target() {
+        // at-gitignore-fix (pi alignment): directories in .gitignore (e.g. Rust's target/) do not enter candidates —
+        // fd (pi) respects .gitignore by default; v1 previously used walkdir without respect, so target files could be selected.
+        let tmp = tempfile::tempdir().unwrap();
+        setup_folder(
+            tmp.path(),
+            &["target/debug", "src", ".git", "docs"],
+            &[
+                ".gitignore",
+                "target/debug/zen",
+                "src/main.rs",
+                ".git/config",
+                "docs/guide.md",
+            ],
+        );
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        let ct = CancellationToken::new();
+        let entries = walk_directory(tmp.path(), "", 100, &ct);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            entries
+                .iter()
+                .all(|e| !(e.path == "target" || e.path.starts_with("target/"))),
+            "target/ is excluded by .gitignore: {paths:?}"
+        );
+        assert!(!paths.contains(&"target"), "target/ directory does not appear: {paths:?}");
+        assert!(paths.contains(&"src/main.rs"), "Unignored files still present: {paths:?}");
+        assert!(
+            paths.contains(&"docs/guide.md"),
+            "Unignored files still present: {paths:?}"
+        );
+        assert!(
+            paths.contains(&".gitignore"),
+            ".gitignore itself is visible: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn walk_directory_gitignore_negation_keeps_files() {
+        // .gitignore negation patterns (!) keep files explicitly added back (same fd/git semantics);
+        // Note: the ignore crate applies .gitignore only when a `.git` directory exists (same behavior as fd/ripgrep,
+        // real repositories always have it; this test uses a fixture containing .git).
+        let tmp = tempfile::tempdir().unwrap();
+        setup_folder(
+            tmp.path(),
+            &[".git", "src"],
+            &[
+                ".gitignore",
+                "src/important.txt",
+                "src/keep.log",
+                "src/other.log",
+            ],
+        );
+        std::fs::write(tmp.path().join(".gitignore"), "*.log\n!keep.log\n").unwrap();
+        let ct = CancellationToken::new();
+        let entries = walk_directory(tmp.path(), "", 100, &ct);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.path.starts_with(".git/") && e.path != "src/other.log"),
+            "*.log ignored (keep.log excluded), .git excluded: {paths:?}"
+        );
+        // keep.log restored by a negation pattern is listed; other.log, which no negation matches, is not
+        assert!(
+            paths.contains(&"src/keep.log"),
+            "!keep.log negation preserved: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"src/other.log"),
+            "other.log remains in ignore set: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/important.txt"),
+            "txt is unaffected: {paths:?}"
+        );
     }
 
     #[test]

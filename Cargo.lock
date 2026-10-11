@@ -2714,6 +2714,7 @@ dependencies = [
  "futures",
  "futures-util",
  "home",
+ "ignore",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -2726,7 +2727,6 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width 0.1.14",
- "walkdir",
  "zen-ai",
  "zen-core",
 ]

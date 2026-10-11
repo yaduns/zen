@@ -3568,6 +3568,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_at_tab_apply_places_cursor_after_value() {
+        // Reproduce user observation: type `@Car` → after Tab selects `@Cargo.toml`, cursor should be after `@Cargo.toml `
+        // (consistent with pi: before+value+trailing space=12), not stuck at the edit point.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+                let mut u = InteractiveUi::new(
+                    theme().clone(),
+                    kb(),
+                    editor_kb(),
+                    select_kb(),
+                    tmp.path().display().to_string(),
+                    UiPrefs::default(),
+                    None,
+                    crate::commands::build_slash_command_list(&[], &[]),
+                    5,
+                );
+                // User has finished typing `@Car` (editor content + cursor)
+                u.editor.set_text("@Car");
+                u.editor.set_cursor(0, 4);
+                // First Tab: open completion (not yet active → trigger_autocomplete)
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                for _ in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    if u.poll_autocomplete() {
+                        break;
+                    }
+                }
+                let has_sugg = u
+                    .autocomplete
+                    .as_ref()
+                    .and_then(|o| o.suggestions.as_ref())
+                    .is_some_and(|s| !s.items().is_empty());
+                assert!(has_sugg, "@Car should have candidates");
+                // Second Tab: apply selected item
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                assert_eq!(u.editor.text(), "@Cargo.toml ", "After apply: completion text + trailing space");
+                assert_eq!(
+                    u.editor.cursor(),
+                    (0, 12),
+                    "cursor is after `@Cargo.toml ` (pi-consistent: 11 chars + trailing space = 12)"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_at_full_keyboard_tab_apply_cursor() {
+        // Full keyboard path: type `@Car` key by key (each via natural trigger + 20ms debounce + poll), after Tab applies
+        // Cursor after `@Cargo.toml ` (consistent with pi = 12). Guards against stale overlay cursor/line snapshot on the real path.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+                let mut u = InteractiveUi::new(
+                    theme().clone(),
+                    kb(),
+                    editor_kb(),
+                    select_kb(),
+                    tmp.path().display().to_string(),
+                    UiPrefs::default(),
+                    None,
+                    crate::commands::build_slash_command_list(&[], &[]),
+                    5,
+                );
+                for ch in ['@', 'C', 'a', 'r'] {
+                    let _ = u.handle_key(&press(KeyCode::Char(ch)));
+                    // Wait for debounce + candidates ready (each key's overlay completes poll)
+                    for _ in 0..8 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        if u.poll_autocomplete() {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(u.editor.text(), "@Car", "editor content after typing key by key");
+                assert_eq!(u.editor.cursor(), (0, 4));
+                // Tab: apply selected item
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                assert_eq!(u.editor.text(), "@Cargo.toml ", "After apply: completion text + trailing space");
+                assert_eq!(
+                    u.editor.cursor(),
+                    (0, 12),
+                    "cursor is after `@Cargo.toml ` (pi-consistent)"
+                );
+                // Render-layer caret (visible cursor/IME anchor) matches state: col 12 = after trailing space
+                let mut buf = zen_tui::screen::ScreenBuffer::new(100, 24);
+                u.editor.render(&mut buf, 0, 0, 100, 24);
+                assert_eq!(
+                    u.editor.cursor_position(),
+                    (12, 1),
+                    "Render caret after `@Cargo.toml `"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn test_tab_on_non_command_quietly_closes() {
         tokio::task::LocalSet::new()
             .run_until(async {

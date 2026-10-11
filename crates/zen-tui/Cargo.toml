@@ -22,8 +22,10 @@ syntect = { workspace = true }
 # Home directory resolution (~ expansion, autocomplete expand_home_path) — workspace's existing `home` crate
 # (aligned with zen-core/src/paths.rs and zen-app config precedent); the `dirs` originally proposed in the task doc is no longer introduced.
 home = { workspace = true }
-# 进程内目录递归遍历（@ 附件自动补全，替代 pi 的外部 fd 二进制）
-walkdir = { workspace = true }
+# In-process recursive directory traversal (@ attachment autocomplete, replacing pi's external fd binary): same-origin as fd/ripgrep's
+# `ignore` crate — respects .gitignore/.ignore/.git/info/exclude (at-gitignore-fix: aligned with pi's
+# fd default behavior; ignored directories such as target/ no longer appear in @ candidates) + built-in loop protection.
+ignore = { workspace = true }
 pulldown-cmark = { workspace = true }
 zen-core = { workspace = true }
 zen-ai = { workspace = true }
