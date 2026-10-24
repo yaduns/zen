@@ -386,6 +386,8 @@ pub struct Model {
     pub cost_rates: Option<CostRates>,
     /// Protocol binding
     pub api: crate::provider::Api,
+    /// Request compatibility switches (the `compat` subset of `models.json`; consumed by T-AI-02-10).
+    pub compat: Option<crate::provider::OpenAiCompletionsCompat>,
 }
 
 /// Describes per-million-token rates for a model, used to compute actual cost from token usage.

@@ -1,46 +1,43 @@
 use std::collections::HashMap;
 use std::env;
 
-use crate::provider::{default_provider_name, resolve_provider, Provider};
+use crate::catalog::Catalog;
+use crate::provider::Provider;
 use crate::types::{Cost, CostRates, Model};
 
 impl Model {
     /// Create the default model config from environment variables (default provider opencode-go, model deepseek-v4-flash).
     ///
-    /// Provider selection: env `ZEN_PROVIDER` (default `opencode-go`); model id / base_url /
-    /// max_tokens are read from per-provider env vars (see the env var conventions in the `provider` module).
+    /// Provider selection: env `ZEN_PROVIDER` (default `opencode-go`) → default model from the built-in `models.json` catalog;
+    /// then apply the temporary env override shim from T-AI-02-9 (`*_BASE_URL`/`*_MODEL`/`*_MAX_TOKENS`,
+    /// removed after T-AI-02-11 injects the user catalog).
+    ///
+    /// # Panics
+    /// The default provider does not exist in the built-in catalog or has no models (compile-time constant error, locked by the `embedded_catalog_parses` unit test).
     pub fn from_env() -> Self {
-        let name = default_provider_name();
-        let provider =
-            resolve_provider(&name).unwrap_or_else(|| panic!("unknown default provider: {}", name));
-        Self::from_provider(provider.as_ref())
+        let mut model = Catalog::embedded()
+            .default_model()
+            .unwrap_or_else(|err| panic!("unknown default provider: {err}"));
+        apply_provider_env_overrides(&mut model);
+        model
     }
 
-    /// Build the model for the selected provider.
+    /// Construct the model from the selected provider: take the provider's first model in the catalog.
     ///
-    /// Model id and max_tokens are read from per-provider env vars (`OPENCODE_MODEL`/
-    /// `ARK_MODEL`, `OPENCODE_MAX_TOKENS`/`ARK_MAX_TOKENS`), defaulting to
-    /// `deepseek-v4-flash` and 384000 respectively (aligned with DeepSeek-V4-Flash max output length); base_url
-    /// comes from `provider.base_url()` (which internally reads
-    /// `OPENCODE_BASE_URL`/`ARK_BASE_URL` and falls back to the default endpoint); the `provider` field is set to `provider.id()`.
+    /// Unknown provider falls back to the existing defaults (`deepseek-v4-flash` + 1M context + 384k output) and logs
+    /// `tracing::warn`, as a compatibility shim before T-AI-02-11; known providers apply the temporary env override shim.
     pub fn from_provider(provider: &dyn Provider) -> Self {
-        Self {
-            id: provider_model_id(provider.id()).unwrap_or_else(|| "deepseek-v4-flash".to_string()),
-            provider: provider.id().to_string(),
-            api: provider.api(),
-            base_url: provider.base_url(),
-            max_tokens: provider_max_tokens(provider.id()),
-            context_window: 1_000_000,
-            reasoning: true,
-            name: None,
-            headers: None,
-            cost_rates: Some(CostRates {
-                input: 0.5,
-                output: 2.0,
-                cache_read: 0.1,
-                cache_write: 0.5,
-            }),
-        }
+        let mut model = Catalog::embedded()
+            .first_model(provider.id())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    provider = provider.id(),
+                    "provider not found in models.json catalog; using legacy defaults"
+                );
+                legacy_fallback_model(provider)
+            });
+        apply_provider_env_overrides(&mut model);
+        model
     }
 
     /// Set model ID.
@@ -132,27 +129,51 @@ impl Model {
     }
 }
 
-/// Read the model id env var per provider (`OPENCODE_MODEL`/`ARK_MODEL`); returns None for unknown providers.
-fn provider_model_id(provider: &str) -> Option<String> {
-    match provider {
-        "opencode-go" => env::var("OPENCODE_MODEL").ok(),
-        "huoshan" => env::var("ARK_MODEL").ok(),
-        _ => None,
+/// Compatibility fallback for unknown providers: keeps the T-AI-02-4-era defaults (1M context / 384k output).
+/// After T-AI-02-11 injects the user catalog, unknown providers should raise an explicit error instead of silently falling back.
+fn legacy_fallback_model(provider: &dyn Provider) -> Model {
+    Model {
+        id: "deepseek-v4-flash".to_string(),
+        name: None,
+        provider: provider.id().to_string(),
+        api: provider.api(),
+        base_url: provider.base_url(),
+        context_window: 1_000_000,
+        max_tokens: 384_000,
+        reasoning: true,
+        headers: None,
+        cost_rates: Some(CostRates {
+            input: 0.5,
+            output: 2.0,
+            cache_read: 0.1,
+            cache_write: 0.5,
+        }),
+        compat: None,
     }
 }
 
-/// Read the max_tokens env var per provider (`OPENCODE_MAX_TOKENS`/`ARK_MAX_TOKENS`);
-/// defaults to 384000 when unset or unparsable (aligned with DeepSeek-V4-Flash max output length).
-fn provider_max_tokens(provider: &str) -> u64 {
-    let var = match provider {
-        "opencode-go" => "OPENCODE_MAX_TOKENS",
-        "huoshan" => "ARK_MAX_TOKENS",
-        _ => return 384_000,
+/// Temporary env override shim from T-AI-02-9: preserve the existing `*_BASE_URL`/`*_MODEL`/`*_MAX_TOKENS` behavior,
+/// to be removed after T-AI-02-11 injects the user `models.json` (the six overrides will be expressed by the catalog instead).
+fn apply_provider_env_overrides(model: &mut Model) {
+    let (base_url_var, model_var, max_tokens_var) = match model.provider.as_str() {
+        "opencode-go" => ("OPENCODE_BASE_URL", "OPENCODE_MODEL", "OPENCODE_MAX_TOKENS"),
+        "huoshan" => ("ARK_BASE_URL", "ARK_MODEL", "ARK_MAX_TOKENS"),
+        _ => return,
     };
-    env::var(var)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(384_000)
+    if let Some(value) = non_empty_env(base_url_var) {
+        model.base_url = value;
+    }
+    if let Some(value) = non_empty_env(model_var) {
+        model.id = value;
+    }
+    if let Some(value) = non_empty_env(max_tokens_var).and_then(|value| value.parse().ok()) {
+        model.max_tokens = value;
+    }
+}
+
+/// Read a non-empty environment variable (empty string/whitespace-only is treated as unset).
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -179,6 +200,7 @@ mod tests {
                 cache_read: 0.5,
                 cache_write: 0.5,
             }),
+            compat: None,
         }
     }
 
@@ -316,8 +338,40 @@ mod tests {
     }
 
     // ── from_env / from_provider ──
-    // Depends on process env vars (ZEN_PROVIDER / OPENCODE_* / ARK_*), not a pure function. For testing,
-    // Recommend explicitly setting env vars inside the test function and using the serial_test crate for serialization,
-    // to prevent interference between parallel tests.
-    // Not implemented yet; will add once serial_test or a mocking approach is introduced.
+
+    #[test]
+    fn from_provider_reads_catalog_model() {
+        let provider = crate::provider::resolve_provider("huoshan").expect("huoshan provider");
+        let model = Model::from_provider(provider.as_ref());
+        assert_eq!(model.provider, "huoshan");
+        assert_eq!(model.context_window, 1_000_000);
+        assert!(model.compat.is_some());
+    }
+
+    #[test]
+    fn from_provider_unknown_uses_legacy_defaults() {
+        struct UnknownProvider;
+
+        impl Provider for UnknownProvider {
+            fn id(&self) -> &str {
+                "unknown"
+            }
+            fn api(&self) -> crate::provider::Api {
+                crate::provider::Api::OpenAiCompletions
+            }
+            fn base_url(&self) -> String {
+                "https://unknown.test".to_string()
+            }
+            fn resolve_api_key(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let model = Model::from_provider(&UnknownProvider);
+        assert_eq!(model.id, "deepseek-v4-flash");
+        assert_eq!(model.provider, "unknown");
+        assert_eq!(model.base_url, "https://unknown.test");
+        assert_eq!(model.context_window, 1_000_000);
+        assert_eq!(model.max_tokens, 384_000);
+    }
 }

@@ -1,4 +1,4 @@
-//! Multi-provider interface and built-in implementations (Phase 1: opencode-go default + huoshan).
+//! Multi-provider interfaces and catalog-driven implementations (built-in defaults: opencode-go + huoshan).
 //!
 //! Mirrors Pi's `Provider` interface in `packages/ai/src/models.ts`, the `Api` protocol types
 //! in `types.ts`, and the one implementation file per provider under `providers/`. Auth is **API key +
@@ -19,16 +19,18 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::{resolve_config_value, Catalog, ProviderConfig};
 use crate::types::Model;
-use crate::utils::provider_env::get_provider_env_value;
 
 /// Protocol type. Aligned with pi's `Api` (types.ts KnownApi). zen currently only supports
 /// OpenAI Chat Completions compatible protocol (both providers use it); add variants when integrating new protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Api {
     /// OpenAI Chat Completions compatible protocol
+    #[serde(rename = "openai-completions")]
     OpenAiCompletions,
     // Placeholder: enable when implementing the OpenAI Responses protocol in the future
+    #[serde(rename = "openai-responses")]
     OpenAiResponses,
 }
 
@@ -46,12 +48,71 @@ impl std::fmt::Display for Api {
 ///
 /// - `OpenAi` (aligned with pi `"openai"`): only sends `reasoning_effort`; no thinking toggle.
 /// - `DeepSeek` (aligned with pi `"deepseek"`): attaches `thinking: {type: "enabled"/"disabled"}` + `reasoning_effort`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ThinkingFormat {
     /// Aligned with pi compat.thinkingFormat "openai": only reasoning_effort, no thinking toggle
+    #[serde(rename = "openai")]
     OpenAi,
     /// Aligned with pi compat.thinkingFormat "deepseek": thinking:{type:enabled/disabled} + reasoning_effort
+    #[serde(rename = "deepseek")]
     DeepSeek,
+}
+
+/// `max_tokens` request field name. Aligned with pi `compat.maxTokensField`:
+/// most compat endpoints use `max_tokens`; OpenAI o-series / gpt-5 use `max_completion_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// Send `max_tokens` (default).
+    #[default]
+    MaxTokens,
+    /// Send `max_completion_tokens`.
+    MaxCompletionTokens,
+}
+
+/// Session affinity header format family. Aligned with pi `compat.sessionAffinityFormat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionAffinityFormat {
+    /// Send `session_id` + `x-client-request-id` + `x-session-affinity`.
+    #[default]
+    #[serde(rename = "openai")]
+    Openai,
+    /// Send only `x-client-request-id` + `x-session-affinity` (no `session_id`).
+    #[serde(rename = "openai-nosession")]
+    OpenaiNosession,
+    /// Send only `x-session-id`.
+    #[serde(rename = "openrouter")]
+    Openrouter,
+}
+
+/// OpenAI Completions request compatibility switches (the `compat` subset of `models.json`).
+///
+/// Lives in `provider.rs` (alongside [`Api`]/[`ThinkingFormat`]) — request-layer semantics,
+/// not catalog schema; `catalog.rs` only references it. `Model.compat` holds it, T-AI-02-10 consumes it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiCompletionsCompat {
+    /// Thinking toggle format family; defaults to [`ThinkingFormat::OpenAi`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_format: Option<ThinkingFormat>,
+    /// `max_tokens` field name; defaults to [`MaxTokensField::MaxTokens`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
+    /// Whether `stream_options.include_usage` is supported; defaults to `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_usage_in_streaming: Option<bool>,
+    /// Whether the `developer` role is supported; defaults to `false` (use `system`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_developer_role: Option<bool>,
+    /// Whether `reasoning_effort` is supported; defaults to `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning_effort: Option<bool>,
+    /// Whether to send session affinity headers; defaults to `false` (the opencode attribution header is preserved by a private function).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_session_affinity_headers: Option<bool>,
+    /// Session affinity header format family; defaults to [`SessionAffinityFormat::Openai`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_affinity_format: Option<SessionAffinityFormat>,
 }
 
 /// Called by `build_request_body` before each turn in interactive mode: resolves the thinking-toggle format family based on the provider name,
@@ -70,7 +131,7 @@ pub fn thinking_format_for_provider(provider_name: &str) -> ThinkingFormat {
 /// Association with `Model`: `Provider::id()` string-equals `Model.provider` (`String`)
 /// means the model belongs to that provider.
 ///
-/// Auth: `resolve_api_key` currently reads from the provider's own env var (e.g. `OPENCODE_API_KEY`);
+/// Authentication: `resolve_api_key` resolves from the `apiKey` config value recorded in the catalog (literal / `$ENV` / `${ENV}`);
 /// When auth.json support is added later, add "file > env" priority logic inside this method; signature stays unchanged.
 pub trait Provider: Send + Sync {
     /// Provider identifier (e.g. "opencode-go"). String equality with `Model.provider` establishes the association.
@@ -78,9 +139,9 @@ pub trait Provider: Send + Sync {
     /// Protocol type (currently only `OpenAiCompletions` for zen)
     fn api(&self) -> Api;
     /// API endpoint base URL (without the /chat/completions path). Returns an owned `String`
-    /// to support env overrides (e.g. `OPENCODE_BASE_URL`).
+    /// (catalog value; before T-AI-02-11, `Model::from_*` still applies the `*_BASE_URL` env shim).
     fn base_url(&self) -> String;
-    /// Resolve the API key (read from the provider's own env var)
+    /// Parse API key (the `apiKey` config value recorded in the catalog; before T-AI-02-10 the request layer still uses env match).
     fn resolve_api_key(&self) -> Option<String>;
 
     /// HTTP headers this provider requires to be attached to **every request** (provider-owned: the request-building layer only merges them).
@@ -112,14 +173,10 @@ pub fn default_provider_name() -> String {
     std::env::var("ZEN_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string())
 }
 
-/// Resolve a provider by name; returns `None` for unknown names.
-/// The future `--provider` CLI arg (T-AP-08-1) reuses this function.
+/// Resolves a provider by name: looks up the built-in [`Catalog`] (overridden by user catalog injection in T-AI-02-11).
+/// Returns `None` on miss; signatures of existing callers (openai_stream / services / examples) stay unchanged.
 pub fn resolve_provider(name: &str) -> Option<Box<dyn Provider>> {
-    match name {
-        "opencode-go" => Some(Box::new(OpenCodeGoProvider)),
-        "huoshan" => Some(Box::new(HuoshanProvider)),
-        _ => None,
-    }
+    Catalog::embedded().provider(name)
 }
 
 /// opencode session header name (required by the gateway; missing → 400 `MissingSessionID`).
@@ -129,71 +186,76 @@ const OPENCODE_CLIENT_HEADER: &str = "x-opencode-client";
 /// `x-opencode-client` value: pi passes `"pi"`; zen is a separate implementation and passes `"zen"`.
 const ZEN_CLIENT_ID: &str = "zen";
 
-/// OpenCode Go (default provider). Key: `OPENCODE_API_KEY`; endpoint: `https://opencode.ai/zen/go/v1`
-/// (overridable via `OPENCODE_BASE_URL`).
-pub struct OpenCodeGoProvider;
+/// Catalog-driven provider adapter: replaces the hand-written impls of `OpenCodeGoProvider`/`HuoshanProvider`.
+/// Constructed by [`Catalog::provider`]; fields come from [`ProviderConfig`] in `models.json`.
+pub(crate) struct ConfiguredProvider {
+    id: String,
+    config: ProviderConfig,
+}
 
-impl Provider for OpenCodeGoProvider {
+impl ConfiguredProvider {
+    /// Construct the adapter (`id` and `config` come from the catalog record).
+    pub(crate) fn new(id: String, config: ProviderConfig) -> Self {
+        Self { id, config }
+    }
+}
+
+impl Provider for ConfiguredProvider {
     fn id(&self) -> &str {
-        "opencode-go"
+        &self.id
     }
 
     fn api(&self) -> Api {
-        Api::OpenAiCompletions
+        self.config.api.unwrap_or(Api::OpenAiCompletions)
     }
 
     fn base_url(&self) -> String {
-        get_provider_env_value("OPENCODE_BASE_URL", None)
-            .unwrap_or_else(|| "https://opencode.ai/zen/go/v1".to_string())
+        self.config.base_url.clone().unwrap_or_default()
     }
 
     fn resolve_api_key(&self) -> Option<String> {
-        get_provider_env_value("OPENCODE_API_KEY", None)
+        self.config
+            .api_key
+            .as_deref()
+            .and_then(resolve_config_value)
     }
 
-    /// The opencode gateway requires a session header; if missing, returns 400 `MissingSessionID`.
-    /// Aligns with pi `provider-attribution.ts:getSessionHeaders` (`if (!sessionId) return undefined`;
-    /// empty string is also falsy → not sent).
-    /// **Registered deviation**: pi also checks `provider === "opencode"` (old name) and `baseUrl.hostname === "opencode.ai"`
-    /// Two branches—the zen registry is closed and has no old-name alias, so judging by provider name (this impl) is already equivalent; neither branch is implemented;
-    /// The branding/telemetry headers from `getDefaultAttributionHeaders` belong to multi-provider attribution and remain omitted per the scope.md omission table.
     fn request_headers(
         &self,
         _model: &Model,
         session_id: Option<&str>,
     ) -> Option<HashMap<String, String>> {
-        let session_id = session_id.filter(|id| !id.is_empty())?;
-        Some(HashMap::from([
-            (OPENCODE_SESSION_HEADER.to_string(), session_id.to_string()),
-            (
-                OPENCODE_CLIENT_HEADER.to_string(),
-                ZEN_CLIENT_ID.to_string(),
-            ),
-        ]))
+        let mut headers = self.config.headers.clone().unwrap_or_default();
+        if let Some(attribution) = provider_attribution_headers(&self.id, session_id) {
+            headers.extend(attribution);
+        }
+        if headers.is_empty() {
+            None
+        } else {
+            Some(headers)
+        }
     }
 }
 
-/// Volcengine Ark (huoshan). Key: `ARK_API_KEY`; endpoint: `https://ark.cn-beijing.volces.com/api/coding/v3`
-/// (overridable via `ARK_BASE_URL`).
-pub struct HuoshanProvider;
-
-impl Provider for HuoshanProvider {
-    fn id(&self) -> &str {
-        "huoshan"
+/// Session header attribution required by the opencode gateway (a subset of pi `provider-attribution.ts::getSessionHeaders`).
+///
+/// Provider name is not rewritten, and no session is fabricated when empty; T-AI-02-10 decides whether to route differently
+/// `compat.sendSessionAffinityHeaders`。
+fn provider_attribution_headers(
+    provider_id: &str,
+    session_id: Option<&str>,
+) -> Option<HashMap<String, String>> {
+    let session_id = session_id.filter(|id| !id.is_empty())?;
+    if provider_id != "opencode-go" && provider_id != "opencode" {
+        return None;
     }
-
-    fn api(&self) -> Api {
-        Api::OpenAiCompletions
-    }
-
-    fn base_url(&self) -> String {
-        get_provider_env_value("ARK_BASE_URL", None)
-            .unwrap_or_else(|| "https://ark.cn-beijing.volces.com/api/coding/v3".to_string())
-    }
-
-    fn resolve_api_key(&self) -> Option<String> {
-        get_provider_env_value("ARK_API_KEY", None)
-    }
+    Some(HashMap::from([
+        (OPENCODE_SESSION_HEADER.to_string(), session_id.to_string()),
+        (
+            OPENCODE_CLIENT_HEADER.to_string(),
+            ZEN_CLIENT_ID.to_string(),
+        ),
+    ]))
 }
 
 #[cfg(test)]
@@ -264,8 +326,8 @@ mod tests {
 
     #[test]
     fn test_request_headers_opencode_with_session() {
-        let provider = OpenCodeGoProvider;
-        let model = Model::from_provider(&provider);
+        let provider = resolve_provider("opencode-go").expect("opencode-go provider");
+        let model = Model::from_provider(provider.as_ref());
         let headers = provider
             .request_headers(&model, Some("session-abc"))
             .expect("Should return both headers when session exists");
@@ -282,20 +344,61 @@ mod tests {
 
     #[test]
     fn test_request_headers_opencode_without_or_empty_session() {
-        let provider = OpenCodeGoProvider;
-        let model = Model::from_provider(&provider);
-        // No session context / empty string (pi falsy semantics) → do not fabricate; return None
-        assert!(provider.request_headers(&model, None).is_none());
-        assert!(provider.request_headers(&model, Some("")).is_none());
+        let provider = resolve_provider("opencode-go").expect("opencode-go provider");
+        let model = Model::from_provider(provider.as_ref());
+        // No session context / empty string (pi falsy semantics) → don't fabricate session headers; static client identity headers are still sent with the catalog.
+        for session in [None, Some("")] {
+            let headers = provider
+                .request_headers(&model, session)
+                .expect("Static client identification header");
+            assert_eq!(
+                headers.get(OPENCODE_CLIENT_HEADER).map(String::as_str),
+                Some(ZEN_CLIENT_ID)
+            );
+            assert!(!headers.contains_key(OPENCODE_SESSION_HEADER));
+            assert_eq!(headers.len(), 1);
+        }
     }
 
     #[test]
     fn test_request_headers_huoshan_walks_default_none() {
-        let provider = HuoshanProvider;
-        let model = Model::from_provider(&provider);
+        let provider = resolve_provider("huoshan").expect("huoshan provider");
+        let model = Model::from_provider(provider.as_ref());
         // Not overridden → default implementation returns None (huoshan needs no extra headers)
         assert!(provider
             .request_headers(&model, Some("session-abc"))
             .is_none());
+    }
+
+    // ── serde (values from models.json) ──
+
+    #[test]
+    fn api_deserializes_kebab_case() {
+        let api: Api = serde_json::from_str("\"openai-completions\"").expect("api");
+        assert_eq!(api, Api::OpenAiCompletions);
+        assert_eq!(
+            serde_json::to_string(&api).expect("serialize api"),
+            "\"openai-completions\""
+        );
+    }
+
+    #[test]
+    fn thinking_format_deserializes_kebab_case() {
+        let format: ThinkingFormat = serde_json::from_str("\"deepseek\"").expect("format");
+        assert_eq!(format, ThinkingFormat::DeepSeek);
+    }
+
+    #[test]
+    fn max_tokens_field_deserializes_snake_case() {
+        let field: MaxTokensField =
+            serde_json::from_str("\"max_completion_tokens\"").expect("field");
+        assert_eq!(field, MaxTokensField::MaxCompletionTokens);
+    }
+
+    #[test]
+    fn session_affinity_format_deserializes_kebab_case() {
+        let format: SessionAffinityFormat =
+            serde_json::from_str("\"openai-nosession\"").expect("format");
+        assert_eq!(format, SessionAffinityFormat::OpenaiNosession);
     }
 }

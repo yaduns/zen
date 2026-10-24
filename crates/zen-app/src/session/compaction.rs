@@ -474,6 +474,7 @@ mod tests {
             reasoning: true,
             headers: None,
             cost_rates: None,
+            compat: None,
         }
     }
 

@@ -758,6 +758,7 @@ mod tests {
             headers: None,
             cost_rates,
             api: zen_ai::provider::Api::OpenAiCompletions,
+            compat: None,
         }
     }
 

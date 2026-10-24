@@ -368,6 +368,7 @@ mod tests {
             headers: None,
             cost_rates: None,
             api: Api::OpenAiCompletions,
+            compat: None,
         }
     }
 

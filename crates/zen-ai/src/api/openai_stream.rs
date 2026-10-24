@@ -1879,6 +1879,7 @@ mod tests {
             reasoning: true,
             headers: None,
             cost_rates: None,
+            compat: None,
         }
     }
 
@@ -2088,15 +2089,19 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_request_headers_opencode_without_session_is_empty() {
+    fn test_merge_request_headers_opencode_without_session_keeps_client_header() {
         let model = Model {
             provider: "opencode-go".into(),
             ..sample_model()
         };
-        assert!(
-            merge_request_headers(&model, &StreamConfig::default()).is_empty(),
-            "no session context (compaction/branch summary) -> do not fabricate session headers"
+        let merged = merge_request_headers(&model, &StreamConfig::default());
+        // No session context (compression/branch summary) → do not fabricate session headers; static client identification headers from the catalog are still sent.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged.get("x-opencode-client").map(String::as_str),
+            Some("zen")
         );
+        assert!(!merged.contains_key("x-opencode-session"));
     }
 
     #[test]

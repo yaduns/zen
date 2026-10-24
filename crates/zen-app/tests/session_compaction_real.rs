@@ -33,6 +33,7 @@ fn test_model() -> Model {
         reasoning: true,
         headers: None,
         cost_rates: None,
+        compat: None,
     }
 }
 

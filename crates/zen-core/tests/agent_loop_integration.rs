@@ -293,6 +293,7 @@ fn default_model() -> Model {
         reasoning: false,
         headers: None,
         cost_rates: None,
+        compat: None,
     }
 }
 

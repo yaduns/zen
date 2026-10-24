@@ -215,6 +215,7 @@ mod tests {
             reasoning: false,
             headers: None,
             cost_rates: None,
+            compat: None,
         }
     }
 

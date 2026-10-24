@@ -1,0 +1,53 @@
+{
+  "providers": {
+    "opencode-go": {
+      "name": "OpenCode Go",
+      "api": "openai-completions",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKey": "$OPENCODE_API_KEY",
+      "headers": {
+        "x-opencode-client": "zen"
+      },
+      "compat": {
+        "thinkingFormat": "openai"
+      },
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "cost": {
+            "input": 0.5,
+            "output": 2.0,
+            "cacheRead": 0.1,
+            "cacheWrite": 0.5
+          }
+        }
+      ]
+    },
+    "huoshan": {
+      "name": "Volcengine Ark",
+      "api": "openai-completions",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "apiKey": "$ARK_API_KEY",
+      "compat": {
+        "thinkingFormat": "deepseek"
+      },
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "cost": {
+            "input": 0.5,
+            "output": 2.0,
+            "cacheRead": 0.1,
+            "cacheWrite": 0.5
+          }
+        }
+      ]
+    }
+  }
+}
