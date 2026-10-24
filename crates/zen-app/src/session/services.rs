@@ -25,6 +25,7 @@ use crate::config::settings::{SettingsData, SettingsManager};
 use crate::prompt_templates::LoadedPromptTemplate;
 use crate::resources::{load_resources, LoadResourcesOptions, LoadResourcesResult};
 use crate::session::agent_session::{AgentSession, SessionStore};
+use crate::session::provider_attribution::with_provider_attribution;
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
 };
@@ -198,6 +199,9 @@ pub fn create_agent_session(
     // T-AI-02-6: store constructed before agent; session_id readable before Agent::new → threaded through the whole chain
     // (Agent.session_id → AgentLoopConfig → StreamConfig → request body prompt_cache_key)
     let session_id = session_store.session_id();
+    // T-AI-02-10: provider attribution headers (e.g. opencode `x-opencode-session`) are injected at the assembly layer
+    // (the request layer no longer contains resolve_provider; see `session::provider_attribution`).
+    let stream_fn = with_provider_attribution(stream_fn);
     let agent = Agent::new(
         state,
         ToolExecutionMode::Parallel,

@@ -1,11 +1,13 @@
-use crate::provider::{resolve_provider, thinking_format_for_provider, ThinkingFormat};
+use crate::catalog::Catalog;
+use crate::provider::{
+    MaxTokensField, OpenAiCompletionsCompat, SessionAffinityFormat, ThinkingFormat,
+};
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, ContentBlockList, Context,
     ErrorStopReason, Message, Model, NonErrorStopReason, StopReason, StreamFn, TextContent,
     ThinkingContent, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolFunction, Usage,
 };
 use crate::utils::error_body::{extract_error_body, extract_readable_error_message};
-use crate::utils::provider_env::get_provider_env_value;
 use eventsource_stream::Eventsource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -54,7 +56,7 @@ pub enum StreamError {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct Request {
     /// Model ID (e.g. `"deepseek-v4-flash"`).
     model: String,
@@ -63,15 +65,18 @@ struct Request {
     /// Tool definition list, set only when `context.tools` is non-empty and the message history contains tool calls/results.
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDefinition>>,
-    /// Tool selection strategy
+    /// Tool selection policy (in the OpenAI protocol shape, converted via `tool_choice_to_request`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<ToolChoice>,
-    /// Maximum output token count.
+    tool_choice: Option<serde_json::Value>,
+    /// Maximum output token count (used when `maxTokensField == "max_tokens"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
+    /// Maximum output token count (used when `maxTokensField == "max_completion_tokens"`, for OpenAI o-series/gpt-5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u64>,
     /// Whether to use streaming responses. Always `true` for zen.
     stream: bool,
-    /// Streaming options, includes `include_usage`.
+    /// Streaming options, including `include_usage`. Not serialized when `supportsUsageInStreaming == false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptionsParam>,
     /// Temperature parameter, controlling the randomness of the output.
@@ -83,20 +88,19 @@ struct Request {
     /// Stop word list; generation terminates when the model outputs any stop word.
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
-    /// DeepSeek thinking mode strength (API string value, converted from ThinkingLevel)
-    #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning_effort")]
+    /// Reasoning effort (API string value, converted from ThinkingLevel; subject to dual gating by `supportsReasoningEffort` and
+    /// `model.reasoning`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
-    /// DeepSeek-family endpoint thinking toggle (`thinking: {type: "enabled"/"disabled"}`), per provider thinking
-    /// Format-family extra (aligns with pi compat.thinkingFormat "deepseek" branch, openai-completions.ts:664-673);
+    /// Thinking toggle for DeepSeek-family endpoints (`thinking: {type: "enabled"/"disabled"}`), appended based on the
+    /// `compat.thinkingFormat` format family (aligned with pi openai-completions.ts:664-673);
     /// Not sent in openai format (opencode-go).
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingParam>,
     /// Session affinity cache key (OpenAI `prompt_cache_key` request field); omitted entirely when None.
     /// Value = `StreamConfig.session_id` truncated by `clamp_openai_prompt_cache_key` (≤64 code points),
     /// so the server routes requests for the same session to the same cache shard (aligns with pi buildParams parameter).
-    /// Note: struct-level `rename_all = "camelCase"` produces `promptCacheKey`, so an explicit rename is required
-    /// to the API-required snake_case (see `reasoning_effort` in the same struct for precedent).
-    #[serde(skip_serializing_if = "Option::is_none", rename = "prompt_cache_key")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
 }
 
@@ -107,10 +111,8 @@ struct ThinkingParam {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct StreamOptionsParam {
-    /// Whether to return usage information in the final chunk.
-    /// zen is always set to `true`.
+    /// Whether to return usage information in the final chunk, gated by `compat.supportsUsageInStreaming` (default `true`).
     include_usage: bool,
 }
 
@@ -124,6 +126,11 @@ enum RequestMessage {
     /// System message, sets the assistant's behavior and role.
     System {
         /// System instruction content.
+        content: String,
+    },
+    /// Developer message (replaces `system` when `supportsDeveloperRole` is enabled and the model supports reasoning).
+    Developer {
+        /// Developer instruction content.
         content: String,
     },
     /// User message, containing user input (text or text + image).
@@ -346,6 +353,12 @@ struct PromptTokensDetails {
 /// - `cancel`: Optional cancellation token. On cancellation, SSE reading terminates immediately, pushing `Error::Cancelled`
 ///   events and closing the channel.
 ///
+/// # Edge Cases
+/// This function is a low-level direct-call entry point and **does not append provider attribution headers** (such as the
+/// `x-opencode-session` header enforced by the opencode gateway)—it must go through the app assembly layer (`zen_app::session::provider_attribution`)
+/// or provide them yourself in `StreamConfig.headers`; for the api key, `StreamConfig.api_key` takes precedence,
+/// Falls back to `Catalog::api_key`.
+///
 /// # Return Value
 ///
 /// `Ok(UnboundedReceiver<AssistantMessageEvent>)` — the receiving end of the async event stream.
@@ -362,16 +375,9 @@ pub async fn stream(
     let cfg = options.unwrap_or_default();
     let cancel = cancel.unwrap_or_default();
 
-    // 1. API Key
-    let api_key = cfg
-        .api_key
-        .clone()
-        .or_else(|| match model.provider.as_str() {
-            // Per-provider env variable (aligned with pi `envApiKeyAuth`)
-            "opencode-go" => get_provider_env_value("OPENCODE_API_KEY", None),
-            _ => get_provider_env_value("ARK_API_KEY", None),
-        })
-        .ok_or(StreamError::NoApiKey)?;
+    // 1. API Key (`cfg.api_key` takes precedence, falling back to `Catalog::embedded().api_key(model)` as a data-driven fallback;
+    //    No longer reads env by provider name—see `api_key_for_request`)
+    let api_key = api_key_for_request(model, &cfg).ok_or(StreamError::NoApiKey)?;
 
     // 2. Build request body
     let body = build_request_body(model, context, &cfg);
@@ -486,14 +492,150 @@ fn thinking_level_to_api_value(level: ThinkingLevel) -> Option<String> {
     }
 }
 
+/// Gets `model.compat` (optional); returns `None` when absent, letting each accessor apply the protocol default.
+fn compat_of(model: &Model) -> Option<&OpenAiCompletionsCompat> {
+    model.compat.as_ref()
+}
+
+/// Called whenever `build_request_body` constructs a request: resolves `model.compat.thinking_format` (users can
+/// change it in models.json) into a thinking-format family, so DeepSeek-family endpoints no longer guess based on the provider name.
+/// Defaults to `ThinkingFormat::OpenAi` (reasoning_effort only; does not send the thinking toggle).
+fn thinking_format_of(model: &Model) -> ThinkingFormat {
+    compat_of(model)
+        .and_then(|compat| compat.thinking_format)
+        .unwrap_or(ThinkingFormat::OpenAi)
+}
+
+/// Called during request construction: determines which field name to use for `max_tokens` (`max_tokens` or `max_completion_tokens`),
+/// Supports standard compatible endpoints and both OpenAI o-series and gpt-5 conventions. Defaults to `MaxTokensField::MaxTokens`.
+fn max_tokens_field_of(model: &Model) -> MaxTokensField {
+    compat_of(model)
+        .and_then(|compat| compat.max_tokens_field)
+        .unwrap_or_default()
+}
+
+/// Called during request construction: determines whether to send `stream_options:{include_usage:true}` (unsupported by endpoints without usage).
+/// Defaults to `true` (preserving zen's existing behavior).
+fn supports_usage_in_streaming(model: &Model) -> bool {
+    compat_of(model)
+        .and_then(|compat| compat.supports_usage_in_streaming)
+        .unwrap_or(true)
+}
+
+/// Request construction call: Determines whether the system prompt uses the `developer` role instead (`model.reasoning` and when the endpoint supports it).
+/// Defaults to `false` (conservatively use `system`, consistent with existing behavior).
+fn supports_developer_role(model: &Model) -> bool {
+    compat_of(model)
+        .and_then(|compat| compat.supports_developer_role)
+        .unwrap_or(false)
+}
+
+/// Request construction call: Determines whether to send `reasoning_effort` (endpoints that do not support this parameter will error if it is sent).
+/// Defaults to `true`.
+fn supports_reasoning_effort(model: &Model) -> bool {
+    compat_of(model)
+        .and_then(|compat| compat.supports_reasoning_effort)
+        .unwrap_or(true)
+}
+
+/// Request construction call: Determines whether to append the DeepSeek-family `thinking:{type}` toggle based on `compat.thinking_format`.
+/// `reasoning_effort` is the converted API string (`None` = disabled). If not `model.reasoning` or not DeepSeek
+/// format → `None` (aligns with the pi deepseek branch, which requires `model.reasoning`).
+fn build_thinking_param(model: &Model, reasoning_effort: Option<&str>) -> Option<ThinkingParam> {
+    if !model.reasoning {
+        return None;
+    }
+    match thinking_format_of(model) {
+        ThinkingFormat::DeepSeek => Some(ThinkingParam {
+            r#type: if reasoning_effort.is_some() {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            },
+        }),
+        ThinkingFormat::OpenAi => None,
+    }
+}
+
+/// Request construction call: Produces the message for the system prompt (`system` or `developer` role),
+/// Determined by `model.reasoning && compat.supports_developer_role`.
+fn system_request_message(model: &Model, prompt: &str) -> RequestMessage {
+    if model.reasoning && supports_developer_role(model) {
+        RequestMessage::Developer {
+            content: prompt.to_string(),
+        }
+    } else {
+        RequestMessage::System {
+            content: prompt.to_string(),
+        }
+    }
+}
+
+/// Converts the internal `ToolChoice` to the OpenAI protocol shape (`"auto"`/`"none"`/`"required"` or
+/// `{"type":"function","function":{"name":...}}`）——`ToolChoice`'s derive serialization is externally tagged
+/// (`"Auto"` / `{"Function":...}`) cannot be sent directly, so they are explicitly converted at the request boundary.
+fn tool_choice_to_request(choice: &ToolChoice) -> serde_json::Value {
+    match choice {
+        ToolChoice::Auto => serde_json::Value::String("auto".to_string()),
+        ToolChoice::None => serde_json::Value::String("none".to_string()),
+        ToolChoice::Required => serde_json::Value::String("required".to_string()),
+        ToolChoice::Function { name } => serde_json::json!({
+            "type": "function",
+            "function": { "name": name },
+        }),
+    }
+}
+
+/// Request header merge call: based on `compat.send_session_affinity_headers` / `session_affinity_format`
+/// Generates session affinity headers. Header-name literals follow pi `buildHeaders` (`openai-completions.ts:551-560`):
+/// When `sessionId && sendSessionAffinityHeaders`, `sessionAffinityFormat == "openrouter"` → only
+/// `x-session-id`; otherwise, `openai` additionally includes `session_id`; both cases include `x-client-request-id`/
+/// `x-session-affinity`. If `session_id` is empty/missing or the switch is disabled → empty map (do not fabricate a session ID).
+fn session_affinity_headers(model: &Model, session_id: Option<&str>) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    let Some(compat) = compat_of(model) else {
+        return headers;
+    };
+    if !compat.send_session_affinity_headers.unwrap_or(false) {
+        return headers;
+    }
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return headers;
+    };
+    match compat.session_affinity_format.unwrap_or_default() {
+        SessionAffinityFormat::Openrouter => {
+            headers.insert("x-session-id".to_string(), session_id.to_string());
+        }
+        SessionAffinityFormat::Openai => {
+            headers.insert("session_id".to_string(), session_id.to_string());
+            headers.insert("x-client-request-id".to_string(), session_id.to_string());
+            headers.insert("x-session-affinity".to_string(), session_id.to_string());
+        }
+        SessionAffinityFormat::OpenaiNosession => {
+            headers.insert("x-client-request-id".to_string(), session_id.to_string());
+            headers.insert("x-session-affinity".to_string(), session_id.to_string());
+        }
+    }
+    headers
+}
+
+/// Called before `stream()` sends the request: resolves the Bearer key for this request—`cfg.api_key` (injected by the app/agent loop, preferred)
+/// Otherwise fall back to `Catalog::embedded().api_key(model)` (transitional shim so `stream_collect` direct calls and compression/
+/// branch-summary paths have no gap). If both are empty → `None`, and the call site reports `StreamError::NoApiKey`.
+/// **Keyless endpoint decision**: the v1 request layer always requires a Bearer key; it does not implement "do not send Authorization when apiKey is absent";
+/// The "keyless endpoint" wording for `Catalog::api_key` only describes its None semantics (see open question 3).
+fn api_key_for_request(model: &Model, cfg: &StreamConfig) -> Option<String> {
+    cfg.api_key
+        .clone()
+        .or_else(|| Catalog::embedded().api_key(model))
+}
+
 fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> Request {
     let mut messages = Vec::new();
 
-    // System prompt as the first message
+    // System prompt as the first message (the `developer`/`system` role is determined by compat and model.reasoning)
     if let Some(ref prompt) = context.system_prompt {
-        messages.push(RequestMessage::System {
-            content: prompt.clone(),
-        });
+        messages.push(system_request_message(model, prompt));
     }
 
     // Convert all messages
@@ -510,7 +652,13 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
         }
     });
 
-    let reasoning_effort = cfg.reasoning_effort.and_then(thinking_level_to_api_value);
+    // reasoning_effort dual gating: model must support reasoning and the endpoint must accept the parameter (aligned with the pi conditional branch).
+    let reasoning_effort = if model.reasoning && supports_reasoning_effort(model) {
+        cfg.reasoning_effort.and_then(thinking_level_to_api_value)
+    } else {
+        None
+    };
+
     // Session affinity cache key: sent whenever `session_id` is present (pi's baseUrl whitelist condition gate
     // `baseUrl.includes("api.openai.com") || cacheRetention=="long"` dropped alongside multi-provider quirks—
     // zen's default endpoint is not openai.com; mechanical copying = never sends = dead code; endpoint's parameter acceptance has been verified on real hardware
@@ -518,50 +666,54 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
     // zero change to the default-path request body.
     let prompt_cache_key =
         crate::api::prompt_cache::clamp_openai_prompt_cache_key(cfg.session_id.as_deref());
-    // Append thinking toggle per provider thinking format family: DeepSeek-family (huoshan)
-    // On → {type:"enabled"}, Off → {type:"disabled"} (avoids "can't turn Off a session that was enabled",
-    // aligns with the pi deepseek branch; openai-format providers like opencode-go don't send it).
-    let thinking = match thinking_format_for_provider(&model.provider) {
-        ThinkingFormat::DeepSeek => Some(ThinkingParam {
-            r#type: if reasoning_effort.is_some() {
-                "enabled".to_string()
-            } else {
-                "disabled".to_string()
-            },
-        }),
-        ThinkingFormat::OpenAi => None,
+
+    // Thinking switch: appended according to compat.thinkingFormat (enabled for DeepSeek models → {type:"enabled"},
+    // Off → {type:"disabled"}; not sent for openai formats such as opencode-go).
+    let thinking = build_thinking_param(model, reasoning_effort.as_deref());
+
+    // The max_tokens field name is determined by compat.maxTokensField (one of two; the other is None).
+    let max_tokens_value = cfg.max_tokens.or(Some(model.max_tokens));
+    let (max_tokens, max_completion_tokens) = match max_tokens_field_of(model) {
+        MaxTokensField::MaxTokens => (max_tokens_value, None),
+        MaxTokensField::MaxCompletionTokens => (None, max_tokens_value),
     };
 
-    let req = Request {
+    // stream_options is gated by compat.supportsUsageInStreaming (defaults to true).
+    let stream_options = if supports_usage_in_streaming(model) {
+        Some(StreamOptionsParam {
+            include_usage: true,
+        })
+    } else {
+        None
+    };
+
+    Request {
         model: model.id.clone(),
         messages,
         tools,
-        tool_choice: cfg.tool_choice.clone(),
-        max_tokens: cfg.max_tokens.or(Some(model.max_tokens)),
+        tool_choice: cfg.tool_choice.as_ref().map(tool_choice_to_request),
+        max_tokens,
+        max_completion_tokens,
         stream: true,
-        stream_options: Some(StreamOptionsParam {
-            include_usage: true,
-        }),
+        stream_options,
         temperature: cfg.temperature,
         top_p: None,
         stop: None,
         reasoning_effort,
         thinking,
         prompt_cache_key,
-    };
-
-    req
+    }
 }
 
-/// Merge the HTTP headers to add to this request: first ask the provider whether it has any to include (provider-owned, such as the opencode session header),
-/// Then overlay the caller's explicit headers—**later values with the same name override** (matching pi `mergeProviderAttributionHeaders`'s object-spread, last-write-wins override
-/// semantics). Why merge into a map first instead of calling `.header()` twice: reqwest `RequestBuilder::header()` uses
-/// `HeaderMap::append`; setting the same header twice sends **multiple values** instead of overriding; after merging into a map, each key is set only once, so override semantics hold.
-/// Returns an empty map = no additional headers.
+/// Merge the HTTP headers to add to this request: start with `model.headers` (static catalog headers), then layer in compat session affinity headers,
+/// Then layer in the caller's explicit headers—**later values with the same name override**. Why merge into a map first instead of calling `.header()` twice:
+/// reqwest `RequestBuilder::header()` uses `HeaderMap::append`; setting the same header twice sends **multiple values** instead of overriding;
+/// After merging into a map, each key is set only once, so override semantics hold. Returning an empty map = no additional headers.
+/// Provider attribution headers (e.g., opencode `x-opencode-session`) are not generated at the request layer, but by the app assembly layer via
+/// `cfg.headers` injection (see `zen-app::session::provider_attribution`).
 fn merge_request_headers(model: &Model, cfg: &StreamConfig) -> HashMap<String, String> {
-    let mut merged = resolve_provider(&model.provider)
-        .and_then(|provider| provider.request_headers(model, cfg.session_id.as_deref()))
-        .unwrap_or_default();
+    let mut merged = model.headers.clone().unwrap_or_default();
+    merged.extend(session_affinity_headers(model, cfg.session_id.as_deref()));
     if let Some(headers) = &cfg.headers {
         for (key, value) in headers {
             merged.insert(key.clone(), value.clone());
@@ -1883,6 +2035,14 @@ mod tests {
         }
     }
 
+    /// Sample model with compat (T-AI-02-10: all request-side behavior is driven by `model.compat`).
+    fn model_with_compat(compat: OpenAiCompletionsCompat) -> Model {
+        Model {
+            compat: Some(compat),
+            ..sample_model()
+        }
+    }
+
     /// Minimal test Tool: `to_api_definition()` uses the default implementation (assembles name/description/parameters).
     #[derive(Debug)]
     struct MockTool {
@@ -1969,7 +2129,7 @@ mod tests {
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         // Request-boundary tool definitions are derived from executable tools' to_api_definition()
         assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "bash");
-        assert_eq!(req.tool_choice, Some(ToolChoice::Auto));
+        assert_eq!(req.tool_choice, Some(serde_json::json!("auto")));
     }
 
     #[test]
@@ -2041,124 +2201,191 @@ mod tests {
         assert_eq!(key, "😀".repeat(64));
     }
 
-    // ── Header merging (opencode-session-header-fix)──
+    // ── Request header merging (model.headers + compat session affinity + cfg.headers)──
 
     #[test]
-    fn test_merge_request_headers_opencode_session() {
+    fn test_merge_request_headers_model_static_then_caller_override() {
         let model = Model {
-            provider: "opencode-go".into(),
+            headers: Some(HashMap::from([
+                ("x-opencode-client".to_string(), "zen".to_string()),
+                ("X-Same".to_string(), "model".to_string()),
+            ])),
             ..sample_model()
         };
         let cfg = StreamConfig {
-            session_id: Some("s-1".into()),
-            ..Default::default()
-        };
-        let merged = merge_request_headers(&model, &cfg);
-        assert_eq!(merged.len(), 2, "session header plus client identifier header");
-        assert_eq!(
-            merged.get("x-opencode-session").map(String::as_str),
-            Some("s-1")
-        );
-        assert_eq!(
-            merged.get("x-opencode-client").map(String::as_str),
-            Some("zen")
-        );
-    }
-
-    #[test]
-    fn test_merge_request_headers_caller_overrides_provider_same_key() {
-        let model = Model {
-            provider: "opencode-go".into(),
-            ..sample_model()
-        };
-        let cfg = StreamConfig {
-            session_id: Some("s-1".into()),
             headers: Some(HashMap::from([(
-                "x-opencode-session".to_string(),
+                "X-Same".to_string(),
                 "caller".to_string(),
             )])),
             ..Default::default()
         };
         let merged = merge_request_headers(&model, &cfg);
-        // Same-name overrides become a single value (not appended as dual values) — this is the reason this helper exists
         assert_eq!(merged.len(), 2);
-        assert_eq!(
-            merged.get("x-opencode-session").map(String::as_str),
-            Some("caller")
-        );
-    }
-
-    #[test]
-    fn test_merge_request_headers_opencode_without_session_keeps_client_header() {
-        let model = Model {
-            provider: "opencode-go".into(),
-            ..sample_model()
-        };
-        let merged = merge_request_headers(&model, &StreamConfig::default());
-        // No session context (compression/branch summary) → do not fabricate session headers; static client identification headers from the catalog are still sent.
-        assert_eq!(merged.len(), 1);
         assert_eq!(
             merged.get("x-opencode-client").map(String::as_str),
             Some("zen")
         );
-        assert!(!merged.contains_key("x-opencode-session"));
+        // Same-name overrides become a single value (not appended as dual values) — this is the reason this helper exists
+        assert_eq!(merged.get("X-Same").map(String::as_str), Some("caller"));
     }
 
     #[test]
-    fn test_merge_request_headers_unknown_provider_keeps_caller_headers() {
-        // sample_model.provider = "deepseek" → resolve_provider returns None → no provider header
-        let cfg = StreamConfig {
-            headers: Some(HashMap::from([("X-Test".to_string(), "1".to_string())])),
-            ..Default::default()
-        };
-        let merged = merge_request_headers(&sample_model(), &cfg);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged.get("X-Test").map(String::as_str), Some("1"));
+    fn test_merge_request_headers_no_sources_is_empty() {
         assert!(merge_request_headers(&sample_model(), &StreamConfig::default()).is_empty());
     }
 
-    // ── thinking toggle (T-thinking-invisible-fix defect B: appended per provider format family) ──
+    #[test]
+    fn test_merge_request_headers_session_affinity_openai() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            session_affinity_format: Some(SessionAffinityFormat::Openai),
+            ..Default::default()
+        });
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            ..Default::default()
+        };
+        let merged = merge_request_headers(&model, &cfg);
+        assert_eq!(merged.get("session_id").map(String::as_str), Some("s-1"));
+        assert_eq!(
+            merged.get("x-client-request-id").map(String::as_str),
+            Some("s-1")
+        );
+        assert_eq!(
+            merged.get("x-session-affinity").map(String::as_str),
+            Some("s-1")
+        );
+        assert_eq!(merged.len(), 3);
+    }
 
     #[test]
-    fn test_build_request_body_thinking_medium_huoshan() {
-        // huoshan (DeepSeek format) Medium → thinking:{type:"enabled"} + reasoning_effort:"medium"
-        let model = Model {
-            provider: "huoshan".into(),
-            ..sample_model()
+    fn test_merge_request_headers_session_affinity_openai_nosession() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            session_affinity_format: Some(SessionAffinityFormat::OpenaiNosession),
+            ..Default::default()
+        });
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            ..Default::default()
         };
-        let ctx = sample_context();
+        let merged = merge_request_headers(&model, &cfg);
+        assert!(
+            !merged.contains_key("session_id"),
+            "nosession does not send session_id"
+        );
+        assert_eq!(
+            merged.get("x-client-request-id").map(String::as_str),
+            Some("s-1")
+        );
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_request_headers_session_affinity_openrouter() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            session_affinity_format: Some(SessionAffinityFormat::Openrouter),
+            ..Default::default()
+        });
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            ..Default::default()
+        };
+        let merged = merge_request_headers(&model, &cfg);
+        assert_eq!(merged.get("x-session-id").map(String::as_str), Some("s-1"));
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_request_headers_session_affinity_disabled_by_default() {
+        // sendSessionAffinityHeaders not enabled in compat → do not send any affinity headers
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            ..Default::default()
+        };
+        assert!(merge_request_headers(&sample_model(), &cfg).is_empty());
+    }
+
+    #[test]
+    fn test_merge_request_headers_session_affinity_empty_session_skipped() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            ..Default::default()
+        });
+        for session in [None, Some("")] {
+            let cfg = StreamConfig {
+                session_id: session.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(
+                merge_request_headers(&model, &cfg).is_empty(),
+                "Empty/missing session must not fabricate affinity header"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_request_headers_caller_overrides_affinity_same_key() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            send_session_affinity_headers: Some(true),
+            session_affinity_format: Some(SessionAffinityFormat::Openai),
+            ..Default::default()
+        });
+        let cfg = StreamConfig {
+            session_id: Some("s-1".into()),
+            headers: Some(HashMap::from([(
+                "x-session-affinity".to_string(),
+                "caller".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let merged = merge_request_headers(&model, &cfg);
+        assert_eq!(
+            merged.get("x-session-affinity").map(String::as_str),
+            Some("caller"),
+            "Caller explicit header overrides compat affinity header (single value)"
+        );
+        assert_eq!(merged.len(), 3);
+    }
+
+    // ── thinking toggle (T-AI-02-10: appended according to `model.compat.thinking_format`; no longer based on the provider name)──
+
+    #[test]
+    fn test_build_request_body_thinking_medium_deepseek() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            thinking_format: Some(ThinkingFormat::DeepSeek),
+            ..Default::default()
+        });
         let cfg = StreamConfig {
             reasoning_effort: Some(ThinkingLevel::Medium),
             ..Default::default()
         };
-        let req = build_request_body(&model, &ctx, &cfg);
+        let req = build_request_body(&model, &sample_context(), &cfg);
         assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
         let t = req
             .thinking
             .as_ref()
-            .expect("huoshan Medium should include the thinking switch");
+            .expect("DeepSeek Medium should include thinking switch");
         assert_eq!(t.r#type, "enabled");
-        // Serialized form: {"thinking":{"type":"enabled"},"reasoning_effort":"medium"}
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["thinking"]["type"], "enabled");
         assert_eq!(json["reasoning_effort"], "medium");
     }
 
     #[test]
-    fn test_build_request_body_thinking_off_huoshan() {
-        // huoshan Off → thinking:{type:"disabled"}, don't send reasoning_effort
-        // (avoids "sessions that had thinking enabled can't be turned off after switching to Off", aligns with pi deepseek branch thinkingLevelMap.off)
-        let model = Model {
-            provider: "huoshan".into(),
-            ..sample_model()
-        };
-        let ctx = sample_context();
-        let req = build_request_body(&model, &ctx, &StreamConfig::default());
+    fn test_build_request_body_thinking_off_deepseek() {
+        // Off → thinking:{type:"disabled"}, do not send reasoning_effort
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            thinking_format: Some(ThinkingFormat::DeepSeek),
+            ..Default::default()
+        });
+        let req = build_request_body(&model, &sample_context(), &StreamConfig::default());
         assert!(req.reasoning_effort.is_none());
         let t = req
             .thinking
             .as_ref()
-            .expect("huoshan Off should include the thinking switch");
+            .expect("DeepSeek Off should include thinking switch");
         assert_eq!(t.r#type, "disabled");
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["thinking"]["type"], "disabled");
@@ -2166,23 +2393,220 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_body_thinking_opencode_go_no_switch() {
-        // opencode-go (OpenAI format) Medium → reasoning_effort only, don't send the thinking toggle (aligns with pi)
-        let model = Model {
-            provider: "opencode-go".into(),
-            ..sample_model()
-        };
-        let ctx = sample_context();
+    fn test_build_request_body_thinking_openai_no_switch() {
+        // openai format (also a default) → reasoning_effort only; do not send the thinking toggle
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            thinking_format: Some(ThinkingFormat::OpenAi),
+            ..Default::default()
+        });
         let cfg = StreamConfig {
             reasoning_effort: Some(ThinkingLevel::Medium),
             ..Default::default()
         };
-        let req = build_request_body(&model, &ctx, &cfg);
+        let req = build_request_body(&model, &sample_context(), &cfg);
         assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
-        assert!(req.thinking.is_none(), "opencode-go does not send the thinking switch");
+        assert!(req.thinking.is_none(), "openai format does not send thinking switch");
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("thinking").is_none());
         assert_eq!(json["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_deepseek_non_reasoning_no_switch() {
+        // model.reasoning=false → do not send thinking even for the DeepSeek format (the pi branch requires model.reasoning)
+        let model = Model {
+            reasoning: false,
+            ..model_with_compat(OpenAiCompletionsCompat {
+                thinking_format: Some(ThinkingFormat::DeepSeek),
+                ..Default::default()
+            })
+        };
+        let req = build_request_body(&model, &sample_context(), &StreamConfig::default());
+        assert!(req.thinking.is_none());
+    }
+
+    // ── compat request handling (T-AI-02-10)──
+
+    #[test]
+    fn test_max_tokens_field_default_is_max_tokens() {
+        let req = build_request_body(&sample_model(), &sample_context(), &StreamConfig::default());
+        assert_eq!(req.max_tokens, Some(8192));
+        assert!(req.max_completion_tokens.is_none());
+    }
+
+    #[test]
+    fn test_max_tokens_field_max_completion_tokens() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
+            ..Default::default()
+        });
+        let req = build_request_body(&model, &sample_context(), &StreamConfig::default());
+        assert!(req.max_tokens.is_none());
+        assert_eq!(req.max_completion_tokens, Some(8192));
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("max_tokens").is_none());
+        assert_eq!(json["max_completion_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_stream_options_disabled_when_supports_usage_false() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            supports_usage_in_streaming: Some(false),
+            ..Default::default()
+        });
+        let req = build_request_body(&model, &sample_context(), &StreamConfig::default());
+        assert!(req.stream_options.is_none());
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_stream_options_default_enabled() {
+        let req = build_request_body(&sample_model(), &sample_context(), &StreamConfig::default());
+        assert!(req.stream_options.is_some());
+    }
+
+    #[test]
+    fn test_developer_role_when_reasoning_and_supported() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            supports_developer_role: Some(true),
+            ..Default::default()
+        });
+        let req = build_request_body(&model, &sample_context(), &StreamConfig::default());
+        assert!(matches!(req.messages[0], RequestMessage::Developer { .. }));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_system_role_by_default() {
+        let req = build_request_body(&sample_model(), &sample_context(), &StreamConfig::default());
+        assert!(matches!(req.messages[0], RequestMessage::System { .. }));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_developer_role_not_used_when_reasoning_false() {
+        let model = Model {
+            reasoning: false,
+            ..model_with_compat(OpenAiCompletionsCompat {
+                supports_developer_role: Some(true),
+                ..Default::default()
+            })
+        };
+        let req = build_request_body(&model, &sample_context(), &StreamConfig::default());
+        assert!(matches!(req.messages[0], RequestMessage::System { .. }));
+    }
+
+    #[test]
+    fn test_reasoning_effort_suppressed_when_unsupported() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            supports_reasoning_effort: Some(false),
+            ..Default::default()
+        });
+        let cfg = StreamConfig {
+            reasoning_effort: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let req = build_request_body(&model, &sample_context(), &cfg);
+        assert!(req.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_effort_suppressed_when_model_not_reasoning() {
+        let model = Model {
+            reasoning: false,
+            ..sample_model()
+        };
+        let cfg = StreamConfig {
+            reasoning_effort: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let req = build_request_body(&model, &sample_context(), &cfg);
+        assert!(req.reasoning_effort.is_none());
+    }
+
+    // ── api_key_for_request (prefers cfg.api_key, falls back to Catalog)──
+
+    #[test]
+    fn test_api_key_prefers_config() {
+        let cfg = StreamConfig {
+            api_key: Some("cfg-key".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            api_key_for_request(&sample_model(), &cfg).as_deref(),
+            Some("cfg-key")
+        );
+    }
+
+    #[test]
+    fn test_api_key_none_when_no_config_and_unknown_provider() {
+        // sample_model.provider = "deepseek" is not in the built-in catalog → Catalog::api_key returns None
+        assert!(api_key_for_request(&sample_model(), &StreamConfig::default()).is_none());
+    }
+
+    // ── serialization lock (prevents camelCase regression)──
+
+    #[test]
+    fn test_request_body_serialization_uses_snake_case_keys() {
+        let model = model_with_compat(OpenAiCompletionsCompat {
+            max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
+            ..Default::default()
+        });
+        let cfg = StreamConfig {
+            tool_choice: Some(ToolChoice::Auto),
+            session_id: Some("s".into()),
+            reasoning_effort: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let req = build_request_body(&model, &sample_context(), &cfg);
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        for key in [
+            "max_completion_tokens",
+            "tool_choice",
+            "stream_options",
+            "prompt_cache_key",
+            "reasoning_effort",
+        ] {
+            assert!(obj.contains_key(key), "Should contain snake_case key {key}");
+        }
+        assert_eq!(json["stream_options"]["include_usage"], true);
+        for bad in [
+            "maxTokens",
+            "maxCompletionTokens",
+            "toolChoice",
+            "streamOptions",
+            "includeUsage",
+            "promptCacheKey",
+            "reasoningEffort",
+        ] {
+            assert!(!obj.contains_key(bad), "Must not contain camelCase key {bad}");
+        }
+    }
+
+    #[test]
+    fn test_tool_choice_serializes_openai_shape() {
+        assert_eq!(
+            tool_choice_to_request(&ToolChoice::Auto),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            tool_choice_to_request(&ToolChoice::None),
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            tool_choice_to_request(&ToolChoice::Required),
+            serde_json::json!("required")
+        );
+        assert_eq!(
+            tool_choice_to_request(&ToolChoice::Function {
+                name: "read".into()
+            }),
+            serde_json::json!({"type": "function", "function": {"name": "read"}})
+        );
     }
 
     // ═════════════════════════════════════════════════════════════

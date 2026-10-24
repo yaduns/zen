@@ -2,6 +2,7 @@ pub mod agent_session;
 pub mod compaction;
 pub mod jsonl;
 pub mod navigation;
+mod provider_attribution;
 pub mod runtime;
 pub mod services;
 mod session_cwd;

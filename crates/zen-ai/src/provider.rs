@@ -92,7 +92,8 @@ pub enum SessionAffinityFormat {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiCompletionsCompat {
-    /// Thinking toggle format family; defaults to [`ThinkingFormat::OpenAi`].
+    /// Thinking toggle format family; defaults to [`ThinkingFormat::OpenAi`] (since T-AI-02-10 the request layer reads this field,
+    /// no longer inferred from the provider name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_format: Option<ThinkingFormat>,
     /// `max_tokens` field name; defaults to [`MaxTokensField::MaxTokens`].
@@ -115,17 +116,6 @@ pub struct OpenAiCompletionsCompat {
     pub session_affinity_format: Option<SessionAffinityFormat>,
 }
 
-/// Called by `build_request_body` before each turn in interactive mode: resolves the thinking-toggle format family based on the provider name,
-/// Determines whether to append the `thinking:{type:...}` parameter to the request body (DeepSeek-family endpoints require an explicit toggle to enable/disable thinking).
-/// Unknown providers always fall back to `OpenAi` (reasoning_effort only, matching pi detectCompat's default branch,
-/// opencode-completions.ts:1304——opencode-go classifies a baseUrl starting with opencode.ai as openai format).
-pub fn thinking_format_for_provider(provider_name: &str) -> ThinkingFormat {
-    match provider_name {
-        "huoshan" => ThinkingFormat::DeepSeek,
-        _ => ThinkingFormat::OpenAi,
-    }
-}
-
 /// Multi-provider extension interface. Aligns with pi's `Provider<TApi>` (models.ts:67).
 ///
 /// Association with `Model`: `Provider::id()` string-equals `Model.provider` (`String`)
@@ -141,7 +131,7 @@ pub trait Provider: Send + Sync {
     /// API endpoint base URL (without the /chat/completions path). Returns an owned `String`
     /// (catalog value; before T-AI-02-11, `Model::from_*` still applies the `*_BASE_URL` env shim).
     fn base_url(&self) -> String;
-    /// Parse API key (the `apiKey` config value recorded in the catalog; before T-AI-02-10 the request layer still uses env match).
+    /// Parses the API key (the `apiKey` config value stored in the catalog; consumed by the request layer via `Catalog::api_key`).
     fn resolve_api_key(&self) -> Option<String>;
 
     /// HTTP headers this provider requires to be attached to **every request** (provider-owned: the request-building layer only merges them).
@@ -292,34 +282,6 @@ mod tests {
         // Default when ZEN_PROVIDER is unset (test processes usually don't set it; if CI sets it, use that value to override the assertion)
         let name = default_provider_name();
         assert!(!name.is_empty());
-    }
-
-    // ── thinking_format_for_provider ──
-
-    #[test]
-    fn test_thinking_format_huoshan_is_deepseek() {
-        // Volcano Engine Ark DeepSeek-family endpoints require an explicit thinking:{type} toggle
-        assert_eq!(
-            thinking_format_for_provider("huoshan"),
-            ThinkingFormat::DeepSeek
-        );
-    }
-
-    #[test]
-    fn test_thinking_format_opencode_go_is_openai() {
-        // opencode-go matches pi detectCompat: openai format, reasoning_effort only
-        assert_eq!(
-            thinking_format_for_provider("opencode-go"),
-            ThinkingFormat::OpenAi
-        );
-    }
-
-    #[test]
-    fn test_thinking_format_unknown_falls_back_openai() {
-        assert_eq!(
-            thinking_format_for_provider("nonexistent"),
-            ThinkingFormat::OpenAi
-        );
     }
 
     // ── request_headers (opencode session header, opencode-session-header-fix) ──

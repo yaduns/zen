@@ -289,9 +289,11 @@ impl Catalog {
     }
 
     /// Resolve the API key for a model's provider (`apiKey` config value: literal / `$ENV` / `${ENV}`).
-    /// Return `None` when there is no `apiKey` or env is missing (keyless endpoint).
+    /// Returns `None` if `apiKey` is absent or env is missing.
     ///
-    /// **Currently no consumers**: reserved for the T-AI-02-10 request layer (removing the api key `match`).
+    /// **No consumers?** Consumer: request-layer api-key fallback (`openai_stream::api_key_for_request`).
+    /// Note: the request layer always requires a Bearer key; `None` is treated as `StreamError::NoApiKey`; v1 does not support
+    /// keyless endpoints (custom providers must configure `apiKey`), see open question 3 in `tasks/T-AI-02-10-implemented.md`.
     pub fn api_key(&self, model: &Model) -> Option<String> {
         let config = self.providers.get(&model.provider)?;
         let raw = config.api_key.as_deref()?;

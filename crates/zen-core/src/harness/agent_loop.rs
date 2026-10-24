@@ -161,6 +161,20 @@ pub async fn run_agent_loop_continue(
     Ok(new_messages)
 }
 
+/// Called by `stream_assistant_response` before each LLM call: determines the Bearer key for this request,
+/// making `hooks.get_api_key` actually take effect (its result was previously discarded).
+///
+/// Priority: `config.api_key` (explicit static injection by the caller; no production code writes it currently, tests only)
+/// → `hooks.get_api_key(provider)` (the real app-layer implementation is tracked under T-AI-02-11) → `None`.
+/// The request layer has another transitional fallback to `Catalog::embedded().api_key(model)` (see `openai_stream::api_key_for_request`),
+/// Not repeated here.
+async fn resolve_api_key(config: &AgentLoopConfig, hooks: &dyn AgentLoopHooks) -> Option<String> {
+    match config.api_key.clone() {
+        Some(key) => Some(key),
+        None => hooks.get_api_key(&config.model.provider).await,
+    }
+}
+
 /// Stream the LLM's assistant response.
 ///
 /// Calls `stream_fn` to obtain an `AssistantMessageEventStream`, processes all events (start/delta/end),
@@ -199,16 +213,15 @@ pub(crate) async fn stream_assistant_response(
         tools: context.tools.clone(),
     };
 
-    // 3. Resolve API key via hooks (for side effects / logging; StreamConfig is opaque)
-    if config.api_key.is_none() {
-        hooks.get_api_key(&config.model.provider).await;
-    }
+    // 3. Resolve API key via hooks → write into StreamConfig (result previously discarded, T-AI-02-10 wiring)
+    let api_key = resolve_api_key(config, hooks).await;
 
     // 4. Call stream_fn
     let stream_config = StreamConfig {
-        reasoning_effort: config.reasoning, // ← from AgentLoopConfig (new field added by fix item 3)
+        api_key,                               // ← T-AI-02-10: Bearer key injected via hooks/static injection
+        reasoning_effort: config.reasoning,    // ← from AgentLoopConfig (new field added by fix item 3)
         session_id: config.session_id.clone(), // ← T-AI-02-6: session affinity cache key → request body prompt_cache_key
-        ..Default::default()                   // ← the remaining 6 fields keep defaults
+        ..Default::default()                   // ← remaining fields stay default
     };
     let mut receiver = match stream_fn(
         &config.model,
@@ -832,6 +845,67 @@ mod tests {
     fn test_should_terminate_tool_batch_single_false() {
         let calls = vec![make_outcome(false)];
         assert!(!should_terminate_tool_batch(&calls));
+    }
+
+    // ── resolve_api_key（T-AI-02-10）──
+
+    struct ApiKeyHooks(Option<String>);
+
+    #[async_trait::async_trait]
+    impl AgentLoopHooks for ApiKeyHooks {
+        async fn get_api_key(&self, _provider: &str) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    fn api_key_config() -> AgentLoopConfig {
+        AgentLoopConfig {
+            model: zen_ai::types::Model {
+                id: "test".into(),
+                name: None,
+                provider: "test".into(),
+                api: zen_ai::provider::Api::OpenAiCompletions,
+                base_url: "https://api.test.com".into(),
+                context_window: 1000,
+                max_tokens: 100,
+                reasoning: false,
+                headers: None,
+                cost_rates: None,
+                compat: None,
+            },
+            api_key: None,
+            tool_execution: ToolExecutionMode::Sequential,
+            reasoning: None,
+            session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_api_key_prefers_static_config() {
+        let mut config = api_key_config();
+        config.api_key = Some("cfg-key".into());
+        let hooks = ApiKeyHooks(Some("hook-key".into()));
+        assert_eq!(
+            resolve_api_key(&config, &hooks).await.as_deref(),
+            Some("cfg-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_api_key_falls_back_to_hooks() {
+        let config = api_key_config();
+        let hooks = ApiKeyHooks(Some("hook-key".into()));
+        assert_eq!(
+            resolve_api_key(&config, &hooks).await.as_deref(),
+            Some("hook-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_api_key_none_when_both_absent() {
+        let config = api_key_config();
+        let hooks = ApiKeyHooks(None);
+        assert!(resolve_api_key(&config, &hooks).await.is_none());
     }
 
     // The following functions depend on external state (StreamFn, AgentLoopHooks trait, Tool trait, CancellationToken, etc.),
