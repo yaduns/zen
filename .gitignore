@@ -2,3 +2,5 @@ target/
 reference/
 .DS_Store
 *.bak
+__pycache__/
+*.pyc
