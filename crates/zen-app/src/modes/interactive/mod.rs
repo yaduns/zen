@@ -85,7 +85,8 @@ pub struct InteractiveModeOptions {
 /// produced by (status/footer/queue updates), applied to the data snapshot on the UI side by `InteractiveUi::apply`.
 /// Sent within the synchronous callback via `UnboundedSender`; **must not be lost** (unbounded means no blocking when full).
 /// Cloned for enqueueing in the UI task's on_wake (`Arc<Mutex<VecDeque<UiEvent>>>`).
-#[allow(clippy::large_enum_variant)] // The Message snapshot variant is fairly large, which is acceptable internally to the channel design
+#[allow(clippy::large_enum_variant)]
+// The Message snapshot variant is fairly large, which is acceptable internally to the channel design
 #[derive(Debug, Clone)]
 pub(crate) enum UiEvent {
     /// Status line (Working/Retry/Compaction/BranchSummary/Error/Warning; idle = None + ClearStatus).
@@ -140,7 +141,8 @@ pub(crate) enum UiEvent {
     CompactionSummary { summary: String, tokens_before: u64 },
     /// Per-frame footer data snapshot (assembled by the main task from AgentSession state).
     Footer(FooterData),
-    #[allow(dead_code)] // v1 seam: bash session-state switch (sent explicitly by the main task once T-AP-04-2 lands);
+    #[allow(dead_code)]
+    // v1 seam: bash session-state switch (sent explicitly by the main task once T-AP-04-2 lands);
     // the editor body `!` prefix already drives the border color locally via on_change
     BashMode(bool),
     /// Continuous animation toggle (true during the streaming loader → constant 16ms repaints; the render layer, via
@@ -223,7 +225,8 @@ pub(crate) enum StatusSpec {
     /// Busy status line (spinner + message, message is updatable).
     Working { message: String },
     /// Request retry countdown (`StatusIndicator::retry` argument).
-    #[allow(dead_code)] // v1 has no retry orchestration (StreamFn-level retry deferred to T-AP-04-2)
+    #[allow(dead_code)]
+    // v1 has no retry orchestration (StreamFn-level retry deferred to T-AP-04-2)
     Retry {
         attempt: u32,
         max_attempts: u32,

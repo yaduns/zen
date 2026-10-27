@@ -13,9 +13,9 @@ use zen_core::session::tree::{SessionContext, SessionTree, SessionTreeEntry, Ses
 
 /// Session lifecycle manager
 pub struct SessionManager {
-    cwd: String,                // Immutable: unchanged after construction; source of the &str for session_store::cwd()
-    sessions_root: PathBuf,     // Immutable: default get_sessions_dir()
-    persist: bool,              // Immutable: in_memory=false
+    cwd: String, // Immutable: unchanged after construction; source of the &str for session_store::cwd()
+    sessions_root: PathBuf, // Immutable: default get_sessions_dir()
+    persist: bool, // Immutable: in_memory=false
     inner: Mutex<SessionInner>, // Mutable: all state that may change
 }
 

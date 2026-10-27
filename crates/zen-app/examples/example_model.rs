@@ -1,5 +1,5 @@
 //! Flag example: `--model` — override model id (change id based on the default model).
-//! Run: `cargo run -p zen-app --example example_model -- my-model "hello"`
+//! Run: `cargo run -p zen-app --example example_model -- my-model "Hello"`
 
 #[path = "_support/common.rs"]
 mod common;

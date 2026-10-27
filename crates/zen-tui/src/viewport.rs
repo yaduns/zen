@@ -439,12 +439,12 @@ mod tests {
         assert_eq!(c.lines[0].len(), 1);
         assert_eq!(c.lines[0][0].text, "abcd");
 
-        // Wide chars: ab(2) + CJK char(2) = 4 exactly fills
+        // Wide chars: ab(2) + one CJK char(2) = 4 exactly fills
         let mut c2 = ScrollbackCanvas::new(4, 10);
         c2.push_line(vec![plain("ab中")]);
         assert_eq!(c2.lines[0][0].text, "ab中");
 
-        // 3 columns can't fit a wide char: don't split it in half, drop it entirely
+        // 3 columns can't fit a 2-column CJK char: don't split it in half, drop it entirely
         let mut c3 = ScrollbackCanvas::new(3, 10);
         c3.push_line(vec![plain("ab中")]);
         assert_eq!(c3.lines[0][0].text, "ab");

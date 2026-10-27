@@ -1,5 +1,5 @@
 //! Flag example: `--append-system-prompt` — append text to the end of the system prompt.
-//! Run: `cargo run -p zen-app --example example_append_system_prompt -- "Always answer in Chinese." "hello"`
+//! Run: `cargo run -p zen-app --example example_append_system_prompt -- "Always answer in Chinese." "Hello"`
 
 #[path = "_support/common.rs"]
 mod common;

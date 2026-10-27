@@ -98,7 +98,7 @@ pub struct InteractiveUi {
     bash_index: Option<usize>, // Current streaming user bash row index (T-AP-04-2-fix: located via BashUpdate/BashEnd)
     tool_indices: HashMap<String, usize>, // tool_call_id → chat line index
     footer_data: Option<FooterData>, // Per-frame state snapshot (the footer is supplied by the main task each frame via UiEvent::Footer)
-    status: Option<StatusSpec>, // Per-frame state snapshot
+    status: Option<StatusSpec>,      // Per-frame state snapshot
     // Persistent status line instance: reused across frames to preserve the Loader animation clock (Working→Working only updates the message, no rebuild).
     // Lifecycle maintained by apply (apply_status / ClearStatus / ThemeChanged); the render side only draws, never constructs —
     // fixes the animation defect where per-frame transient construction → started_at re-anchored every frame → spinner stuck on the first frame.
@@ -106,7 +106,7 @@ pub struct InteractiveUi {
     folded: HashSet<usize>, // Collapsed row set (tree/branch/compaction/skill collapse; ToolsExpand flips locally)
     is_bash_mode: bool,     // Editor border indicator (! prefix)
     hide_thinking_block: bool, // Thinking collapse for assistant-row rendering (initial value injected from settings, T-AP-02-3-fix)
-    output_pad: u16,           // Left padding for message output (initial value injected from settings, T-AP-02-3-fix)
+    output_pad: u16, // Left padding for message output (initial value injected from settings, T-AP-02-3-fix)
     route: Rc<RefCell<EditorRoute>>, // Editor callbacks → routing slot for handle_key (see EditorRoute)
     /// Settings manager (T-AP-02-3-fix): shared on the panel persistence callback side (callable synchronously from update_global);
     /// Injected during main-task init (None when agent_dir is unavailable, panel unusable).

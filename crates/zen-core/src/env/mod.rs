@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_trailing_partial_len_truncated_multibyte() {
-        // CJK char = E4 B8 AD; only E4 B8 given (missing AD) → carry 2 bytes
+        // One CJK char = E4 B8 AD; only E4 B8 given (missing AD) → carry 2 bytes
         assert_eq!(trailing_partial_len(&[0xE4, 0xB8]), 2);
         // Only E4 given → carry 1 byte
         assert_eq!(trailing_partial_len(&[0xE4]), 1);
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_stream_decoder_multibyte_spanning_chunks() {
-        // Split CJK char (E4 B8 AD) into [E4 B8] + [AD]; cross-chunk joined decoding must not produce U+FFFD
+        // Split a 3-byte CJK char (E4 B8 AD) into [E4 B8] + [AD]; cross-chunk joined decoding must not produce U+FFFD
         let mut d = StreamDecoder::new();
         assert_eq!(d.feed(&[0xE4, 0xB8]), ""); // Incomplete → this chunk emits no text
         assert_eq!(d.feed(&[0xAD]), "中");

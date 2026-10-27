@@ -9,10 +9,10 @@ use unicode_segmentation::UnicodeSegmentation;
 /// In handle_key, a no-op falls through. esc/cancel semantics = Esc/Ctrl+C triggers on_escape
 pub struct Input {
     value: String,                           // Input content
-    cursor: usize,                           // Cursor byte offset, always at a grapheme boundary (insert/delete advances by grapheme)
-    focused: bool,                           // Reverse-video cursor + allow hardware cursor positioning
+    cursor: usize, // Cursor byte offset, always at a grapheme boundary (insert/delete advances by grapheme)
+    focused: bool, // Reverse-video cursor + allow hardware cursor positioning
     on_submit: Option<Box<dyn FnMut(&str)>>, // Enter submits (current value as argument)
-    on_escape: Option<Box<dyn FnMut()>>,     // Esc/Ctrl+C cancels
+    on_escape: Option<Box<dyn FnMut()>>, // Esc/Ctrl+C cancels
     scroll_start_col: usize, // Horizontal scroll window start column (value-column units, excluding the prompt; recorded by render)
 }
 
@@ -296,7 +296,7 @@ mod tests {
         i.set_value("abc");
         assert_eq!(i.value, "abc");
         assert_eq!(i.cursor, 3);
-        // Byte count: each CJK character in the sample is 3 bytes
+        // Byte count: each CJK character is 3 bytes
         i.set_value("你好");
         assert_eq!(i.cursor, 6);
         assert_eq!(i.get_value(), "你好");
@@ -344,7 +344,7 @@ mod tests {
         let mut i = Input::new();
         i.set_value("你a好"); // Bytes 3+1+3 = 7
         assert_eq!(i.cursor, 7);
-        // Move left by grapheme cluster: 'B' → 'a' → 'A' → 0
+        // Move left by grapheme cluster: last CJK char → a → first CJK char → 0
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Left)));
         assert_eq!(i.cursor, 4);
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Left)));

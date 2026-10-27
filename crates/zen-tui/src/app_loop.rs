@@ -14,12 +14,12 @@ use tokio_util::sync::CancellationToken;
 pub struct TuiLoop {
     terminal: Terminal,                 // Output sink; start/stop enter/exit raw mode
     buffer: ScreenBuffer,               // Current frame buffer; resize/flush inside run
-    render_requested: bool,             // Render merge flag: set by request_render(), reset after being consumed by tick
+    render_requested: bool, // Render merge flag: set by request_render(), reset after being consumed by tick
     animation_enabled: bool, // Timed refresh mode: when set, tick continuously repaints (loader animation) — no event driving needed
     last_render_at: std::time::Instant, // Last render timestamp, for coalescing/throttling reference (mainly for debugging/stats when tick interval is fixed)
     min_render_interval: std::time::Duration, // Minimum render interval, default 16ms; the tick interval takes this value
-    started: bool,                      // Set after start(); used for precondition checks before run()
-    stopped: bool,                      // Lifecycle termination flag
+    started: bool, // Set after start(); used for precondition checks before run()
+    stopped: bool, // Lifecycle termination flag
     wake_stream: Option<Pin<Box<dyn futures::Stream<Item = WakeOutcome> + Send>>>, // /// Fourth external wake path (T-AP-11-1 patch): the "message → WakeOutcome" stream registered at assembly; None if unregistered. Items are already erased to `WakeOutcome`, so TuiLoop needs no generics.
 }
 

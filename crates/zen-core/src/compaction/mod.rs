@@ -26,8 +26,8 @@ use zen_ai::utils::retry::RetryPolicy;
 /// Configuration container for compaction thresholds and retention policies, shared by should_compact/find_cut_point/compact
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionSettings {
-    pub enabled: bool,           // When false, should_compact always returns false (automatic compaction switch)
-    pub reserve_tokens: u64,     // Tokens reserved for the summary prompt and output; u64 matches Model.max_tokens
+    pub enabled: bool, // When false, should_compact always returns false (automatic compaction switch)
+    pub reserve_tokens: u64, // Tokens reserved for the summary prompt and output; u64 matches Model.max_tokens
     pub keep_recent_tokens: u64, // Approximate token budget for recent context retained after compaction
 }
 
@@ -76,10 +76,10 @@ pub struct CompactionDetails {
 /// derive(Clone, Serialize): travels with the enum as the AgentEvent::CompactionEnd payload (T-AP-04-3 event surface).
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactionResult {
-    pub summary: String,             // Summary text (including the file operation addendum)
+    pub summary: String, // Summary text (including the file operation addendum)
     pub first_kept_entry_id: String, // Retained history start entry id (optional for pi = transitional artifact, required for zen)
     pub tokens_before: u64,          // Estimated context token count before compaction
-    pub usage: Option<Usage>,        // Summary LLM call usage (two combine operations for split-turn)
+    pub usage: Option<Usage>, // Summary LLM call usage (two combine operations for split-turn)
     pub retained_tail: Vec<Message>, // Retained tail messages stored directly in the entry (empty = none)
     pub details: CompactionDetails,  // File operation list
 }
@@ -91,19 +91,19 @@ pub struct CompactionPreparation {
     turn_prefix_messages: Vec<Message>, // Turn-prefix messages summarized separately for split-turn (empty otherwise)
     retained_tail: Vec<Message>,        // Retained tail messages
     is_split_turn: bool,                // Whether the cut point splits an in-progress turn
-    tokens_before: u64,                 // Estimated token count before compaction (read via the estimate_messages accessor)
-    previous_summary: Option<String>,   // Previous compaction summary (for iterative updates)
-    file_ops: FileOperations,           // File operations accumulated since the previous compaction boundary
-    settings: CompactionSettings,       // Settings used in this run
+    tokens_before: u64, // Estimated token count before compaction (read via the estimate_messages accessor)
+    previous_summary: Option<String>, // Previous compaction summary (for iterative updates)
+    file_ops: FileOperations, // File operations accumulated since the previous compaction boundary
+    settings: CompactionSettings, // Settings used in this run
 }
 
 /// Output of find_cut_point, describing the selected cut point and its turn semantics.
 /// pub(crate): find_cut_point in cut.rs is pub(crate) and returns this type,
 /// A private field triggers a private_interfaces warning; the field remains accessible within the module.
 pub(crate) struct CutPointResult {
-    first_kept_entry_index: usize,   // Index of the first entry retained after compaction
+    first_kept_entry_index: usize, // Index of the first entry retained after compaction
     turn_start_index: Option<usize>, // Starting entry index of the turn containing the cut point
-    is_split_turn: bool,             // Whether the cut point splits an in-progress turn
+    is_split_turn: bool,           // Whether the cut point splits an in-progress turn
 }
 
 /// File-operation accumulator (read/written/edited buckets), used to generate the summary addendum and details.

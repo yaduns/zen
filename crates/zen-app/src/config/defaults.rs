@@ -4,7 +4,7 @@
 // stay in their respective domain modules (algorithms still work without settings); this file only defines default decisions for the "settings system" and references
 // domain constants as the folding base (without copying values). The sole exit for setting defaults = `fold_effective` → `SettingsEffective`,
 // Consumers (services assembly / interactive / T-AP-04-3) obtain effective values via `SettingsManager::effective()`,
-// Do not write `unwrap_or(literal)` fallbacks in consumers again.
+// Do not write `unwrap_or(<literal>)` fallbacks in consumers again.
 // See reference/pi-original/packages/coding-agent/src/core/defaults.ts and settings-manager.ts
 // The `??` fallbacks in each getter (this file consolidates defaults scattered across getters into constants + folding functions).
 

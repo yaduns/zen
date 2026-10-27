@@ -218,8 +218,8 @@ pub(crate) async fn stream_assistant_response(
 
     // 4. Call stream_fn
     let stream_config = StreamConfig {
-        api_key,                               // ← T-AI-02-10: Bearer key injected via hooks/static injection
-        reasoning_effort: config.reasoning,    // ← from AgentLoopConfig (new field added by fix item 3)
+        api_key, // ← T-AI-02-10: Bearer key injected via hooks/static injection
+        reasoning_effort: config.reasoning, // ← from AgentLoopConfig (new field added by fix item 3)
         session_id: config.session_id.clone(), // ← T-AI-02-6: session affinity cache key → request body prompt_cache_key
         ..Default::default()                   // ← remaining fields stay default
     };

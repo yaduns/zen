@@ -78,7 +78,7 @@ pub struct LoadPromptTemplatesResult {
     pub diagnostics: Vec<PromptTemplateDiagnostic>,
 }
 
-/// The slash command expansion path (T-AP-03-2) is called before user input is submitted to the agent: if the text has the form `/templateName args` and
+/// The slash command expansion path (T-AP-03-2) is called before user input is submitted to the agent: if the text has the form `/TEMPLATE_NAME ARGS` and
 /// a template with the same name is found in the template list, substitute the parameters into the template body to produce the final prompt—expand known / commands and leave unknown
 /// ones unchanged. It is a pure function, performs no file I/O, and does not depend on session state.
 /// Signature upgrade (T-AP-05-4 P4 decision): input changed from core type to Loaded form, consistent with `expand_prompt_input`
@@ -120,7 +120,7 @@ pub fn expand_prompt_template(text: &str, templates: &[LoadedPromptTemplate]) ->
 }
 
 /// Matching pattern for expanding `/name args` routes (aligned with pi-307 `expandPromptTemplate` regex):
-/// `^/(templateName)(?:\s+(argString))?$`—the template name contains no whitespace; the argument string may be empty or contain newlines (`[\s\S]` is an always-matching character class,
+/// `^/(TEMPLATE_NAME)(?:WHITESPACE(ARGS))?$`—the template name contains no whitespace; the argument string may be empty or contain newlines (`[\s\S]` is an always-matching character class,
 /// equivalent to `(?s:.*)`). The non-greedy match is anchored to the entire string (`^`/`$`).
 fn expansion_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();

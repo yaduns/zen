@@ -1,7 +1,7 @@
 //! Flag example: `--mode json` (JSON event stream in print mode).
 //! Goes directly through the production print outlet `run_print_mode(Mode::Json, ...)`: each AgentEvent is serialized to one JSON line.
 //! Construct `AgentSessionRuntime` first (using the existing public assembly API).
-//! Run: `cargo run -p zen-app --example example_mode_json -- "Hello, introduce yourself in one sentence"`
+//! Run: `cargo run -p zen-app --example example_mode_json -- "Hello, introduce yourself in one sentence."`
 
 #[path = "_support/common.rs"]
 mod common;

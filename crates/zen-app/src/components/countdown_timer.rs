@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 pub struct CountdownTimer {
     timeout: Duration,
     started_at: Option<Instant>, // None = not started/stopped
-    last_remaining: u32,         // Remaining seconds at last callback (avoid repeated callbacks every second)
+    last_remaining: u32, // Remaining seconds at last callback (avoid repeated callbacks every second)
     done: bool,
     on_tick: Option<Box<dyn FnMut(u32)>>, // Remaining-seconds change callback (±1s boundary)
     on_expire: Option<Box<dyn FnMut()>>,  // Zero callback (fired only once)

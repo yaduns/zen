@@ -21,7 +21,7 @@ pub enum PromptTemplateDiagnosticCode {
     FileInfoFailed, // Path metadata probe failed and is not "not found" (not found is silently skipped)
     ListFailed,     // Directory read failed
     ReadFailed,     // File read failed
-    ParseFailed,    // Malformed frontmatter line (same semantics as the identically named skills code)
+    ParseFailed, // Malformed frontmatter line (same semantics as the identically named skills code)
 }
 
 /// Carrier for a non-fatal loading warning—constructed when the loading entry point hits an IO/parse failure, aggregated into the result for the caller to display or ignore
@@ -355,7 +355,7 @@ fn substitution_pattern() -> &'static Regex {
        })
 }
 
-/// Splitting of slash-command arguments: the command expansion path (T-AP-03-4), before feeding `/name` plus the raw argument string after it to
+/// Splitting of slash-command arguments: the command expansion path (T-AP-03-4), before feeding `/name followed by the raw argument string` to
 /// before `substitute_args`, splitting a line of text into an argument array by shell intuition — "a quoted whole counts as one".
 ///
 /// Behavior (aligned with pi-307): characters inside single/double quotes are preserved as-is (quotes themselves stripped, no escape support — same as pi);

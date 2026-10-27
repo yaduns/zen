@@ -1,6 +1,6 @@
 //! Flag example: `--no-session` — do not save the session (temporary session).
 //! Align with `SessionManager::in_memory`: in-memory session, not persisted to JSONL.
-//! Run: `cargo run -p zen-app --example example_no_session -- "hello"`
+//! Run: `cargo run -p zen-app --example example_no_session -- "Hello"`
 
 #[path = "_support/common.rs"]
 mod common;

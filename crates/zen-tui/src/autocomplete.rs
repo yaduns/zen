@@ -83,7 +83,7 @@ pub type ArgumentCompletionCallback =
 pub struct SlashCommand {
     name: String,                                                 // Command name (without /)
     description: Option<String>,                                  // Main body of the dropdown hint
-    argument_hint: Option<String>,                                // Joined with description for display
+    argument_hint: Option<String>, // Joined with description for display
     get_argument_completions: Option<ArgumentCompletionCallback>, // F(argument_prefix, ct) -> ArgumentCompletionFuture; None = no argument completion
 }
 
@@ -1811,9 +1811,9 @@ mod tests {
 
     #[test]
     fn get_suggestions_multibyte_cursor_not_panicking() {
-        // "Hello /src" cursor in the /src segment: prefix should be "/src"
+        // "hello /src": cursor is in the /src segment, so the prefix should be "/src"
         let line = "你好 /src".to_string();
-        // Ask for "CJK text /src"[4..]? — character index 4 maps to byte 10+i… convert via byte_index_of and manually verify the helper
+        // Ask for characters of "hello /src" from index 4? — character index 4 maps to a byte offset; convert via byte_index_of and manually verify the helper
         let byte_col = byte_index_of(&line, 4);
         let text_before = &line[..byte_col];
         assert_eq!(text_before, "你好 /");

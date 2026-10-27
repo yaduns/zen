@@ -14,9 +14,9 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Produced by `word_wrap_line`; consumed by both the editor (cursor column mapping) and components (display line text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChunk {
-    pub text: String,       // Fragment text (visible text after wrapping; display is the buffer's source text)
+    pub text: String, // Fragment text (visible text after wrapping; display is the buffer's source text)
     pub start_index: usize, // Starting byte offset in the source text (UTF-8, same unit as cursor_col/grapheme_indices)
-    pub end_index: usize,   // Ending byte offset in the source text (exclusive; used for cursor attribution / range checks)
+    pub end_index: usize, // Ending byte offset in the source text (exclusive; used for cursor attribution / range checks)
 }
 
 /// Wrap a single line at word boundaries: prefer word boundaries within max_width, allow breaks between adjacent CJK, and split overwide atomic segments into separate chunks.
@@ -515,9 +515,9 @@ mod tests {
 
     #[test]
     fn test_truncate_does_not_split_wide_char() {
-        // "ABCD" each wide 2; max_width 5 → keep 2 columns = "A", otherwise it would split in half
+        // Four 2-column CJK chars; max_width 5 → keep 2 columns = one CJK char, otherwise it would split in half
         assert_eq!(truncate_to_width("一二三四", 5, "..."), "一...");
-        // max_width 7 → keep 4 = "AB"; keep 3 cannot fit two wide characters (4 > 3), so only "A" remains
+        // max_width 7 → keep 4 = two CJK chars; keep 3 cannot fit two wide characters (4 > 3), so only one CJK char remains
         assert_eq!(truncate_to_width("一二三四", 7, "..."), "一二...");
         assert_eq!(truncate_to_width("一二三四", 6, "..."), "一...");
     }
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_truncate_exact_width_keeps_whole_wide_at_boundary() {
-        // "Aabcde" width 7 > max 6 → keep 3; A(2)+a(1) exactly fills, wide character kept whole, b truncated
+        // One CJK char + "abcde" has width 7 > max 6 → keep 3; CJK(2)+a(1) exactly fills, wide character kept whole, b truncated
         assert_eq!(truncate_to_width("你abcde", 6, "..."), "你a...");
     }
 
@@ -556,10 +556,10 @@ mod tests {
 
     #[test]
     fn test_slice_by_column_skips_wide_char_crossing_window() {
-        // "aXb": a at column 0, X at columns 1-2, b at column 3. Window [1,2) → does X fall entirely within the window?
-        // X starts at column 1 and ends at column 3; its right edge exceeds end_col=2 → discarded whole → empty
+        // "a" + CJK + "b": a at column 0, the CJK char at columns 1-2, b at column 3. Window [1,2) → does the CJK char fall entirely within the window?
+        // The CJK char starts at column 1 and ends at column 3; its right edge exceeds end_col=2 → discarded whole → empty
         assert_eq!(slice_by_column("a中b", 1, 1), "");
-        // Window [1,3) → X starts at 1 and ends at 3, entirely inside → kept
+        // Window [1,3) → the CJK char starts at 1 and ends at 3, entirely inside → kept
         assert_eq!(slice_by_column("a中b", 1, 2), "中");
         // Window [3,4) → b
         assert_eq!(slice_by_column("a中b", 3, 1), "b");
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_slice_by_column_start_mid_wide_char_skips_it() {
-        // Window starts in the middle of a wide character (start_col=2, X occupies 1-2) → X's start column 1 < start_col,
+        // Window starts in the middle of a wide character (start_col=2, the CJK char occupies 1-2) → its start column 1 < start_col,
         // so it is not kept; only its right half remains in window [2,3) → empty (matching pi strict semantics: discard whole characters crossing the boundary)
         assert_eq!(slice_by_column("a中b", 2, 1), "");
         // b immediately adjacent to window [3,4) is kept whole

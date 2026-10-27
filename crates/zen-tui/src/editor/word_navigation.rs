@@ -3,14 +3,14 @@
 // Intra-word ASCII punctuation re-segmentation uses crate::wrap::is_punctuation_char (T-TU-03-6).
 // Verified (node v24 Intl.Segmenter vs unicode-segmentation 1.13): all ASCII cases have identical segmentation results
 // (`foo.bar`/`foo:bar`/`don't`/`foo_bar` stay as one segment; `foo-bar`/`foo...bar`/`path/to/file` are segmented),
-// Only CJK Han grouping differs—node ICU groups by dictionary ("hello" "world"), while this module segments per character
+// Only CJK Han grouping differs—node ICU groups by dictionary (multi-char words), while this module segments per character
 // (standard UAX #29 behavior), recorded as an accepted deviation.
 // See reference/pi-original/packages/tui/src/word-navigation.ts
 use crate::wrap::is_punctuation_char;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Whether a word segment is word-like (contains letters/digits), approximating Intl.Segmenter's `isWordLike`.
-/// Whitespace/punctuation segments are always false; Han characters such as "hello" are alphanumeric ✓.
+/// Whitespace/punctuation segments are always false; Han characters are alphanumeric ✓.
 fn is_word_like(segment: &str) -> bool {
     segment.chars().any(|c| c.is_alphanumeric())
 }
@@ -206,13 +206,13 @@ mod tests {
 
     #[test]
     fn test_backward_cjk_per_char() {
-        // Registered deviation: unicode-segmentation segments per character (pi ICU dictionary grouping gives "hello" "world"),
-        // so backward from the start of "test" crosses only one character (boundary) instead of pi's two characters (world).
+        // Registered deviation: unicode-segmentation segments per character (pi ICU dictionary grouping yields multi-char words),
+        // so backward from the start of "test" crosses only one CJK character instead of pi's two.
         let text = "你好世界 test";
         assert_eq!(find_word_backward(text, 17), 13); // Back to the start of "test" (aligned with pi 9→5)
-        assert_eq!(find_word_backward(text, 13), 9); // Backward one character to the start of "boundary" (pi is 5→2, deviation)
-        assert_eq!(find_word_backward(text, 9), 6); // Backward one character to the start of "world"
-        assert_eq!(find_word_backward(text, 6), 3); // Backward one character to the start of "good"
+        assert_eq!(find_word_backward(text, 13), 9); // Backward one character to the start of the 2nd CJK char (pi is 5→2, deviation)
+        assert_eq!(find_word_backward(text, 9), 6); // Backward one character to the start of the 1st CJK char
+        assert_eq!(find_word_backward(text, 6), 3); // Backward one character to the start of the 3rd CJK char
         assert_eq!(find_word_backward(text, 3), 0);
     }
 

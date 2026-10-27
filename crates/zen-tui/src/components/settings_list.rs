@@ -26,10 +26,10 @@ pub type ValueChange = Box<dyn FnMut(&str, &str)>;
 /// `SettingsList::done_submenu` (pi's done callback injection is replaced with an explicit method,
 /// See the SettingsList role description in "Data Model"—inversion of control, avoiding component self-handshaking).
 pub struct SettingItem {
-    pub id: String,                  // Unique identifier (update_value / on_change payload)
-    pub label: String,               // Display name in the left column
+    pub id: String,    // Unique identifier (update_value / on_change payload)
+    pub label: String, // Display name in the left column
     pub description: Option<String>, // Wrapped and displayed below the list when selected
-    pub current_value: String,       // Value displayed in the right column; updated when activated
+    pub current_value: String, // Value displayed in the right column; updated when activated
     /// If provided, Enter/Space cycles through values (aligned with pi `values`).
     pub values: Option<Vec<String>>,
     /// If provided, Enter/Space opens that submenu (aligned with pi `submenu`).
@@ -64,7 +64,7 @@ pub struct SettingsListOptions {
 /// Using index references preserves the "filtered view" semantics, avoids the cloning requirement, and eliminates the need to synchronize two copies during update_value/activation.
 /// When search is disabled, `filtered` always contains all indices (0..n); both branches access items through it.
 pub struct SettingsList {
-    items: Vec<SettingItem>,     // Full settings set (sole owner, includes the submenu closure)
+    items: Vec<SettingItem>, // Full settings set (sole owner, includes the submenu closure)
     filtered: Vec<usize>, // Display view: sequence of indices into items (after search filtering; all indices when search is disabled)
     selected_index: usize, // Selected index, always < filtered.len() (stays 0 for an empty list)
     max_visible: usize,   // Viewport row limit

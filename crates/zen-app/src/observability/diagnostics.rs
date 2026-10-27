@@ -11,7 +11,7 @@ pub enum DiagnosticSeverity {
 
 pub struct RuntimeDiagnostic {
     severity: DiagnosticSeverity, // Determines output color and prefix
-    message: String,              // Human-readable single-line message (to_runtime_diagnostics guarantees one line, no embedded newlines)
+    message: String, // Human-readable single-line message (to_runtime_diagnostics guarantees one line, no embedded newlines)
 }
 
 // File: crates/zen-app/src/observability/diagnostics.rs

@@ -233,7 +233,7 @@ impl Agent {
         AgentLoopConfig {
             model: state.model.clone(), // ← single source of truth: state
             api_key: None,              // Low level goes through hooks.get_api_key
-            tool_execution,             // Passed in as parameters instead of reading from `self` (avoids re-entering the lock while holding the state guard)
+            tool_execution, // Passed in as parameters instead of reading from `self` (avoids re-entering the lock while holding the state guard)
             reasoning: match state.thinking_level {
                 ThinkingLevel::Off => None, // Off → don't send reasoning_effort
                 level => Some(level),       // Pass other levels through unchanged

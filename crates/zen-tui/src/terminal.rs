@@ -8,7 +8,7 @@
 /// `stop()` symmetrically disables them—unsupported terminals ignore enhancement sequences with no side effects (blind push; no query-first negotiation with pi;
 /// The modifyOtherKeys fallback is not implemented in v1; see tasks/T-AP-11-1-fix-implemented.md.
 pub(crate) struct Terminal {
-    out: std::io::Stdout,  // target for writing crossterm commands (tail of queue!/execute!)
+    out: std::io::Stdout, // target for writing crossterm commands (tail of queue!/execute!)
     raw_mode_active: bool, // Record raw mode state across start/stop for idempotent restoration by stop
     cursor_hidden: bool,   // record cursor visibility state to avoid sending Hide/Show repeatedly
     // Keyboard protocol pairing flag (idempotent: do not resend commands when already enabled/disabled; mirrors raw_mode_active)

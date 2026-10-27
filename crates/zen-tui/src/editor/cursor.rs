@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_move_char_multibyte_grapheme_step() {
-        // Two 3-byte CJK graphemes; the cursor must step by grapheme, never split one in half
+        // Two CJK chars = 2 three-byte graphemes; the cursor must step by grapheme, never split one in half
         let mut e = editor_with(&["你好"], 0, 0, 0, 0);
         e.move_char(1);
         assert_eq!(e.cursor(), (0, 3));
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_cursor_visual_col_cjk() {
-        // "aXb": wide char 'X' occupies 2 columns; with the cursor after 'X' (byte offset 4), the visual column is 1+2=3
+        // "a" + one CJK char + "b": the CJK char occupies 2 columns; with the cursor after it, the visual column is 1+2=3
         let mut e = editor_with(&["a你b"], 0, 4, 0, 0);
         assert_eq!(e.cursor_visual_col(), 3);
     }
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_move_vertical_cjk_wide_column() {
-        // Cursor after wide char 'X' (visual col 2); next row "ab" max 2 cols → stop at 'b' (col 1)
+        // Cursor after the CJK char (visual col 2); next row "ab" max 2 cols → stop at 'b' (col 1)
         let mut e = editor_with(&["你好", "ab"], 0, 3, 10, 0);
         e.move_vertical(1);
         assert_eq!(e.cursor(), (1, 1));

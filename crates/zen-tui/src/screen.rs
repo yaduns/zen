@@ -62,9 +62,9 @@ enum CellKind {
 /// flush compares the current frame with the previous one cell by cell, generating crossterm commands only for changed cells (differential refresh); after writing, the current frame is promoted to become the new previous frame.
 /// resize handles terminal size changes (including clearing extra rows when content shrinks).
 pub struct ScreenBuffer {
-    cells: Vec<Cell>,    // Current frame grid; flattened vs nested is an implementation choice, indexed using width
-    width: u16,          // Current frame column count
-    height: u16,         // Current frame row count
+    cells: Vec<Cell>, // Current frame grid; flattened vs nested is an implementation choice, indexed using width
+    width: u16,       // Current frame column count
+    height: u16,      // Current frame row count
     previous: Vec<Cell>, // Snapshot of the previous frame, used for differential refresh comparison; guaranteed to be the same size as cells
 }
 
@@ -326,8 +326,8 @@ impl ScreenBuffer {
         }
 
         // ── Pass 2: output changed cells ──
-        // Without optimization:  SetColors SetAttr Print('A') SetColors SetAttr Print('B') SetColors SetAttr Print('C')
-        // With optimization:  SetColors SetAttr Print('A') Print('B') Print('C')
+        // Without optimization:  SetColors SetAttr Print('cjk1') SetColors SetAttr Print('cjk2') SetColors SetAttr Print('cjk3')
+        // With optimization:  SetColors SetAttr Print('cjk1') Print('cjk2') Print('cjk3')
         // Style of the previous character
         let mut prev_style = Style::default();
         let mut style_dirty = true; // First cell forcibly outputs style
@@ -348,7 +348,7 @@ impl ScreenBuffer {
                     // Orphan continuation cell: needs to write whitespace to the terminal to overwrite the remaining right half of a wide character.
                     // Only when the starting cell of the wide character associated with this continuation cell **has no printable content in the current frame** (cleared/replaced with empty or in
                     // farther right) before overwriting—when the starting cell has just printed a wide character, its right half is already occupied by that wide character,
-                    // printing spaces again will corrupt the display (on a fully dirty first frame, wide characters become “char char char”);
+                    // printing spaces again will corrupt the display (on a fully dirty first frame, wide characters become "x x x");
                     // Skip when the starting cell is this frame's Char (width 2).
                     let start_painted = col > 0
                         && matches!(self.cells[row_offset + col - 1].kind, CellKind::Char)

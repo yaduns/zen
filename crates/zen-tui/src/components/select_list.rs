@@ -8,21 +8,21 @@ use crossterm::event::KeyEvent;
 pub enum SelectAction {
     MoveUp,   // ↑: move selection up, wrap from top to last item
     MoveDown, // ↓: move selection down, wrap from bottom to first item
-    Confirm,  // Enter: activate selected item (SelectList fires on_select / SettingsList cycles value or opens submenu)
-    Cancel,   // Esc/Ctrl+C: cancel (on_cancel)
+    Confirm, // Enter: activate selected item (SelectList fires on_select / SettingsList cycles value or opens submenu)
+    Cancel,  // Esc/Ctrl+C: cancel (on_cancel)
 }
 
 /// Filterable single-select list; holds all items plus a filtered double buffer, selected index, scroll window (selection centered, start..end sliding),
 /// Two-column layout (description column shown when width > 40); selected prefix hardcoded "→ "/" "
 pub struct SelectList {
-    items: Vec<SelectItem>,                         // All items; filtering and selection are based on it
-    filtered_items: Vec<SelectItem>,                // Filtered display view; set_filter recomputes and resets selection to 0
+    items: Vec<SelectItem>, // All items; filtering and selection are based on it
+    filtered_items: Vec<SelectItem>, // Filtered display view; set_filter recomputes and resets selection to 0
     selected_index: usize, // Selected index, always < filtered_items.len() (stays 0 for empty list)
     max_visible: usize,    // Max rows of the scroll window (passed at construction)
     theme: SelectListTheme, // Resolved styles
     layout: SelectListLayoutOptions, // Column width constraints + main column truncation callback
     on_select: Option<Box<dyn FnMut(&SelectItem)>>, // Fired on Confirm (not fired when nothing is selected)
-    on_cancel: Option<Box<dyn FnMut()>>, // Fired on Cancel
+    on_cancel: Option<Box<dyn FnMut()>>,            // Fired on Cancel
     on_selection_change: Option<Box<dyn FnMut(&SelectItem)>>, // Fired on navigation (↑↓)
     // SelectAction-domain keybinding registry (T-AP-06-2 constructor injection): authoritative source for handle_key action routing
     keybindings: KeybindingsManager<SelectAction>,
@@ -31,8 +31,8 @@ pub struct SelectList {
 /// Filterable list item data
 #[derive(Clone)]
 pub struct SelectItem {
-    value: String,               // Filter match key (prefix, case-insensitive) and identifier for the selection callback
-    label: String,               // Display name (get_display_value prefers label, falls back to value when empty)
+    value: String, // Filter match key (prefix, case-insensitive) and identifier for the selection callback
+    label: String, // Display name (get_display_value prefers label, falls back to value when empty)
     description: Option<String>, // Description column shown in wide rows (line breaks/whitespace normalized to a single line)
 }
 
@@ -524,7 +524,7 @@ mod tests {
         // Prefixes not at grapheme boundaries must not panic nor falsely match CJK items (but may match ASCII items)
         l.set_filter("a");
         assert_eq!(l.filtered_items.len(), 1);
-        assert_eq!(l.filtered_items[0].value, "abc"); // "CJK text" — byte 0 is not a char boundary → excluded, only "abc" matches
+        assert_eq!(l.filtered_items[0].value, "abc"); // CJK text: byte 0 is not a char boundary → excluded, only "abc" matches
         l.set_filter("中");
         assert!(l.filtered_items.is_empty());
     }

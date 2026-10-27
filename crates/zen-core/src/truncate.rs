@@ -778,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_tail_bytes_boundary_scan_matches_char_collection() {
-        // "abX" (5 bytes) max_bytes=3 → the boundary scan lands on the lead byte of the CJK char 'X' → "X"
+        // "ab" + one 3-byte CJK char (5 bytes), max_bytes=3 → the boundary scan lands on the lead byte of the CJK char → drop it
         let r = truncate_tail(
             "ab中",
             TruncationOptions {

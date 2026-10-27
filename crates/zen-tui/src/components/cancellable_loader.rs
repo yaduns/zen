@@ -12,8 +12,8 @@ use super::Component;
 /// `cancel_token` is created and passed in by the caller; the async task side holds the same token handle;
 /// On user Esc/Ctrl+C, trigger `token.cancel()` and the `on_cancel` callback (align with pi `onAbort`).
 pub struct CancellableLoader {
-    loader: Loader,                      // Delegated by composition (rendering/messages/animation)
-    cancel_token: CancellationToken,     // Cancellation handle (the caller holds the other end)
+    loader: Loader, // Delegated by composition (rendering/messages/animation)
+    cancel_token: CancellationToken, // Cancellation handle (the caller holds the other end)
     on_cancel: Option<Box<dyn FnMut()>>, // Cancellation callback (pi `onAbort`)
 }
 

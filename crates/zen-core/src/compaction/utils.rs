@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_truncate_for_summary_counts_unicode_chars_not_bytes() {
-        // "hello"×3 = 6 characters (18 bytes in UTF-8) — counted by characters
+        // Three CJK chars = 6 characters (18 bytes in UTF-8) — counted by characters
         let text = "你好你好你好";
         assert_eq!(
             truncate_for_summary(text, 4),
