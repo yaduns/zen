@@ -4,8 +4,8 @@
 fn main() -> anyhow::Result<()> {
     let q = std::env::args().nth(1);
 
-    // --list-models semantics: list selectable models. Phase 1 models come from “provider + each provider's default id”
-    // (env: OPENCODE_MODEL / ARK_MODEL, default deepseek-v4-flash).
+    // --list-models semantics: list selectable models. **This example only demonstrates the first model of each of the two built-in providers**
+    // (real multi-model listing and user models.json consumption are covered by T-V2-02-2).
     let providers = ["opencode-go", "huoshan"];
     for name in providers {
         let model = match zen_ai::provider::resolve_provider(name) {

@@ -166,7 +166,7 @@ pub async fn run_agent_loop_continue(
 ///
 /// Priority: `config.api_key` (explicit static injection by the caller; no production code writes it currently, tests only)
 /// → `hooks.get_api_key(provider)` (the real app-layer implementation is tracked under T-AI-02-11) → `None`.
-/// The request layer has another transitional fallback to `Catalog::embedded().api_key(model)` (see `openai_stream::api_key_for_request`),
+/// The request layer has another fallback layer via `Catalog::current().api_key(model)` (see `openai_stream::api_key_for_request`),
 /// Not repeated here.
 async fn resolve_api_key(config: &AgentLoopConfig, hooks: &dyn AgentLoopHooks) -> Option<String> {
     match config.api_key.clone() {

@@ -375,7 +375,7 @@ pub async fn stream(
     let cfg = options.unwrap_or_default();
     let cancel = cancel.unwrap_or_default();
 
-    // 1. API Key (`cfg.api_key` takes precedence, falling back to `Catalog::embedded().api_key(model)` as a data-driven fallback;
+    // 1. API Key (`cfg.api_key` takes precedence; fall back to `Catalog::current().api_key(model)` as a data-backed fallback;
     //    No longer reads env by provider name—see `api_key_for_request`)
     let api_key = api_key_for_request(model, &cfg).ok_or(StreamError::NoApiKey)?;
 
@@ -620,14 +620,15 @@ fn session_affinity_headers(model: &Model, session_id: Option<&str>) -> HashMap<
 }
 
 /// Called before `stream()` sends the request: resolves the Bearer key for this request—`cfg.api_key` (injected by the app/agent loop, preferred)
-/// Otherwise fall back to `Catalog::embedded().api_key(model)` (transitional shim so `stream_collect` direct calls and compression/
-/// branch-summary paths have no gap). If both are empty → `None`, and the call site reports `StreamError::NoApiKey`.
+/// Otherwise fall back to `Catalog::current().api_key(model)` (so `stream_collect` direct calls and compaction/branch summary paths
+/// have no gap; the data source is the same one used by the selection layer, including the user's `models.json`). If both are empty → `None`, reported by the call site
+/// `StreamError::NoApiKey`。
 /// **Keyless endpoint decision**: the v1 request layer always requires a Bearer key; it does not implement "do not send Authorization when apiKey is absent";
 /// The "keyless endpoint" wording for `Catalog::api_key` only describes its None semantics (see open question 3).
 fn api_key_for_request(model: &Model, cfg: &StreamConfig) -> Option<String> {
     cfg.api_key
         .clone()
-        .or_else(|| Catalog::embedded().api_key(model))
+        .or_else(|| Catalog::current().api_key(model))
 }
 
 fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> Request {

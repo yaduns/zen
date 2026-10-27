@@ -89,6 +89,12 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--export is not supported yet (Phase 2)");
     }
 
+    // T-AI-02-11: one-time startup wiring of the user's `models.json` (built-in catalog ← user overrides) as the single process-wide catalog,
+    // so that process-wide provider/model selection, model materialization, api key resolution, and `/model` candidates all read the same data.
+    // Bad file → diagnostics (stderr + tracing), then fall back to the built-in catalog without aborting startup.
+    // Placed after the `--help`/`--version`/`--export` fast paths: those paths do not wire up a session and need not read models.json.
+    zen_app::config::catalog::init_user_catalog();
+
     let app_mode = resolve_app_mode(&args, stdin_is_terminal());
     info!(
         app_mode = ?app_mode,

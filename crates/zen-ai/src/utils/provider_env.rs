@@ -5,19 +5,15 @@ use std::env;
 
 /// List of known provider environment variable names, used for config discovery and diagnostics.
 /// Per-provider variables (aligned with pi `envApiKeyAuth`); no global `OPENAI_*`.
+/// Per-provider env overrides for endpoint/model/output limit (`*_BASE_URL`/`*_MODEL`/`*_MAX_TOKENS`) have been
+/// removed by T-AI-02-11 and are now expressed via user `models.json`, so they are not in this list.
 pub const KNOWN_PROVIDER_ENV_VARS: &[&str] = &[
     // zen selection layer
     "ZEN_PROVIDER",
     // opencode-go (default provider)
     "OPENCODE_API_KEY",
-    "OPENCODE_BASE_URL",
-    "OPENCODE_MODEL",
-    "OPENCODE_MAX_TOKENS",
     // huoshan (Volcano Engine Ark)
     "ARK_API_KEY",
-    "ARK_BASE_URL",
-    "ARK_MODEL",
-    "ARK_MAX_TOKENS",
 ];
 
 /// Config file takes precedence, provider environment variables as fallback,

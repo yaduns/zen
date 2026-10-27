@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod defaults;
 pub mod settings;
 
@@ -86,6 +87,19 @@ pub fn get_custom_themes_dir() -> Result<PathBuf, PathError> {
 /// Depends on `get_agent_dir`; when env overrides are missing and home is unavailable → `PathError::NoHomeDir`.
 pub fn get_prompts_dir() -> Result<PathBuf, PathError> {
     Ok(get_agent_dir()?.join("prompts"))
+}
+
+/// User model catalog file path: `<agentDir>/models.json`.
+///
+/// Startup wiring and config commands need to know where the user's hand-written model catalog is — `init_user_catalog` reads it to decide which
+/// user providers/models to overlay; T-V2-02-2/3 read it for listing and edit validation. A missing file is not an error
+/// (`Catalog::load` treats it as "no user overrides" and uses only the built-in catalog).
+/// # Errors
+/// Depends on `get_agent_dir`; when env overrides are missing and home is unavailable → `PathError::NoHomeDir`.
+/// # Consumers
+/// `config::catalog::init_user_catalog` (current); T-V2-02-2 (list models) / T-V2-02-3 (config selection) planned to hook in.
+pub fn get_models_path() -> Result<PathBuf, PathError> {
+    Ok(get_agent_dir()?.join("models.json"))
 }
 
 #[cfg(test)]

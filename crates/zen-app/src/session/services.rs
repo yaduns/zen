@@ -34,6 +34,7 @@ use crate::skills::LoadedSkill;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zen_ai::api::stream_for;
+use zen_ai::catalog::Catalog;
 use zen_ai::provider::resolve_provider;
 use zen_ai::tool::{Tool, ToolContext, ToolExecutionMode};
 use zen_ai::types::{ImageContent, Message, Model, ThinkingLevel};
@@ -94,8 +95,14 @@ impl AgentLoopHooks for SessionHooks {
         self.inner.transform_context(messages, cancel).await
     }
 
+    /// Real `get_api_key` hook (T-AI-02-11): `inner` takes precedence (allows caller overrides); if no match, resolve by provider
+    /// name from the current catalog [`Catalog::current`] to resolve `apiKey` (literal / `$ENV`). The result is
+    /// `agent_loop::resolve_api_key` writes to `StreamConfig.api_key`, which the request layer uses first.
     async fn get_api_key(&self, provider: &str) -> Option<String> {
-        self.inner.get_api_key(provider).await
+        match self.inner.get_api_key(provider).await {
+            Some(key) => Some(key),
+            None => Catalog::current().api_key_for_provider(provider),
+        }
     }
 
     async fn should_stop_after_turn(&self, context: &ShouldStopAfterTurnContext) -> bool {
@@ -731,6 +738,13 @@ mod tests {
             std::env::remove_var(key);
             Self { key, old }
         }
+
+        /// Test helper: temporarily set an environment variable (restore the original value when leaving scope).
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -1232,6 +1246,58 @@ mod tests {
         let msgs = vec![tool_result_msg.clone()];
         // empty exclusion set always passes through (filter_excluded guarantee)
         assert_eq!(hooks.filter_messages(msgs.clone()).await, msgs);
+    }
+
+    // ── SessionHooks::get_api_key (T-AI-02-11 real hook) ──
+
+    /// Inner hooks with a fixed API key: only override `get_api_key`; the rest use defaults.
+    struct ApiKeyHooks(Option<String>);
+
+    #[async_trait::async_trait]
+    impl AgentLoopHooks for ApiKeyHooks {
+        async fn get_api_key(&self, _provider: &str) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    fn api_key_hooks(inner: Arc<dyn AgentLoopHooks>) -> SessionHooks {
+        SessionHooks {
+            inner,
+            excluded: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_hooks_get_api_key_prefers_inner() {
+        let inner: Arc<dyn AgentLoopHooks> = Arc::new(ApiKeyHooks(Some("inner-key".into())));
+        let hooks = api_key_hooks(inner);
+        // if inner hits, return immediately; do not query catalog
+        assert_eq!(
+            hooks.get_api_key("opencode-go").await,
+            Some("inner-key".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_hooks_get_api_key_falls_back_to_catalog() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::set("OPENCODE_API_KEY", "env-key");
+        let inner: Arc<dyn AgentLoopHooks> = Arc::new(ApiKeyHooks(None));
+        let hooks = api_key_hooks(inner);
+        // no inner → via Catalog::current().api_key_for_provider
+        // (the built-in opencode-go apiKey template is `$OPENCODE_API_KEY`)
+        assert_eq!(
+            hooks.get_api_key("opencode-go").await,
+            Some("env-key".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_hooks_get_api_key_unknown_provider_none() {
+        let inner: Arc<dyn AgentLoopHooks> = Arc::new(ApiKeyHooks(None));
+        let hooks = api_key_hooks(inner);
+        // provider not in catalog → None (no panic, no fabrication)
+        assert_eq!(hooks.get_api_key("nonexistent").await, None);
     }
 
     // ── resolve_model_from_session (T-AP-08-5: CLI-less resolution for interactive switching) ──

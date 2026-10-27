@@ -108,11 +108,13 @@ pub struct MarkdownSettingsPatch {
 ///
 /// v1 fields dropped (present in pi but not produced by zen): lastChangelogVersion / collapseChangelog /
 /// enableInstallTelemetry / enableAnalytics / trackingId /
-/// transport / enabledModels / websocketConnectTimeoutMs / httpProxy /
+/// transport / websocketConnectTimeoutMs / httpProxy /
 /// packages / extensions / npmCommand / enableSkillCommands / images, and
 /// terminal.showImages / terminal.imageWidthCells / terminal.showTerminalProgress /
 /// defaultProjectTrust / steeringMode / followUpMode / thinkingBudgets /
 /// warnings / treeFilterMode (rationale in tasks/T-AP-02-3-implemented.md).
+/// Note: pi's `terminal.clearOnShrink` is flattened to top-level `clearOnShrink` in zen (see below);
+/// `enabledModels` is implemented by T-V2-02-4 and is not in the dropped list.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsData {

@@ -45,9 +45,10 @@ Environment Variables:
   ZEN_CODING_AGENT_DIR          Config directory (default ~/.zen/agent)
   ZEN_CODING_AGENT_SESSION_DIR  Session storage directory (overridden by --session-dir)
   OPENCODE_API_KEY              OpenCode Go API key
-  OPENCODE_BASE_URL             OpenCode Go base URL (default https://opencode.ai/zen/go/v1)
   ARK_API_KEY                   Volcano Ark (huoshan) API key
-  ARK_BASE_URL                  Volcano Ark base URL"
+
+Provider/model overrides (base URL, model id, max tokens) live in:
+  <ZEN_CODING_AGENT_DIR>/models.json"
 )]
 pub struct CliArgs {
     /// Provider name (defaults to the env var ZEN_PROVIDER, see zen_ai::provider)

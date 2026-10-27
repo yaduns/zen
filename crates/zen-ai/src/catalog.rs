@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,10 @@ static EMBEDDED: LazyLock<Catalog> = LazyLock::new(|| {
     Catalog::from_config(config)
         .expect("embedded assets/models.json must pass validation (test: embedded_catalog_parses)")
 });
+
+/// Process-level unique catalog instance (T-AI-02-11). During `main` startup, load "embedded ← user `models.json`" into it;
+/// when not installed (library/tests/examples), [`Catalog::current`] falls back to [`Catalog::embedded`].
+static INSTALLED: OnceLock<Catalog> = OnceLock::new();
 
 /// Catalog load/lookup error. Library-boundary type, not serialized.
 #[derive(Debug, thiserror::Error)]
@@ -187,10 +191,32 @@ pub struct Catalog {
 impl Catalog {
     /// Built-in default catalog: `opencode-go` / `huoshan` records available out of the box.
     ///
-    /// Current consumers: `provider::resolve_provider`, `Model::from_env`/`from_provider`.
-    /// User catalog injection (`load`) is handled by T-AI-02-11.
+    /// Current consumers: the not-installed fallback of `Catalog::current()`, the bad-file fallback of `load_catalog_for_path`,
+    /// and tests across crates. **Production read paths should go through [`Catalog::current`]** (including user overrides); this function is only for
+    /// "no installation context" and direct use in tests.
     pub fn embedded() -> &'static Catalog {
         &EMBEDDED
+    }
+
+    /// Called once by the process entry point (`zen-app`'s `main`) after user directory resolution completes: installs the "embedded + user overrides" catalog
+    /// as the process-level unique catalog, so that all subsequent provider/model selection, model materialization, and api key resolution read the same data.
+    ///
+    /// Returns `true` if this call performed the installation; returns `false` if already installed (idempotent, later callers are ignored).
+    ///
+    /// # Bounds
+    /// Call-once semantics only; repeated installation does not panic (avoiding crashes from multiple initialization/tests). After installation, [`Catalog::current`]
+    /// always returns that instance. Single production call site: `zen-app/src/config/catalog.rs::init_user_catalog`.
+    pub fn install(catalog: Catalog) -> bool {
+        INSTALLED.set(catalog).is_ok()
+    }
+
+    /// Process-wide unified catalog read point: returns the instance from startup-time [`Catalog::install`]; if not installed (library/tests/examples)
+    /// returns the embedded catalog [`Catalog::embedded`].
+    ///
+    /// This is where the "single source of truth" invariant lands—all consumers obtain the catalog through it (`resolve_provider`,
+    /// `Model::from_env`/`from_provider`, request-layer api-key fallback, `model_catalog`).
+    pub fn current() -> &'static Catalog {
+        INSTALLED.get().unwrap_or_else(|| Self::embedded())
     }
 
     /// Load the catalog: first take the built-in default catalog, then layer the optional user `models.json` on top.
@@ -291,11 +317,19 @@ impl Catalog {
     /// Resolve the API key for a model's provider (`apiKey` config value: literal / `$ENV` / `${ENV}`).
     /// Returns `None` if `apiKey` is absent or env is missing.
     ///
-    /// **No consumers?** Consumer: request-layer api-key fallback (`openai_stream::api_key_for_request`).
+    /// Consumer: request-layer api-key fallback (`openai_stream::api_key_for_request`).
     /// Note: the request layer always requires a Bearer key; `None` is treated as `StreamError::NoApiKey`; v1 does not support
     /// keyless endpoints (custom providers must configure `apiKey`), see open question 3 in `tasks/T-AI-02-10-implemented.md`.
     pub fn api_key(&self, model: &Model) -> Option<String> {
-        let config = self.providers.get(&model.provider)?;
+        self.api_key_for_provider(&model.provider)
+    }
+
+    /// Resolves the API key for a provider (the provider-level `apiKey` config value: literal / `$ENV` / `${ENV}`).
+    /// Consumed by the app layer's `get_api_key(provider)` hook—the hook only receives the provider name, not a `Model`.
+    /// Returns `None` when there is no `apiKey` or the env is missing; **the `None` contract matches `api_key(&Model)`**: the request layer treats it as
+    /// `StreamError::NoApiKey` (v1 does not support keyless endpoints; custom providers must configure `apiKey`).
+    pub fn api_key_for_provider(&self, provider: &str) -> Option<String> {
+        let config = self.providers.get(provider)?;
         let raw = config.api_key.as_deref()?;
         resolve_config_value(raw)
     }
@@ -926,6 +960,12 @@ mod tests {
         assert_eq!(custom.context_window, DEFAULT_CONTEXT_WINDOW);
         assert_eq!(custom.max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(catalog.api_key(&custom), Some("sk-test".to_string()));
+        // T-AI-02-11: api key lookup by provider name (for the app layer get_api_key hook), consistent with api_key(&Model)
+        assert_eq!(
+            catalog.api_key_for_provider("my-compat"),
+            Some("sk-test".to_string())
+        );
+        assert_eq!(catalog.api_key_for_provider("nope"), None);
 
         let _ = std::fs::remove_file(&path);
     }

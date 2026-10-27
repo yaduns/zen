@@ -3,35 +3,25 @@
 // This module is the data source for REQ-V2-02 "model selection": it collects the provider default models currently known to zen into
 // an enumerable list consumed by the `/model` selector, the `/scoped-models` panel and cycle switching.
 //
-// **Interim note (important)**: T-V2-02-1 (model catalog) is not yet planned; this task (T-V2-02-4) first uses a
-// **minimal built-in table** to deliver the “enumerable model set” capability so `/model` is immediately usable; when T-V2-02-1 lands,
-// **extend/replace** this module (e.g., add models.json user overrides, per-model thinking-level capability bits), with consumer signatures unchanged.
-// The shape follows the default recommendation (a) “single-provider built-in static table” from REQ-V2-02 split-level open item ① — do not revive scope
-// discarded model-config/model-registry/model-runtime, and do not perform remote catalog refresh.
+// **interim note**: T-V2-02-4 first delivered `/model` availability with an "enumerable model set"; **T-AI-02-11 has switched the data source
+// from the hardcoded `BUILT_IN_PROVIDERS` table to the process-level catalog `Catalog::current()`** (making user models.json visible as well).
+// When T-V2-02-1 takes over, it owns this module's public surface/naming (`resolve_current_model`/`list_available_models`) and
+// per-model capability bits; it does not revive model-config/model-registry/model-runtime dropped from scope, and does not do remote catalog refresh.
 //
 // Traceability chain: pi-366 (list-models) / pi-368 (model-search) / pi-369 (model-selector) → REQ-V2-02
 // → this module (T-V2-02-4 interim) + T-V2-02-1 (takes over).
 
-use zen_ai::provider::resolve_provider;
+use zen_ai::catalog::Catalog;
 use zen_ai::types::Model;
 
-/// Built-in provider list (consistent with the registry of `zen_ai::provider::resolve_provider`).
-/// Each provider materializes its env/default model via `Model::from_provider` — not fabricated: id/base_url/max_tokens
-/// all come from each provider's existing environment-variable conventions and defaults (see the header comment in `zen-ai/src/provider.rs`).
-const BUILT_IN_PROVIDERS: &[&str] = &["opencode-go", "huoshan"];
-
-/// Enumerate built-in available models — “`/model` needs a candidate list when opened.” Parse each provider and materialize its default model;
-/// unregistered/providers that fail to resolve are silently skipped (without blocking other candidates).
+/// Enumerate available models — "there must be a candidate list when `/model` opens". Data source is the process-level catalog
+/// [`Catalog::current`] (`main` loads user `models.json` overrides at startup; if not installed, built-in catalog),
+/// Sorted by `(provider, id)` to ensure determinism.
 /// Consumers: `/model`, `/scoped-models` in `modes/interactive` and `app.model.cycle*`.
-/// **T-V2-02-1 takeover point**: at that time, merge models.json user overrides and per-model capability bits here.
+/// **T-V2-02-1 takeover point**: function names/public surface and `resolve_current_model`/`list_available_models` are decided there;
+/// This task (T-AI-02-11) only switches the data source from the hardcoded `BUILT_IN_PROVIDERS` table to the catalog.
 pub(crate) fn built_in_models() -> Vec<Model> {
-    let mut out = Vec::new();
-    for name in BUILT_IN_PROVIDERS {
-        if let Some(provider) = resolve_provider(name) {
-            out.push(Model::from_provider(provider.as_ref()));
-        }
-    }
-    out
+    Catalog::current().models()
 }
 
 /// Canonical full model id: `"<provider>/<id>"` — used uniformly for selector row identity, cycle set keys and `SelectorSelected` payloads.

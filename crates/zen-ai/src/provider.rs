@@ -7,8 +7,11 @@
 //!
 //! Env var conventions:
 //! - `ZEN_PROVIDER`: default provider selection (`opencode-go` / `huoshan`), defaults to `opencode-go`
-//! - opencode-go：`OPENCODE_API_KEY` / `OPENCODE_BASE_URL` / `OPENCODE_MODEL` / `OPENCODE_MAX_TOKENS`
-//! - huoshan：`ARK_API_KEY` / `ARK_BASE_URL` / `ARK_MODEL` / `ARK_MAX_TOKENS`
+//! - opencode-go：`OPENCODE_API_KEY`
+//! - huoshan：`ARK_API_KEY`
+//!
+//! Overrides for endpoint/model/output limits are now expressed via user `models.json` (`baseUrl`/`models[].id`/`maxTokens`)
+//! (T-AI-02-11 removed the original six env shims `*_BASE_URL`/`*_MODEL`/`*_MAX_TOKENS`).
 //!
 //! Future full pi compatibility path: `--provider` CLI overrides `ZEN_PROVIDER`, auth.json gains a
 //! "file > env" priority in `resolve_api_key`, and after model cataloging `default_model_id` comes from the catalog — trait/struct shapes remain unchanged.
@@ -163,10 +166,11 @@ pub fn default_provider_name() -> String {
     std::env::var("ZEN_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string())
 }
 
-/// Resolves a provider by name: looks up the built-in [`Catalog`] (overridden by user catalog injection in T-AI-02-11).
-/// Returns `None` on miss; signatures of existing callers (openai_stream / services / examples) stay unchanged.
+/// Resolves a provider by name: looks up the current process catalog [`Catalog::current`] (includes user
+/// `models.json` overrides after `install` during `main` startup; embedded catalog if not installed). Returns `None` if not found; existing callers
+/// (provider_attribution / services / examples) keep their signatures unchanged.
 pub fn resolve_provider(name: &str) -> Option<Box<dyn Provider>> {
-    Catalog::embedded().provider(name)
+    Catalog::current().provider(name)
 }
 
 /// opencode session header name (required by the gateway; missing → 400 `MissingSessionID`).
@@ -257,7 +261,7 @@ mod tests {
         let p = resolve_provider("opencode-go").expect("opencode-go should resolve");
         assert_eq!(p.id(), "opencode-go");
         assert_eq!(p.api(), Api::OpenAiCompletions);
-        // Endpoint defaults (when OPENCODE_BASE_URL is not set)
+        // endpoint comes from the embedded catalog
         assert_eq!(p.base_url(), "https://opencode.ai/zen/go/v1");
     }
 

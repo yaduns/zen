@@ -9,8 +9,8 @@
 //! dynamic attribution headers (e.g. `x-opencode-session` enforced by the opencode gateway) are wrapped by this module one layer outside `StreamFn`,
 //! evaluated per request from the current `model` + `cfg.session_id`, then merged into `StreamConfig.headers`.
 //!
-//! Transitional: the provider source is currently `resolve_provider` (built-in catalog); after T-AI-02-11 injects the single `Catalog`
-//! instance, switch to that instance's provider (seam already registered, see `tasks/T-AI-02-10-implemented.md`).
+//! The provider source is obtained via `resolve_provider` — internally it reads `Catalog::current()` (`install` during `main` startup
+//! ... then includes user `models.json` overrides), so the attribution header and the selection layer share the same catalog data.
 
 use std::collections::HashMap;
 use std::sync::Arc;

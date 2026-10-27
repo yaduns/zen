@@ -1,33 +1,31 @@
 use std::collections::HashMap;
-use std::env;
 
 use crate::catalog::Catalog;
 use crate::provider::Provider;
 use crate::types::{Cost, CostRates, Model};
 
 impl Model {
-    /// Create the default model config from environment variables (default provider opencode-go, model deepseek-v4-flash).
+    /// Selects the default model from the current catalog based on `ZEN_PROVIDER` (default provider `opencode-go`, model
+    /// `deepseek-v4-flash`）。
     ///
-    /// Provider selection: env `ZEN_PROVIDER` (default `opencode-go`) → default model from the built-in `models.json` catalog;
-    /// then apply the temporary env override shim from T-AI-02-9 (`*_BASE_URL`/`*_MODEL`/`*_MAX_TOKENS`,
-    /// removed after T-AI-02-11 injects the user catalog).
+    /// provider selection: env `ZEN_PROVIDER` (default `opencode-go`) → the current catalog [`Catalog::current`]'s
+    /// default model (includes user `models.json` overrides if installed during `main` startup; embedded catalog for library/tests).
     ///
     /// # Panics
-    /// The default provider does not exist in the built-in catalog or has no models (compile-time constant error, locked by the `embedded_catalog_parses` unit test).
+    /// The default provider does not exist in the current catalog or has no models (under the embedded catalog this is a compile-time constant error, locked by unit test
+    /// `embedded_catalog_parses`).
     pub fn from_env() -> Self {
-        let mut model = Catalog::embedded()
+        Catalog::current()
             .default_model()
-            .unwrap_or_else(|err| panic!("unknown default provider: {err}"));
-        apply_provider_env_overrides(&mut model);
-        model
+            .unwrap_or_else(|err| panic!("unknown default provider: {err}"))
     }
 
-    /// Construct the model from the selected provider: take the provider's first model in the catalog.
+    /// Constructs a model for the selected provider: takes the first model of that provider in the current catalog.
     ///
-    /// Unknown provider falls back to the existing defaults (`deepseek-v4-flash` + 1M context + 384k output) and logs
-    /// `tracing::warn`, as a compatibility shim before T-AI-02-11; known providers apply the temporary env override shim.
+    /// If the catalog has no such provider or no models, falls back to the existing defaults (`deepseek-v4-flash` + 1M context + 384k output)
+    /// and logs `tracing::warn` (unknown providers are already returned as `None` by the selection layer `resolve_provider`).
     pub fn from_provider(provider: &dyn Provider) -> Self {
-        let mut model = Catalog::embedded()
+        Catalog::current()
             .first_model(provider.id())
             .unwrap_or_else(|| {
                 tracing::warn!(
@@ -35,9 +33,7 @@ impl Model {
                     "provider not found in models.json catalog; using legacy defaults"
                 );
                 legacy_fallback_model(provider)
-            });
-        apply_provider_env_overrides(&mut model);
-        model
+            })
     }
 
     /// Set model ID.
@@ -130,7 +126,8 @@ impl Model {
 }
 
 /// Compatibility fallback for unknown providers: keeps the T-AI-02-4-era defaults (1M context / 384k output).
-/// After T-AI-02-11 injects the user catalog, unknown providers should raise an explicit error instead of silently falling back.
+/// Normally not triggered under the existing catalog (`resolve_provider` and `from_provider` read the same catalog); only when
+/// a provider exists in the catalog but declares no models is this a defensive fallback.
 fn legacy_fallback_model(provider: &dyn Provider) -> Model {
     Model {
         id: "deepseek-v4-flash".to_string(),
@@ -150,30 +147,6 @@ fn legacy_fallback_model(provider: &dyn Provider) -> Model {
         }),
         compat: None,
     }
-}
-
-/// Temporary env override shim from T-AI-02-9: preserve the existing `*_BASE_URL`/`*_MODEL`/`*_MAX_TOKENS` behavior,
-/// to be removed after T-AI-02-11 injects the user `models.json` (the six overrides will be expressed by the catalog instead).
-fn apply_provider_env_overrides(model: &mut Model) {
-    let (base_url_var, model_var, max_tokens_var) = match model.provider.as_str() {
-        "opencode-go" => ("OPENCODE_BASE_URL", "OPENCODE_MODEL", "OPENCODE_MAX_TOKENS"),
-        "huoshan" => ("ARK_BASE_URL", "ARK_MODEL", "ARK_MAX_TOKENS"),
-        _ => return,
-    };
-    if let Some(value) = non_empty_env(base_url_var) {
-        model.base_url = value;
-    }
-    if let Some(value) = non_empty_env(model_var) {
-        model.id = value;
-    }
-    if let Some(value) = non_empty_env(max_tokens_var).and_then(|value| value.parse().ok()) {
-        model.max_tokens = value;
-    }
-}
-
-/// Read a non-empty environment variable (empty string/whitespace-only is treated as unset).
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]
