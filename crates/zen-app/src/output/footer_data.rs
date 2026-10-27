@@ -848,7 +848,10 @@ mod tests {
         let timed_out = tokio::time::timeout(Duration::from_millis(100), rx.changed())
             .await
             .is_err();
-        assert!(timed_out, "Same branch should not trigger change notification");
+        assert!(
+            timed_out,
+            "Same branch should not trigger change notification"
+        );
         p.dispose();
     }
 
@@ -876,7 +879,10 @@ mod tests {
         let second = tokio::time::timeout(Duration::from_millis(100), rx.changed())
             .await
             .is_err();
-        assert!(second, "Debounce should coalesce into a single notification");
+        assert!(
+            second,
+            "Debounce should coalesce into a single notification"
+        );
         p.dispose();
     }
 
@@ -905,7 +911,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<FsSignal>();
         let (branch_tx, mut rx) = watch::channel(Some("main".to_string()));
         let cancel = CancellationToken::new();
-        let watcher = setup_watcher(&git_paths, &event_tx).expect("watcher should register successfully");
+        let watcher =
+            setup_watcher(&git_paths, &event_tx).expect("watcher should register successfully");
         let task = tokio::spawn(refresh_loop(
             event_rx,
             git_paths.clone(),

@@ -1323,6 +1323,13 @@ fn build_row_line(
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "文件 @apps/server/src/llm/mod.rs 中第415~418行的这段代码:";
+    const CJK_SAMPLE_2: &str = "文件 @..llm/mod.rs 中第251~259行的这段代码：";
+    const CJK_SAMPLE_3: &str = "    /// 构建客户端：用配置超时装配 reqwest::Client。";
+    const CJK_SAMPLE_4: &str = "    /// 输入：config——LLM 路由配置。";
+    const CJK_SAMPLE_5: &str = "第二行";
+    const CJK_SAMPLE_6: &str = "  加粗 和 code";
     use super::*;
 
     fn render(text: &str, width: usize) -> Vec<Vec<StyledSegment>> {
@@ -1413,7 +1420,7 @@ mod tests {
         assert_eq!(
             lines_text(&lines),
             vec![
-                "文件 @apps/server/src/llm/mod.rs 中第415~418行的这段代码:".to_string(),
+                CJK_SAMPLE.to_string(),
                 " let err = match outcome {".to_string(),
                 "                 Ok(value) => return Ok(value),".to_string(),
                 "                 Err(err) => err,".to_string(),
@@ -1432,10 +1439,10 @@ mod tests {
         assert_eq!(
             lines_text(&lines),
             vec![
-                "文件 @..llm/mod.rs 中第251~259行的这段代码：".to_string(),
+                CJK_SAMPLE_2.to_string(),
                 "rust".to_string(),
-                "    /// 构建客户端：用配置超时装配 reqwest::Client。".to_string(),
-                "    /// 输入：config——LLM 路由配置。".to_string(),
+                CJK_SAMPLE_3.to_string(),
+                CJK_SAMPLE_4.to_string(),
                 "    pub fn new(config: LlmConfig) {".to_string(),
                 "        todo!()".to_string(),
                 "    }".to_string(),
@@ -1477,10 +1484,13 @@ mod tests {
         let text = lines_text(&lines);
         // Both lines are in the same code block (``` fence is continuous, no prose line in between)
         let f0 = text.iter().position(|l| l == "```").expect("Opening fence");
-        let f1 = text.iter().rposition(|l| l == "```").expect("Closing fence");
+        let f1 = text
+            .iter()
+            .rposition(|l| l == "```")
+            .expect("Closing fence");
         assert_eq!(f1 - f0, 3, "Code block contains two lines: {text:?}");
         assert!(text[f0 + 1].contains("indented code"));
-        assert!(text[f0 + 2].contains("第二行"));
+        assert!(text[f0 + 2].contains(CJK_SAMPLE_5));
     }
 
     #[test]
@@ -1498,7 +1508,7 @@ mod tests {
         let lines = render("para\n  **加粗** 和 `code`", 80);
         assert_eq!(
             lines_text(&lines),
-            vec!["para".to_string(), "  加粗 和 code".to_string()]
+            vec!["para".to_string(), CJK_SAMPLE_6.to_string()]
         );
     }
 
@@ -1753,7 +1763,10 @@ mod tests {
         ] {
             assert!(style.fg.is_some(), "{name} should have foreground color");
         }
-        assert!(theme.code_block.bg.is_some(), "code_block should have background color");
+        assert!(
+            theme.code_block.bg.is_some(),
+            "code_block should have background color"
+        );
     }
 
     #[test]
@@ -1784,7 +1797,10 @@ mod tests {
         let theme = MarkdownTheme::default();
         let plain = render_markdown(&theme, text, 60);
         let via_override = render_markdown_with_override(&theme, text, 60, None);
-        assert_eq!(plain, via_override, "None form should be byte-for-byte identical");
+        assert_eq!(
+            plain, via_override,
+            "None form should be byte-for-byte identical"
+        );
     }
 
     #[test]

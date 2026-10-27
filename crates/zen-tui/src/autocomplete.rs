@@ -1041,6 +1041,11 @@ fn byte_index_of(line: &str, char_col: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好 世界";
+    const CJK_SAMPLE_2: &str = "你好";
+    const CJK_SAMPLE_3: &str = "你好 /src";
+    const CJK_SAMPLE_4: &str = "你好 /";
     use super::*;
     use std::fs;
 
@@ -1060,7 +1065,7 @@ mod tests {
         assert_eq!(find_last_delimiter("no-delim"), None);
         assert_eq!(find_last_delimiter(""), None);
         // space before CJK: byte index falls on the space
-        assert_eq!(find_last_delimiter("你好 世界"), Some(6));
+        assert_eq!(find_last_delimiter(CJK_SAMPLE), Some(6));
     }
 
     #[test]
@@ -1293,8 +1298,8 @@ mod tests {
     #[test]
     fn byte_index_of_converts_char_col_to_byte() {
         assert_eq!(byte_index_of("abc", 2), 2);
-        assert_eq!(byte_index_of("你好", 1), 3);
-        assert_eq!(byte_index_of("你好", 5), 6); // Beyond → end of line
+        assert_eq!(byte_index_of(CJK_SAMPLE_2, 1), 3);
+        assert_eq!(byte_index_of(CJK_SAMPLE_2, 5), 6); // Beyond → end of line
     }
 
     // ── Filesystem support (tempdir + std fs) ──
@@ -1436,8 +1441,14 @@ mod tests {
                 .all(|e| !(e.path == "target" || e.path.starts_with("target/"))),
             "target/ is excluded by .gitignore: {paths:?}"
         );
-        assert!(!paths.contains(&"target"), "target/ directory does not appear: {paths:?}");
-        assert!(paths.contains(&"src/main.rs"), "Unignored files still present: {paths:?}");
+        assert!(
+            !paths.contains(&"target"),
+            "target/ directory does not appear: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/main.rs"),
+            "Unignored files still present: {paths:?}"
+        );
         assert!(
             paths.contains(&"docs/guide.md"),
             "Unignored files still present: {paths:?}"
@@ -1812,11 +1823,11 @@ mod tests {
     #[test]
     fn get_suggestions_multibyte_cursor_not_panicking() {
         // "hello /src": cursor is in the /src segment, so the prefix should be "/src"
-        let line = "你好 /src".to_string();
+        let line = CJK_SAMPLE_3.to_string();
         // Ask for characters of "hello /src" from index 4? — character index 4 maps to a byte offset; convert via byte_index_of and manually verify the helper
         let byte_col = byte_index_of(&line, 4);
         let text_before = &line[..byte_col];
-        assert_eq!(text_before, "你好 /");
+        assert_eq!(text_before, CJK_SAMPLE_4);
         assert_eq!(
             extract_path_prefix(text_before, true),
             Some("/".to_string())

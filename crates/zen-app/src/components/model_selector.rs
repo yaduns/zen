@@ -505,7 +505,10 @@ mod tests {
     fn search_text_provider_first() {
         let m = Model::from_env().with_id("m-x");
         let t = selector_search_text(&m);
-        assert!(t.starts_with(&m.provider), "provider prefix should come first: {t}");
+        assert!(
+            t.starts_with(&m.provider),
+            "provider prefix should come first: {t}"
+        );
         assert!(t.contains(&format!("{}/m-x", m.provider)));
     }
 
@@ -547,7 +550,11 @@ mod tests {
         let (mut comp, _, _) = component(None, None);
         let tab = KeyEvent::from(crossterm::event::KeyCode::Tab);
         assert!(comp.handle_key(&tab));
-        assert_eq!(comp.scope(), ModelScope::All, "No change when there is no subset");
+        assert_eq!(
+            comp.scope(),
+            ModelScope::All,
+            "No change when there is no subset"
+        );
 
         let (mut comp2, _, _) = component(Some(ids(&["opencode-go/m-b"])), None);
         assert_eq!(comp2.scope(), ModelScope::Scoped);

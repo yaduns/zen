@@ -390,6 +390,8 @@ pub async fn execute_shell_with_capture(
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "hello, world! 中文 🙂";
     use super::*;
     use crate::env::{ExecutionEnv, ExecutionError};
     use crate::truncate::DEFAULT_MAX_LINES;
@@ -441,10 +443,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_keeps_visible_text() {
-        assert_eq!(
-            sanitize_binary_output("hello, world! 中文 🙂"),
-            "hello, world! 中文 🙂"
-        );
+        assert_eq!(sanitize_binary_output(CJK_SAMPLE), CJK_SAMPLE);
         // Keep both 0x20 (space) and 0x7f (DEL)
         assert_eq!(sanitize_binary_output("\x20\x7f"), "\x20\x7f");
     }

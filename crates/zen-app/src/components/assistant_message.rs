@@ -417,7 +417,10 @@ mod tests {
         );
         let mut buf = ScreenBuffer::new(40, 20);
         let painted = comp.render(&mut buf, 0, 0, 40, 20);
-        assert!(painted >= 3, "Long errors should wrap onto multiple lines, actual {painted}");
+        assert!(
+            painted >= 3,
+            "Long errors should wrap onto multiple lines, actual {painted}"
+        );
         assert!(
             flush_text(&mut buf).contains("TAILMARK"),
             "Trailing marker should be visible (not truncated to a single line)"

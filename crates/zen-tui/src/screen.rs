@@ -435,6 +435,11 @@ pub fn visible_width(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "中";
+    const CJK_SAMPLE_2: &str = "中文";
+    const CJK_SAMPLE_3: &str = "a中";
+    const CJK_SAMPLE_4: &str = "中x";
     use super::*;
     use crossterm::style::Color;
 
@@ -526,7 +531,7 @@ mod tests {
     fn test_clear_empties_all_cells() {
         let mut buf = ScreenBuffer::new(3, 3);
         buf.write(0, 0, &color_style(), "A");
-        buf.write(2, 2, &color_style(), "中");
+        buf.write(2, 2, &color_style(), CJK_SAMPLE);
         buf.clear();
         assert!(buf.cells.iter().all(|c| c == &Cell::default()));
     }
@@ -567,10 +572,10 @@ mod tests {
     #[test]
     fn test_write_wide_char_marks_continuation_cell() {
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
         let lead = cell(&buf, 0, 0);
         assert_eq!(lead.kind, CellKind::Char);
-        assert_eq!(lead.content.as_deref(), Some("中"));
+        assert_eq!(lead.content.as_deref(), Some(CJK_SAMPLE));
         let cont = cell(&buf, 1, 0);
         assert_eq!(cont.kind, CellKind::Continuation);
         assert_eq!(cont.content, None);
@@ -580,7 +585,7 @@ mod tests {
     fn test_write_truncates_wide_char_at_right_edge_without_splitting() {
         // width 4, starting column 3, only 1 column left for the wide char (needs 2) → entire wide char is dropped
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(3, 0, &color_style(), "中");
+        buf.write(3, 0, &color_style(), CJK_SAMPLE);
         // neither the start cell nor the continuation cell should be written
         assert_eq!(cell(&buf, 3, 0).kind, CellKind::Empty);
     }
@@ -600,7 +605,7 @@ mod tests {
     fn test_write_narrow_over_wide_start_clears_continuation() {
         // scenario 2: narrow char overwrites a wide char's start cell → continuation cell is cleared as well
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
         assert_eq!(cell(&buf, 1, 0).kind, CellKind::Continuation);
 
         buf.write(0, 0, &color_style(), "B");
@@ -612,7 +617,7 @@ mod tests {
     fn test_write_over_continuation_clears_wide_start() {
         // scenario 1: narrow char lands on a continuation cell → wide char's start cell is cleared
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
         buf.write(1, 0, &color_style(), "B");
         assert_eq!(cell(&buf, 0, 0).kind, CellKind::Empty);
         assert_eq!(cell(&buf, 1, 0).content.as_deref(), Some("B"));
@@ -663,7 +668,7 @@ mod tests {
     #[test]
     fn test_fill_over_wide_char_start_clears_continuation() {
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
         assert_eq!(cell(&buf, 1, 0).kind, CellKind::Continuation);
 
         // Fill overwrites a wide char's start cell → continuation cells cleared too; both cells become fill spaces
@@ -675,7 +680,7 @@ mod tests {
     #[test]
     fn test_fill_over_continuation_clears_wide_start() {
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
         // Fill overwrites a continuation cell → wide char's start cell cleared too (no half wide char left)
         buf.fill(1, 0, 1, 1, &color_style());
         assert_eq!(cell(&buf, 0, 0).kind, CellKind::Empty);
@@ -695,9 +700,9 @@ mod tests {
     #[test]
     fn test_visible_width_measures_by_display_columns() {
         assert_eq!(visible_width("abc"), 3);
-        assert_eq!(visible_width("中文"), 4); // 2 columns per wide char
+        assert_eq!(visible_width(CJK_SAMPLE_2), 4); // 2 columns per wide char
         assert_eq!(visible_width(""), 0);
-        assert_eq!(visible_width("a中"), 3);
+        assert_eq!(visible_width(CJK_SAMPLE_3), 3);
         assert_eq!(visible_width("\u{200b}"), 0); // zero-width char
     }
 
@@ -753,19 +758,21 @@ mod tests {
     #[test]
     fn test_flush_emits_wide_char_and_skips_continuation_print() {
         let mut buf = ScreenBuffer::new(4, 1);
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
 
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
         // the wide char itself is emitted
-        assert!(out.windows("中".len()).any(|w| w == "中".as_bytes()));
+        assert!(out
+            .windows(CJK_SAMPLE.len())
+            .any(|w| w == CJK_SAMPLE.as_bytes()));
     }
 
     #[test]
     fn test_flush_cleared_wide_char_propagates_to_continuation() {
         let mut buf = ScreenBuffer::new(4, 1);
         // first frame renders a wide char
-        buf.write(0, 0, &color_style(), "中");
+        buf.write(0, 0, &color_style(), CJK_SAMPLE);
         let mut first = Vec::new();
         buf.flush(&mut first).unwrap();
 
@@ -820,18 +827,24 @@ mod tests {
         buf.write(5, 0, &Style::default(), "b"); // Middle 1..5 empty
         let segs = buf.line_segments(0);
         let joined: String = segs.iter().map(|s| s.text.clone()).collect();
-        assert_eq!(joined, "a    b", "Interior gaps should be preserved as spaces");
+        assert_eq!(
+            joined, "a    b",
+            "Interior gaps should be preserved as spaces"
+        );
     }
 
     #[test]
     fn test_line_segments_wide_char_not_duplicated() {
         let mut buf = ScreenBuffer::new(6, 1);
         let red = color_style();
-        buf.write(0, 0, &red, "中"); // Middle + continuation cell
+        buf.write(0, 0, &red, CJK_SAMPLE); // Middle + continuation cell
         buf.write(2, 0, &Style::default(), "x");
         let segs = buf.line_segments(0);
         let joined: String = segs.iter().map(|s| s.text.clone()).collect();
-        assert_eq!(joined, "中x", "Wide character continuation cells should be skipped without producing placeholders");
+        assert_eq!(
+            joined, CJK_SAMPLE_4,
+            "Wide character continuation cells should be skipped without producing placeholders"
+        );
     }
 
     #[test]

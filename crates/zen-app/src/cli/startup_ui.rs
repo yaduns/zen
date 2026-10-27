@@ -447,7 +447,10 @@ mod tests {
 
     #[test]
     fn gate_returns_true_only_when_no_env_and_no_settings() {
-        assert!(first_time_setup_gate(None, false), "First launch with no settings → true");
+        assert!(
+            first_time_setup_gate(None, false),
+            "First launch with no settings → true"
+        );
         assert!(
             !first_time_setup_gate(None, true),
             "Existing settings.json → false"
@@ -609,7 +612,10 @@ mod tests {
         assert!(text.contains("Pick one"));
         assert!(text.contains("Continue"));
         assert!(text.contains("Cancel"));
-        assert!(text.contains("→ Continue"), "First item, when preselected, should have an arrow");
+        assert!(
+            text.contains("→ Continue"),
+            "First item, when preselected, should have an arrow"
+        );
     }
 
     // ── persist_first_time_theme (persistence segment, tempdir disk-write assertions) ────

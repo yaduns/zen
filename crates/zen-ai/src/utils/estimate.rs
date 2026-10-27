@@ -226,6 +226,8 @@ pub fn estimate_messages(messages: &[Message]) -> ContextUsageEstimate {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "思考";
     use super::*;
     use crate::types::{
         AssistantMessage, Cost, ImageContent, TextContent, ThinkingContent, ToolCall,
@@ -473,7 +475,7 @@ mod tests {
                     text_signature: None,
                 }),
                 ContentBlock::Thinking(ThinkingContent {
-                    thinking: "Thinking".to_string(), // 6 bytes -> ceil(6/4) = 2
+                    thinking: CJK_SAMPLE.to_string(), // 6 bytes -> ceil(6/4) = 2
                     thinking_signature: None,
                     redacted: None,
                 }),

@@ -2318,7 +2318,9 @@ impl InteractiveUi {
                 text.clone(),
                 theme,
             )),
-            ChatRow::Info { .. } => unreachable!("Info lines are drawn directly by paint_row, bypassing components"),
+            ChatRow::Info { .. } => {
+                unreachable!("Info lines are drawn directly by paint_row, bypassing components")
+            }
         }
     }
 }
@@ -2431,6 +2433,8 @@ pub(crate) enum InfoKind {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "当前目录有哪些文件？";
     use super::*;
     use crate::keybindings::app_default_bindings;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -2622,7 +2626,7 @@ mod tests {
         // Temporary diagnostics: per-line fg/bg of user messages + thinking messages
         let mut u = ui();
         u.apply(UiEvent::MessageStart(Message::User(user_message(
-            "What files are in the current directory?",
+            CJK_SAMPLE,
         ))));
         let m = assistant(
             vec![
@@ -2750,7 +2754,11 @@ mod tests {
         });
         assert!(u.streaming_index.is_none());
         assert!(matches!(&u.chat_rows[0], ChatRow::Assistant(m) if m.content.len() == 1));
-        assert_eq!(u.chat_rows.len(), 1, "normal completion does not append an Info line");
+        assert_eq!(
+            u.chat_rows.len(),
+            1,
+            "normal completion does not append an Info line"
+        );
     }
 
     #[test]
@@ -2806,7 +2814,10 @@ mod tests {
             result: harness_result,
             is_error: false,
         });
-        assert!(!u.tool_indices.contains_key("t1"), "remove the index after completion");
+        assert!(
+            !u.tool_indices.contains_key("t1"),
+            "remove the index after completion"
+        );
         assert!(
             matches!(&u.chat_rows[0], ChatRow::Tool { is_partial: false, result: Some(r), .. } if !r.is_error)
         );
@@ -3009,7 +3020,10 @@ mod tests {
         let mut canvas = ScrollbackCanvas::new(80, 24);
         u.render_scrollback(&mut canvas);
         let hint = canvas.cursor_hint();
-        assert!(hint.is_some(), "IME cursor anchor should be set every frame while the editor is focused");
+        assert!(
+            hint.is_some(),
+            "IME cursor anchor should be set every frame while the editor is focused"
+        );
         let (row, _col) = hint.unwrap();
         assert!(
             row < canvas.content_height(),
@@ -3018,7 +3032,10 @@ mod tests {
         );
         // Empty editor caret column = effective left padding (DEFAULT_EDITOR_PADDING_X=0), within the line width
         if let Some((_row, col)) = hint {
-            assert!(col < 80, "anchor column should be within the line width: {col}");
+            assert!(
+                col < 80,
+                "anchor column should be within the line width: {col}"
+            );
         }
     }
 
@@ -3157,7 +3174,11 @@ mod tests {
             args: serde_json::json!({"path": "a"}),
         });
         assert!(u.folded.is_empty());
-        assert_eq!(u.handle_key(&ctrl('o')), None, "ToolsExpand is consumed locally");
+        assert_eq!(
+            u.handle_key(&ctrl('o')),
+            None,
+            "ToolsExpand is consumed locally"
+        );
         assert_eq!(u.folded.len(), 1, "collapsed set contains the tool line");
         assert_eq!(u.handle_key(&ctrl('o')), None);
         assert!(u.folded.is_empty(), "pressing again expands it");
@@ -3171,7 +3192,9 @@ mod tests {
         }
         // Alt+Enter (default MessageFollowUp keybinding)
         let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
-        let cmd = u.handle_key(&alt_enter).expect("Alt+Enter should produce FollowUp");
+        let cmd = u
+            .handle_key(&alt_enter)
+            .expect("Alt+Enter should produce FollowUp");
         assert!(matches!(cmd, InputCommand::FollowUp(t) if t == "hi"));
         assert_eq!(u.editor.text(), "", "editor is cleared after queuing");
     }
@@ -3265,7 +3288,10 @@ mod tests {
             full_output_path: Some("/tmp/bash-x.log".into()),
         });
 
-        assert!(u.bash_index.is_none(), "close the streaming line after completion");
+        assert!(
+            u.bash_index.is_none(),
+            "close the streaming line after completion"
+        );
         match &u.chat_rows[0] {
             ChatRow::Bash {
                 output,
@@ -3359,7 +3385,11 @@ mod tests {
         let _ = u.handle_key(&press(KeyCode::Up));
         assert_eq!(u.autocomplete.as_ref().unwrap().selected, 0);
         let _ = u.handle_key(&press(KeyCode::Up));
-        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 0, "Up saturates at 0");
+        assert_eq!(
+            u.autocomplete.as_ref().unwrap().selected,
+            0,
+            "Up saturates at 0"
+        );
     }
 
     #[test]
@@ -3409,7 +3439,10 @@ mod tests {
         u.autocomplete = Some(overlay);
         let cmd = u.handle_key(&press(KeyCode::Enter));
         assert!(u.autocomplete.is_none());
-        assert!(cmd.is_none(), "non-`/` prefix completions do not auto-submit: {cmd:?}");
+        assert!(
+            cmd.is_none(),
+            "non-`/` prefix completions do not auto-submit: {cmd:?}"
+        );
         assert_eq!(u.editor.text(), "src/main.rs");
     }
 
@@ -3427,12 +3460,19 @@ mod tests {
         ));
         u.autocomplete = Some(overlay);
         let cmd = u.handle_key(&press(KeyCode::Tab));
-        assert!(u.autocomplete.is_none(), "overlay closes after applying with Tab");
+        assert!(
+            u.autocomplete.is_none(),
+            "overlay closes after applying with Tab"
+        );
         assert!(
             cmd.is_none(),
             "applying with Tab does not submit (only Enter auto-submits for / prefixes)"
         );
-        assert_eq!(u.editor.text(), "/model ", "Tab applies the selected item + trailing space");
+        assert_eq!(
+            u.editor.text(),
+            "/model ",
+            "Tab applies the selected item + trailing space"
+        );
     }
 
     #[test]
@@ -3449,7 +3489,11 @@ mod tests {
         let mut u = ui();
         assert_eq!(u.autocomplete_list_height(40), 0, "no overlay = 0");
         u.autocomplete = Some(overlay_with(vec![("a", "a"), ("b", "b"), ("c", "c")]));
-        assert_eq!(u.autocomplete_list_height(40), 5, "3 items + top and bottom borders 2");
+        assert_eq!(
+            u.autocomplete_list_height(40),
+            5,
+            "3 items + top and bottom borders 2"
+        );
         // max_visible truncation: 7 candidates, max_visible=3 → 3+2=5
         let mut overlay = overlay_with(vec![]);
         overlay.suggestions = Some(AutocompleteSuggestions::new(
@@ -3483,7 +3527,10 @@ mod tests {
                 let mut u = ui_with_commands();
                 u.editor.set_text("/set");
                 let _ = u.handle_key(&press(KeyCode::Tab));
-                assert!(u.autocomplete.is_some(), "Tab starts a completion session (pending)");
+                assert!(
+                    u.autocomplete.is_some(),
+                    "Tab starts a completion session (pending)"
+                );
                 // Drive the LocalSet tasks to completion and wrap up
                 for _ in 0..8 {
                     tokio::task::yield_now().await;
@@ -3491,7 +3538,10 @@ mod tests {
                         break;
                     }
                 }
-                let overlay = u.autocomplete.as_ref().expect("Overlay remains when candidates exist");
+                let overlay = u
+                    .autocomplete
+                    .as_ref()
+                    .expect("Overlay remains when candidates exist");
                 let sugg = overlay.suggestions.as_ref().expect("Candidates in place");
                 let values: Vec<&str> = sugg.items().iter().map(|i| i.value()).collect();
                 assert!(
@@ -3509,7 +3559,10 @@ mod tests {
                 let mut u = ui_with_commands();
                 let _ = u.handle_key(&press(KeyCode::Char('/')));
                 // Editor inserts "/" → maybe_trigger fires (natural trigger, pi trigger_characters semantics)
-                assert!(u.autocomplete.is_some(), "/ at line start naturally triggers completion");
+                assert!(
+                    u.autocomplete.is_some(),
+                    "/ at line start naturally triggers completion"
+                );
                 for _ in 0..8 {
                     tokio::task::yield_now().await;
                     if u.poll_autocomplete() {
@@ -3517,8 +3570,14 @@ mod tests {
                     }
                 }
                 let overlay = u.autocomplete.as_ref().unwrap();
-                let sugg = overlay.suggestions.as_ref().expect("empty prefix = all command candidates");
-                assert!(!sugg.items().is_empty(), "/ prefix yields the full command list");
+                let sugg = overlay
+                    .suggestions
+                    .as_ref()
+                    .expect("empty prefix = all command candidates");
+                assert!(
+                    !sugg.items().is_empty(),
+                    "/ prefix yields the full command list"
+                );
             })
             .await;
     }
@@ -3605,7 +3664,11 @@ mod tests {
                 assert!(has_sugg, "@Car should have candidates");
                 // Second Tab: apply selected item
                 let _ = u.handle_key(&press(KeyCode::Tab));
-                assert_eq!(u.editor.text(), "@Cargo.toml ", "After apply: completion text + trailing space");
+                assert_eq!(
+                    u.editor.text(),
+                    "@Cargo.toml ",
+                    "After apply: completion text + trailing space"
+                );
                 assert_eq!(
                     u.editor.cursor(),
                     (0, 12),
@@ -3644,11 +3707,19 @@ mod tests {
                         }
                     }
                 }
-                assert_eq!(u.editor.text(), "@Car", "editor content after typing key by key");
+                assert_eq!(
+                    u.editor.text(),
+                    "@Car",
+                    "editor content after typing key by key"
+                );
                 assert_eq!(u.editor.cursor(), (0, 4));
                 // Tab: apply selected item
                 let _ = u.handle_key(&press(KeyCode::Tab));
-                assert_eq!(u.editor.text(), "@Cargo.toml ", "After apply: completion text + trailing space");
+                assert_eq!(
+                    u.editor.text(),
+                    "@Cargo.toml ",
+                    "After apply: completion text + trailing space"
+                );
                 assert_eq!(
                     u.editor.cursor(),
                     (0, 12),
@@ -3683,7 +3754,10 @@ mod tests {
                         break;
                     }
                 }
-                assert!(u.autocomplete.is_none(), "No candidates → poll off, stay silent");
+                assert!(
+                    u.autocomplete.is_none(),
+                    "No candidates → poll off, stay silent"
+                );
             })
             .await;
     }
@@ -3732,7 +3806,9 @@ mod tests {
         assert!(u.selector.is_some());
         // ↓ Move to second item → Enter → ChoiceSelected(1)
         assert!(u.handle_key(&press(KeyCode::Down)).is_none());
-        let cmd = u.handle_key(&press(KeyCode::Enter)).expect("Should send selection");
+        let cmd = u
+            .handle_key(&press(KeyCode::Enter))
+            .expect("Should send selection");
         assert_eq!(cmd, InputCommand::ChoiceSelected(1));
         // Main task sends back CloseSelector → unmount
         u.apply(UiEvent::CloseSelector);
@@ -3746,7 +3822,9 @@ mod tests {
             title: "t".to_string(),
             options: vec!["Continue".into(), "Cancel".into()],
         });
-        let cmd = u.handle_key(&press(KeyCode::Esc)).expect("Should send cancellation");
+        let cmd = u
+            .handle_key(&press(KeyCode::Esc))
+            .expect("Should send cancellation");
         assert_eq!(cmd, InputCommand::SelectorCancelled);
     }
 
@@ -3761,7 +3839,9 @@ mod tests {
         for c in "focus".chars() {
             let _ = u.handle_key(&char_key(c));
         }
-        let cmd = u.handle_key(&press(KeyCode::Enter)).expect("Should send command");
+        let cmd = u
+            .handle_key(&press(KeyCode::Enter))
+            .expect("Should send command");
         assert_eq!(cmd, InputCommand::CustomInput("focus".to_string()));
     }
 
@@ -3786,7 +3866,9 @@ mod tests {
         });
         assert!(matches!(u.selector, Some(SelectorOverlay::Session(_))));
         // Enter selects first item → SelectorSelected(path)
-        let cmd = u.handle_key(&press(KeyCode::Enter)).expect("Should send path");
+        let cmd = u
+            .handle_key(&press(KeyCode::Enter))
+            .expect("Should send path");
         assert_eq!(
             cmd,
             InputCommand::SelectorSelected("/tmp/s1.jsonl".to_string())
@@ -3810,7 +3892,9 @@ mod tests {
         });
         assert!(matches!(u.selector, Some(SelectorOverlay::Tree(_))));
         // Esc → SelectorCancelled
-        let cmd = u.handle_key(&press(KeyCode::Esc)).expect("Should send cancellation");
+        let cmd = u
+            .handle_key(&press(KeyCode::Esc))
+            .expect("Should send cancellation");
         assert_eq!(cmd, InputCommand::SelectorCancelled);
     }
 

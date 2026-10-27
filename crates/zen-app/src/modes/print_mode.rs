@@ -292,7 +292,8 @@ mod tests {
 
     #[test]
     fn test_serialize_event_line_unit_variant_ends_with_newline() {
-        let line = serialize_event_line(&AgentEvent::AgentStart).expect("AgentStart should be serializable");
+        let line = serialize_event_line(&AgentEvent::AgentStart)
+            .expect("AgentStart should be serializable");
         assert!(line.ends_with('\n'), "Line should end with newline");
     }
 

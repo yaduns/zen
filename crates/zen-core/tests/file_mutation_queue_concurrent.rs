@@ -219,10 +219,9 @@ async fn symlink_alias_shares_mutation_queue_with_real_path() {
     });
 
     task_a.await.expect("task A panicked");
-    let result = task_b
-        .await
-        .expect("task B panicked")
-        .expect("edit on alias path must wait for the lock-holding operation on the real path to complete");
+    let result = task_b.await.expect("task B panicked").expect(
+        "edit on alias path must wait for the lock-holding operation on the real path to complete",
+    );
     assert_eq!(result.message.tool_name, "edit");
 
     let final_content = std::fs::read_to_string(&real).expect("read back");

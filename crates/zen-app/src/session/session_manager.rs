@@ -1412,7 +1412,10 @@ mod tests {
         {
             assert_eq!(summary, "summary text");
             assert_eq!(*tokens_before, 12_345);
-            assert!(retained_tail.is_none(), "empty retained_tail should be written as None");
+            assert!(
+                retained_tail.is_none(),
+                "empty retained_tail should be written as None"
+            );
             assert!(details.as_ref().unwrap().get("readFiles").is_some());
         } else {
             panic!("expected compaction entry");

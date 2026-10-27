@@ -31,6 +31,11 @@ pub fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "\x1b[31m你好\x1b[0m";
+    const CJK_SAMPLE_2: &str = "你好";
+    const CJK_SAMPLE_3: &str = "\x1b[1m中文\x1b[0m 🙂";
+    const CJK_SAMPLE_4: &str = "中文 🙂";
     use super::*;
 
     // ── Migrated from the existing 3 assertions in components/bash_execution.rs (T-AP-11-2) ──────
@@ -71,8 +76,8 @@ mod tests {
 
     #[test]
     fn preserves_multibyte_utf8_around_sequences() {
-        assert_eq!(strip_ansi("\x1b[31m你好\x1b[0m"), "你好");
-        assert_eq!(strip_ansi("\x1b[1m中文\x1b[0m 🙂"), "中文 🙂");
+        assert_eq!(strip_ansi(CJK_SAMPLE), CJK_SAMPLE_2);
+        assert_eq!(strip_ansi(CJK_SAMPLE_3), CJK_SAMPLE_4);
     }
 
     #[test]

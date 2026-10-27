@@ -64,6 +64,9 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "中文 & test";
+    const CJK_SAMPLE_2: &str = "中文 &amp; test";
     use super::*;
 
     // Skill fields constructed per design (name/description/content/file_path/disable_model_invocation) assumption; adjust if inconsistent with the actual definition.
@@ -113,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_escape_xml_unicode_preserved() {
-        assert_eq!(escape_xml("Chinese & test"), "Chinese &amp; test");
+        assert_eq!(escape_xml(CJK_SAMPLE), CJK_SAMPLE_2);
     }
 
     // ─── format_skills_for_system_prompt ───────────────────────────

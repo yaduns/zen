@@ -118,7 +118,10 @@ mod tests {
             providers.contains(&"opencode-go"),
             "missing opencode-go: {providers:?}"
         );
-        assert!(providers.contains(&"huoshan"), "missing huoshan: {providers:?}");
+        assert!(
+            providers.contains(&"huoshan"),
+            "missing huoshan: {providers:?}"
+        );
         // every model id is non-empty
         assert!(models.iter().all(|m| !m.id.is_empty()));
     }

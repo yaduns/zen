@@ -392,6 +392,9 @@ fn trailing_partial_len(buf: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "中";
+    const CJK_SAMPLE_2: &str = "中!";
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -465,10 +468,10 @@ mod tests {
     fn test_trailing_partial_len_full_multibyte_is_complete() {
         // Complete multibyte character at the tail → nothing to carry
         assert_eq!(trailing_partial_len("é".as_bytes()), 0); // 2 bytes
-        assert_eq!(trailing_partial_len("中".as_bytes()), 0); // 3 bytes
+        assert_eq!(trailing_partial_len(CJK_SAMPLE.as_bytes()), 0); // 3 bytes
         assert_eq!(trailing_partial_len("🦀".as_bytes()), 0); // 4 bytes
                                                               // Complete character followed by ASCII at the tail → nothing to carry
-        assert_eq!(trailing_partial_len("中!".as_bytes()), 0);
+        assert_eq!(trailing_partial_len(CJK_SAMPLE_2.as_bytes()), 0);
     }
 
     #[test]
@@ -512,8 +515,8 @@ mod tests {
         // Split a 3-byte CJK char (E4 B8 AD) into [E4 B8] + [AD]; cross-chunk joined decoding must not produce U+FFFD
         let mut d = StreamDecoder::new();
         assert_eq!(d.feed(&[0xE4, 0xB8]), ""); // Incomplete → this chunk emits no text
-        assert_eq!(d.feed(&[0xAD]), "中");
-        assert_eq!(d.take_text(), "中");
+        assert_eq!(d.feed(&[0xAD]), CJK_SAMPLE);
+        assert_eq!(d.take_text(), CJK_SAMPLE);
     }
 
     #[test]
@@ -851,7 +854,10 @@ mod tests {
         // exec returns Ok(exit_code 0) on its own; if it does not return within 3s, kill_all did not kill it.
         let res = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
         match res {
-            Ok(Ok(Ok(out))) => assert_eq!(out.exit_code, 0, "signal termination should map to exit_code 0"),
+            Ok(Ok(Ok(out))) => assert_eq!(
+                out.exit_code, 0,
+                "signal termination should map to exit_code 0"
+            ),
             Ok(Ok(Err(e))) => panic!("exec should not error (token not cancelled): {e}"),
             Ok(Err(_)) => panic!("exec task panic"),
             Err(_elapsed) => {

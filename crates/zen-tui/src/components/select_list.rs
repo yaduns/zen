@@ -428,6 +428,11 @@ impl super::Component for SelectList {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好";
+    const CJK_SAMPLE_2: &str = "再见";
+    const CJK_SAMPLE_3: &str = "你";
+    const CJK_SAMPLE_4: &str = "中";
 
     /// Test constructor: default SelectAction keymap (no user overrides).
     fn kb() -> KeybindingsManager<SelectAction> {
@@ -516,16 +521,22 @@ mod tests {
 
     #[test]
     fn set_filter_safe_across_multi_byte_boundary() {
-        let mut l = SelectList::new(items(&["你好", "再见", "abc"]), 3, theme(), layout(), kb());
+        let mut l = SelectList::new(
+            items(&[CJK_SAMPLE, CJK_SAMPLE_2, "abc"]),
+            3,
+            theme(),
+            layout(),
+            kb(),
+        );
         // Valid prefix (full grapheme) hit
-        l.set_filter("你");
+        l.set_filter(CJK_SAMPLE_3);
         assert_eq!(l.filtered_items.len(), 1);
-        assert_eq!(l.filtered_items[0].value, "你好");
+        assert_eq!(l.filtered_items[0].value, CJK_SAMPLE);
         // Prefixes not at grapheme boundaries must not panic nor falsely match CJK items (but may match ASCII items)
         l.set_filter("a");
         assert_eq!(l.filtered_items.len(), 1);
         assert_eq!(l.filtered_items[0].value, "abc"); // CJK text: byte 0 is not a char boundary → excluded, only "abc" matches
-        l.set_filter("中");
+        l.set_filter(CJK_SAMPLE_4);
         assert!(l.filtered_items.is_empty());
     }
 

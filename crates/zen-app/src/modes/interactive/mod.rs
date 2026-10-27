@@ -3011,7 +3011,10 @@ mod tests {
         );
         assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
         assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
-        assert!(rx.try_recv().is_err(), "no CacheMissNotice when the gate is closed");
+        assert!(
+            rx.try_recv().is_err(),
+            "no CacheMissNotice when the gate is closed"
+        );
     }
 
     /// Resume stream payload: hint inserted after the payment message (flat index); `debug_assert` invariants hold.
@@ -3074,7 +3077,10 @@ mod tests {
         let (messages, notices) = restore_history_payload(&session, true);
         assert_eq!(messages.len(), 2);
         assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].0, 1, "hint is inserted after the payment message (flat index 1)");
+        assert_eq!(
+            notices[0].0, 1,
+            "hint is inserted after the payment message (flat index 1)"
+        );
         assert!(notices[0]
             .1
             .starts_with("Cache miss: 100k tokens re-billed"));
@@ -3188,7 +3194,10 @@ mod tests {
         let mut mode = InteractiveMode::new(test_runtime(), options(), None);
         assert!(!mode.is_initialized);
         assert!(!mode.is_shutting_down);
-        assert!(mode.input_tx.is_some(), "channel sender pending handoff at init");
+        assert!(
+            mode.input_tx.is_some(),
+            "channel sender pending handoff at init"
+        );
         assert!(mode.ui_event_rx.is_some());
         assert!(mode.ui_task.is_none());
         assert!(mode.subscription.is_none());
@@ -3335,7 +3344,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        panic!("wait_for_count({n}) timed out: currently {} entries", store.count());
+        panic!(
+            "wait_for_count({n}) timed out: currently {} entries",
+            store.count()
+        );
     }
 
     /// RunDone reset guard regression: after one round completes, `run_task` is reset so a second Submit can start the second round.

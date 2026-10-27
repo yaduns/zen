@@ -43,8 +43,9 @@ pub fn make_session(
     tools: Vec<Arc<dyn Tool>>,
     thinking: ThinkingLevel,
 ) -> AgentSession {
-    let stream_fn =
-        stream_for(model.api).expect("Protocol pointed to by model.api is not implemented; see stream_for binding table");
+    let stream_fn = stream_for(model.api).expect(
+        "Protocol pointed to by model.api is not implemented; see stream_for binding table",
+    );
     create_agent_session(
         model,
         system_prompt,

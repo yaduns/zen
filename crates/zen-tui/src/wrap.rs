@@ -300,6 +300,21 @@ pub fn is_punctuation_char(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好世界";
+    const CJK_SAMPLE_2: &str = "你";
+    const CJK_SAMPLE_3: &str = "好";
+    const CJK_SAMPLE_4: &str = "世";
+    const CJK_SAMPLE_5: &str = "界";
+    const CJK_SAMPLE_6: &str = "ab你好cd";
+    const CJK_SAMPLE_7: &str = "一二三四";
+    const CJK_SAMPLE_8: &str = "一...";
+    const CJK_SAMPLE_9: &str = "一二...";
+    const CJK_SAMPLE_10: &str = "你abcde";
+    const CJK_SAMPLE_11: &str = "你a...";
+    const CJK_SAMPLE_12: &str = "a中b";
+    const CJK_SAMPLE_13: &str = "中";
+    const CJK_SAMPLE_14: &str = "好世";
     use super::*;
 
     // ── word_wrap_line (moved from editor/wrap.rs, T-TU-01-3) ──
@@ -364,34 +379,34 @@ mod tests {
     #[test]
     fn test_word_wrap_cjk_breakable() {
         // CJK characters are breakable between any two
-        let chunks = word_wrap_line("你好世界", 2);
+        let chunks = word_wrap_line(CJK_SAMPLE, 2);
         // Each CJK char is width 2, so each gets its own chunk at max_width=2
         assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].text, "你");
-        assert_eq!(chunks[1].text, "好");
-        assert_eq!(chunks[2].text, "世");
-        assert_eq!(chunks[3].text, "界");
+        assert_eq!(chunks[0].text, CJK_SAMPLE_2);
+        assert_eq!(chunks[1].text, CJK_SAMPLE_3);
+        assert_eq!(chunks[2].text, CJK_SAMPLE_4);
+        assert_eq!(chunks[3].text, CJK_SAMPLE_5);
     }
 
     #[test]
     fn test_word_wrap_cjk_with_ascii() {
-        let chunks = word_wrap_line("ab你好cd", 4);
+        let chunks = word_wrap_line(CJK_SAMPLE_6, 4);
         // "ab" = 2 + one CJK char = 2 → total 4, fits
         // But CJK boundary allows break after "ab" if needed
         // Actually: "ab" (2) + CJK (2) = 4 fits, then CJK (2) + "cd" (2) = 4
         assert!(!chunks.is_empty());
         // Verify continuity
         assert_eq!(chunks[0].start_index, 0);
-        assert_eq!(chunks.last().unwrap().end_index, "ab你好cd".len());
+        assert_eq!(chunks.last().unwrap().end_index, CJK_SAMPLE_6.len());
     }
 
     #[test]
     fn test_word_wrap_wide_char_exceeds_width() {
         // A CJK char (width 2) in max_width=1
-        let chunks = word_wrap_line("你", 1);
+        let chunks = word_wrap_line(CJK_SAMPLE_2, 1);
         // Wide char exceeds width, gets its own chunk (visual overflow)
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].text, "你");
+        assert_eq!(chunks[0].text, CJK_SAMPLE_2);
     }
 
     #[test]
@@ -516,10 +531,10 @@ mod tests {
     #[test]
     fn test_truncate_does_not_split_wide_char() {
         // Four 2-column CJK chars; max_width 5 → keep 2 columns = one CJK char, otherwise it would split in half
-        assert_eq!(truncate_to_width("一二三四", 5, "..."), "一...");
+        assert_eq!(truncate_to_width(CJK_SAMPLE_7, 5, "..."), CJK_SAMPLE_8);
         // max_width 7 → keep 4 = two CJK chars; keep 3 cannot fit two wide characters (4 > 3), so only one CJK char remains
-        assert_eq!(truncate_to_width("一二三四", 7, "..."), "一二...");
-        assert_eq!(truncate_to_width("一二三四", 6, "..."), "一...");
+        assert_eq!(truncate_to_width(CJK_SAMPLE_7, 7, "..."), CJK_SAMPLE_9);
+        assert_eq!(truncate_to_width(CJK_SAMPLE_7, 6, "..."), CJK_SAMPLE_8);
     }
 
     #[test]
@@ -533,7 +548,7 @@ mod tests {
     #[test]
     fn test_truncate_exact_width_keeps_whole_wide_at_boundary() {
         // One CJK char + "abcde" has width 7 > max 6 → keep 3; CJK(2)+a(1) exactly fills, wide character kept whole, b truncated
-        assert_eq!(truncate_to_width("你abcde", 6, "..."), "你a...");
+        assert_eq!(truncate_to_width(CJK_SAMPLE_10, 6, "..."), CJK_SAMPLE_11);
     }
 
     // ── slice_by_column ──
@@ -558,26 +573,26 @@ mod tests {
     fn test_slice_by_column_skips_wide_char_crossing_window() {
         // "a" + CJK + "b": a at column 0, the CJK char at columns 1-2, b at column 3. Window [1,2) → does the CJK char fall entirely within the window?
         // The CJK char starts at column 1 and ends at column 3; its right edge exceeds end_col=2 → discarded whole → empty
-        assert_eq!(slice_by_column("a中b", 1, 1), "");
+        assert_eq!(slice_by_column(CJK_SAMPLE_12, 1, 1), "");
         // Window [1,3) → the CJK char starts at 1 and ends at 3, entirely inside → kept
-        assert_eq!(slice_by_column("a中b", 1, 2), "中");
+        assert_eq!(slice_by_column(CJK_SAMPLE_12, 1, 2), CJK_SAMPLE_13);
         // Window [3,4) → b
-        assert_eq!(slice_by_column("a中b", 3, 1), "b");
+        assert_eq!(slice_by_column(CJK_SAMPLE_12, 3, 1), "b");
     }
 
     #[test]
     fn test_slice_by_column_start_mid_wide_char_skips_it() {
         // Window starts in the middle of a wide character (start_col=2, the CJK char occupies 1-2) → its start column 1 < start_col,
         // so it is not kept; only its right half remains in window [2,3) → empty (matching pi strict semantics: discard whole characters crossing the boundary)
-        assert_eq!(slice_by_column("a中b", 2, 1), "");
+        assert_eq!(slice_by_column(CJK_SAMPLE_12, 2, 1), "");
         // b immediately adjacent to window [3,4) is kept whole
-        assert_eq!(slice_by_column("a中b", 3, 1), "b");
+        assert_eq!(slice_by_column(CJK_SAMPLE_12, 3, 1), "b");
     }
 
     #[test]
     fn test_slice_by_column_full_line_context() {
         // Covers the typical Input windowing scenario: wide characters fully preserved in the middle of the window
-        assert_eq!(slice_by_column("你好世界", 2, 4), "好世");
+        assert_eq!(slice_by_column(CJK_SAMPLE, 2, 4), CJK_SAMPLE_14);
     }
 
     // ── normalize_tabs ──

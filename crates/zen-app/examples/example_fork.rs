@@ -82,7 +82,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 2. Fork from the source session (fork_from copies all entries to a new file with a new id)
-    let source_path = source.get_session_file().expect("File session should have a path");
+    let source_path = source
+        .get_session_file()
+        .expect("File session should have a path");
     let forked = SessionManager::fork_from(
         &source_path,
         &cwd,

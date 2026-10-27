@@ -333,7 +333,10 @@ mod tests {
         assert_eq!(s.max_retries, 3);
         assert_eq!(s.base_delay_ms, 2_000);
         assert_eq!(s.max_retry_delay_ms, 60_000);
-        assert_eq!(s.timeout_ms, None, "timeout_ms has no pi default, passed through");
+        assert_eq!(
+            s.timeout_ms, None,
+            "timeout_ms has no pi default, passed through"
+        );
     }
 
     #[test]
@@ -376,7 +379,10 @@ mod tests {
         };
         let s = effective_compaction(Some(&patch));
         assert!(!s.enabled);
-        assert_eq!(s.reserve_tokens, 16_384, "uncovered leaf fields keep their defaults");
+        assert_eq!(
+            s.reserve_tokens, 16_384,
+            "uncovered leaf fields keep their defaults"
+        );
         assert_eq!(s.keep_recent_tokens, 30_000);
     }
 
@@ -397,7 +403,10 @@ mod tests {
             "pi default tree"
         );
         assert_eq!(eff.editor_padding_x, 0);
-        assert_eq!(eff.output_pad, 1, "pi default 1, T-AP-02-3-fix fallback assigned to this task");
+        assert_eq!(
+            eff.output_pad, 1,
+            "pi default 1, T-AP-02-3-fix fallback assigned to this task"
+        );
         assert_eq!(
             eff.autocomplete_max_visible, 5,
             "pi default 5 (interactive current value 10 consolidated)"
@@ -430,6 +439,9 @@ mod tests {
         assert_eq!(eff.theme, None, "path-like forms are filtered out");
         assert_eq!(eff.editor_padding_x, 3, "clamp 0..=3");
         assert_eq!(eff.autocomplete_max_visible, 3, "clamp 3..=20");
-        assert_eq!(eff.output_pad, 0, "explicit 0 preserved (pi getOutputPad semantics)");
+        assert_eq!(
+            eff.output_pad, 0,
+            "explicit 0 preserved (pi getOutputPad semantics)"
+        );
     }
 }

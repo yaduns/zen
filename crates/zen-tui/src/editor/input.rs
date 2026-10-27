@@ -710,11 +710,23 @@ mod tests {
         )]));
         ed.set_text("ab");
         ed.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        assert_eq!(ed.cursor(), (0, 1), "ctrl+o should match the overridden MoveCursorLeft");
+        assert_eq!(
+            ed.cursor(),
+            (0, 1),
+            "ctrl+o should match the overridden MoveCursorLeft"
+        );
         ed.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert_eq!(ed.cursor(), (0, 1), "Default ctrl+b was overridden and released, no longer matches");
+        assert_eq!(
+            ed.cursor(),
+            (0, 1),
+            "Default ctrl+b was overridden and released, no longer matches"
+        );
         ed.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(ed.cursor(), (0, 1), "Default left was overridden and released, no longer matches");
+        assert_eq!(
+            ed.cursor(),
+            (0, 1),
+            "Default left was overridden and released, no longer matches"
+        );
     }
 
     #[test]

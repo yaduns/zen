@@ -659,7 +659,8 @@ mod tests {
             "prev summary",
             Some(vec![user_message("tail msg")]),
         );
-        let message = message_from_entry(&entry).expect("Compaction should produce summary message");
+        let message =
+            message_from_entry(&entry).expect("Compaction should produce summary message");
         let text = user_text(&message);
         assert!(text.starts_with("[Context Summarize - Before Compact 100 tokens]"));
         // pi-227 deliberate difference: no retained_tail (the tail belongs to current path reconstruction, not to the discarded segment narrative)

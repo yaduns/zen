@@ -393,7 +393,10 @@ mod tests {
 
         let out = build_all_session_listings(&root);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].cwd, "/projA", "s1 later activity timestamp should rank first");
+        assert_eq!(
+            out[0].cwd, "/projA",
+            "s1 later activity timestamp should rank first"
+        );
         assert_eq!(out[1].cwd, "/projB");
         assert!(out[0].modified >= out[1].modified);
         let _ = std::fs::remove_dir_all(&root);
@@ -446,7 +449,10 @@ mod tests {
 
         let out = build_session_listings("/proj", &root);
         assert_eq!(out.len(), 1);
-        assert!(out[0].name.is_none(), "latest session_info None overwrites old name");
+        assert!(
+            out[0].name.is_none(),
+            "latest session_info None overwrites old name"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

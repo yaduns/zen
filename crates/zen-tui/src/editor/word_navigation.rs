@@ -130,6 +130,9 @@ pub(super) fn find_word_forward(text: &str, cursor: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好世界 test";
+    const CJK_SAMPLE_2: &str = "你好";
     use super::*;
 
     // ── find_word_backward (migrated from pi word-navigation.test.ts backward cases, ASCII 1:1) ──
@@ -208,7 +211,7 @@ mod tests {
     fn test_backward_cjk_per_char() {
         // Registered deviation: unicode-segmentation segments per character (pi ICU dictionary grouping yields multi-char words),
         // so backward from the start of "test" crosses only one CJK character instead of pi's two.
-        let text = "你好世界 test";
+        let text = CJK_SAMPLE;
         assert_eq!(find_word_backward(text, 17), 13); // Back to the start of "test" (aligned with pi 9→5)
         assert_eq!(find_word_backward(text, 13), 9); // Backward one character to the start of the 2nd CJK char (pi is 5→2, deviation)
         assert_eq!(find_word_backward(text, 9), 6); // Backward one character to the start of the 1st CJK char
@@ -293,7 +296,7 @@ mod tests {
     #[test]
     fn test_forward_cjk_per_char_walks_to_end() {
         // Per-character segmentation (registered deviation): each forward press advances one character, eventually reaching end of line
-        let text = "你好世界 test";
+        let text = CJK_SAMPLE;
         let mut pos = 0;
         while pos < text.len() {
             let next = find_word_forward(text, pos);
@@ -318,7 +321,7 @@ mod tests {
     fn test_is_word_like() {
         assert!(is_word_like("hello"));
         assert!(is_word_like("foo.bar"));
-        assert!(is_word_like("你好"));
+        assert!(is_word_like(CJK_SAMPLE_2));
         assert!(is_word_like("123"));
         assert!(!is_word_like("  "));
         assert!(!is_word_like("."));

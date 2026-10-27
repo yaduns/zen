@@ -500,7 +500,11 @@ mod tests {
             "With rows=10, cap=5; 5 content lines hit the top at 7"
         );
         e.set_text(t8);
-        assert_eq!(e.needed_height(40, 10), 7, "8 content lines are still truncated by cap=5 to 7");
+        assert_eq!(
+            e.needed_height(40, 10),
+            7,
+            "8 content lines are still truncated by cap=5 to 7"
+        );
         // rows=40 → cap = max(5, 12) = 12: 7 content rows → 9 (not capped), 20 rows → 14
         e.set_text(t5);
         assert_eq!(e.needed_height(40, 40), 7);
@@ -517,7 +521,11 @@ mod tests {
         }
         t20.pop();
         e.set_text(&t20);
-        assert_eq!(e.needed_height(40, 40), 14, "20 content lines are truncated by cap=12 to 14");
+        assert_eq!(
+            e.needed_height(40, 40),
+            14,
+            "20 content lines are truncated by cap=12 to 14"
+        );
     }
 
     /// P0-A core regression: rendered visible rows always equal needed_height − 2 (any rows/content combination),
@@ -567,7 +575,10 @@ mod tests {
             .collect();
         assert_eq!(rows, vec!["a", "b", "c", "d", "e", "f", "g"]);
         // bottom border (row 8) has no ↓N more indicator (content within budget)
-        assert!(!join_row(&buf, 8).contains('↓'), "No ↓ indicator should appear when under budget");
+        assert!(
+            !join_row(&buf, 8).contains('↓'),
+            "No ↓ indicator should appear when under budget"
+        );
     }
 
     /// Old fixed-height h=3 path behavior unchanged (regression guard: visible=1, matching the old clamp(5,1,1)).
@@ -584,9 +595,16 @@ mod tests {
             "When scroll offset >0, top border should have ↑N more; actual {top:?}"
         );
         let content = join_row(&buf, 1);
-        assert_eq!(content.trim_end(), "world", "At height 3, only the line containing the cursor is shown");
+        assert_eq!(
+            content.trim_end(),
+            "world",
+            "At height 3, only the line containing the cursor is shown"
+        );
         let bottom = join_row(&buf, 2);
-        assert!(bottom.starts_with('─'), "Bottom border is at line 2; actual {bottom:?}");
+        assert!(
+            bottom.starts_with('─'),
+            "Bottom border is at line 2; actual {bottom:?}"
+        );
     }
 
     /// ↓N more appears only when content truly exceeds the budget (no indicator when content ≤ cap; when over cap and there is content above the cursor

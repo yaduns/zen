@@ -400,6 +400,14 @@ async fn select_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<Se
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str =
+        "[main] node 2: mode resolution (--mode > --print > non-TTY stdin > interactive)";
+    const CJK_SAMPLE_2: &str = "[main] node 2.5: 首次设置完成（主题已持久化）";
+    const CJK_SAMPLE_3: &str = "[main] node 3: 读取 stdin + 构建初始消息";
+    const CJK_SAMPLE_4: &str = "[main] node 4: 装配工厂 -> AgentSessionRuntime 就绪";
+    const CJK_SAMPLE_5: &str = "[main] node 5: print 模式分发完成";
+    const CJK_SAMPLE_6: &str = "[main] node 5: interactive 模式分发完成";
     use super::*;
 
     /// Test helper: construct CliArgs (aligned with args.rs test conventions).
@@ -457,7 +465,10 @@ mod tests {
             fallback_cwd: "/current".to_string(),
         };
         let (msg, code) = missing_cwd_print_disposition(&issue);
-        assert_eq!(code, 1, "print branch error exit code aligned with pi exit(1)");
+        assert_eq!(
+            code, 1,
+            "print branch error exit code aligned with pi exit(1)"
+        );
         assert!(
             msg.contains("/project/ghost"),
             "dispose message should include the stored session_cwd"
@@ -554,7 +565,11 @@ mod tests {
         let sm = select_session_manager(&args, Path::new("/proj"))
             .await
             .unwrap();
-        assert_eq!(sm.get_session_id(), "newname", "on miss → create injects id");
+        assert_eq!(
+            sm.get_session_id(),
+            "newname",
+            "on miss → create injects id"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -596,7 +611,10 @@ mod tests {
         let sm = select_session_manager(&args, Path::new("/proj"))
             .await
             .unwrap();
-        assert!(sm.get_session_file().is_none(), "no-session in-memory session");
+        assert!(
+            sm.get_session_file().is_none(),
+            "no-session in-memory session"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

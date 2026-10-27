@@ -391,6 +391,8 @@ fn write_segments<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "ab中";
     use super::*;
     use crossterm::style::Color;
 
@@ -441,12 +443,12 @@ mod tests {
 
         // Wide chars: ab(2) + one CJK char(2) = 4 exactly fills
         let mut c2 = ScrollbackCanvas::new(4, 10);
-        c2.push_line(vec![plain("ab中")]);
-        assert_eq!(c2.lines[0][0].text, "ab中");
+        c2.push_line(vec![plain(CJK_SAMPLE)]);
+        assert_eq!(c2.lines[0][0].text, CJK_SAMPLE);
 
         // 3 columns can't fit a 2-column CJK char: don't split it in half, drop it entirely
         let mut c3 = ScrollbackCanvas::new(3, 10);
-        c3.push_line(vec![plain("ab中")]);
+        c3.push_line(vec![plain(CJK_SAMPLE)]);
         assert_eq!(c3.lines[0][0].text, "ab");
     }
 
@@ -460,9 +462,15 @@ mod tests {
         }
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
-        assert!(out.windows(5).any(|w| w == b"line0"), "First frame should write all lines");
+        assert!(
+            out.windows(5).any(|w| w == b"line0"),
+            "First frame should write all lines"
+        );
         assert!(out.windows(5).any(|w| w == b"line4"));
-        assert_eq!(c.prev_viewport_top, 2, "height=3, 5 lines → viewport top=5-3=2");
+        assert_eq!(
+            c.prev_viewport_top, 2,
+            "height=3, 5 lines → viewport top=5-3=2"
+        );
         assert_eq!(c.prev_lines.len(), 5);
         assert_eq!(c.hardware_cursor_row, 4);
     }
@@ -473,7 +481,10 @@ mod tests {
         c.push_line(vec![plain("a")]);
         c.push_line(vec![plain("b")]);
         c.flush(&mut Vec::new()).unwrap();
-        assert_eq!(c.prev_viewport_top, 0, "Content does not exceed screen → viewport top=0");
+        assert_eq!(
+            c.prev_viewport_top, 0,
+            "Content does not exceed screen → viewport top=0"
+        );
     }
 
     // ── flush: diff (no change / append / scroll beyond screen) ──
@@ -498,8 +509,14 @@ mod tests {
         c.push_line(vec![plain("b")]);
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
-        assert!(out.windows(1).any(|w| w == b"b"), "Diff should output newly added lines");
-        assert_eq!(c.prev_viewport_top, 0, "Viewport top unchanged when content fits screen");
+        assert!(
+            out.windows(1).any(|w| w == b"b"),
+            "Diff should output newly added lines"
+        );
+        assert_eq!(
+            c.prev_viewport_top, 0,
+            "Viewport top unchanged when content fits screen"
+        );
     }
 
     #[test]
@@ -517,7 +534,10 @@ mod tests {
         }
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
-        assert!(out.windows(2).any(|w| w == b"r2"), "Latest line should be visible");
+        assert!(
+            out.windows(2).any(|w| w == b"r2"),
+            "Latest line should be visible"
+        );
         assert_eq!(c.prev_viewport_top, 1);
         assert!(
             out.windows(2).any(|w| w == b"\r\n"),
@@ -605,7 +625,11 @@ mod tests {
         let mut c = ScrollbackCanvas::new(10, 5);
         assert_eq!(c.cursor_hint(), None);
         c.push_line(vec![plain("a")]);
-        assert_eq!(c.line_count(), 1, "line_count reflects the number of pushed lines");
+        assert_eq!(
+            c.line_count(),
+            1,
+            "line_count reflects the number of pushed lines"
+        );
         c.set_cursor_hint(Some((1, 2)));
         assert_eq!(c.cursor_hint(), Some((1, 2)));
         // clear() resets the anchor (re-set by draw each frame)
@@ -647,7 +671,10 @@ mod tests {
             false
         };
         let text = String::from_utf8_lossy(&out);
-        assert!(!has_position(&text), "Without an anchor, no positioning sequence should be output: {text:?}");
+        assert!(
+            !has_position(&text),
+            "Without an anchor, no positioning sequence should be output: {text:?}"
+        );
     }
 
     #[test]
@@ -666,7 +693,10 @@ mod tests {
             text.contains("\x1b[3G"),
             "Should move to absolute column 3 (0-based 2+1): {text:?}"
         );
-        assert_eq!(c.hardware_cursor_row, 1, "Anchor line synchronized as diff baseline");
+        assert_eq!(
+            c.hardware_cursor_row, 1,
+            "Anchor line synchronized as diff baseline"
+        );
     }
 
     #[test]
@@ -687,7 +717,10 @@ mod tests {
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("\x1b[6G"), "Should contain column positioning: {text:?}");
+        assert!(
+            text.contains("\x1b[6G"),
+            "Should contain column positioning: {text:?}"
+        );
         assert!(
             !text.contains("\x1b[1A") && !text.contains("\x1b[1B"),
             "Same anchor line should not cause line movement: {text:?}"

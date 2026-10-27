@@ -841,7 +841,10 @@ mod tests {
             }
             for k in &d.default_keys {
                 if let Some(prev) = seen.insert(*k, d.action) {
-                    panic!("global action default key conflict: {prev:?} and {:?} both bound to {k}", d.action);
+                    panic!(
+                        "global action default key conflict: {prev:?} and {:?} both bound to {k}",
+                        d.action
+                    );
                 }
             }
         }
@@ -946,7 +949,11 @@ mod tests {
                 .iter()
                 .filter(|(_, a)| *a == Some(variant))
                 .collect();
-            assert_eq!(hits.len(), 1, "{variant:?} should appear exactly once in APP_ID_TABLE");
+            assert_eq!(
+                hits.len(),
+                1,
+                "{variant:?} should appear exactly once in APP_ID_TABLE"
+            );
         }
         let some = APP_ID_TABLE.iter().filter(|(_, a)| a.is_some()).count();
         assert_eq!(some, 36);
@@ -986,7 +993,10 @@ mod tests {
                 .iter()
                 .filter(|(_, a)| *a == Some(variant))
                 .count();
-            assert_eq!(hits, 1, "{variant:?} should appear exactly once in EDITOR_ID_TABLE");
+            assert_eq!(
+                hits, 1,
+                "{variant:?} should appear exactly once in EDITOR_ID_TABLE"
+            );
         }
         let some = EDITOR_ID_TABLE.iter().filter(|(_, a)| a.is_some()).count();
         assert_eq!(some, 24);
@@ -1001,7 +1011,10 @@ mod tests {
                 .iter()
                 .filter(|(_, a)| *a == Some(variant))
                 .count();
-            assert_eq!(hits, 1, "{variant:?} should appear exactly once in SELECT_ID_TABLE");
+            assert_eq!(
+                hits, 1,
+                "{variant:?} should appear exactly once in SELECT_ID_TABLE"
+            );
         }
     }
 
@@ -1208,7 +1221,10 @@ mod tests {
             Some(&serde_json::json!("enter"))
         );
         assert_eq!(obj.get("custom.unknown"), Some(&serde_json::json!("f1")));
-        assert!(!obj.contains_key("cursorUp"), "Old key name should be rewritten");
+        assert!(
+            !obj.contains_key("cursorUp"),
+            "Old key name should be rewritten"
+        );
     }
 
     #[test]
@@ -1254,12 +1270,18 @@ mod tests {
     fn legacy_targets_are_all_loadable() {
         // Migration targets must be recognized by the loader (action id or placeholder), otherwise migration is pointless
         for (legacy, canonical) in LEGACY_KEYBINDING_NAMES {
-            assert_ne!(legacy, canonical, "legacy key name must not equal the canonical name: {legacy}");
+            assert_ne!(
+                legacy, canonical,
+                "legacy key name must not equal the canonical name: {legacy}"
+            );
             let known = app_action_from_id(canonical).is_some()
                 || editor_action_from_id(canonical).is_some()
                 || select_action_from_id(canonical).is_some()
                 || is_reserved_pi_id(canonical);
-            assert!(known, "migration target {canonical} (from {legacy}) is not in any id table");
+            assert!(
+                known,
+                "migration target {canonical} (from {legacy}) is not in any id table"
+            );
         }
     }
 

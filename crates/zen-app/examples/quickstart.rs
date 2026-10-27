@@ -31,8 +31,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. Pick model + protocol (protocol stream implementation determined by binding table: OpenAiCompletions → openai_completions_stream)
     let model = Model::from_env();
-    let stream_fn =
-        stream_for(model.api).expect("Protocol pointed to by model.api is not implemented; see stream_for binding table");
+    let stream_fn = stream_for(model.api).expect(
+        "Protocol pointed to by model.api is not implemented; see stream_for binding table",
+    );
 
     // 2. Assemble session (create_agent_session = createAgent; here: empty tools + empty hooks + in-memory session)
     let cwd = std::env::current_dir()?;

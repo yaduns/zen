@@ -730,7 +730,11 @@ mod tests {
     #[test]
     fn enable_all_and_saturation() {
         let all = ids(&["a", "b"]);
-        assert_eq!(enable_all(None, &all, None), None, "Already fully enabled stays fully enabled");
+        assert_eq!(
+            enable_all(None, &all, None),
+            None,
+            "Already fully enabled stays fully enabled"
+        );
         assert_eq!(
             enable_all(Some(ids(&["a"])), &all, None),
             None,

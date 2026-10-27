@@ -812,13 +812,15 @@ mod tests {
 
     #[test]
     fn notice_default_label_with_cost() {
-        let text = cache_miss_notice_text(&miss(105_000, 0.36225, 60_000, false)).expect("Should display");
+        let text =
+            cache_miss_notice_text(&miss(105_000, 0.36225, 60_000, false)).expect("Should display");
         assert_eq!(text, "Cache miss: 105k tokens re-billed (~$0.36)");
     }
 
     #[test]
     fn notice_model_switch_label() {
-        let text = cache_miss_notice_text(&miss(105_000, 0.36225, 60_000, true)).expect("Should display");
+        let text =
+            cache_miss_notice_text(&miss(105_000, 0.36225, 60_000, true)).expect("Should display");
         assert!(
             text.starts_with("Cache miss after model switch: "),
             "{text}"
@@ -828,14 +830,15 @@ mod tests {
     #[test]
     fn notice_idle_label_at_and_above_ttl_boundary() {
         // idle_ms == CACHE_TTL_MS (300_000 = 5m) triggers idle label
-        let text =
-            cache_miss_notice_text(&miss(105_000, 0.36225, CACHE_TTL_MS, false)).expect("Should display");
+        let text = cache_miss_notice_text(&miss(105_000, 0.36225, CACHE_TTL_MS, false))
+            .expect("Should display");
         assert_eq!(
             text,
             "Cache miss after 5m idle: 105k tokens re-billed (~$0.36)"
         );
         // 6.5 minutes → Math.round → 7m
-        let text = cache_miss_notice_text(&miss(105_000, 0.36225, 390_000, false)).expect("Should display");
+        let text = cache_miss_notice_text(&miss(105_000, 0.36225, 390_000, false))
+            .expect("Should display");
         assert_eq!(
             text,
             "Cache miss after 7m idle: 105k tokens re-billed (~$0.36)"

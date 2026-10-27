@@ -1759,7 +1759,10 @@ mod tests {
             "prompt_cache_hit_tokens": 999
         });
         let (_, _, cache_read, _, _) = parse_usage(&json);
-        assert_eq!(cache_read, 20, "OpenAI shape takes precedence over DeepSeek shape");
+        assert_eq!(
+            cache_read, 20,
+            "OpenAI shape takes precedence over DeepSeek shape"
+        );
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -2406,7 +2409,10 @@ mod tests {
         };
         let req = build_request_body(&model, &sample_context(), &cfg);
         assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
-        assert!(req.thinking.is_none(), "openai format does not send thinking switch");
+        assert!(
+            req.thinking.is_none(),
+            "openai format does not send thinking switch"
+        );
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("thinking").is_none());
         assert_eq!(json["reasoning_effort"], "medium");
@@ -2584,7 +2590,10 @@ mod tests {
             "promptCacheKey",
             "reasoningEffort",
         ] {
-            assert!(!obj.contains_key(bad), "Must not contain camelCase key {bad}");
+            assert!(
+                !obj.contains_key(bad),
+                "Must not contain camelCase key {bad}"
+            );
         }
     }
 
@@ -3258,7 +3267,10 @@ mod tests {
             .filter(|e| matches!(e, AssistantMessageEvent::ToolcallEnd { .. }))
             .count();
         assert_eq!(starts, 3, "One ToolcallStart for each of the three tools");
-        assert_eq!(deltas, 6, "One ToolcallDelta for each of 6 argument increments");
+        assert_eq!(
+            deltas, 6,
+            "One ToolcallDelta for each of 6 argument increments"
+        );
         assert_eq!(ends, 3, "All three tools ToolcallEnd (defect 6 regression)");
         assert_eq!(
             acc.content_blocks.len(),

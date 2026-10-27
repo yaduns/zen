@@ -361,6 +361,9 @@ fn normalize_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你";
+    const CJK_SAMPLE_2: &str = "a你b";
 
     use crate::keybindings::KeybindingsManager;
     use std::collections::HashMap;
@@ -402,7 +405,7 @@ mod tests {
     fn test_insert_char_multibyte() {
         let mut e = e(0);
         e.insert_char('你');
-        assert_eq!(e.text(), "你");
+        assert_eq!(e.text(), CJK_SAMPLE);
         assert_eq!(e.cursor(), (0, 3)); // 3 UTF-8 bytes
     }
 
@@ -431,7 +434,7 @@ mod tests {
     #[test]
     fn test_backspace_multibyte() {
         let mut e = e(0);
-        e.insert_text_at_cursor("a你b");
+        e.insert_text_at_cursor(CJK_SAMPLE_2);
         e.set_cursor_col(4); // after the CJK char (bytes 1..4)
         e.backspace();
         assert_eq!(e.text(), "ab");
@@ -504,7 +507,7 @@ mod tests {
     #[test]
     fn test_delete_forward_multibyte() {
         let mut e = e(0);
-        e.insert_text_at_cursor("a你b");
+        e.insert_text_at_cursor(CJK_SAMPLE_2);
         e.set_cursor_col(1); // before the CJK char
         e.delete_forward();
         assert_eq!(e.text(), "ab");

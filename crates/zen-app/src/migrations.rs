@@ -221,7 +221,10 @@ mod tests {
             .join("sessions")
             .join(encode_cwd("/home/user/project"));
         assert!(correct_dir.join("stray.jsonl").exists());
-        assert!(!agent.join("stray.jsonl").exists(), "original file should be moved away");
+        assert!(
+            !agent.join("stray.jsonl").exists(),
+            "original file should be moved away"
+        );
     }
 
     #[test]
@@ -265,7 +268,10 @@ mod tests {
         std::fs::create_dir_all(&target_dir).unwrap();
         write(&target_dir.join("stray.jsonl"), "existing");
         assert_eq!(migrate_sessions_from_agent_root(agent), 0);
-        assert!(agent.join("stray.jsonl").exists(), "original file should be preserved");
+        assert!(
+            agent.join("stray.jsonl").exists(),
+            "original file should be preserved"
+        );
     }
 
     #[test]
@@ -324,7 +330,10 @@ mod tests {
             .unwrap()
             .clone();
         assert!(obj.contains_key("tui.editor.cursorUp"));
-        assert!(!obj.contains_key("cursorUp"), "Old key name should be rewritten");
+        assert!(
+            !obj.contains_key("cursorUp"),
+            "Old key name should be rewritten"
+        );
         // Idempotent: second call no longer rewrites
         assert!(!migrate_keybindings_config_file(agent));
     }

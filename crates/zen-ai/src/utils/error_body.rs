@@ -95,6 +95,9 @@ pub fn truncate_error_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好世界，这是一个测试";
+    const CJK_SAMPLE_2: &str = "你好世界... [truncated 7 chars]";
     use super::*;
 
     // ── truncate_error_text ──
@@ -129,8 +132,8 @@ mod tests {
     #[test]
     fn test_truncate_unicode_multi_byte() {
         // Each Chinese character is multibyte, but chars().count() counts characters
-        let result = truncate_error_text("你好世界，这是一个测试", 4);
-        assert_eq!(result, "你好世界... [truncated 7 chars]");
+        let result = truncate_error_text(CJK_SAMPLE, 4);
+        assert_eq!(result, CJK_SAMPLE_2);
     }
 
     // ── extract_openai_error_message ──

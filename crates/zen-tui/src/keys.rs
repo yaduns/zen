@@ -434,7 +434,10 @@ mod tests {
         assert_eq!(id.to_string(), "shift+tab");
         // real event (BackTab, terminal form with the modifier bit missing) → from_key_event normalizes by adding SHIFT → binding matches
         let ev = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
-        assert!(KeyId::matches(ev, &id), "BackTab event should match the shift+tab binding");
+        assert!(
+            KeyId::matches(ev, &id),
+            "BackTab event should match the shift+tab binding"
+        );
         // BackTab with the SHIFT modifier also matches
         let ev2 = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         assert!(KeyId::matches(ev2, &id));
@@ -657,7 +660,10 @@ mod tests {
         ] {
             let k = event(KeyCode::Enter, mods, KeyEventKind::Press);
             let out = normalize_apple_terminal_enter(k, true, true);
-            assert_eq!(out.modifiers, mods, "Modifiers {mods:?} should be preserved as-is");
+            assert_eq!(
+                out.modifiers, mods,
+                "Modifiers {mods:?} should be preserved as-is"
+            );
         }
     }
 

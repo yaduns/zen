@@ -270,6 +270,10 @@ impl super::Component for Input {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好";
+    const CJK_SAMPLE_2: &str = "你a好";
+    const CJK_SAMPLE_3: &str = "你a";
     use super::*;
     use crate::components::Component;
     use crate::screen::{ScreenBuffer, Style};
@@ -297,9 +301,9 @@ mod tests {
         assert_eq!(i.value, "abc");
         assert_eq!(i.cursor, 3);
         // Byte count: each CJK character is 3 bytes
-        i.set_value("你好");
+        i.set_value(CJK_SAMPLE);
         assert_eq!(i.cursor, 6);
-        assert_eq!(i.get_value(), "你好");
+        assert_eq!(i.get_value(), CJK_SAMPLE);
     }
 
     #[test]
@@ -342,7 +346,7 @@ mod tests {
     #[test]
     fn handle_key_moves_by_grapheme_over_cjk() {
         let mut i = Input::new();
-        i.set_value("你a好"); // Bytes 3+1+3 = 7
+        i.set_value(CJK_SAMPLE_2); // Bytes 3+1+3 = 7
         assert_eq!(i.cursor, 7);
         // Move left by grapheme cluster: last CJK char → a → first CJK char → 0
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Left)));
@@ -376,9 +380,9 @@ mod tests {
     #[test]
     fn handle_key_backspace_deletes_cjk_grapheme() {
         let mut i = Input::new();
-        i.set_value("你a好");
+        i.set_value(CJK_SAMPLE_2);
         assert!(i.handle_key(&KeyEvent::from(KeyCode::Backspace)));
-        assert_eq!(i.value, "你a");
+        assert_eq!(i.value, CJK_SAMPLE_3);
         assert_eq!(i.cursor, 4);
     }
 

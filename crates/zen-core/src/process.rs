@@ -501,7 +501,11 @@ mod tests {
 
         reg1.kill_all();
         assert!(reg1.is_empty());
-        assert_eq!(reg2.len(), 1, "reg2 should not be affected by reg1 kill_all");
+        assert_eq!(
+            reg2.len(),
+            1,
+            "reg2 should not be affected by reg1 kill_all"
+        );
     }
 
     #[cfg(unix)]
@@ -530,7 +534,10 @@ mod tests {
             reaped, pid as libc::pid_t,
             "should reap killed detached child processes"
         );
-        assert!(libc::WIFSIGNALED(status), "child process should be terminated by signal");
+        assert!(
+            libc::WIFSIGNALED(status),
+            "child process should be terminated by signal"
+        );
         assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
     }
 }

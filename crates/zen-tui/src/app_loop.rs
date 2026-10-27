@@ -513,7 +513,10 @@ mod tests {
         // Render → request one redraw
         loop_.apply_wake_outcome(WakeOutcome::Render);
         assert!(loop_.render_requested);
-        assert!(!loop_.animation_enabled, "Render does not affect animation state");
+        assert!(
+            !loop_.animation_enabled,
+            "Render does not affect animation state"
+        );
         // Animate(true) → start continuous animation
         loop_.apply_wake_outcome(WakeOutcome::Animate(true));
         assert!(loop_.animation_enabled);
@@ -554,7 +557,11 @@ mod tests {
         tx.send(9).unwrap();
         assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Render));
         drop(tx);
-        assert_eq!(loop_.next_wake().await, None, "Wakeup stream ends after channel disconnect");
+        assert_eq!(
+            loop_.next_wake().await,
+            None,
+            "Wakeup stream ends after channel disconnect"
+        );
     }
 
     #[tokio::test]
@@ -563,6 +570,9 @@ mod tests {
         let mut loop_ = TuiLoop::new().unwrap();
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(10), loop_.next_wake()).await;
-        assert!(result.is_err(), "Should never become ready when unregistered (timeout expires)");
+        assert!(
+            result.is_err(),
+            "Should never become ready when unregistered (timeout expires)"
+        );
     }
 }

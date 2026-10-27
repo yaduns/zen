@@ -492,7 +492,11 @@ mod tests {
         assert_eq!(table.len(), 24);
         let mut seen = std::collections::HashSet::new();
         for d in &table {
-            assert!(seen.insert(d.action.clone()), "Duplicate action {:?}", d.action);
+            assert!(
+                seen.insert(d.action.clone()),
+                "Duplicate action {:?}",
+                d.action
+            );
             assert!(!d.default_keys.is_empty());
         }
     }

@@ -207,6 +207,9 @@ pub fn supports_language(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "/* Comment starts";
+    const CJK_SAMPLE_2: &str = "Still in comment */";
     use super::*;
 
     /// Aggregate all styles across all lines, taking the judgment of whether "an explicit foreground color exists" (plain degradation always yields fg=None).
@@ -226,8 +229,15 @@ mod tests {
         let rows = highlight("fn main() {}", Some("rust"), DEFAULT_THEME);
         assert_eq!(rows.len(), 1);
         // Keyword is colored: at least one segment has an explicit foreground color (plain degradation yields all fg=None)
-        assert!(any_fg_set(&rows[0]), "Rust highlighting should produce styled spans");
-        assert_eq!(row_text(&rows[0]), "fn main() {}", "Concatenating spans should reconstruct the original text");
+        assert!(
+            any_fg_set(&rows[0]),
+            "Rust highlighting should produce styled spans"
+        );
+        assert_eq!(
+            row_text(&rows[0]),
+            "fn main() {}",
+            "Concatenating spans should reconstruct the original text"
+        );
     }
 
     #[test]
@@ -244,7 +254,10 @@ mod tests {
         let rows = highlight("#!/usr/bin/env python\nprint(1)", None, DEFAULT_THEME);
         assert_eq!(rows.len(), 2);
         // Shebang triggers syntax recognition → second line (the print call) should be colored
-        assert!(any_fg_set(&rows[1]), "shebang should trigger Python syntax detection");
+        assert!(
+            any_fg_set(&rows[1]),
+            "shebang should trigger Python syntax detection"
+        );
         assert_eq!(row_text(&rows[1]), "print(1)");
     }
 
@@ -252,7 +265,10 @@ mod tests {
     fn test_highlight_no_language_without_shebang_plain() {
         let rows = highlight("just some text", None, DEFAULT_THEME);
         assert_eq!(rows.len(), 1);
-        assert!(!any_fg_set(&rows[0]), "Without a shebang, it should be treated as plain text");
+        assert!(
+            !any_fg_set(&rows[0]),
+            "Without a shebang, it should be treated as plain text"
+        );
     }
 
     // ── Line-count invariant and boundaries ──
@@ -291,19 +307,19 @@ mod tests {
     #[test]
     fn test_highlight_stateful_across_lines() {
         let ss = syntax_set();
-        let syntax = ss.find_syntax_by_token("rust").expect("Built-in Rust syntax");
+        let syntax = ss
+            .find_syntax_by_token("rust")
+            .expect("Built-in Rust syntax");
         let theme = resolve_syntect_theme(DEFAULT_THEME);
 
         // Context: first line opens a block comment → second line is still inside the comment scope
         let mut hl_ctx = HighlightLines::new(syntax, theme);
-        let l1 = hl_ctx.highlight_line("/* Comment starts", ss).expect("fmt ok");
-        let l2 = hl_ctx.highlight_line("Still in comment */", ss).expect("fmt ok");
+        let l1 = hl_ctx.highlight_line(CJK_SAMPLE, ss).expect("fmt ok");
+        let l2 = hl_ctx.highlight_line(CJK_SAMPLE_2, ss).expect("fmt ok");
 
         // Same line text without context: should be parsed as ordinary code (not comment scope)
         let mut hl_fresh = HighlightLines::new(syntax, theme);
-        let l2_fresh = hl_fresh
-            .highlight_line("Still in comment */", ss)
-            .expect("fmt ok");
+        let l2_fresh = hl_fresh.highlight_line(CJK_SAMPLE_2, ss).expect("fmt ok");
 
         // In cross-line context the second line falls in comment scope (style differs from the style of independently parsed code) → proves state continuation
         assert_ne!(
@@ -361,14 +377,20 @@ mod tests {
         for lang in [
             "rust", "Rust", "ts", "py", "json", "yaml", "markdown", "go", "js",
         ] {
-            assert!(supports_language(lang), "Language {lang} should be supported");
+            assert!(
+                supports_language(lang),
+                "Language {lang} should be supported"
+            );
         }
     }
 
     #[test]
     fn test_supports_language_unknown() {
         for lang in ["no-such-lang-123", ""] {
-            assert!(!supports_language(lang), "Unknown language {lang:?} should return false");
+            assert!(
+                !supports_language(lang),
+                "Unknown language {lang:?} should return false"
+            );
         }
     }
 
@@ -390,9 +412,15 @@ mod tests {
         .collect();
 
         for lang in REQUIRED_LANGUAGES {
-            assert!(supports_language(lang), "{lang} should be in the supported list");
+            assert!(
+                supports_language(lang),
+                "{lang} should be in the supported list"
+            );
             let rows = highlight(snippets[lang], Some(lang), DEFAULT_THEME);
-            assert!(!rows.is_empty(), "Highlighting {lang} should produce at least one line");
+            assert!(
+                !rows.is_empty(),
+                "Highlighting {lang} should produce at least one line"
+            );
         }
     }
 
@@ -431,6 +459,9 @@ mod tests {
         assert_eq!(row_text(&dark[0]), row_text(&light[0]));
         let d_fgs: Vec<_> = dark[0].iter().map(|s| s.style.fg).collect();
         let l_fgs: Vec<_> = light[0].iter().map(|s| s.style.fg).collect();
-        assert_ne!(d_fgs, l_fgs, "At least one token span should be colored differently between dark/light themes");
+        assert_ne!(
+            d_fgs, l_fgs,
+            "At least one token span should be colored differently between dark/light themes"
+        );
     }
 }

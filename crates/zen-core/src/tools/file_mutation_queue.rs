@@ -125,6 +125,9 @@ fn mutation_key(file_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "second 不应在 first 释放前开始";
+    const CJK_SAMPLE_2: &str = "alias 不应在 target 释放前开始";
     use super::*;
     use tokio::sync::oneshot;
 
@@ -259,9 +262,7 @@ mod tests {
         });
 
         // second is queued: must not enter f before first releases
-        let started = second_started_rx
-            .try_recv()
-            .expect_err("second must not start before first is released");
+        let started = second_started_rx.try_recv().expect_err(CJK_SAMPLE);
         assert!(matches!(
             started,
             tokio::sync::oneshot::error::TryRecvError::Empty
@@ -357,9 +358,7 @@ mod tests {
         });
 
         // alias and target share the same queue after canonicalize: alias must not enter f before target releases
-        let started = a_started_rx
-            .try_recv()
-            .expect_err("alias must not start before target is released");
+        let started = a_started_rx.try_recv().expect_err(CJK_SAMPLE_2);
         assert!(matches!(
             started,
             tokio::sync::oneshot::error::TryRecvError::Empty
@@ -431,7 +430,10 @@ mod tests {
         // B has acquired the lock and entered f (still in flight, not yet cleaned up); the entry should still be in the map at this point
         b_entered_rx.await.unwrap();
         let map = queue.inner.lock().await;
-        assert!(map.contains_key(&key), "Entry must not be deleted while tasks are in flight");
+        assert!(
+            map.contains_key(&key),
+            "Entry must not be deleted while tasks are in flight"
+        );
         drop(map);
 
         // Release B: B is the last in-flight task → its cleanup removes the entry (map does not grow unboundedly)

@@ -1142,7 +1142,10 @@ mod tests {
 
         apply_session_restore(&args, &ctx, &mut model, &mut thinking);
 
-        assert_eq!(model.id, "my-model", "CLI --model takes precedence, not overridden");
+        assert_eq!(
+            model.id, "my-model",
+            "CLI --model takes precedence, not overridden"
+        );
         assert_eq!(model.provider, baseline.provider, "provider not overridden");
         // thinking not explicitly specified (model shorthand has no colon) → restore
         assert_eq!(thinking, ThinkingLevel::High);
@@ -1156,7 +1159,11 @@ mod tests {
 
         apply_session_restore(&args, &ctx, &mut model, &mut thinking);
 
-        assert_eq!(thinking, ThinkingLevel::Low, "CLI --thinking takes precedence");
+        assert_eq!(
+            thinking,
+            ThinkingLevel::Low,
+            "CLI --thinking takes precedence"
+        );
         // model not provided → restore
         assert_eq!(model.provider, "huoshan");
     }
@@ -1209,7 +1216,11 @@ mod tests {
         let msgs = vec![user_msg("secret", 777), user_msg("keep", 1)];
         let result = hooks.filter_messages(msgs.clone()).await;
 
-        assert_eq!(seen.lock().unwrap()[0], msgs, "inner delegation receives full set");
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            msgs,
+            "inner delegation receives full set"
+        );
         assert_eq!(result, vec![user_msg("keep", 1)]);
     }
 
@@ -1344,7 +1355,10 @@ mod tests {
         let settings = SettingsManager::empty();
         let ctx = empty_ctx();
         let (model, thinking) = resolve_model_from_session(&ctx, &settings);
-        assert_eq!(model.provider, "opencode-go", "no resume/fallback → env default");
+        assert_eq!(
+            model.provider, "opencode-go",
+            "no resume/fallback → env default"
+        );
         assert_eq!(thinking, DEFAULT_THINKING_LEVEL);
     }
 }

@@ -609,6 +609,8 @@ fn queue_texts(queue: &Arc<Mutex<VecDeque<Message>>>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "continue 校验失败（continue_turn 已前置校验，理论不可达）";
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -813,7 +815,11 @@ mod tests {
 
         unsub();
         agent.on_event(&AgentEvent::AgentStart).await;
-        assert_eq!(count.load(Ordering::SeqCst), 1, "no events received after unsubscribe");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "no events received after unsubscribe"
+        );
     }
 
     #[tokio::test]
@@ -994,15 +1000,24 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        assert!(entered, "is_run should be true during prompt run (D7 wiring)");
+        assert!(
+            entered,
+            "is_run should be true during prompt run (D7 wiring)"
+        );
         agent.abort();
         spawn1.await.expect("first round task should not panic");
-        assert!(!agent.is_run(), "is_run resets after run ends (RunGuard Drop)");
+        assert!(
+            !agent.is_run(),
+            "is_run resets after run ends (RunGuard Drop)"
+        );
 
         // Second round: unblock + engine's fresh internal token (not cancelled) → should complete normally (returns an assistant message)
         block.store(false, Ordering::SeqCst);
         let msgs = agent.prompt("second", &[]).await;
-        assert!(!msgs.is_empty(), "second round should produce message (normal completion)");
+        assert!(
+            !msgs.is_empty(),
+            "second round should produce message (normal completion)"
+        );
         assert!(agent
             .messages()
             .iter()
@@ -1041,7 +1056,10 @@ mod tests {
     fn test_make_config_reasoning_off_is_none() {
         let cfg = Agent::make_config(&agent_state(), ToolExecutionMode::Sequential, None);
         assert_eq!(cfg.reasoning, None, "Off → do not send reasoning_effort");
-        assert_eq!(cfg.api_key, None, "api_key fixed to None, uses hooks.get_api_key");
+        assert_eq!(
+            cfg.api_key, None,
+            "api_key fixed to None, uses hooks.get_api_key"
+        );
     }
 
     #[test]

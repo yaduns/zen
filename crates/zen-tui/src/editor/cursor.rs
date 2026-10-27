@@ -299,6 +299,9 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好";
+    const CJK_SAMPLE_2: &str = "a你b";
 
     use crate::keybindings::KeybindingsManager;
     use std::collections::HashMap;
@@ -377,7 +380,7 @@ mod tests {
     #[test]
     fn test_move_char_multibyte_grapheme_step() {
         // Two CJK chars = 2 three-byte graphemes; the cursor must step by grapheme, never split one in half
-        let mut e = editor_with(&["你好"], 0, 0, 0, 0);
+        let mut e = editor_with(&[CJK_SAMPLE], 0, 0, 0, 0);
         e.move_char(1);
         assert_eq!(e.cursor(), (0, 3));
         e.move_char(1); // At end of line: record preferred_visual_col = 4 (each grapheme is 2 columns, accumulated visual column)
@@ -413,7 +416,7 @@ mod tests {
     #[test]
     fn test_cursor_visual_col_cjk() {
         // "a" + one CJK char + "b": the CJK char occupies 2 columns; with the cursor after it, the visual column is 1+2=3
-        let mut e = editor_with(&["a你b"], 0, 4, 0, 0);
+        let mut e = editor_with(&[CJK_SAMPLE_2], 0, 4, 0, 0);
         assert_eq!(e.cursor_visual_col(), 3);
     }
 
@@ -545,7 +548,7 @@ mod tests {
     #[test]
     fn test_move_vertical_cjk_wide_column() {
         // Cursor after the CJK char (visual col 2); next row "ab" max 2 cols → stop at 'b' (col 1)
-        let mut e = editor_with(&["你好", "ab"], 0, 3, 10, 0);
+        let mut e = editor_with(&[CJK_SAMPLE, "ab"], 0, 3, 10, 0);
         e.move_vertical(1);
         assert_eq!(e.cursor(), (1, 1));
     }

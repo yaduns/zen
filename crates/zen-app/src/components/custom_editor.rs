@@ -342,7 +342,11 @@ mod tests {
     fn handle_paste_delegates_to_editor() {
         let mut editor = CustomEditor::new(0, kb(), editor_kb());
         editor.handle_paste("line1\r\nline2");
-        assert_eq!(editor.text(), "line1\nline2", "Delegates newline normalization semantics to Editor");
+        assert_eq!(
+            editor.text(),
+            "line1\nline2",
+            "Delegates newline normalization semantics to Editor"
+        );
         // tab expansion + non-printable filtering also take effect
         let mut editor2 = CustomEditor::new(0, kb(), editor_kb());
         editor2.handle_paste("a\tb\x01c");

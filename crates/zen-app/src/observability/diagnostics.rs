@@ -597,12 +597,20 @@ mod tests {
         assert_eq!(groups[0].losers, vec!["/l1"]);
 
         push_collision(&mut groups, "x", "/w2", "/l2");
-        assert_eq!(groups.len(), 1, "Same-name hit should append loser instead of creating a new group");
+        assert_eq!(
+            groups.len(),
+            1,
+            "Same-name hit should append loser instead of creating a new group"
+        );
         assert_eq!(groups[0].winner_path, "/w1", "Group winner remains first");
         assert_eq!(groups[0].losers, vec!["/l1", "/l2"]);
 
         push_collision(&mut groups, "y", "/w3", "/l3");
-        assert_eq!(groups.len(), 2, "New name should create a new group (first-seen order)");
+        assert_eq!(
+            groups.len(),
+            2,
+            "New name should create a new group (first-seen order)"
+        );
         assert_eq!(groups[1].name, "y");
     }
 

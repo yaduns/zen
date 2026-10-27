@@ -1363,7 +1363,10 @@ mod tests {
         let summary = comp.flat[0].summary();
         assert_eq!(summary.chars().count(), 80);
         assert!(summary.starts_with("net"));
-        assert!(summary.ends_with('x'), "truncate within the first 80 characters after normalization");
+        assert!(
+            summary.ends_with('x'),
+            "truncate within the first 80 characters after normalization"
+        );
         assert!(!summary.contains(' '));
     }
 
@@ -1421,7 +1424,10 @@ mod tests {
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
         let text = zen_core::ansi::strip_ansi(&String::from_utf8_lossy(&out));
-        assert!(text.contains("[mytag]"), "line should contain a label: {text}");
+        assert!(
+            text.contains("[mytag]"),
+            "line should contain a label: {text}"
+        );
         assert!(
             text.contains("hello world"),
             "node content should still follow the label: {text}"

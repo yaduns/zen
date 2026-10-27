@@ -373,6 +373,11 @@ fn unchanged_result(
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "中中中中中";
+    const CJK_SAMPLE_2: &str = "中中中... [truncated]";
+    const CJK_SAMPLE_3: &str = "ab中";
+    const CJK_SAMPLE_4: &str = "中";
     use super::*;
 
     // ── format_size ──────────────────────────────────────────────
@@ -460,9 +465,9 @@ mod tests {
     #[test]
     fn test_truncate_line_counts_chars_not_bytes() {
         // Each Chinese character occupies 3 bytes but counts as 1 character
-        let r = truncate_line("中中中中中", 3);
+        let r = truncate_line(CJK_SAMPLE, 3);
         assert!(r.was_truncated);
-        assert_eq!(r.text, "中中中... [truncated]");
+        assert_eq!(r.text, CJK_SAMPLE_2);
     }
 
     // ── truncate_head ────────────────────────────────────────────
@@ -780,13 +785,13 @@ mod tests {
     fn test_tail_bytes_boundary_scan_matches_char_collection() {
         // "ab" + one 3-byte CJK char (5 bytes), max_bytes=3 → the boundary scan lands on the lead byte of the CJK char → drop it
         let r = truncate_tail(
-            "ab中",
+            CJK_SAMPLE_3,
             TruncationOptions {
                 max_lines: 10,
                 max_bytes: 3,
             },
         );
-        assert_eq!(r.content, "中");
+        assert_eq!(r.content, CJK_SAMPLE_4);
     }
 
     #[test]

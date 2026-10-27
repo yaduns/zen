@@ -184,6 +184,8 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
+    const CJK_SAMPLE: &str = "你好你好你好";
     use super::*;
     use serde_json::json;
     use zen_ai::types::{
@@ -424,7 +426,7 @@ mod tests {
     #[test]
     fn test_truncate_for_summary_counts_unicode_chars_not_bytes() {
         // Three CJK chars = 6 characters (18 bytes in UTF-8) — counted by characters
-        let text = "你好你好你好";
+        let text = CJK_SAMPLE;
         assert_eq!(
             truncate_for_summary(text, 4),
             "你好你好\n\n[... 2 more characters truncated]"
