@@ -11,13 +11,36 @@ impl Model {
     /// provider selection: env `ZEN_PROVIDER` (default `opencode-go`) → the current catalog [`Catalog::current`]'s
     /// default model (includes user `models.json` overrides if installed during `main` startup; embedded catalog for library/tests).
     ///
-    /// # Panics
-    /// The default provider does not exist in the current catalog or has no models (under the embedded catalog this is a compile-time constant error, locked by unit test
-    /// `embedded_catalog_parses`).
+    /// # Fallback behaviour (never panics)
+    /// When the selected provider is missing from the catalog (e.g. `ZEN_PROVIDER` names a provider
+    /// that only exists in a `models.json` that was never installed), the first model of the catalog is
+    /// used and a `tracing::warn` is emitted. Library code must not abort the process on a
+    /// configuration mistake; callers that need the error use [`Self::try_from_env`].
     pub fn from_env() -> Self {
-        Catalog::current()
-            .default_model()
-            .unwrap_or_else(|err| panic!("unknown default provider: {err}"))
+        match Self::try_from_env() {
+            Ok(model) => model,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "default provider is not in the model catalog; falling back to the first catalog model"
+                );
+                Self::first_available().unwrap_or_else(legacy_default_model)
+            }
+        }
+    }
+
+    /// Non-panicking, error-reporting variant of [`Self::from_env`].
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownProvider`] when the selected provider is absent from the catalog,
+    /// [`CatalogError::NoDefaultModel`] when it is present but declares no models.
+    pub fn try_from_env() -> Result<Self, crate::catalog::CatalogError> {
+        Catalog::current().default_model()
+    }
+
+    /// First model declared by the current catalog (the fallback used by [`Self::from_env`]).
+    pub fn first_available() -> Option<Self> {
+        Catalog::current().models().into_iter().next()
     }
 
     /// Constructs a model for the selected provider: takes the first model of that provider in the current catalog.
@@ -128,6 +151,29 @@ impl Model {
 /// Compatibility fallback for unknown providers: keeps the T-AI-02-4-era defaults (1M context / 384k output).
 /// Normally not triggered under the existing catalog (`resolve_provider` and `from_provider` read the same catalog); only when
 /// a provider exists in the catalog but declares no models is this a defensive fallback.
+/// Hard-coded last-resort model used when even the catalog is empty (unreachable with the embedded
+/// catalog, kept so `from_env` never panics).
+fn legacy_default_model() -> Model {
+    Model {
+        id: "deepseek-v4-flash".to_string(),
+        name: None,
+        provider: "opencode-go".to_string(),
+        api: crate::provider::Api::OpenAiCompletions,
+        base_url: "https://opencode.ai/zen/go/v1".to_string(),
+        context_window: 1_000_000,
+        max_tokens: 384_000,
+        reasoning: true,
+        headers: None,
+        cost_rates: Some(CostRates {
+            input: 0.5,
+            output: 2.0,
+            cache_read: 0.1,
+            cache_write: 0.5,
+        }),
+        compat: None,
+    }
+}
+
 fn legacy_fallback_model(provider: &dyn Provider) -> Model {
     Model {
         id: "deepseek-v4-flash".to_string(),
@@ -175,6 +221,65 @@ mod tests {
             }),
             compat: None,
         }
+    }
+
+    // ── default model selection (from_env / try_from_env) ──
+
+    /// Serialises the env-mutating tests below (they read `ZEN_PROVIDER`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores `ZEN_PROVIDER` on drop.
+    struct EnvGuard(Option<String>);
+    impl EnvGuard {
+        fn set(v: &str) -> Self {
+            let old = std::env::var("ZEN_PROVIDER").ok();
+            std::env::set_var("ZEN_PROVIDER", v);
+            Self(old)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("ZEN_PROVIDER", v),
+                None => std::env::remove_var("ZEN_PROVIDER"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_try_from_env_reports_unknown_provider() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set("provider-that-does-not-exist");
+        let err = Model::try_from_env().expect_err("unknown provider must be an error");
+        assert!(
+            matches!(err, crate::catalog::CatalogError::UnknownProvider(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_env_falls_back_instead_of_panicking() {
+        // Regression: `from_env` used to panic ("unknown default provider"), aborting library users
+        // and examples when ZEN_PROVIDER named a provider that is not in the catalog.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set("provider-that-does-not-exist");
+        let model = Model::from_env();
+        assert_ne!(model.provider, "provider-that-does-not-exist");
+        assert!(
+            Catalog::current()
+                .models()
+                .iter()
+                .any(|m| m.provider == model.provider && m.id == model.id),
+            "fallback model must come from the catalog: {}/{}",
+            model.provider,
+            model.id
+        );
+    }
+
+    #[test]
+    fn test_first_available_returns_a_catalog_model() {
+        let model = Model::first_available().expect("embedded catalog is non-empty");
+        assert!(!model.provider.is_empty() && !model.id.is_empty());
     }
 
     // ── builder methods ──

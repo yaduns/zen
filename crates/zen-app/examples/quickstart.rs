@@ -8,7 +8,8 @@
 //! This is the instructional starting point of the main pipeline; `main.rs`'s `create_initial_runtime_from_cli` merely wraps
 //! an extra layer of CLI glue around it (CLI customization for model/tools/system prompt/store), not the main pipeline itself.
 //!
-//! Run (requires a provider API key, e.g. `export OPENCODE_API_KEY=xxx`):
+//! Run (needs a model endpoint: add a provider to `~/.zen/agent/models.json` and export the
+//! variable its `apiKey` field references, e.g. `export ZEN_LLM_API_KEY=sk-...`):
 //! ```sh
 //! cargo run -p zen-app --example quickstart -- "Hello, introduce yourself in one sentence"
 //! ```
@@ -25,6 +26,9 @@ use zen_core::env::ShellConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Make `~/.zen/agent/models.json` visible (main does this at startup; examples are separate binaries).
+    zen_app::config::catalog::init_user_catalog();
+
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "hello, briefly introduce yourself".to_string());
@@ -56,6 +60,13 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Real LLM call: send one round of prompt, print the assistant's text reply
     let replies = session.prompt(&prompt, &[]).await?;
+    // A failed turn is recorded on the assistant message rather than returned as Err.
+    if let Some(err) = replies.iter().find_map(|msg| match msg {
+        Message::Assistant(a) => a.error_message.clone(),
+        _ => None,
+    }) {
+        anyhow::bail!("the model call failed: {err}");
+    }
     for msg in replies {
         if let Message::Assistant(assistant) = msg {
             for block in assistant.content {

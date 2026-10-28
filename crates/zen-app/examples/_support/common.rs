@@ -17,6 +17,15 @@ use zen_app::session::services::{create_agent_session, NoopHooks};
 use zen_app::session::session_manager::SessionManager;
 use zen_core::env::ShellConfig;
 
+/// Install the user `models.json` catalog (`~/.zen/agent/models.json`) as the process catalog.
+///
+/// Without this the examples would only see the two providers compiled into the binary, so a
+/// provider the user added to `models.json` would look "unknown". `main` does the same thing at
+/// startup; examples are separate binaries and must opt in explicitly.
+pub fn init_catalog() {
+    zen_app::config::catalog::init_user_catalog();
+}
+
 /// Current working directory as a string.
 pub fn cwd_str() -> String {
     std::env::current_dir()
@@ -64,6 +73,14 @@ pub fn make_session(
 /// Run one real LLM prompt and print all of the assistant's text blocks.
 pub async fn run_and_print(session: &mut AgentSession, prompt: &str) -> anyhow::Result<()> {
     let replies = session.prompt(prompt, &[]).await?;
+    // A failed turn is *not* an Err: the loop records it on the assistant message. Surface it,
+    // otherwise a missing API key or an unreachable endpoint would exit 0 with no output.
+    if let Some(err) = replies.iter().find_map(|msg| match msg {
+        Message::Assistant(a) => a.error_message.clone(),
+        _ => None,
+    }) {
+        anyhow::bail!("the model call failed: {err}");
+    }
     for msg in replies {
         if let Message::Assistant(assistant) = msg {
             for block in assistant.content {

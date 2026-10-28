@@ -9,6 +9,7 @@ use zen_ai::types::{Model, ThinkingLevel};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let model_id = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "deepseek-v4-flash".into());

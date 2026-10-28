@@ -9,6 +9,7 @@ use zen_ai::types::ThinkingLevel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let level = std::env::args().nth(1).unwrap_or_else(|| "off".into());
     let prompt = std::env::args().nth(2).unwrap_or_else(|| "Hello".into());
 

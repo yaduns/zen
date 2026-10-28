@@ -1,7 +1,8 @@
 # zen Examples — CLI flag overrides and quick start
 
 Example programs with real LLM calls. **No existing code is modified**; only public APIs are used.
-A provider API key must be configured before running (e.g. `export OPENCODE_API_KEY=xxx`).
+A model endpoint must be configured before running: add a provider to `~/.zen/agent/models.json`
+(any OpenAI-compatible endpoint) and export the variable its `apiKey` field references.
 
 ## Quick start
 
@@ -56,7 +57,6 @@ cargo run -p zen-app --example quickstart -- "introduce yourself in one sentence
 |---------|---------|------|
 | `example_mode_json` | `--mode json` | Goes through the production print outlet `run_print_mode(Mode::Json)`, outputting events as one JSON per line |
 | `example_version` | `--version` | Prints the version number |
-| `example_export` | `--export` | Not yet implemented (Phase 2); demonstrates the main fast-path bail behavior |
 
 ### Shared boilerplate
 
@@ -118,7 +118,6 @@ cargo run -p zen-app --example example_skills -- <directory containing SKILL.md>
 | `--exclude-tools` | `example_tools` | ✅ blacklist filtering |
 | `--no-tools` | `example_tools` | ✅ |
 | `--no-builtin-tools` | `example_tools` | ✅ |
-| `--export` | `example_export` | ⚠️ Phase 2 |
 | `--no-skills` | — | 📋 no-op (no skills engine in Phase 1) |
 | `--skills` | `example_skills` | ✅ |
 | `--prompt-templates` | — | 📋 Phase 2 (template system does not exist) |

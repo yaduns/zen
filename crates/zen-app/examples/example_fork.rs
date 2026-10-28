@@ -42,6 +42,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let args = Args::parse();
     let prompt = if args.prompt.is_empty() {
         "What was the passphrase I just said?".to_string()

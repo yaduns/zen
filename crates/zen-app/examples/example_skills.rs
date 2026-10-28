@@ -17,6 +17,7 @@ use zen_core::skills::load::load_skills;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let skill_dir = std::env::args()
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: example_skills <skill-dir> [prompt]"))?;

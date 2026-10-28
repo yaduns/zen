@@ -35,6 +35,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let args = Args::parse();
     let prompt = if args.prompt.is_empty() {
         "List files in the current directory".to_string()

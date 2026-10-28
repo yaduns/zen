@@ -10,6 +10,7 @@ use zen_ai::types::ThinkingLevel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "Hello".into());
 
     // --no-session semantics: use the in_memory store (no file writes); see example_session_dir for the file-session counterpart.

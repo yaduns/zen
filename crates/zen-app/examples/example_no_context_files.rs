@@ -15,6 +15,7 @@ use zen_app::system_prompt::load_project_context_files;
 use zen_core::harness::system_prompt::{build_system_prompt, BuildSystemPromptOptions};
 
 fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let agent_dir = get_agent_dir().unwrap_or_else(|_| PathBuf::from(""));
     let cwd = PathBuf::from(cwd_str());
 

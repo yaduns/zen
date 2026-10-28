@@ -10,6 +10,7 @@ use zen_ai::types::ThinkingLevel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let provider = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "opencode-go".into());

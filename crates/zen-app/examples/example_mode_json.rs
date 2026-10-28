@@ -24,6 +24,7 @@ use zen_core::env::ShellConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    common::init_catalog();
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "Hello".into());
 
     let model = Model::from_env();
