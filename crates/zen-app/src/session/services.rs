@@ -287,6 +287,9 @@ pub async fn create_initial_runtime_from_cli(
     // Known provider matched → rebuild the model by provider (provider side); default_model only changes the id,
     // default_thinking_level fills in thinking. Extracted as a free function for unit testing (T-AP-02-3 additional fields).
     apply_settings_defaults(args, &ctx, &merged, &mut model, &mut thinking_level);
+    // Diagnose a model that the catalog cannot serve (unknown id / missing key) before the first request,
+    // instead of letting it surface as an opaque API error after the user typed a prompt.
+    warn_model_configuration(&model);
 
     // 2.6 Resource loading (unified loading taken over by T-AP-05-3): skills + prompt templates + themes + context + system prompt discovery
     //     (default directories + CLI `--skill`/`--prompt-template`/`--theme` + settings.skills/prompts/themes
@@ -561,7 +564,7 @@ fn resolve_model_from_session(
     let merged = settings.merged();
     if ctx.model.is_none() {
         if let Some(provider_name) = merged.default_provider.as_deref() {
-            if let Some(provider) = resolve_provider(provider_name) {
+            if let Some(provider) = resolve_settings_provider(provider_name) {
                 model = Model::from_provider(provider.as_ref());
             }
         }
@@ -575,6 +578,85 @@ fn resolve_model_from_session(
         }
     }
     (model, thinking)
+}
+
+/// Resolve a provider name declared in `settings.json` (`defaultProvider`), warning when the name is
+/// absent from the current catalog.
+///
+/// A stale `defaultProvider` used to be ignored **silently**, which made "I edited models.json but zen
+/// still talks to the old provider" impossible to diagnose. The warning names the catalog providers so the
+/// fix (rename the entry, or update settings) is obvious.
+///
+/// # Returns
+/// `Some(provider)` when the name is known; `None` (after warning on stderr) otherwise, so callers keep the
+/// previously resolved model.
+fn resolve_settings_provider(name: &str) -> Option<Box<dyn zen_ai::provider::Provider>> {
+    if let Some(provider) = resolve_provider(name) {
+        return Some(provider);
+    }
+    let mut known: Vec<String> = Catalog::current()
+        .models()
+        .iter()
+        .map(|m| m.provider.clone())
+        .collect();
+    known.sort();
+    known.dedup();
+    eprintln!(
+        "Warning: settings.json defaultProvider '{name}' is not in the model catalog (known: {}); ignoring it",
+        if known.is_empty() {
+            "none".to_string()
+        } else {
+            known.join(", ")
+        }
+    );
+    None
+}
+
+/// Configuration problems that will make the first request fail, as human-readable warnings.
+///
+/// Pure function (no side effects) so the diagnostics are unit-testable; the caller prints them.
+/// Two failure modes are covered, both of which are otherwise only visible as an opaque API error:
+///
+/// 1. **Model not in the catalog** — `settings.json` `defaultModel` (or `--model`) names an id the provider
+///    does not declare in `models.json`; the request is sent with the unknown id and the endpoint rejects it.
+/// 2. **No API key** — the provider's `apiKey` (literal or `$ENV`) does not resolve; v1 always sends an
+///    `Authorization: Bearer` header, so keyless local endpoints must configure a placeholder key.
+///
+/// # Returns
+/// Empty when the model is fully resolvable; otherwise one message per problem.
+pub(crate) fn model_config_warnings(model: &Model) -> Vec<String> {
+    let catalog = Catalog::current();
+    let mut warnings = Vec::new();
+
+    let in_catalog = catalog
+        .models()
+        .iter()
+        .any(|m| m.provider == model.provider && m.id == model.id);
+    if !in_catalog {
+        warnings.push(format!(
+            "model '{}/{}' is not declared in models.json; the endpoint will reject it (add it to the provider's \"models\" list, or fix settings.json defaultModel)",
+            model.provider, model.id
+        ));
+    }
+
+    if catalog.api_key(model).is_none() {
+        warnings.push(format!(
+            "no API key resolved for provider '{}' (set the environment variable referenced by models.json apiKey; local endpoints can use any placeholder value)",
+            model.provider
+        ));
+    }
+
+    warnings
+}
+
+/// Print [`model_config_warnings`] for a runtime-resolved model (one line per problem, on stderr).
+///
+/// Called once per process at assembly time: the model is not yet used, so the user gets the diagnosis
+/// before the first turn rather than as an API error afterwards.
+fn warn_model_configuration(model: &Model) {
+    for warning in model_config_warnings(model) {
+        eprintln!("Warning: {warning}");
+    }
 }
 
 /// Apply the fill-in from settings' default_provider/default_model/default_thinking_level.
@@ -597,7 +679,7 @@ fn apply_settings_defaults(
 ) {
     if args.provider.is_none() && args.model.is_none() && ctx.model.is_none() {
         if let Some(provider_name) = merged.default_provider.as_deref() {
-            if let Some(provider) = resolve_provider(provider_name) {
+            if let Some(provider) = resolve_settings_provider(provider_name) {
                 *model = Model::from_provider(provider.as_ref());
             }
         }
@@ -1360,5 +1442,68 @@ mod tests {
             "no resume/fallback → env default"
         );
         assert_eq!(thinking, DEFAULT_THINKING_LEVEL);
+    }
+
+    // ── model_config_warnings / resolve_settings_provider (settings-vs-models.json mismatch) ──
+
+    #[test]
+    fn model_config_warnings_flags_model_missing_from_catalog() {
+        // settings.json defaultModel / --model naming an id the provider never declares in models.json:
+        // the request would be sent with an unknown id, so the user must be warned before the first turn.
+        let mut model = Model::from_env();
+        model.id = "definitely-not-a-model".to_string();
+        let warnings = model_config_warnings(&model);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("is not declared in models.json")),
+            "expected unknown-model warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn model_config_warnings_flags_missing_api_key() {
+        let _l = ENV_LOCK.lock().unwrap();
+        // The embedded default provider resolves its key from $OPENCODE_API_KEY; clearing it (before the
+        // model is materialised, since the catalog reads env on demand) must produce the key warning.
+        let _g = EnvVarGuard::remove("OPENCODE_API_KEY");
+        let _p = EnvVarGuard::remove("ZEN_PROVIDER");
+        let model = Model::from_env();
+        let warnings = model_config_warnings(&model);
+        assert!(
+            warnings.iter().any(|w| w.contains("no API key resolved")),
+            "expected missing-key warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn model_config_warnings_clean_for_catalog_model_with_key() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _k = EnvVarGuard::set("OPENCODE_API_KEY", "test-key");
+        let _p = EnvVarGuard::remove("ZEN_PROVIDER");
+        let model = Model::from_env();
+        assert_eq!(
+            model_config_warnings(&model),
+            Vec::<String>::new(),
+            "a catalog model with a resolvable key must not warn"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_provider_returns_none_for_unknown_name() {
+        // A stale settings.json defaultProvider must not abort startup: it is reported and ignored.
+        let _l = ENV_LOCK.lock().unwrap();
+        assert!(
+            resolve_settings_provider("no-such-provider").is_none(),
+            "unknown provider name must resolve to None (caller keeps the previous model)"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_provider_returns_catalog_provider() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let provider =
+            resolve_settings_provider("opencode-go").expect("embedded provider resolves");
+        assert_eq!(provider.id(), "opencode-go");
     }
 }
