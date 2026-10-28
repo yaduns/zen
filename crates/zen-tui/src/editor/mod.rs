@@ -11,6 +11,7 @@ use crate::screen::Style;
 mod cursor;
 mod history;
 mod input;
+mod kill_ring;
 mod render;
 mod text;
 mod undo;
@@ -115,6 +116,8 @@ pub struct Editor {
     history_draft: Option<EditorState>, // Draft stashed when first entering history browsing; restored on exit
     preferred_visual_col: Option<usize>, // Sticky column; only valid during vertical movement (e.g. 9th character in the current row, cursor moves down to 6th character in row 2, then 16th in row 3: cursor should end at the last character of row 2, i.e. the 9th character of row 3)
     snapped_from_cursor_col: Option<usize>, // Original cursor column before snapping to an atomic segment (unbreakable atomic rows break the snapped_from_cursor_col memory; in that case snapped_from_cursor_col takes precedence)
+    kill_ring: Vec<String>, // Emacs-style kill ring (oldest first); backs Ctrl+Y / Alt+Y (see kill_ring.rs)
+    yank_index: usize, // Ring position of the entry currently yanked (yank-pop walks backwards from here)
     undo_stack: Vec<EditorState>, // Undo stack (T-TU-03-5, pi-406): before an edit operation mutates state, push a clone of EditorState; Undo pops to restore; submit clears. Snapshots exclude view state (scroll/sticky etc.), which is rebuilt per pi semantics on undo
     last_action: Option<LastAction>, // Last input action category (matches pi lastAction; T-TU-03-5 uses only TypeWord for word-character insertion merge detection; kill/yank variants are not implemented due to T-TU-03-7 Drop)
     on_submit: Option<Box<dyn FnMut(&str)>>, // Submit callback; receives the expanded text after trim (no marker in this task, i.e. trim of the full text)
@@ -166,6 +169,8 @@ impl Editor {
             history_draft: None,
             preferred_visual_col: None,
             snapped_from_cursor_col: None,
+            kill_ring: Vec::new(),
+            yank_index: 0,
             undo_stack: Vec::new(),
             last_action: None,
             on_submit: None,

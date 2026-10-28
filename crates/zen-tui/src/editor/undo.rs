@@ -14,6 +14,9 @@ use super::Editor;
 pub(super) enum LastAction {
     /// The previous action was a word-character insertion (`insert_char` set): consecutive word characters are merged into one undo unit.
     TypeWord,
+    /// The previous action inserted a kill-ring entry (`Ctrl+Y`): a following `Alt+Y` may undo it and
+    /// insert the previous entry instead (kill_ring.rs).
+    Yank,
 }
 
 impl Editor {

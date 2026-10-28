@@ -568,6 +568,14 @@ impl AgentSession {
     pub fn follow_up_messages(&self) -> Vec<String> {
         self.agent.follow_up_messages()
     }
+
+    /// Remove and return the most recently queued follow-up message (LIFO), for the interactive
+    /// `Alt+Up` "restore queued message" action (delegated to the engine).
+    ///
+    /// Returns `None` when nothing is queued.
+    pub fn take_last_follow_up(&self) -> Option<String> {
+        self.agent.take_last_follow_up()
+    }
 }
 
 /// Error type for AgentSession operations.
@@ -927,6 +935,20 @@ mod tests {
             session.steering_messages(),
             vec!["hello".to_string(), "world".to_string()]
         );
+    }
+
+    #[test]
+    fn test_take_last_follow_up_restores_lifo() {
+        // Backs the interactive `Alt+Up` action: pop the most recently queued message.
+        let store = Arc::new(MockStore::default());
+        let session = test_session(store);
+        session.follow_up("first", &[]);
+        session.follow_up("second", &[]);
+
+        assert_eq!(session.take_last_follow_up().as_deref(), Some("second"));
+        assert_eq!(session.follow_up_messages(), vec!["first".to_string()]);
+        assert_eq!(session.take_last_follow_up().as_deref(), Some("first"));
+        assert_eq!(session.take_last_follow_up(), None);
     }
 
     #[test]

@@ -1046,9 +1046,15 @@ impl InteractiveMode {
                 self.show_warning("Copy message to clipboard: not available in v1")
             }
             AppAction::MessageFollowUp => {} // Already converted to a FollowUp(text) command on the UI side
-            AppAction::MessageDequeue => {
-                self.show_warning("No queued messages to restore (queue pop pending)")
-            }
+            AppAction::MessageDequeue => match self.runtime.session.take_last_follow_up() {
+                Some(text) => {
+                    // Put the message back into the editor so it can be edited and re-sent.
+                    let _ = self.ui_event_tx.send(UiEvent::EditorSetText(text));
+                    self.push_pending();
+                    self.show_status("Restored queued message into the editor");
+                }
+                None => self.show_warning("No queued messages to restore"),
+            },
             // Model selection (T-V2-02-4): cycling/opening the selector is handled by the main task;
             // scoped-models panel actions (app.models.*) are routed via app_kb inside the panel and are unreachable here.
             AppAction::ModelCycleForward => self.cycle_scoped_model(true),

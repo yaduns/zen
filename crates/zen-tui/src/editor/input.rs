@@ -165,19 +165,19 @@ impl Editor {
             }
             EditorAction::DeleteWordBackward => {
                 self.exit_history_browsing();
-                self.delete_word_backward();
+                self.kill_with_capture(|e| e.delete_word_backward());
             }
             EditorAction::DeleteWordForward => {
                 self.exit_history_browsing();
-                self.delete_word_forward();
+                self.kill_with_capture(|e| e.delete_word_forward());
             }
             EditorAction::DeleteToLineStart => {
                 self.exit_history_browsing();
-                self.delete_to_line_start();
+                self.kill_with_capture(|e| e.delete_to_line_start());
             }
             EditorAction::DeleteToLineEnd => {
                 self.exit_history_browsing();
-                self.delete_to_line_end();
+                self.kill_with_capture(|e| e.delete_to_line_end());
             }
             EditorAction::NewLine => {
                 self.exit_history_browsing();
@@ -190,9 +190,10 @@ impl Editor {
                 }
             }
 
-            // ── Not implemented (Yank/YankPop: v1 has no kill ring, T-TU-03-7 Drop; Tab: T-TU-03-3 assembly) ──
-            EditorAction::Yank => { /* no-op */ }
-            EditorAction::YankPop => { /* no-op */ }
+            // ── Kill ring (T-TU-03-7): Ctrl+Y inserts the last kill, Alt+Y walks back through it ──
+            EditorAction::Yank => self.yank(),
+            EditorAction::YankPop => self.yank_pop(),
+            // Tab is handled by the autocomplete layer (zen-app UI), not by the editor core.
             EditorAction::Tab => { /* no-op */ }
 
             // ── Undo (T-TU-03-5): pop the stack to restore the state before the last edit ──

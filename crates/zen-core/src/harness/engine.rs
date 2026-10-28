@@ -579,6 +579,23 @@ impl Agent {
     pub fn follow_up_messages(&self) -> Vec<String> {
         queue_texts(&self.follow_up_queue)
     }
+
+    /// Remove and return the most recently queued follow-up message (LIFO), as plain text.
+    ///
+    /// Backs the interactive "restore queued message" action (`Alt+Up`). The loop drains the queue
+    /// head-first (`get_follow_up_messages`), so popping from the **back** hands the user the message
+    /// they queued last — the one they are most likely to want to edit again.
+    ///
+    /// # Returns
+    /// `None` when the queue is empty (the caller reports "nothing to restore"). Non-text blocks
+    /// (images) are dropped, matching [`Self::follow_up_messages`]'s display contract.
+    pub fn take_last_follow_up(&self) -> Option<String> {
+        let message = {
+            let mut queue = self.follow_up_queue.lock().ok()?;
+            queue.pop_back()?
+        };
+        Some(message_text(&message))
+    }
 }
 
 /// Helper that takes a plain-text snapshot of all messages in the queue (read-only, no drain).
@@ -590,21 +607,29 @@ fn queue_texts(queue: &Arc<Mutex<VecDeque<Message>>>) -> Vec<String> {
         .lock()
         .unwrap() // Lock poisoning only occurs when the lock-holding thread panics, consistent with the existing drain path in this file (get_steering_messages)
         .iter()
-        .map(|msg| match msg {
-            Message::User(user) => match &user.content {
-                ContentBlockList::Text(text) => text.clone(),
-                ContentBlockList::Blocks(blocks) => blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(t) => Some(t.text.clone()),
-                        _ => None, // Image/Thinking/ToolCall blocks are not included in text display
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            },
-            _ => String::new(), // The queue can only hold User messages; defensive fallback
-        })
+        .map(message_text)
         .collect()
+}
+
+/// Plain-text view of one queued message.
+///
+/// `Blocks` messages concatenate their text blocks and skip image/thinking/tool-call blocks;
+/// only [`Message::User`] can be queued, so other variants fall back to an empty string.
+fn message_text(msg: &Message) -> String {
+    match msg {
+        Message::User(user) => match &user.content {
+            ContentBlockList::Text(text) => text.clone(),
+            ContentBlockList::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None, // Image/Thinking/ToolCall blocks are not included in text display
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+        _ => String::new(), // The queue can only hold User messages; defensive fallback
+    }
 }
 
 #[cfg(test)]
@@ -861,6 +886,26 @@ mod tests {
             agent.follow_up_messages(),
             vec!["please continue".to_string()]
         );
+    }
+
+    #[test]
+    fn test_take_last_follow_up_pops_lifo() {
+        // Alt+Up restore: the message queued *last* is the one handed back first, because the loop
+        // drains the queue head-first (FIFO) and the user edits the most recent one.
+        let agent = test_agent();
+        agent.follow_up("first", &[]);
+        agent.follow_up("second", &[]);
+
+        assert_eq!(agent.take_last_follow_up().as_deref(), Some("second"));
+        assert_eq!(agent.take_last_follow_up().as_deref(), Some("first"));
+        assert_eq!(agent.take_last_follow_up(), None, "empty queue → None");
+        assert!(agent.follow_up_messages().is_empty());
+    }
+
+    #[test]
+    fn test_take_last_follow_up_empty_queue() {
+        let agent = test_agent();
+        assert_eq!(agent.take_last_follow_up(), None);
     }
 
     #[tokio::test]
