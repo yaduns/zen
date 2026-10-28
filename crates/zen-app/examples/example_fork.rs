@@ -100,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. build_context restores history + set_messages injects (aligned with pi)
     let ctx = forked.build_context();
-    eprintln!("[example] Forked session restored {} history messages", ctx.messages.len());
+    eprintln!(
+        "[example] Forked session restored {} history messages",
+        ctx.messages.len()
+    );
 
     let model = Model::from_env();
     let stream_fn = stream_for(model.api).expect("protocol not implemented");

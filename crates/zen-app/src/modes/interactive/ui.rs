@@ -2433,8 +2433,6 @@ pub(crate) enum InfoKind {
 
 #[cfg(test)]
 mod tests {
-    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
-    const CJK_SAMPLE: &str = "当前目录有哪些文件？";
     use super::*;
     use crate::keybindings::app_default_bindings;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -2626,7 +2624,7 @@ mod tests {
         // Temporary diagnostics: per-line fg/bg of user messages + thinking messages
         let mut u = ui();
         u.apply(UiEvent::MessageStart(Message::User(user_message(
-            CJK_SAMPLE,
+            "What files are in the current directory?",
         ))));
         let m = assistant(
             vec![

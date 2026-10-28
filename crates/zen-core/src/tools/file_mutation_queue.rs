@@ -125,9 +125,6 @@ fn mutation_key(file_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
-    const CJK_SAMPLE: &str = "second 不应在 first 释放前开始";
-    const CJK_SAMPLE_2: &str = "alias 不应在 target 释放前开始";
     use super::*;
     use tokio::sync::oneshot;
 
@@ -262,7 +259,9 @@ mod tests {
         });
 
         // second is queued: must not enter f before first releases
-        let started = second_started_rx.try_recv().expect_err(CJK_SAMPLE);
+        let started = second_started_rx
+            .try_recv()
+            .expect_err("second must not start before first is released");
         assert!(matches!(
             started,
             tokio::sync::oneshot::error::TryRecvError::Empty
@@ -358,7 +357,9 @@ mod tests {
         });
 
         // alias and target share the same queue after canonicalize: alias must not enter f before target releases
-        let started = a_started_rx.try_recv().expect_err(CJK_SAMPLE_2);
+        let started = a_started_rx
+            .try_recv()
+            .expect_err("alias must not start before target is released");
         assert!(matches!(
             started,
             tokio::sync::oneshot::error::TryRecvError::Empty

@@ -609,8 +609,6 @@ fn queue_texts(queue: &Arc<Mutex<VecDeque<Message>>>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
-    const CJK_SAMPLE: &str = "continue 校验失败（continue_turn 已前置校验，理论不可达）";
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
