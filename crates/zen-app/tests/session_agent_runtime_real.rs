@@ -75,6 +75,7 @@ async fn real_test_session_agent_runtime_fork() {
         },
         SessionStartReason::Startup,
         Vec::new(),
+        Default::default(),
     );
 
     // 2) Round one: remember ORANGE (via runtime entry)

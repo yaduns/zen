@@ -1,5 +1,6 @@
 use crate::resources::ResourceLoadDiagnostic;
 use crate::session::agent_session::{AgentSession, SessionStore};
+use crate::session::assembly_options::SessionAssemblyOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use zen_core::process::ProcessRegistry;
@@ -47,6 +48,12 @@ pub struct AgentSessionRuntime {
     /// Lifetime is per-assembly: each assembly (including session switch) produces fresh diagnostics, discarded with the old runtime,
     /// so they live in runtime rather than in services that survive switches.
     pub diagnostics: Vec<ResourceLoadDiagnostic>,
+    /// Command-line overrides that were in effect at process startup (REQ-APP-01, T-AP-01-6).
+    ///
+    /// Kept on the runtime so every later session assembled in this process (`/new`, `/resume`, `/fork`, `/clone`)
+    /// replays them — zen's equivalent of pi's `createRuntime` closure capturing the parsed CLI. Without it a
+    /// read-only session (`--tools read,…`) regains the default writable tool group after one switch.
+    pub assembly: SessionAssemblyOptions,
 }
 
 /// Create the initial runtime.
@@ -58,6 +65,9 @@ pub struct AgentSessionRuntime {
 /// - `session`: already-built AgentSession
 /// - `services`: cwd-bound runtime services
 /// - `start_reason`: reason for this creation (Startup/Resume/New/Fork)
+/// - `diagnostics`: resource-loading diagnostics collected while assembling this session
+/// - `assembly`: command-line overrides this runtime must replay on later switches (startup path builds it from
+///   the CLI, switch path copies it from the old runtime)
 ///
 /// # Behavior
 /// Package session + services into an `AgentSessionRuntime`. No cwd existence check is performed
@@ -72,12 +82,14 @@ pub fn create_initial_runtime(
     services: AgentSessionServices,
     start_reason: SessionStartReason,
     diagnostics: Vec<ResourceLoadDiagnostic>,
+    assembly: SessionAssemblyOptions,
 ) -> AgentSessionRuntime {
     AgentSessionRuntime {
         session: Arc::new(session),
         services,
         start_reason,
         diagnostics,
+        assembly,
     }
 }
 
@@ -102,7 +114,10 @@ where
     ) -> anyhow::Result<(AgentSession, AgentSessionServices, SessionStartReason)>,
 {
     // 1) Destructure the old runtime: services are moved into the closure, session drops naturally with `old` (teardown)
-    let AgentSessionRuntime { services, .. } = current;
+    //    `assembly` is carried over unchanged: a replaced session must keep the same command-line overrides.
+    let AgentSessionRuntime {
+        services, assembly, ..
+    } = current;
     // 2) Closure: construct new session + services + start_reason from the old services (ownership transfer)
     let (session, services, start_reason) = create_runtime_fn(services)?;
     // 3) Construct new runtime (session wrapped in Arc, D3)
@@ -114,6 +129,7 @@ where
         // session switches that need resource re-assembly go through assemble_runtime_from_session_manager
         // (via create_initial_runtime carrying new diagnostics), not this path.
         diagnostics: Vec::new(),
+        assembly,
     })
 }
 
@@ -286,7 +302,13 @@ mod tests {
         let reason = SessionStartReason::Startup;
         let diagnostics = Vec::new();
 
-        let rt = create_initial_runtime(session, services, reason, diagnostics);
+        let rt = create_initial_runtime(
+            session,
+            services,
+            reason,
+            diagnostics,
+            SessionAssemblyOptions::default(),
+        );
 
         // Session is validated via session_store (cwd accessible)
         assert_eq!(rt.session.cwd(), "/tmp/cwd");
@@ -302,7 +324,13 @@ mod tests {
         let reason = SessionStartReason::Resume("/sessions/abc.jsonl".into());
         let diagnostics = Vec::new();
 
-        let rt = create_initial_runtime(session, services, reason, diagnostics);
+        let rt = create_initial_runtime(
+            session,
+            services,
+            reason,
+            diagnostics,
+            SessionAssemblyOptions::default(),
+        );
 
         match &rt.start_reason {
             SessionStartReason::Resume(path) => {
@@ -319,7 +347,13 @@ mod tests {
         let reason = SessionStartReason::Fork("entry-42".into());
         let diagnostics = Vec::new();
 
-        let rt = create_initial_runtime(session, services, reason, diagnostics);
+        let rt = create_initial_runtime(
+            session,
+            services,
+            reason,
+            diagnostics,
+            SessionAssemblyOptions::default(),
+        );
 
         match &rt.start_reason {
             SessionStartReason::Fork(id) => assert_eq!(id, "entry-42"),
@@ -336,6 +370,7 @@ mod tests {
             test_services("/old/cwd", "/old/agent"),
             SessionStartReason::Startup,
             Vec::new(),
+            SessionAssemblyOptions::default(),
         );
 
         let captured_cwd = Arc::new(std::sync::Mutex::new(PathBuf::new()));
@@ -365,6 +400,7 @@ mod tests {
             test_services("/work", "/agent"),
             SessionStartReason::Startup,
             Vec::new(),
+            SessionAssemblyOptions::default(),
         );
 
         let result = replace_runtime::<fn(AgentSessionServices) -> _>(old_rt, |_services| {
@@ -389,6 +425,7 @@ mod tests {
             test_services("/work", "/agent"),
             SessionStartReason::Startup,
             Vec::new(),
+            SessionAssemblyOptions::default(),
         );
 
         let new_rt = replace_runtime(old_rt, |services| {
@@ -412,6 +449,7 @@ mod tests {
             test_services("/old/cwd", "/old/agent"),
             SessionStartReason::Startup,
             Vec::new(),
+            SessionAssemblyOptions::default(),
         );
 
         let new_rt = replace_runtime(old_rt, |_old_services| {
@@ -426,5 +464,40 @@ mod tests {
 
         assert_eq!(new_rt.services.cwd, PathBuf::from("/brand-new/cwd"));
         assert_eq!(new_rt.services.agent_dir, PathBuf::from("/brand-new/agent"));
+    }
+
+    #[test]
+    fn test_replace_runtime_carries_assembly_overrides() {
+        // REQ-APP-01 (T-AP-01-6): replacing the session must keep the launch-time command-line overrides —
+        // otherwise a read-only runtime would turn writable after the replacement.
+        let assembly = SessionAssemblyOptions {
+            tool_selection: zen_core::tools::factory::ToolSelection {
+                tools: vec!["read".into(), "grep".into()],
+                ..Default::default()
+            },
+            no_skills: true,
+            ..Default::default()
+        };
+        let old_rt = create_initial_runtime(
+            test_session("s1", "/work"),
+            test_services("/work", "/agent"),
+            SessionStartReason::Startup,
+            Vec::new(),
+            assembly.clone(),
+        );
+
+        let new_rt = replace_runtime(old_rt, |services| {
+            Ok((
+                test_session("s2", "/work"),
+                services,
+                SessionStartReason::New,
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(
+            new_rt.assembly, assembly,
+            "replace_runtime must carry the command-line overrides unchanged"
+        );
     }
 }

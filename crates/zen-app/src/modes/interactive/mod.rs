@@ -1736,25 +1736,32 @@ impl InteractiveMode {
             let _ = h.await;
         }
 
-        // 2. Assemble the new runtime (reuse the settings manager; load on demand when agent_dir is absent)
+        // 2. Assemble the new runtime: reuse the settings manager, and replay the launch-time command-line
+        //    overrides carried by the current runtime (T-AP-01-6) so the new session keeps e.g. a read-only tool set.
+        //    `agent_dir` is resolved once here and shared with settings loading / `AgentSessionServices`.
         let cwd = PathBuf::from(session_manager.get_cwd());
+        let agent_dir = config::get_agent_dir().unwrap_or_default();
         let settings = match &self.settings_manager {
             Some(s) => Arc::clone(s),
-            None => {
-                let agent_dir = config::get_agent_dir().unwrap_or_default();
-                Arc::new(SettingsManager::load(&cwd, &agent_dir))
+            None => Arc::new(SettingsManager::load(&cwd, &agent_dir)),
+        };
+        let assembly = self.runtime.assembly.clone();
+        let new_runtime = match assemble_runtime_from_session_manager(
+            &cwd,
+            agent_dir,
+            session_manager,
+            settings,
+            assembly,
+            reason,
+        )
+        .await
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                self.show_error(format!("Failed to switch session: {e}"));
+                return false;
             }
         };
-        let new_runtime =
-            match assemble_runtime_from_session_manager(&cwd, session_manager, settings, reason)
-                .await
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    self.show_error(format!("Failed to switch session: {e}"));
-                    return false;
-                }
-            };
 
         // 3. Unsubscribe old agent + replace runtime (old session drop teardown) + resubscribe
         if let Some(sub) = self.subscription.take() {
@@ -2529,6 +2536,7 @@ mod tests {
             services,
             crate::session::runtime::SessionStartReason::Startup,
             Vec::new(),
+            crate::session::assembly_options::SessionAssemblyOptions::default(),
         )
     }
 
@@ -3384,6 +3392,7 @@ mod tests {
             },
             start_reason: crate::session::runtime::SessionStartReason::Startup,
             diagnostics: Vec::new(),
+            assembly: crate::session::assembly_options::SessionAssemblyOptions::default(),
         };
         let mut mode = InteractiveMode::new(runtime, options(), None);
         // T-AP-06-3: init constructs footer_data (dispatch_loop depends on its branch_rx);

@@ -139,8 +139,9 @@ pub fn session_entry_to_context_messages(
 pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContext {
     // 1. Derive state: iterate path_entries and take the most recent value
     //    empty string = no entry (unset) — must not use "off" as the default: that would conflate "new session has no record" with
-    //    conflated with "explicitly recorded as off", causing services assembly's `apply_settings_defaults`
-    //    gate (`ctx.thinking_level.trim().is_empty()`) to be misjudged as "session already set" and skipped
+    //    conflated with "explicitly recorded as off", causing services assembly's settings-fill-in gate
+    //    (`ctx.thinking_level.trim().is_empty()` in `resolve_model_and_thinking`; formerly `apply_settings_defaults`)
+    //    to be misjudged as "session already set" and skipped
     //    settings.defaultThinkingLevel (T-AP-02-3-fix verification feedback fix).
     let mut thinking_level = String::new();
     let mut model: Option<SessionModel> = None;

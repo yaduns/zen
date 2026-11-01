@@ -52,8 +52,13 @@ async fn main() -> anyhow::Result<()> {
         session_store: store,
         registry: zen_core::process::ProcessRegistry::new(),
     };
-    let runtime =
-        create_initial_runtime(session, services, SessionStartReason::Startup, Vec::new());
+    let runtime = create_initial_runtime(
+        session,
+        services,
+        SessionStartReason::Startup,
+        Vec::new(),
+        Default::default(),
+    );
 
     // --mode json: use the print outlet; events emitted one JSON per line.
     let exit = run_print_mode(runtime, Mode::Json, vec![], Some(prompt), vec![]).await?;

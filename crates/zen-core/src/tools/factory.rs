@@ -75,7 +75,7 @@ pub struct ToolFactory {
 /// cli-tools-flags-fix). v1 has no extension/custom tools: `no_tools` and `no_builtin_tools`
 /// both collapse to "no built-in tools"; the semantic distinction is preserved (custom tools will only be
 /// (turned off by `no_tools`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolSelection {
     /// Allow-list (`--tools`); when non-empty, only tools in the list are created (unknown names silently skipped, aligned with pi).
     pub tools: Vec<String>,
