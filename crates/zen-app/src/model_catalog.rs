@@ -110,7 +110,11 @@ mod tests {
     }
 
     #[test]
-    fn built_in_models_covers_both_providers() {
+    fn built_in_models_lists_default_provider_only() {
+        // `/model` enumerates this list. `huoshan` is carried as a legacy catalog record with
+        // `"listed": false`, so it no longer appears here — while staying resolvable by id
+        // (`--provider huoshan`, `defaultProvider`, session restore), covered in zen-ai's
+        // `unlisted_provider_stays_resolvable_but_is_not_enumerated`.
         let _g = env_lock();
         let models = built_in_models();
         let providers: Vec<&str> = models.iter().map(|m| m.provider.as_str()).collect();
@@ -119,8 +123,8 @@ mod tests {
             "missing opencode-go: {providers:?}"
         );
         assert!(
-            providers.contains(&"huoshan"),
-            "missing huoshan: {providers:?}"
+            !providers.contains(&"huoshan"),
+            "huoshan must not be listed in the picker: {providers:?}"
         );
         // every model id is non-empty
         assert!(models.iter().all(|m| !m.id.is_empty()));

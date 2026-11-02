@@ -31,6 +31,7 @@
       "api": "openai-completions",
       "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
       "apiKey": "$ARK_API_KEY",
+      "listed": false,
       "compat": {
         "thinkingFormat": "deepseek"
       },

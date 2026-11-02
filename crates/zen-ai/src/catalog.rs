@@ -113,6 +113,13 @@ pub struct ProviderConfig {
     /// Model definitions; if absent, only provider-level fields are overridden.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<ModelDef>>,
+    /// Whether this provider appears in the enumerable model list (`/model`, `/scoped-models`, model cycling).
+    /// Missing = listed. `false` keeps the provider **resolvable by id** (`--provider`, `defaultProvider` in
+    /// settings, session restore, request-layer api-key lookup) while hiding it from the picker — used for
+    /// built-in records kept only for backward compatibility (e.g. `huoshan`, a v1-era default).
+    /// A user `models.json` can flip it back with `"listed": true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listed: Option<bool>,
     /// Patches for existing models; key = model id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_overrides: Option<HashMap<String, ModelOverride>>,
@@ -263,12 +270,16 @@ impl Catalog {
     }
 
     /// Enumerate all models in the catalog (provider × model materialized), sorted by `(provider, id)` for determinism.
+    /// Providers marked `"listed": false` are skipped (resolvable by id, but not offered to the picker).
     ///
     /// Current consumers: T-AI-02-11 (replacing zen-app `model_catalog::built_in_models`) and
     /// T-V2-02-1/2 (list models).
     pub fn models(&self) -> Vec<Model> {
         let mut out = Vec::new();
         for (provider, config) in &self.providers {
+            if config.listed == Some(false) {
+                continue;
+            }
             for def in config.models.as_deref().unwrap_or(&[]) {
                 out.push(materialize_model(provider, config, def));
             }
@@ -641,6 +652,11 @@ fn merge_provider(base: &mut ProviderConfig, user: ProviderConfig) {
     if user.api_key.is_some() {
         base.api_key = user.api_key;
     }
+    // Listing flag merges like the other provider scalars, so a user `"listed": true` can put a
+    // built-in unlisted provider (e.g. `huoshan`) back into the picker.
+    if user.listed.is_some() {
+        base.listed = user.listed;
+    }
     if let Some(headers) = user.headers {
         base.headers
             .get_or_insert_with(HashMap::new)
@@ -877,10 +893,45 @@ mod tests {
 
     #[test]
     fn embedded_catalog_models_are_sorted() {
+        // `huoshan` is a legacy record carried with `"listed": false`, so the enumerable list (which feeds
+        // `/model`) contains only the default provider. It stays resolvable by id — see the test below.
         let models = Catalog::embedded().models();
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].provider, "huoshan");
-        assert_eq!(models[1].provider, "opencode-go");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider, "opencode-go");
+    }
+
+    #[test]
+    fn unlisted_provider_stays_resolvable_but_is_not_enumerated() {
+        // Rationale: existing settings (`defaultProvider: "huoshan"`), session restore and `--provider huoshan`
+        // must keep working after the provider stopped being offered in the picker.
+        let catalog = Catalog::embedded();
+        let provider = catalog.provider("huoshan").expect("huoshan still resolves");
+        assert_eq!(provider.id(), "huoshan");
+        assert_eq!(
+            provider.base_url(),
+            "https://ark.cn-beijing.volces.com/api/coding/v3"
+        );
+        assert!(catalog.model("huoshan", "deepseek-v4-flash").is_some());
+        assert!(catalog
+            .models()
+            .iter()
+            .all(|model| model.provider != "huoshan"));
+    }
+
+    #[test]
+    fn user_models_json_can_relist_an_unlisted_provider() {
+        // Escape hatch: `"listed": true` in the user file overrides the built-in flag.
+        let path = temp_models_path("relist");
+        std::fs::write(
+            &path,
+            r#"{ "providers": { "huoshan": { "listed": true } } }"#,
+        )
+        .expect("write temp models.json");
+        let catalog = Catalog::load(Some(&path)).expect("load");
+        assert!(catalog
+            .models()
+            .iter()
+            .any(|model| model.provider == "huoshan"));
     }
 
     #[test]
