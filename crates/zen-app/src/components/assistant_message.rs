@@ -21,7 +21,7 @@ enum Planned {
     Label { text: String, style: Style },
     /// markdown segment (text block, base theme).
     Markdown { text: String, theme: MarkdownTheme },
-    /// thinking expansion segment: carries the base theme (including syntax_theme_name, code blocks inside thinking still get syntax highlighting),
+    /// thinking expansion segment: carries the base theme (including the syntax palette, so code blocks inside thinking still get theme-colored syntax highlighting),
     /// paint_plan renders the text stream with segment-level overrides (thinkingText gray + italic) (T-TU-02-1-fix).
     ThinkingMarkdown { text: String, theme: MarkdownTheme },
 }
@@ -607,8 +607,8 @@ mod tests {
                 _ => None,
             })
             .expect("Expanding thinking should produce a ThinkingMarkdown segment");
-        // Carries the base theme (including syntax_theme_name → code blocks inside thinking are still syntax-colored per theme)
-        assert_eq!(thinking.syntax_theme_name, comp.base_md.syntax_theme_name);
+        // Carries the base theme (including syntax_palette → code blocks inside thinking are still syntax-colored per theme)
+        assert_eq!(thinking.syntax_palette, comp.base_md.syntax_palette);
     }
 
     #[test]

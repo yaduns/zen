@@ -496,9 +496,9 @@ impl InteractiveUi {
             );
         }
 
-        // 4. Initial appearance and focus: normal border (aligned with pi's `getThinkingBorderColor("off")`),
+        // 4. Initial appearance and focus: normal border (pi `getEditorTheme().borderColor` = `fg("borderMuted")`),
         // Focus the editor on startup (aligns with pi `ui.setFocus(editor)`).
-        editor.set_border_style(Style::fg(theme.fg(ColorToken::ThinkingOff)));
+        editor.set_border_style(Style::fg(theme.fg(ColorToken::BorderMuted)));
         editor.set_focused(true);
 
         // 5. Initial footer baseline: show cwd on the first frame (placeholder until the first real Footer event arrives;

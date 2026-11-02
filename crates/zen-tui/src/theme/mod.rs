@@ -16,6 +16,7 @@ use crossterm::style::{Attribute, Color};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::highlight::SyntaxPalette;
 use crate::markdown::MarkdownTheme;
 use crate::screen::Style;
 
@@ -372,12 +373,21 @@ impl Theme {
                 bg: None,
                 attributes: vec![Attribute::Bold],
             },
+            // Inline emphasis inherits the surrounding text color, matching pi 1.4: `em`/`del` only
+            // add font attributes (pi-tui markdown.js `case "em"` / `case "del"`), they never take a
+            // separate token — otherwise `*italic*` would be recolored to `mdHeading` (bright yellow on
+            // the 1.4 palette) and `~~del~~` to `muted`. `fg: None` = keep the baseline from `text`
+            // (which user messages override with `userMessageText`).
             italic: Style {
-                fg: Some(self.fg(ColorToken::MdHeading)),
+                fg: None,
                 bg: None,
                 attributes: vec![Attribute::Italic],
             },
-            strikethrough: self.style(ColorToken::Muted, None, &[Attribute::CrossedOut]),
+            strikethrough: Style {
+                fg: None,
+                bg: None,
+                attributes: vec![Attribute::CrossedOut],
+            },
             underline: Style {
                 fg: Some(self.fg(ColorToken::Text)),
                 bg: None,
@@ -397,15 +407,18 @@ impl Theme {
             hr: self.style(ColorToken::MdHr, None, &[]),
             list_bullet: self.style(ColorToken::MdListBullet, None, &[]),
             code_block_indent: "  ".to_string(),
-            syntax_theme_name: self.syntax_theme_name().to_string(),
+            syntax_palette: self.syntax_palette(),
         }
     }
 
     /// Called by the select list component (T-TU-01-4) during construction—
     /// Constructs a SelectListTheme from the current theme colors.
+    /// Selection is expressed by the accent foreground only (no row background), matching pi 1.4's
+    /// `getSelectListTheme` (`selectedPrefix`/`selectedText` = `fg("accent")`); `selectedBg` stays
+    /// reserved for the tree/session selectors and the autocomplete dropdown, as in pi.
     pub fn select_list_theme(&self) -> crate::components::select_list::SelectListTheme {
         crate::components::select_list::SelectListTheme::new(
-            self.style(ColorToken::Accent, Some(BgToken::SelectedBg), &[]),
+            self.style(ColorToken::Accent, None, &[]),
             self.style(ColorToken::Muted, None, &[]),
             self.style(ColorToken::Muted, None, &[]),
             self.style(ColorToken::Muted, None, &[]),
@@ -426,13 +439,34 @@ impl Theme {
         }
     }
 
-    /// Called by the syntax highlighting module (T-AP-10-1) when highlighting code—
-    /// Returns the syntect theme name corresponding to the current theme (e.g. "base16-ocean.dark"),
-    /// Used to select a built-in syntect theme. v1 maps by theme name: dark → base16-ocean.dark, light → base16-ocean.light.
-    pub fn syntax_theme_name(&self) -> &str {
-        match self.name.as_str() {
-            "light" => "base16-ocean.light",
-            _ => "base16-ocean.dark",
+    /// Called by the markdown renderer path when a code block needs syntax colors —
+    /// hands out a copied palette built from this theme's nine `syntax*` tokens plus `muted`/`text`,
+    /// so code blocks are painted by the theme instead of a hardcoded built-in palette (T-AP-10-1-fix).
+    /// Boundary: a token whose resolved color is the terminal default (`""` in JSON → `Color::Reset`)
+    /// becomes `None`, which makes the highlighter skip that rule and keep the base color.
+    pub fn syntax_palette(&self) -> SyntaxPalette {
+        /// `Reset` (terminal default) carries no concrete color → `None` = "no rule for this slot".
+        fn opt(color: Color) -> Option<Color> {
+            if color == Color::Reset {
+                None
+            } else {
+                Some(color)
+            }
+        }
+        SyntaxPalette {
+            comment: opt(self.colors.syntax_comment),
+            keyword: opt(self.colors.syntax_keyword),
+            function: opt(self.colors.syntax_function),
+            variable: opt(self.colors.syntax_variable),
+            string: opt(self.colors.syntax_string),
+            number: opt(self.colors.syntax_number),
+            type_name: opt(self.colors.syntax_type),
+            operator: opt(self.colors.syntax_operator),
+            punctuation: opt(self.colors.syntax_punctuation),
+            // pi maps the `meta` highlight class to the non-`syntax*` token `muted`.
+            muted: opt(self.colors.muted),
+            // pi's `subst` class is `fg("text")`: unmatched code text follows the body text color.
+            base: opt(self.colors.text),
         }
     }
 
@@ -780,9 +814,23 @@ pub fn load_theme_from_json(json: &str, source_path: Option<PathBuf>) -> Result<
 // ── Built-in themes ──────────────────────────────────────────────────────
 
 /// Built-in dark theme JSON (embedded at compile time).
+///
+/// Data provenance (T-AP-11-3-fix): palette synchronized with pi 1.4.0's
+/// `dist/modes/interactive/theme/dark.json` (OKHSL-authored). zen only accepts 6-digit hex,
+/// so the values were converted offline by pi's own color pipeline
+/// (`scripts/pi-theme-to-zen.mjs` → pi-tui `parseColor` + `colorToRgb`), not by eye.
+/// The `vars` indirection is intentionally kept so shared colors stay adjustable in one place.
+/// Re-run that script instead of hand-editing hex literals; the expected result is tabulated in
+/// `tasks/T-AP-11-3-fix-implemented.md` appendix A.
 const BUILTIN_DARK_JSON: &str = include_str!("builtin_dark.json");
 
 /// Built-in light theme JSON (embedded at compile time).
+///
+/// Data provenance (theme-role-alignment-fix): palette synchronized with pi 1.4.0's
+/// `dist/modes/interactive/theme/light.json`, converted offline by the same
+/// `scripts/pi-theme-to-zen.mjs` pipeline as the dark theme (pi-tui `parseColor` + `colorToRgb`).
+/// Keeping both built-ins on one generation avoids a palette jump when the terminal
+/// appearance flips (the `light/dark` auto setting).
 const BUILTIN_LIGHT_JSON: &str = include_str!("builtin_light.json");
 
 /// Built-in dark theme (lazy parsing cache).
@@ -968,21 +1016,21 @@ mod tests {
     fn test_load_builtin_dark_theme() {
         let theme = builtin_dark_theme();
         assert_eq!(theme.name, "dark");
-        // Verify some known colors
+        // Verify some known colors (pi 1.4 dark palette: accent = violet, error = red)
         assert_eq!(
             theme.fg(ColorToken::Accent),
             Color::Rgb {
-                r: 0x8a,
-                g: 0xbe,
-                b: 0xb7
+                r: 0xa7,
+                g: 0x98,
+                b: 0xd7
             }
         );
         assert_eq!(
             theme.fg(ColorToken::Error),
             Color::Rgb {
-                r: 0xcc,
-                g: 0x66,
-                b: 0x66
+                r: 0xea,
+                g: 0x7f,
+                b: 0x81
             }
         );
     }
@@ -991,12 +1039,13 @@ mod tests {
     fn test_load_builtin_light_theme() {
         let theme = builtin_light_theme();
         assert_eq!(theme.name, "light");
+        // pi 1.4 light palette: accent = violet
         assert_eq!(
             theme.fg(ColorToken::Accent),
             Color::Rgb {
-                r: 0x5a,
-                g: 0x80,
-                b: 0x80
+                r: 0x74,
+                g: 0x59,
+                b: 0xb4
             }
         );
     }
@@ -1092,17 +1141,17 @@ mod tests {
         assert_eq!(
             style.fg,
             Some(Color::Rgb {
-                r: 0x8a,
-                g: 0xbe,
-                b: 0xb7
+                r: 0xa7,
+                g: 0x98,
+                b: 0xd7
             })
         );
         assert_eq!(
             style.bg,
             Some(Color::Rgb {
-                r: 0x3a,
-                g: 0x3a,
-                b: 0x4a
+                r: 0x21,
+                g: 0x3b,
+                b: 0x49
             })
         );
         assert_eq!(style.attributes, vec![Attribute::Bold]);
@@ -1116,18 +1165,43 @@ mod tests {
         assert_eq!(
             md_theme.text.fg,
             Some(Color::Rgb {
-                r: 0xd4,
-                g: 0xd4,
-                b: 0xd4
+                r: 0xde,
+                g: 0xe0,
+                b: 0xe1
             })
         );
     }
 
     #[test]
+    fn test_theme_markdown_inline_emphasis_inherits_text_color() {
+        // pi 1.4's `em`/`del` only add font attributes; they never take a token color.
+        // `fg: None` is what makes the renderer keep the surrounding baseline (which user
+        // messages override with `userMessageText`), instead of recoloring italic to the
+        // bright `mdHeading` yellow and strikethrough to `muted`.
+        let md_theme = builtin_dark_theme().markdown_theme();
+        assert_eq!(md_theme.italic.fg, None);
+        assert_eq!(md_theme.italic.attributes, vec![Attribute::Italic]);
+        assert_eq!(md_theme.strikethrough.fg, None);
+        assert_eq!(
+            md_theme.strikethrough.attributes,
+            vec![Attribute::CrossedOut]
+        );
+        // Blockquote keeps its own color + italic (pi `markdown.js` quote path), so it must stay set.
+        assert!(md_theme.quote.fg.is_some());
+    }
+
+    #[test]
     fn test_theme_select_list_theme() {
+        // Selection is accent foreground only, with no row background — matches pi 1.4's
+        // `getSelectListTheme` (`selectedPrefix`/`selectedText` = fg("accent")); `selectedBg`
+        // stays reserved for the tree/session selectors and the autocomplete dropdown.
         let theme = builtin_dark_theme();
-        let _sl_theme = theme.select_list_theme();
-        // Successful construction is enough
+        let sl_theme = theme.select_list_theme();
+        assert_eq!(
+            sl_theme.selected_style().fg,
+            Some(theme.fg(ColorToken::Accent))
+        );
+        assert_eq!(sl_theme.selected_style().bg, None);
     }
 
     #[test]
@@ -1138,15 +1212,43 @@ mod tests {
     }
 
     #[test]
-    fn test_theme_syntax_theme_name() {
+    fn test_theme_syntax_palette() {
+        // Code blocks are painted from the theme's `syntax*` tokens (T-AP-10-1-fix), no longer from a
+        // built-in syntect theme name. pi 1.4 dark: syntaxKeyword = blue (#69add0); light: blue (#2f7899).
+        let dark = builtin_dark_theme().syntax_palette();
         assert_eq!(
-            builtin_dark_theme().syntax_theme_name(),
-            "base16-ocean.dark"
+            dark.keyword,
+            Some(Color::Rgb {
+                r: 0x69,
+                g: 0xad,
+                b: 0xd0
+            })
         );
         assert_eq!(
-            builtin_light_theme().syntax_theme_name(),
-            "base16-ocean.light"
+            dark.string,
+            Some(Color::Rgb {
+                r: 0xde,
+                g: 0x8d,
+                b: 0x5a
+            })
         );
+        // `base` follows the body text token (pi `subst → fg("text")`).
+        assert_eq!(dark.base, Some(dark_text_color()));
+        let light = builtin_light_theme().syntax_palette();
+        assert_eq!(
+            light.keyword,
+            Some(Color::Rgb {
+                r: 0x2f,
+                g: 0x78,
+                b: 0x99
+            })
+        );
+        assert_ne!(dark.keyword, light.keyword);
+    }
+
+    /// Body text color of the built-in dark theme (helper for the palette test).
+    fn dark_text_color() -> Color {
+        builtin_dark_theme().fg(ColorToken::Text)
     }
 
     #[test]
@@ -1155,17 +1257,17 @@ mod tests {
         assert_eq!(
             theme.thinking_border_color(zen_ai::types::ThinkingLevel::Off),
             Color::Rgb {
-                r: 0x50,
-                g: 0x50,
-                b: 0x50
+                r: 0x6c,
+                g: 0x76,
+                b: 0x7b
             }
         );
         assert_eq!(
             theme.thinking_border_color(zen_ai::types::ThinkingLevel::Max),
             Color::Rgb {
-                r: 0xff,
-                g: 0x5f,
-                b: 0xff
+                r: 0xfe,
+                g: 0x54,
+                b: 0x62
             }
         );
     }

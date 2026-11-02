@@ -95,6 +95,12 @@ impl SelectListTheme {
             no_match_style,
         }
     }
+
+    /// Read access to the selected-row style — lets the theme layer's tests lock the selection
+    /// presentation (pi 1.4 expresses selection by accent foreground only, with no row background).
+    pub fn selected_style(&self) -> &Style {
+        &self.selected_style
+    }
 }
 
 /// Primary column layout constraints and custom truncation callback

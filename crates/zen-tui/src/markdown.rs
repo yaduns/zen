@@ -5,7 +5,7 @@
 // zen_tui::highlight (T-AP-10-1); wrapping reuses wrap::word_wrap_line (word-boundary/CJK-aware, byte-range back-mapping to style segments);
 // pi's ANSI string output model collapses to a Style-segment model (aligned with the hash screen::Style carrier),
 // MarkdownOptions (preserve* normalization options) and cache fields (ScreenBuffer differential model re-renders every frame) are collapsed entirely.
-use crate::highlight::{self, StyledSegment};
+use crate::highlight::{self, StyledSegment, SyntaxPalette};
 use crate::screen::{visible_width, Style};
 use crate::wrap::word_wrap_line;
 use crossterm::style::{Attribute, Color};
@@ -17,8 +17,8 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 /// Attribute bits for `link` stacked with `underline`; `bold/italic/strikethrough` are the
 /// foreground color and attribute source for the corresponding inline element (aligned with pi's level composition: bold uses the brightest foreground, italic uses purple, strikethrough uses gray).
 /// Pure data, Clone/PartialEq/Debug-able; not serialized (runtime visual data).
-/// `Default` provides a dark theme suited to the zen dark TUI (base16-ocean.dark palette,
-/// same family as the default theme in `highlight.rs`); when the T-AP-11-3 theme system is integrated, it will construct this type to populate the field.
+/// `Default` provides a dark theme suited to the zen dark TUI (base16-ocean.dark palette);
+/// once a `Theme` is available, `Theme::markdown_theme()` constructs this type instead (T-AP-11-3).
 #[derive(Clone, PartialEq, Debug)]
 pub struct MarkdownTheme {
     /// Plain text baseline style; used when not overridden by inline styles
@@ -54,11 +54,13 @@ pub struct MarkdownTheme {
     pub list_bullet: Style,
     /// Prefix indent before each line of a code block (default `"  "`)
     pub code_block_indent: String,
-    /// Name of the built-in syntect theme used for code block syntax highlighting (in the same family as `highlight.rs` `DEFAULT_THEME`).
-    /// The renderer is self-contained: code block coloring resolves by this name and does not depend on a `Theme` reference (T-AP-11-3 via
-    /// `Theme::syntax_theme_name` supplies the dark/light mapping; `markdown_theme()` populates it;
-    /// `Default` provides the dark-mode fallback).
-    pub syntax_theme_name: String,
+    /// Syntax coloring palette for code blocks, carried straight from the theme (T-AP-10-1-fix):
+    /// `Theme::syntax_palette()` builds it from the nine `syntax*` tokens + `text`/`muted`, and
+    /// `highlight::highlight` turns it into a one-shot syntect theme — so code-block colors follow the
+    /// active theme instead of a fixed built-in palette.
+    /// The renderer stays self-contained: it needs no `Theme` reference, just this copied palette
+    /// (`Default` supplies base16-ocean.dark's measured colors for print mode / first frame).
+    pub syntax_palette: SyntaxPalette,
 }
 
 impl Default for MarkdownTheme {
@@ -117,7 +119,7 @@ impl Default for MarkdownTheme {
             hr: fg(0x65, 0x73, 0x7e),                                    // base03
             list_bullet: fg(0x96, 0xb5, 0xb4),                           // base0C
             code_block_indent: "  ".to_string(),
-            syntax_theme_name: "base16-ocean.dark".to_string(),
+            syntax_palette: SyntaxPalette::default(),
         }
     }
 }
@@ -598,7 +600,7 @@ impl<'a, 'b> MarkdownRenderer<'a, 'b> {
                 self.in_code_block = false;
                 let lang_ref = self.code_lang.as_deref();
                 let highlighted =
-                    highlight::highlight(&self.code_buf, lang_ref, &self.theme.syntax_theme_name);
+                    highlight::highlight(&self.code_buf, lang_ref, &self.theme.syntax_palette);
                 let indent = self.theme.code_block_indent.clone();
 
                 for row in highlighted {

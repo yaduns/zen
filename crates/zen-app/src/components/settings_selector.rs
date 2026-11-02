@@ -184,6 +184,7 @@ fn make_submenu(
     current_value: &str,
     list_theme: SelectListTheme,
     accent_style: Style,
+    description_style: Style,
     select_kb: KeybindingsManager<SelectAction>,
     close: SubmenuClose,
 ) -> Box<dyn Component> {
@@ -219,6 +220,7 @@ fn make_submenu(
         description,
         list,
         theme: accent_style,
+        description_style,
     })
 }
 
@@ -228,6 +230,10 @@ struct SelectSubmenu {
     description: Option<String>,
     list: SelectList,
     theme: Style,
+    /// Style of the description line (theme `dim`). pi uses `fg("dim")` there
+    /// (`getSettingsListTheme().description`); before this it was a hardcoded ANSI grey (index 8),
+    /// i.e. the terminal palette leaked into a themed panel.
+    description_style: Style,
 }
 
 impl Component for SelectSubmenu {
@@ -246,12 +252,7 @@ impl Component for SelectSubmenu {
         if let Some(desc) = &self.description {
             if remaining > 0 {
                 buf.fill(x, row, width, 1, &Style::default());
-                buf.write(
-                    x + 1,
-                    row,
-                    &Style::fg(crossterm::style::Color::DarkGrey),
-                    desc,
-                );
+                buf.write(x + 1, row, &self.description_style, desc);
                 painted += 1;
                 row += 1;
                 remaining -= 1;
@@ -327,6 +328,9 @@ impl SettingsSelectorComponent {
         let close: SubmenuClose = Rc::new(RefCell::new(None));
         let list_theme = theme.select_list_theme();
         let accent_style = Style::fg(theme.fg(ColorToken::Accent));
+        // Description lines (`getSettingsListTheme().description` = `fg("dim")`): keep them theme-driven
+        // instead of the terminal's ANSI grey, so the panel stays in the theme's grey ramp.
+        let description_style = Style::fg(theme.fg(ColorToken::Dim));
         let mut callbacks = callbacks;
         let on_cancel = std::mem::replace(&mut callbacks.on_cancel, Box::new(|| {}));
 
@@ -474,6 +478,7 @@ impl SettingsSelectorComponent {
             let close = close.clone();
             let lt = list_theme.clone();
             let accent = accent_style.clone();
+            let desc_style = description_style.clone();
             let skb = select_kb.clone();
             let current = config.thinking_level.to_string().to_ascii_lowercase();
             let levels = config.available_thinking_levels.clone();
@@ -491,6 +496,7 @@ impl SettingsSelectorComponent {
                         &current,
                         lt.clone(),
                         accent.clone(),
+                        desc_style.clone(),
                         skb.clone(),
                         close.clone(),
                     )
@@ -501,6 +507,7 @@ impl SettingsSelectorComponent {
         {
             let lt = list_theme.clone();
             let accent = accent_style.clone();
+            let desc_style = description_style.clone();
             let skb = select_kb.clone();
             let themes = config.available_themes.clone();
             let current_theme = config.current_theme.clone();
@@ -523,6 +530,7 @@ impl SettingsSelectorComponent {
                         &current_theme,
                         lt.clone(),
                         accent.clone(),
+                        desc_style.clone(),
                         skb.clone(),
                         close.clone(),
                     )
@@ -726,6 +734,34 @@ mod tests {
             DoubleEscapeAction::None
         );
         assert_eq!(DoubleEscapeAction::None.to_str(), "none");
+    }
+
+    #[test]
+    fn submenu_description_uses_theme_dim() {
+        // pi's `getSettingsListTheme().description` is `fg("dim")`; the submenu description line used to
+        // hardcode ANSI grey 8, which followed the terminal palette instead of the theme.
+        let t = theme();
+        let mut sub = SelectSubmenu {
+            title: "Theme".into(),
+            description: Some("Color theme for the interface".into()),
+            list: SelectList::new(
+                vec![SelectItem::new("dark", "dark", None)],
+                1,
+                t.select_list_theme(),
+                SelectListLayoutOptions::default(),
+                select_kb(),
+            ),
+            theme: Style::fg(t.fg(ColorToken::Accent)),
+            description_style: Style::fg(t.fg(ColorToken::Dim)),
+        };
+        let mut buf = ScreenBuffer::new(60, 10);
+        sub.render(&mut buf, 0, 0, 60, 10);
+        let row = buf.line_segments(1);
+        let desc = row
+            .iter()
+            .find(|s| s.text.contains("Color theme"))
+            .expect("description row rendered");
+        assert_eq!(desc.style.fg, Some(t.fg(ColorToken::Dim)));
     }
 
     #[test]
