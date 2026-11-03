@@ -2105,9 +2105,20 @@ impl InteractiveUi {
         let caret_fixed_row = status_h as usize + caret_pos.1 as usize;
         let caret_col = caret_pos.0 as usize;
         let mut caret_canvas_row: Option<usize> = None;
-        for r in 0..fixed_h {
-            let segs = fixed.line_segments(r);
-            if !segs.is_empty() {
+        // Blank rows *inside* the fixed region are real visual space (e.g. empty lines typed into the editor with
+        // Shift+Enter), so they must be pushed as empty lines instead of being dropped; otherwise the editor's empty
+        // lines collapse and the caret appears glued to the line above it. Only trailing blank rows (padding below
+        // the last painted row) are skipped, preserving the "no stray blank rows in scrollback" intent.
+        let last_painted = (0..fixed_h)
+            .rev()
+            .find(|r| !fixed.line_segments(*r).is_empty());
+        if let Some(last_painted) = last_painted {
+            for r in 0..=last_painted {
+                let segs = fixed.line_segments(r);
+                if segs.is_empty() {
+                    canvas.push_line(Vec::new());
+                    continue;
+                }
                 if r as usize == caret_fixed_row {
                     caret_canvas_row = Some(canvas.line_count());
                 }
@@ -3091,6 +3102,41 @@ mod tests {
     }
 
     // ── render_scrollback: editor height grows dynamically with content (T-AP-11-1-fix) ──
+
+    #[test]
+    fn editor_blank_lines_keep_their_row_in_scrollback() {
+        // Regression: blank lines typed with Shift+Enter used to collapse in the scrollback bridging step
+        // (only non-empty rows were pushed), so the caret stayed glued one row below the text no matter how
+        // many times Shift+Enter was pressed. Each extra empty line must add exactly one row to the output.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut u = ui();
+        for ch in "hello".chars() {
+            u.handle_key(&KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        u.handle_key(&shift_enter);
+        let mut c1 = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut c1);
+        let after_one = c1.content_height();
+        assert_eq!(u.editor.text(), "hello\n");
+
+        u.handle_key(&shift_enter);
+        assert_eq!(u.editor.text(), "hello\n\n");
+        let mut c2 = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut c2);
+        assert_eq!(
+            c2.content_height(),
+            after_one + 1,
+            "a second Shift+Enter must add one visible row (blank line above the caret)"
+        );
+
+        // Third time: still one row per empty line, caret keeps moving down.
+        u.handle_key(&shift_enter);
+        assert_eq!(u.editor.text(), "hello\n\n\n");
+        let mut c3 = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut c3);
+        assert_eq!(c3.content_height(), after_one + 2);
+    }
 
     #[test]
     fn test_scrollback_editor_grows_with_content() {
