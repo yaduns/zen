@@ -995,7 +995,15 @@ impl InteractiveMode {
             .as_ref()
             .expect("init idempotent guard ensures footer_data is constructed")
             .branch_rx();
-        let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings, branch_rx);
+        // Footer source instead of a FooterCtx snapshot: the bridge rebuilds the footer context per event, so a
+        // model switch made after subscribing (e.g. `/model`) is reflected while the run is streaming — a captured
+        // snapshot used to send the footer back to the old model until the run finished (fixture: footer showed
+        // deepseek during the run after switching to mimo, then reverted to mimo once the run ended).
+        let footer = BridgeFooter {
+            session: Arc::clone(&self.runtime.session),
+            auto_compact: self.settings.auto_compact,
+            git_branch_rx: branch_rx,
+        };
         // T-OB-01-3: cache miss prompt context (gate = settings snapshot; session reference used to read entries/model)
         let cache = CacheMissContext {
             enabled: self.settings.show_cache_miss_notices,
@@ -1004,7 +1012,7 @@ impl InteractiveMode {
         self.runtime
             .session
             .subscribe(Box::new(move |event: &AgentEvent| {
-                bridge_agent_event(event, &tx, &usage, &ctx, &cache);
+                bridge_agent_event(event, &tx, &usage, &footer, &cache);
             }))
     }
 
@@ -2083,13 +2091,23 @@ impl FooterCtx {
         settings: &SettingsConfig,
         git_branch_rx: watch::Receiver<Option<String>>,
     ) -> Self {
+        Self::new(session, settings.auto_compact, git_branch_rx)
+    }
+
+    /// Same as [`FooterCtx::from_session`] but taking the only settings bit the footer needs, so the event
+    /// bridge (which has no `SettingsConfig` at hand) can rebuild the context per event.
+    fn new(
+        session: &AgentSession,
+        auto_compact: bool,
+        git_branch_rx: watch::Receiver<Option<String>>,
+    ) -> Self {
         FooterCtx {
             pwd: session.cwd().to_string(),
             model_id: session.model().id.clone(),
             model_provider: session.model().provider.clone(),
             thinking_level: session.thinking_level(),
             context_window: session.model().context_window,
-            auto_compact: settings.auto_compact,
+            auto_compact,
             git_branch_rx,
         }
     }
@@ -2127,6 +2145,25 @@ impl FooterCtx {
     }
 }
 
+/// Live footer source for the event bridge: holds what `FooterCtx` needs (session + settings snapshot + branch
+/// subscription) and rebuilds the context on demand. Reading `session.model()` at event time is what keeps the
+/// footer right after an in-session model switch.
+struct BridgeFooter {
+    /// Session the events come from (model / thinking level / context window are read from it live).
+    session: Arc<AgentSession>,
+    /// Footer `(auto)` marker (the only settings bit the footer shows).
+    auto_compact: bool,
+    /// git branch latest-value subscription (cloned per rebuild, T-AP-06-3).
+    git_branch_rx: watch::Receiver<Option<String>>,
+}
+
+impl BridgeFooter {
+    /// Build a fresh [`FooterCtx`] from the current session state.
+    fn ctx(&self) -> FooterCtx {
+        FooterCtx::new(&self.session, self.auto_compact, self.git_branch_rx.clone())
+    }
+}
+
 /// Bridge cache-miss notice context (T-OB-01-3): gate + session reference. Private — built by `subscribe_to_agent`,
 /// read-only in `bridge_agent_event`. Gate = `settings.show_cache_miss_notices` snapshot (captured at subscription); toggling
 /// in the settings panel at runtime requires re-subscription (session switch) to take effect; deviation registered in the task doc's open questions.
@@ -2159,7 +2196,7 @@ fn bridge_agent_event(
     event: &AgentEvent,
     tx: &mpsc::UnboundedSender<UiEvent>,
     usage: &Mutex<UsageTurnState>,
-    ctx: &FooterCtx,
+    footer: &BridgeFooter,
     cache: &CacheMissContext,
 ) {
     match event {
@@ -2239,9 +2276,10 @@ fn bridge_agent_event(
                     }
                 }
             }
-            // Footer invalidation per event (pi footer.invalidate())
+            // Footer invalidation per event (pi footer.invalidate()) — rebuilt from the live session, never from a
+            // subscribe-time snapshot (see `BridgeFooter`).
             let totals = usage.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = tx.send(UiEvent::Footer(ctx.footer(&totals)));
+            let _ = tx.send(UiEvent::Footer(footer.ctx().footer(&totals)));
         }
         AgentEvent::ToolExecutionStart {
             tool_call_id,
@@ -2676,6 +2714,19 @@ mod tests {
         }
     }
 
+    /// Bridge source backed by a real (mock-store) session, so per-event footer rebuilds are exercised.
+    fn test_bridge_footer() -> BridgeFooter {
+        let store: Arc<dyn SessionStore> = Arc::new(MockStore {
+            session_id_val: "s1".into(),
+            cwd_val: "/work".into(),
+        });
+        BridgeFooter {
+            session: Arc::new(AgentSession::new(test_agent(), store)),
+            auto_compact: false,
+            git_branch_rx: test_branch_rx(),
+        }
+    }
+
     fn test_footer_ctx() -> FooterCtx {
         FooterCtx {
             pwd: "/work".into(),
@@ -2696,7 +2747,7 @@ mod tests {
             &AgentEvent::AgentStart,
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         assert!(matches!(
@@ -2704,6 +2755,39 @@ mod tests {
             Ok(UiEvent::Status(StatusSpec::Working { .. }))
         ));
         assert!(matches!(rx.try_recv(), Ok(UiEvent::SetAnimation(true))));
+    }
+
+    #[test]
+    fn footer_reflects_model_switch_made_after_subscribe() {
+        // Regression: the bridge used to capture a FooterCtx snapshot at subscribe time, so every per-event footer
+        // invalidation re-sent the OLD model — after `/model` the footer showed the new model until the run started,
+        // flipped back to the previous one while streaming, and returned to the new one once the run finished.
+        let footer = test_bridge_footer();
+        let mut switched = footer.session.model();
+        switched.id = "mimo-v2.6-flash".into();
+        footer.session.set_model(switched);
+        assert_eq!(footer.ctx().model_id, "mimo-v2.6-flash");
+
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTurnState::default());
+        bridge_agent_event(
+            &AgentEvent::MessageEnd {
+                message: Message::Assistant(assistant_with_usage("hi", mk_usage(10, 5, 0))),
+            },
+            &tx,
+            &usage,
+            &footer,
+            &CacheMissContext::disabled(),
+        );
+        // MessageEnd, then the footer invalidation — which must carry the *current* model.
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
+        match rx.try_recv() {
+            Ok(UiEvent::Footer(data)) => assert_eq!(
+                data.model_id, "mimo-v2.6-flash",
+                "footer pushed during a run must read the live session model, not a subscribe-time snapshot"
+            ),
+            other => panic!("expected Footer event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2716,7 +2800,7 @@ mod tests {
             },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         // MessageEnd delivered
@@ -2743,7 +2827,7 @@ mod tests {
             },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         assert!(matches!(
@@ -2766,7 +2850,7 @@ mod tests {
             },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         assert!(matches!(
@@ -2948,7 +3032,7 @@ mod tests {
             &AgentEvent::MessageEnd { message: msg },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &cache,
         );
         // Event sequence: MessageEnd → CacheMissNotice → Footer
@@ -2991,7 +3075,7 @@ mod tests {
                 },
                 &tx,
                 &usage,
-                &test_footer_ctx(),
+                &test_bridge_footer(),
                 &cache,
             );
             assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
@@ -3020,7 +3104,7 @@ mod tests {
             &AgentEvent::MessageEnd { message: msg },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
@@ -3124,7 +3208,7 @@ mod tests {
             },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         assert!(matches!(
@@ -3157,7 +3241,7 @@ mod tests {
             },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         assert!(matches!(
@@ -3185,7 +3269,7 @@ mod tests {
             },
             &tx,
             &usage,
-            &test_footer_ctx(),
+            &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
         // ToolResult does not go through message lines (no MessageStart event)

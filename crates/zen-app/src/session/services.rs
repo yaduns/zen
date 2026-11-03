@@ -587,24 +587,26 @@ fn resolve_model_and_thinking(
     let model = match &options.cli_model {
         Some(cli_model) => cli_model.clone(),
         None => match &ctx.model {
-            Some(SessionModel { provider, model_id }) => match resolve_provider(provider) {
-                Some(p) => {
-                    let mut restored = Model::from_provider(p.as_ref());
-                    restored.id = model_id.clone();
-                    restored
-                }
-                None => Model::from_env(),
-            },
+            // Restore by exact `(provider, id)` catalog lookup: taking `Model::from_provider` + renaming the id
+            // would borrow the provider's *first* model's `reasoning`/`maxTokens`/cost (that mismatch is what made
+            // a restored non-reasoning model send reasoning params and get a 400 back).
+            Some(SessionModel { provider, model_id }) => {
+                crate::model_catalog::model_for(provider, model_id).unwrap_or_else(Model::from_env)
+            }
             None => {
                 let mut model = Model::from_env();
-                if let Some(provider_name) = merged.default_provider.as_deref() {
-                    if let Some(provider) = resolve_settings_provider(provider_name) {
+                let mut provider_name = model.provider.clone();
+                if let Some(name) = merged.default_provider.as_deref() {
+                    if let Some(provider) = resolve_settings_provider(name) {
                         model = Model::from_provider(provider.as_ref());
+                        provider_name = provider.id().to_string();
                     }
                 }
                 // Independent of the provider branch: an unknown default_provider must not swallow default_model.
+                // Resolve within the catalog so the model keeps its own per-model config (see `model_for`).
                 if let Some(default_model) = &merged.default_model {
-                    model.id = default_model.clone();
+                    model = crate::model_catalog::model_for(&provider_name, default_model)
+                        .unwrap_or_else(|| model.clone().with_id(default_model.clone()));
                 }
                 model
             }

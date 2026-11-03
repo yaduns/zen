@@ -308,6 +308,25 @@ impl Catalog {
         Some(materialize_model(provider, config, def))
     }
 
+    /// Resolve `(provider, id)` preferring the exact catalog entry, falling back to the provider's **first** model with
+    /// `id` overridden when that id is not defined here.
+    ///
+    /// Why it exists: `first_model` + renaming the id (the pre-T-AI-02-11 shim) silently gives a model another model's
+    /// `reasoning` / `maxTokens` / cost — restoring a non-reasoning model that way made zen send reasoning parameters
+    /// and the gateway answered `400 … Upstream response was not valid JSON`.
+    ///
+    /// Returns `None` when the provider itself is unknown to this catalog.
+    ///
+    /// Current consumer: zen-app `model_catalog::model_for` (session restore / settings defaults / `--model`).
+    pub fn model_or_first(&self, provider: &str, id: &str) -> Option<Model> {
+        if let Some(model) = self.model(provider, id) {
+            return Some(model);
+        }
+        let mut fallback = self.first_model(provider)?;
+        fallback.id = id.to_string();
+        Some(fallback)
+    }
+
     /// Get the default model: the provider is determined by `ZEN_PROVIDER` (default `opencode-go`), the model is that provider's first entry.
     ///
     /// Current consumers: `Model::from_env` (this task) and T-AI-02-11 (flag-free startup).
@@ -940,6 +959,25 @@ mod tests {
         assert!(!model.provider.is_empty());
         assert!(!model.id.is_empty());
         assert_eq!(model.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn model_or_first_prefers_exact_entry_then_falls_back() {
+        let catalog = Catalog::embedded();
+        // Exact id → recorded model.
+        let exact = catalog
+            .model_or_first("opencode-go", "deepseek-v4-flash")
+            .expect("exact entry");
+        assert_eq!(exact.id, "deepseek-v4-flash");
+        assert!(exact.reasoning);
+        // Unknown id on a known provider → provider's first model, id overridden (legacy shim semantics).
+        let fallback = catalog
+            .model_or_first("opencode-go", "not-defined")
+            .expect("fallback");
+        assert_eq!(fallback.id, "not-defined");
+        assert_eq!(fallback.base_url, exact.base_url);
+        // Unknown provider → None (caller keeps its previous model).
+        assert!(catalog.model_or_first("no-such-provider", "x").is_none());
     }
 
     #[test]

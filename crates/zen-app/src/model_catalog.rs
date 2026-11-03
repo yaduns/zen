@@ -24,6 +24,38 @@ pub(crate) fn built_in_models() -> Vec<Model> {
     Catalog::current().models()
 }
 
+/// Resolve `(provider, id)` to a concrete model, **preferring the catalog entry for that exact id** so the
+/// model keeps its own per-model configuration (`reasoning` / `maxTokens` / `contextWindow` / cost / compat).
+///
+/// Why this exists: the older paths did `Model::from_provider(provider)` + `model.id = id`, which takes the
+/// provider's **first** model and only renames it. That silently hands a non-reasoning model the reasoning flag,
+/// output cap and price of a different model — e.g. restoring `mimo-v2.6-flash` produced
+/// `reasoning = true, max_tokens = 384000` (borrowed from `deepseek-v4-flash`), which made the gateway reject
+/// the request with `400 … Upstream response was not valid JSON`.
+///
+/// Falls back to the provider's first model with the id overridden only when the id is genuinely absent from the
+/// catalog (a name the user typed but never defined), and warns, because that fallback cannot be correct config.
+///
+/// Consumers: session restore / settings defaults / `--model` resolution (all three had the same flaw).
+pub(crate) fn model_for(provider: &str, id: &str) -> Option<Model> {
+    model_for_in(Catalog::current(), provider, id)
+}
+
+/// [`model_for`] against an explicit catalog (testable without touching the process-wide catalog).
+pub(crate) fn model_for_in(catalog: &Catalog, provider: &str, id: &str) -> Option<Model> {
+    match catalog.model(provider, id) {
+        Some(model) => Some(model),
+        None => {
+            let fallback = catalog.model_or_first(provider, id)?;
+            eprintln!(
+                "Warning: model '{provider}/{id}' is not defined in the model catalog; falling back to the provider's \
+                 first model (reasoning/maxTokens/cost may not match). Add it under providers.{provider}.models in models.json"
+            );
+            Some(fallback)
+        }
+    }
+}
+
 /// Canonical full model id: `"<provider>/<id>"` — used uniformly for selector row identity, cycle set keys and `SelectorSelected` payloads.
 /// Consumers: the two model selection components + selection routing in `modes/interactive`.
 pub(crate) fn full_id(model: &Model) -> String {
@@ -128,6 +160,55 @@ mod tests {
         );
         // every model id is non-empty
         assert!(models.iter().all(|m| !m.id.is_empty()));
+    }
+
+    #[test]
+    fn model_for_prefers_the_exact_catalog_entry() {
+        // Regression (session restore / settings defaults / `--model`): resolving `(provider, id)` used to be
+        // "take the provider's FIRST model, then rename it", so a non-reasoning model inherited another model's
+        // `reasoning` flag, output cap and price — enough to make the gateway reject the request with
+        // `400 … Upstream response was not valid JSON`.
+        use zen_ai::catalog::Catalog;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "providers": {
+                "testprov": {
+                  "api": "openai-completions",
+                  "baseUrl": "https://test.invalid/v1",
+                  "apiKey": "sk-test",
+                  "models": [
+                    { "id": "reasoning-model", "reasoning": true, "maxTokens": 999 },
+                    { "id": "plain-model", "maxTokens": 1234 }
+                  ]
+                }
+              }
+            }"#,
+        )
+        .expect("write models.json");
+        let catalog = Catalog::load(Some(&path)).expect("load");
+
+        // ① Exact id → that model's own configuration.
+        let plain = model_for_in(&catalog, "testprov", "plain-model").expect("exact entry");
+        assert_eq!(plain.id, "plain-model");
+        assert!(
+            !plain.reasoning,
+            "must not borrow the first model's reasoning flag"
+        );
+        assert_eq!(plain.max_tokens, 1234);
+
+        // ② Unknown id → documented fallback (provider's first model, id overridden).
+        let fallback = model_for_in(&catalog, "testprov", "not-in-catalog").expect("fallback");
+        assert_eq!(fallback.id, "not-in-catalog");
+        assert!(
+            fallback.reasoning,
+            "fallback takes the provider's first model"
+        );
+
+        // ③ Unknown provider → None (caller keeps its previous model).
+        assert!(model_for_in(&catalog, "no-such-provider", "x").is_none());
     }
 
     #[test]

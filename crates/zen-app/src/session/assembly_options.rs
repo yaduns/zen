@@ -151,7 +151,9 @@ fn resolve_cli_model_and_thinking(args: &CliArgs) -> (Option<Model>, Option<Thin
             None => (id_part, None),
         };
 
-        let mut resolved = match provider_part {
+        // Resolve the exact `(provider, id)` catalog entry first, so `--model provider/id` keeps that model's own
+        // `reasoning`/`maxTokens`/cost instead of borrowing the provider's first model (see `model_catalog::model_for`).
+        let base = match provider_part {
             Some(provider_name) => match resolve_provider(provider_name) {
                 Some(provider) => Model::from_provider(provider.as_ref()),
                 None => {
@@ -161,7 +163,10 @@ fn resolve_cli_model_and_thinking(args: &CliArgs) -> (Option<Model>, Option<Thin
             },
             None => model.clone().unwrap_or_else(Model::from_env),
         };
-        resolved.id = id.to_string();
+        let resolved = match crate::model_catalog::model_for(&base.provider, id) {
+            Some(exact) => exact,
+            None => base.with_id(id.to_string()),
+        };
         model = Some(resolved);
 
         if let Some(suffix) = thinking_part {
