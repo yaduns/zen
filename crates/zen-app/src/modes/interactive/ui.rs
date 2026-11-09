@@ -1527,7 +1527,8 @@ impl InteractiveUi {
                 }
             }
             UiEvent::SetAnimation(_) => {
-                // Takes effect in the render layer (WakeOutcome::Animate is handled by the on_wake closure); no local state here.
+                // Takes effect in the render layer: the on_wake closure maps it to `WakeOutcome::Animate(Some(80 ms))`/`Animate(None)`
+                // (zen_tui `DEFAULT_ANIMATION_INTERVAL`), arming/disarming the loop's animation cadence. No local state needed.
             }
             UiEvent::AutocompleteReady => {
                 // Pure wake no-op: only triggers next-frame render (render layer poll_autocomplete installs completion candidates),
@@ -2125,6 +2126,12 @@ impl InteractiveUi {
                 canvas.push_line(segs);
             }
         }
+        // PF-01: register how many rows the fixed region **actually** contributed to the line stream.
+        // `fixed_h` is only the worst-case allocation (`status + editor + dropdown + footer`); the tail rows are
+        // frequently never painted (footer without data returns early, dropdown inactive), so passing the bound
+        // would make "did the fixed region get rewritten?" look better than reality. Frame metrics derive the
+        // fixed-region write count from this number, `line_total` and `last_repaint_span`.
+        canvas.set_fixed_rows(last_painted.map_or(0, |r| r as usize + 1));
         canvas.set_cursor_hint(caret_canvas_row.map(|row| (row, caret_col)));
     }
 
@@ -3046,6 +3053,117 @@ mod tests {
                 "anchor column should be within the line width: {col}"
             );
         }
+    }
+
+    // ── PF-01: fixed-region registration + frame benchmark ──
+
+    #[test]
+    fn test_render_scrollback_registers_actually_pushed_fixed_rows() {
+        // PF-01 contract: the canvas is told the rows the fixed region *actually* pushed, not the `fixed_h`
+        // worst-case allocation.
+        let mut u = ui();
+        let width = 80;
+        let rows = 24;
+        let editor_h = u.editor.needed_height(width, rows);
+        let fixed_h_upper_bound = 2 + editor_h + 2; // status 2 + editor + footer 2 (dropdown inactive)
+
+        // Default fixture: the startup footer baseline exists, so this particular frame happens to fill the
+        // whole budget — equality here is incidental, not the contract.
+        let mut filled = ScrollbackCanvas::new(width, rows);
+        u.render_scrollback(&mut filled);
+        assert!(
+            filled.fixed_rows() > 0,
+            "status/editor rows are always pushed"
+        );
+        assert_eq!(
+            filled.content_height(),
+            filled.fixed_rows(),
+            "empty transcript ⇒ the line stream is nothing but the fixed region"
+        );
+        assert!(filled.fixed_rows() <= fixed_h_upper_bound as usize);
+
+        // Drop the footer snapshot: the footer then paints nothing while its two rows are still budgeted for.
+        // Registering the bound would keep reporting `fixed_h` here — this is the regression under guard.
+        u.footer_data = None;
+        let mut shrunk = ScrollbackCanvas::new(width, rows);
+        u.render_scrollback(&mut shrunk);
+        assert_eq!(
+            shrunk.fixed_rows(),
+            fixed_h_upper_bound as usize - 2,
+            "unpainted trailing rows must not be registered (bound={fixed_h_upper_bound})"
+        );
+        assert_eq!(shrunk.content_height(), shrunk.fixed_rows());
+    }
+
+    #[test]
+    fn test_fixed_rows_are_independent_of_message_area_growth() {
+        // Invariant the frame metrics rely on: growing the transcript adds message rows only, never fixed rows.
+        let mut u = ui();
+        let width = 80;
+        let rows = 24;
+        let mut before = ScrollbackCanvas::new(width, rows);
+        u.render_scrollback(&mut before);
+        u.apply(UiEvent::MessageStart(Message::User(user_message(
+            "hello\nsecond line",
+        ))));
+        u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+            vec![text_block("first answer")],
+            StopReason::Stop,
+        ))));
+        let mut after = ScrollbackCanvas::new(width, rows);
+        u.render_scrollback(&mut after);
+        assert_eq!(
+            after.fixed_rows(),
+            before.fixed_rows(),
+            "fixed-region row count must not depend on the transcript length"
+        );
+        assert!(
+            after.content_height() > before.content_height(),
+            "message area should have grown the line stream"
+        );
+    }
+
+    /// Manual whole-frame benchmark (PF-01): synthesizes a transcript with code blocks and times one
+    /// `render_scrollback` pass, which is the per-frame cost the performance plan measures on real sessions.
+    ///
+    /// Ignored by default (it is a measurement, not an assertion). Run with:
+    /// `cargo test -p zen-app --release -- --ignored --nocapture frame_render`
+    #[test]
+    #[ignore = "manual frame benchmark (release): cargo test -p zen-app --release -- --ignored"]
+    fn frame_render_bench_scrollback() {
+        let code = "```rust\nfn f(x: u32) -> u32 {\n    // comment\n    x + 1\n}\n```\n";
+        let prose = "The session tree is the core of the product: every message hangs off the previous one.\n\n";
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        for i in 0..12 {
+            blocks.push(text_block(&format!(
+                "{prose}Paragraph {i} of the synthetic transcript.\n"
+            )));
+            blocks.push(text_block(code));
+        }
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("bench"))));
+        u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+            blocks,
+            StopReason::Stop,
+        ))));
+        let width = 80;
+        let canvas_rows = 40;
+        // Warm-up (first frame also populates internal state such as editor layout).
+        let mut warm = ScrollbackCanvas::new(width, canvas_rows);
+        u.render_scrollback(&mut warm);
+        let iterations = 10;
+        let started = std::time::Instant::now();
+        let mut lines = 0;
+        for _ in 0..iterations {
+            let mut canvas = ScrollbackCanvas::new(width, canvas_rows);
+            u.render_scrollback(&mut canvas);
+            lines = canvas.content_height();
+        }
+        let per_frame = started.elapsed() / iterations;
+        println!(
+            "frame_render_bench: transcript_lines={lines} per_frame={:.2}ms",
+            per_frame.as_secs_f64() * 1000.0
+        );
     }
 
     #[test]

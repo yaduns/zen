@@ -37,6 +37,9 @@ tokio = { version = "1", features = [
     "io-util",
     "signal",
     "io-std",
+    # PF-03: the TUI frame scheduler is built on `tokio::time::sleep_until` (conditional frame timer), so `time` must be an
+    # explicit feature of this crate rather than something pulled in transitively by `reqwest`/`hyper-util`.
+    "time",
 ] }
 tokio-util = "0.7"
 
@@ -127,4 +130,11 @@ walkdir = "2"
 
 # ── file watching (theme hot-reload, T-AP-11-3) ────────────────
 notify = "7"
+
+# ── benchmarks (PF-01, frame-budget guard) ─────────────────────
+# plotters/rayon are disabled on purpose: the CI gate only needs the console statistics, not HTML
+# reports or parallel sampling (keeps the dev-dependency tree small).
+criterion = { version = "0.6", default-features = false, features = [
+    "cargo_bench_support",
+] }
 

@@ -7,6 +7,7 @@ pub mod highlight;
 pub mod keybindings;
 pub mod keys;
 pub mod markdown;
+pub mod metrics;
 #[cfg(target_os = "macos")]
 pub mod native_modifiers;
 pub mod screen;

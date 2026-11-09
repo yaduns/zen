@@ -16,6 +16,7 @@ use crate::observability::cache_stats::{
     cache_miss_notice_text, collect_cache_misses, detect_cache_miss,
 };
 use crate::observability::diagnostics::format_resource_diagnostics;
+use crate::observability::frame_report::report_frame_stats;
 
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
@@ -57,7 +58,7 @@ use zen_ai::types::{ImageContent, Message, Model, ThinkingLevel};
 use zen_core::harness::types::AgentEvent;
 use zen_core::session::context::{build_context_entries, session_entry_to_context_messages};
 use zen_core::session::tree::SessionTreeEntry;
-use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop, WakeOutcome};
+use zen_tui::app_loop::{EventOutcome, TuiError, TuiLoop, WakeOutcome, DEFAULT_ANIMATION_INTERVAL};
 use zen_tui::keybindings::{editor_default_bindings, select_default_bindings, KeybindingsManager};
 use zen_tui::keys::{
     is_apple_terminal_session, native_shift_pressed, normalize_apple_terminal_enter,
@@ -145,8 +146,9 @@ pub(crate) enum UiEvent {
     // v1 seam: bash session-state switch (sent explicitly by the main task once T-AP-04-2 lands);
     // the editor body `!` prefix already drives the border color locally via on_change
     BashMode(bool),
-    /// Continuous animation toggle (true during the streaming loader → constant 16ms repaints; the render layer, via
-    /// `WakeOutcome::Animate` takes effect).
+    /// Continuous animation toggle: `true` while the streaming loader should spin (`AgentStart`), `false` once the run ends
+    /// (`AgentEnd`). The render layer turns it into `WakeOutcome::Animate`, i.e. arms/disarms the loop's animation cadence
+    /// (default [`DEFAULT_ANIMATION_INTERVAL`] = 80 ms; there is no free-running 16 ms repaint).
     SetAnimation(bool),
     /// Pure wake-up (no side effects, apply is a no-op): enqueued when autocomplete candidates become ready asynchronously (the `trigger_autocomplete`
     /// spawn task sends back through the wake channel), and the render layer triggers the next frame via `WakeOutcome::Render`
@@ -615,7 +617,7 @@ impl InteractiveMode {
                         .unwrap_or_else(|e| e.into_inner())
                         .push_back(ev.clone());
                     match ev {
-                        UiEvent::SetAnimation(v) => WakeOutcome::Animate(*v),
+                        UiEvent::SetAnimation(v) => animation_wake_intent(*v),
                         _ => WakeOutcome::Render,
                     }
                 }),
@@ -685,6 +687,10 @@ impl InteractiveMode {
                 .await;
             // Both run and stop are executed (even if run errors, the terminal is restored before propagating the error).
             let stop_result = tui.stop();
+            // PF-01: frame-metrics summary, printed only when ZEN_TUI_TRACE_FRAMES was set at loop construction
+            // (silent by default). Emitted after `stop()` so it lands below the restored terminal, not inside the
+            // raw-mode TUI area, and to stderr so print/redirected sessions keep stdout clean.
+            report_frame_stats(&tui.frame_stats());
             run_result?;
             stop_result?;
             Ok(())
@@ -2361,6 +2367,20 @@ fn is_tool_result(message: &Message) -> bool {
     matches!(message, Message::ToolResult(_))
 }
 
+/// Translate the UI-side "animation on/off" intent into zen-tui's render intent (pure decision seam, unit tested).
+///
+/// PF-03: the interactive layer only knows *whether* the loader should spin; the repaint rate belongs to the loop. So `true`
+/// arms the cadence with [`DEFAULT_ANIMATION_INTERVAL`] (all `Loader` call sites use the default interval — a loader with a custom
+/// `LoaderIndicatorOptions.interval_ms` would need its period passed through here) and `false` disarms it.
+/// Consumer: the `on_wake` closure in `init` (registered via `TuiLoop::set_external_wakeup`).
+pub(crate) fn animation_wake_intent(enabled: bool) -> WakeOutcome {
+    if enabled {
+        WakeOutcome::Animate(Some(DEFAULT_ANIMATION_INTERVAL))
+    } else {
+        WakeOutcome::Animate(None)
+    }
+}
+
 /// Resume-stream private helper (T-OB-01-3): builds the `RestoreHistory` payload (messages + cache miss notice position).
 /// Contract: `agent.messages()` ≡ per-entry flattening of `build_context_entries(branch_entries())` — holds at both
 /// resume points (init and session switch) (just assembled, `state.messages` is the flattened context; `steer`/`follow_up` use a separate
@@ -2755,6 +2775,16 @@ mod tests {
             Ok(UiEvent::Status(StatusSpec::Working { .. }))
         ));
         assert!(matches!(rx.try_recv(), Ok(UiEvent::SetAnimation(true))));
+    }
+
+    #[test]
+    fn animation_wake_intent_arms_default_cadence_and_disarms() {
+        // PF-03: the UI side only says "spin / stop"; the default cadence is zen-tui's single source of truth (80 ms).
+        assert_eq!(
+            animation_wake_intent(true),
+            WakeOutcome::Animate(Some(DEFAULT_ANIMATION_INTERVAL))
+        );
+        assert_eq!(animation_wake_intent(false), WakeOutcome::Animate(None));
     }
 
     #[test]

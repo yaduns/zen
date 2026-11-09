@@ -48,6 +48,13 @@ pub struct ScrollbackCanvas {
     /// flush finalization positions the (hidden) hardware cursor here for system IME spelling string/candidate window anchoring
     /// (aligned with pi CURSOR_MARKER → positionHardwareCursor semantics); None when no focus/no editor.
     cursor_hint: Option<(usize, usize)>,
+    /// PF-01: rows of the bottom fixed region (status + editor + dropdown + footer) that the draw side actually
+    /// pushed into this frame's line stream. Registered by `set_fixed_rows`; consumed by frame metrics so that
+    /// "did the fixed region get rewritten?" is answerable (and, from PF-06 on, as the anchored region's height).
+    fixed_rows: usize,
+    /// PF-01: content rows actually written by the most recent flush, as an inclusive `[first, last]` span.
+    /// Reset to `None` at the start of every flush so a no-change frame never reports a stale span.
+    last_repaint_span: Option<(usize, usize)>,
 }
 
 impl ScrollbackCanvas {
@@ -64,15 +71,19 @@ impl ScrollbackCanvas {
             prev_height: height,
             hardware_cursor_row: 0,
             cursor_hint: None,
+            fixed_rows: 0,
+            last_repaint_span: None,
         }
     }
 
     /// Clear this frame's line stream; call before each draw (aligns with `render_frame`'s `buffer.clear()` contract);
     /// `prev_lines`/`prev_viewport_top` are kept as the previous frame's diff baseline.
-    /// IME cursor anchor is also reset (re-set every frame by draw side, terminal-ime-anchor-fix).
+    /// IME cursor anchor is also reset (re-set every frame by draw side, terminal-ime-anchor-fix), and so is the
+    /// last repaint span (a cleared stream cannot describe the previous frame's writes any more).
     pub fn clear(&mut self) {
         self.lines.clear();
         self.cursor_hint = None;
+        self.last_repaint_span = None;
     }
 
     /// Append a screen line to the end of the line stream (shared entry point for consecutive message-area lines and fixed-area tail lines).
@@ -114,6 +125,41 @@ impl ScrollbackCanvas {
         self.cursor_hint
     }
 
+    /// Register how many rows at the tail of this frame's line stream belong to the bottom fixed region
+    /// (status + editor + dropdown + footer).
+    ///
+    /// Pass the rows **actually pushed** — `zen-app` computes them as `last_painted.map_or(0, |r| r + 1)` —
+    /// not the theoretical `fixed_h` upper bound: the fixed buffer is allocated for the worst case, so its
+    /// trailing rows are often never painted (footer without data returns early, dropdown inactive, …), and an
+    /// upper bound would make "did the fixed region get rewritten?" look better than it is.
+    ///
+    /// Consumer: `zen-app` `InteractiveUi::render_scrollback` (every frame); read back by frame metrics, and by
+    /// PF-06 as the height of the bottom anchored region.
+    pub fn set_fixed_rows(&mut self, rows: usize) {
+        self.fixed_rows = rows;
+    }
+
+    /// Rows registered by the draw side via [`Self::set_fixed_rows`] for the current frame.
+    ///
+    /// Boundary: reset to 0 by [`Self::set_size`] on a geometry change; a frame that bails out before drawing
+    /// (e.g. zero width) leaves the previous value in place, but such a frame produces no meaningful metrics
+    /// either (the line stream is empty).
+    pub fn fixed_rows(&self) -> usize {
+        self.fixed_rows
+    }
+
+    /// Content rows **written** by the most recent flush, as an inclusive `[first, last]` span.
+    ///
+    /// `None` when the flush found nothing to write (reset at flush entry, so a no-change frame can never
+    /// leak the previous frame's span). A full redraw writes every content row, hence `[0, line_total - 1]` —
+    /// this is "rows written", not "visible repaint window".
+    ///
+    /// Consumers: PF-05 ("an append writes only the new rows") and PF-06 (fixed-region write count, derived
+    /// together with `line_total` / `fixed_rows`).
+    pub fn last_repaint_span(&self) -> Option<(usize, usize)> {
+        self.last_repaint_span
+    }
+
     /// Canvas column width (per-line truncation / single-line measured width); lets the app side build component render buffers per screen width.
     pub fn width(&self) -> u16 {
         self.width
@@ -138,6 +184,10 @@ impl ScrollbackCanvas {
             self.viewport_top = 0;
             self.hardware_cursor_row = 0;
             self.cursor_hint = None;
+            // PF-01: the fixed-region registration and the repaint span belong to the old geometry; the next
+            // flush is a full redraw, so a stale value would mislead the frame metrics.
+            self.fixed_rows = 0;
+            self.last_repaint_span = None;
         }
         changed
     }
@@ -156,6 +206,9 @@ impl ScrollbackCanvas {
         let width = self.width as usize;
         let new_len = self.lines.len();
         let prev_len = self.prev_lines.len();
+        // PF-01: this span always describes the *current* flush only; clearing it here means the early-return
+        // paths below (nothing changed, or a redraw that fails) can never leave a stale window behind.
+        self.last_repaint_span = None;
 
         // Find first / last changed lines (total-order comparison of Vec<StyledSegment>).
         let max_lines = new_len.max(prev_len);
@@ -223,6 +276,8 @@ impl ScrollbackCanvas {
 
         // Render only the changed lines (first..=renderEnd), clearing each line with \x1b[2K to prevent ghosting (open issue 3).
         let render_end = last.min(new_len - 1);
+        // PF-01: rows written by this flush (inclusive span, in content-row coordinates).
+        self.last_repaint_span = Some((first, render_end));
         for i in first..=render_end {
             if i > first {
                 out.write_all(b"\r\n")?;
@@ -310,6 +365,10 @@ impl ScrollbackCanvas {
         self.viewport_top = self.prev_viewport_top;
         self.prev_lines = self.lines.clone();
         self.prev_height = height as u16;
+        // PF-01: a full redraw writes **every** content row (cleared screen + one `\x1b[2K` + line per row; the
+        // overflow scrolls into scrollback), so the span covers the whole line stream rather than just the
+        // visible window. Empty stream ⇒ nothing written ⇒ None.
+        self.last_repaint_span = new_len.checked_sub(1).map(|last| (0, last));
         // IME cursor anchor: the full redraw path also positions after finalization (terminal-ime-anchor-fix).
         self.position_cursor_hint(out)?;
         Ok(())
@@ -760,5 +819,92 @@ mod tests {
             .or_else(|| text.find("\x1b[31m"))
             .expect("Should contain foreground color sequence");
         assert!(reset < color, "Reset must precede color command: {text:?}");
+    }
+
+    // ── PF-01: repaint span + fixed-row registration ──
+
+    #[test]
+    fn repaint_span_of_first_flush_covers_every_line() {
+        // First flush takes the full-redraw path; a full redraw writes every content row
+        // (screen clear + one \x1b[2K + line per row), so the span is the whole stream.
+        let mut c = ScrollbackCanvas::new(20, 3);
+        for i in 0..5 {
+            c.push_line(vec![plain(&format!("line{i}"))]);
+        }
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        assert_eq!(c.last_repaint_span(), Some((0, 4)));
+    }
+
+    #[test]
+    fn repaint_span_is_none_when_nothing_changed() {
+        // Steady-state frame: flush early-returns, and the span must not leak the previous frame's window.
+        let mut c = ScrollbackCanvas::new(20, 5);
+        c.push_line(vec![plain("a")]);
+        c.push_line(vec![plain("b")]);
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        assert_eq!(c.last_repaint_span(), Some((0, 1)));
+        out.clear();
+        c.flush(&mut out).unwrap();
+        assert!(out.is_empty(), "steady-state frame must write nothing");
+        assert_eq!(
+            c.last_repaint_span(),
+            None,
+            "no-change frame must not report a stale span"
+        );
+    }
+
+    #[test]
+    fn repaint_span_of_append_starts_at_the_new_line() {
+        let mut c = ScrollbackCanvas::new(20, 5);
+        c.push_line(vec![plain("a")]);
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        c.clear();
+        c.push_line(vec![plain("a")]);
+        c.push_line(vec![plain("b")]);
+        out.clear();
+        c.flush(&mut out).unwrap();
+        assert_eq!(c.last_repaint_span(), Some((1, 1)));
+    }
+
+    #[test]
+    fn repaint_span_of_empty_stream_is_none() {
+        let mut c = ScrollbackCanvas::new(20, 3);
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        assert_eq!(c.last_repaint_span(), None);
+    }
+
+    #[test]
+    fn clear_and_set_size_reset_the_repaint_span() {
+        let mut c = ScrollbackCanvas::new(20, 5);
+        c.push_line(vec![plain("a")]);
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        assert!(c.last_repaint_span().is_some());
+        c.clear();
+        assert_eq!(c.last_repaint_span(), None);
+        // Re-arm it with a real change (pushing the identical line again would make the diff empty),
+        // then a geometry change must drop it as well.
+        c.push_line(vec![plain("b")]);
+        c.flush(&mut out).unwrap();
+        assert!(c.last_repaint_span().is_some());
+        c.set_size(30, 6);
+        assert_eq!(c.last_repaint_span(), None);
+    }
+
+    #[test]
+    fn fixed_rows_round_trip_and_reset_on_size_change() {
+        let mut c = ScrollbackCanvas::new(40, 10);
+        assert_eq!(c.fixed_rows(), 0);
+        c.set_fixed_rows(7);
+        assert_eq!(c.fixed_rows(), 7);
+        // Same geometry → keeps the registration; a real resize drops it (new geometry, new layout).
+        assert!(!c.set_size(40, 10));
+        assert_eq!(c.fixed_rows(), 7);
+        assert!(c.set_size(41, 10));
+        assert_eq!(c.fixed_rows(), 0);
     }
 }

@@ -3,22 +3,26 @@
 // Animation is derived from started_at and elapsed/interval (pi's setInterval + ui.requestRender back-reference
 // have all been eliminated: repaint scheduling belongs to TuiLoop animation mode; the component has no cyclic back-reference and no style cache).
 
+use crate::app_loop::DEFAULT_ANIMATION_INTERVAL;
 use crate::screen::{ScreenBuffer, Style};
 use std::time::{Duration, Instant};
 
 /// Default animation frames (aligned with pi `DEFAULT_FRAMES`, ten braille frames).
 const DEFAULT_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Default frame interval in milliseconds (aligned with pi `DEFAULT_INTERVAL_MS`).
-const DEFAULT_INTERVAL_MS: u64 = 80;
 
-/// Spinner + single-line message component. Animation frames are derived from started_at and elapsed/interval (periodic repaint is driven by TuiLoop animation mode,
-/// the application layer is responsible for set_animation(true/false); Loader has no cyclic back-reference); set_indicator resets the frame table/interval and reanchors the clock.
+/// Spinner + single-line message component. Animation frames are derived from started_at and elapsed/interval (periodic repaint is
+/// driven by the TuiLoop animation cadence (`set_animation(Some(interval))` / `WakeOutcome::Animate`); the application layer decides
+/// when to arm it; Loader has no cyclic back-reference); set_indicator resets the frame table/interval and reanchors the clock.
+///
+/// The default frame interval is [`DEFAULT_ANIMATION_INTERVAL`] (aligned with pi `DEFAULT_INTERVAL_MS`): the spinner's frame
+/// derivation and the loop's repaint cadence are the same knob in pi, so both must read one constant or the spinner would appear
+/// to stall or skip frames.
 pub struct Loader {
     message: String,             // Display message (default "Loading...")
     spinner_style: Style,        // spinner style
     message_style: Style,        // message style
     frames: Vec<String>,         // Frame table (default DEFAULT_FRAMES, nine braille segments)
-    interval: Duration,          // Frame interval (default DEFAULT_INTERVAL_MS = 80ms)
+    interval: Duration,          // Frame interval (default DEFAULT_ANIMATION_INTERVAL = 80ms)
     started_at: Option<Instant>, // Animation clock anchor; set by start(), cleared by stop() (frame 0 when not running)
 }
 
@@ -38,7 +42,7 @@ impl Loader {
             spinner_style,
             message_style,
             frames: DEFAULT_FRAMES.iter().map(|s| s.to_string()).collect(),
-            interval: Duration::from_millis(DEFAULT_INTERVAL_MS),
+            interval: DEFAULT_ANIMATION_INTERVAL,
             started_at: None,
         }
     }
@@ -76,15 +80,14 @@ impl Loader {
                     Some(f) => f.clone(),
                     None => DEFAULT_FRAMES.iter().map(|s| s.to_string()).collect(),
                 };
-                let ms = opts
-                    .interval_ms
-                    .filter(|&v| v > 0)
-                    .unwrap_or(DEFAULT_INTERVAL_MS);
-                self.interval = Duration::from_millis(ms);
+                let ms = opts.interval_ms.filter(|&v| v > 0);
+                self.interval = ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(DEFAULT_ANIMATION_INTERVAL);
             }
             None => {
                 self.frames = DEFAULT_FRAMES.iter().map(|s| s.to_string()).collect();
-                self.interval = Duration::from_millis(DEFAULT_INTERVAL_MS);
+                self.interval = DEFAULT_ANIMATION_INTERVAL;
             }
         }
         // Reanchor animation clock: equivalent to start(); frame sequence restarts from 0
@@ -147,7 +150,7 @@ mod tests {
     fn new_defaults() {
         let l = Loader::new(Style::default(), Style::default(), "Loading...");
         assert_eq!(l.frames.len(), DEFAULT_FRAMES.len());
-        assert_eq!(l.interval, Duration::from_millis(DEFAULT_INTERVAL_MS));
+        assert_eq!(l.interval, DEFAULT_ANIMATION_INTERVAL);
         assert!(!l.is_running());
     }
 
@@ -192,7 +195,7 @@ mod tests {
         l.interval = Duration::from_millis(999);
         l.set_indicator(None);
         assert_eq!(l.frames.len(), DEFAULT_FRAMES.len());
-        assert_eq!(l.interval, Duration::from_millis(DEFAULT_INTERVAL_MS));
+        assert_eq!(l.interval, DEFAULT_ANIMATION_INTERVAL);
         // set_indicator re-anchors the animation clock → running
         assert!(l.is_running());
     }
@@ -229,7 +232,7 @@ mod tests {
             interval_ms: Some(0), // ≤0 → default
         };
         l.set_indicator(Some(&opts));
-        assert_eq!(l.interval, Duration::from_millis(DEFAULT_INTERVAL_MS));
+        assert_eq!(l.interval, DEFAULT_ANIMATION_INTERVAL);
     }
 
     #[test]

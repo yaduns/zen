@@ -7,6 +7,8 @@
 // Output is organized by logical line, 1:1 with input lines (an empty line yields an empty Vec), so the renderer can place cells line by line.
 use crate::screen::Style;
 use crossterm::style::{Attribute, Color};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
     FontStyle, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
@@ -71,12 +73,14 @@ fn syntax_set() -> &'static SyntaxSet {
 /// Syntax coloring palette handed from the theme to the highlighter — the single surface through which
 /// theme colors enter code blocks (before T-AP-10-1-fix the palette was a hardcoded syntect built-in theme,
 /// so the theme's nine `syntax*` tokens never reached the code block).
-/// Built by `Theme::syntax_palette()`, carried on `MarkdownTheme`, and turned into a one-shot syntect
-/// `Theme` by [`build_syntect_theme`] inside [`highlight`].
+/// Built by `Theme::syntax_palette()`, carried on `MarkdownTheme`, and looked up (or synthesized on a miss) in the
+/// palette-keyed theme cache by [`syntect_theme`] inside [`highlight`].
 /// Each slot is `None` when the theme leaves that token as the terminal default (`""` → `Color::Reset`),
 /// in which case no rule is emitted and the text keeps the base/fallback color.
 /// Pure runtime rendering data; `Copy` (11 resolved colors), never serialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Hash` exists so the palette's **content** can key the theme cache (PF-02): it is a `Copy` value, so two themes
+/// with identical palettes produce the same key; [`crossterm::style::Color`] itself implements `Hash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyntaxPalette {
     /// Comments (`comment.*`, and `punctuation.definition.comment`). pi: `comment`/`doctag` → `fg("syntaxComment")`.
     pub comment: Option<Color>,
@@ -325,12 +329,14 @@ fn resolve_syntax(language: Option<&str>, code: &str) -> Option<&'static SyntaxR
     }
 }
 
-/// Builds a throwaway syntect theme from the palette — the bridge that lets theme tokens actually paint code blocks.
+/// Builds a syntect theme from the palette — the bridge that lets theme tokens actually paint code blocks.
 /// `palette.base` becomes the theme's default foreground (glyphs matching no rule), and every [`SCOPE_RULES`] entry whose
 /// slot resolves to a color becomes one `ThemeItem` with that foreground and an empty font style (pi's syntax coloring
 /// never adds bold/italic, so the synthesized theme does not either).
-/// Built per code block instead of cached: a theme is only a few dozen `ThemeItem`s, and caching would have to be keyed
-/// by palette (i.e. invalidated on every theme switch) for negligible gain.
+/// **Only called on a theme-cache miss** ([`SyntectThemeCache::theme`]): the palette → theme mapping is cached, because
+/// building it costs ≈9 µs per code block in-repo (8.8 µs steady / 16 µs cold, release) — 44 selector parses, each one
+/// taking syntect's process-global scope-repo lock — and the palette rarely changes within a frame (PF-02).
+/// Do not call this directly from the render path.
 /// Selector parse failures are skipped rather than panicking (project rule: no `unwrap`/`expect` outside `main`/tests);
 /// the table is a compile-time constant and `test_scope_rules_all_parse` locks that every selector parses.
 fn build_syntect_theme(palette: &SyntaxPalette) -> Theme {
@@ -359,6 +365,86 @@ fn build_syntect_theme(palette: &SyntaxPalette) -> Theme {
         },
         scopes,
     }
+}
+
+// ── Palette-keyed syntect theme cache (PF-02) ──────────────────────────────────
+
+/// Keeps the palette → syntect theme mapping so the 44 scope-selector parses (each taking syntect's process-global
+/// scope-repo lock) happen once per distinct palette instead of once per code block per frame.
+/// Key = the palette's **content** (`SyntaxPalette: Copy + Eq + Hash`), value = the synthesized theme behind an `Arc`;
+/// a hit costs one hash lookup + one `Arc::clone`, a miss costs one `build_syntect_theme`.
+/// No eviction: the key space is the set of distinct palettes a process ever sees (built-in themes + user theme reloads,
+/// 1–3 entries in practice, a few KB each). Runtime-only rendering state, never serialized.
+/// A dedicated type rather than a bare static `HashMap` so the "get or build" decision has a name and so tests can
+/// instantiate a local cache and read per-palette build counts (see [`SyntectThemeCache::builds_of`]).
+struct SyntectThemeCache {
+    /// Palette content → synthesized theme. `Arc` so callers share one immutable theme with no copy.
+    entries: HashMap<SyntaxPalette, Arc<Theme>>,
+    /// Per-palette miss count — the acceptance instrument for "N calls on one palette ⇒ 1 build".
+    /// `cfg(test)`-gated: release builds carry neither the field nor the increment.
+    #[cfg(test)]
+    builds: HashMap<SyntaxPalette, u32>,
+}
+
+impl SyntectThemeCache {
+    /// Creates an empty cache — used by the process-wide singleton below and by unit tests (each test gets its own).
+    fn new() -> Self {
+        SyntectThemeCache {
+            entries: HashMap::new(),
+            #[cfg(test)]
+            builds: HashMap::new(),
+        }
+    }
+
+    /// Returns the theme for `palette`, building and registering it on the first sight of that palette.
+    /// The hit path is one `HashMap` lookup + one `Arc::clone` and allocates nothing (no temporary key copy);
+    /// the miss path runs `build_syntect_theme` once and returns the freshly cached `Arc`.
+    fn theme(&mut self, palette: &SyntaxPalette) -> Arc<Theme> {
+        if let Some(theme) = self.entries.get(palette) {
+            return Arc::clone(theme);
+        }
+        let theme = Arc::new(build_syntect_theme(palette));
+        self.entries.insert(*palette, Arc::clone(&theme));
+        self.note_build(palette);
+        theme
+    }
+
+    /// Miss accounting in test builds; the release build's version is intentionally empty (zero cache-side diagnostics).
+    #[cfg(test)]
+    fn note_build(&mut self, palette: &SyntaxPalette) {
+        *self.builds.entry(*palette).or_insert(0) += 1;
+    }
+
+    /// Miss accounting in release builds: nothing to record.
+    #[cfg(not(test))]
+    fn note_build(&mut self, _palette: &SyntaxPalette) {}
+
+    /// How many times `palette` was actually synthesized (`0` = never seen).
+    /// Per-palette rather than a single counter because the test suite runs in parallel in one process: a global
+    /// scalar would be polluted by other tests' misses, whereas each test that uses a palette no other test touches
+    /// owns its own bucket.
+    #[cfg(test)]
+    fn builds_of(&self, palette: &SyntaxPalette) -> u32 {
+        self.builds.get(palette).copied().unwrap_or(0)
+    }
+}
+
+/// Process-wide palette → theme cache. Same shape as [`SYNTAX_SET`] (one lazily built singleton for the whole process),
+/// wrapped in a `Mutex` because the singleton is shared and tests exercise it from several threads.
+static SYNTECT_THEME_CACHE: LazyLock<Mutex<SyntectThemeCache>> =
+    LazyLock::new(|| Mutex::new(SyntectThemeCache::new()));
+
+/// The highlighter's single entry point for "give me the theme for this palette" — replaces the per-block
+/// `build_syntect_theme` call, so the fixed cost of a code block is paid once per palette instead of once per block.
+/// A poisoned lock is tolerated (`into_inner`): a theme cache must never take rendering down (precedent: `metrics.rs`).
+/// The critical section covers the lookup and, on a miss, the build (≈10 µs) — it never spans an `HighlightLines`,
+/// so highlighting itself still runs lock-free.
+/// Consumers: [`highlight`] (only call site); `highlight.rs` unit tests (wiring assertions).
+fn syntect_theme(palette: &SyntaxPalette) -> Arc<Theme> {
+    let mut cache = SYNTECT_THEME_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.theme(palette)
 }
 
 /// When highlight execution receives a (Style, &str) span from syntect, it translates its display semantics into a
@@ -404,8 +490,10 @@ fn syntect_style_to_screen(style: &syntect::highlighting::Style, has_base: bool)
 /// `find_syntax_by_extension`; None → `find_syntax_by_first_line` (shebang); unrecognized always yields
 /// default style (no coloring) segments, no error.
 /// Theme: `palette` carries the current theme's nine `syntax*` tokens (via `MarkdownTheme.syntax_palette`, built by
-/// `Theme::syntax_palette`) and is turned into a syntect theme on the spot — so code blocks follow the zen theme
-/// (dark / light / user themes) instead of a fixed built-in palette (T-AP-10-1-fix closes the T-AP-10-1 integration gap).
+/// `Theme::syntax_palette`) and is resolved through the palette-keyed theme cache ([`syntect_theme`], built on a miss)
+/// — so code blocks follow the zen theme (dark / light / user themes) instead of a fixed built-in palette
+/// (T-AP-10-1-fix closes the T-AP-10-1 integration gap), and repeated renders under one theme no longer pay the
+/// ≈10.7 µs per-block theme-synthesis cost (PF-02).
 /// Boundary: split lines by `\n` (per `str::lines` semantics); output line count is 1:1 with input (empty lines yield an empty Vec,
 /// ensuring line-by-line alignment in the rendering layer); empty input returns an empty Vec; CRLF/CR is normalized first by the caller (REQ-TUI-02 markdown
 /// already commits to normalizing line endings, this function does not handle `\r`); TABs are kept as-is, width expansion is the rendering layer's responsibility.
@@ -428,7 +516,7 @@ pub fn highlight(
             .collect();
     };
 
-    let theme = build_syntect_theme(palette);
+    let theme = syntect_theme(palette);
     let has_base = theme.settings.foreground.is_some();
     let mut hl = HighlightLines::new(syntax, &theme);
     // Each line is handed to syntect WITH its terminator: the grammars come from
@@ -1018,6 +1106,140 @@ mod tests {
         assert_eq!(
             fg_of(&rows[0], "fn"),
             Some(Color::Rgb { r: 255, g: 0, b: 0 })
+        );
+    }
+
+    // ── Palette-keyed theme cache (PF-02) ──
+
+    /// Palette that paints only `keyword`, with a colour no other test uses — so the global cache bucket it lands in
+    /// belongs to this test alone (the suite runs in parallel inside one process).
+    fn palette_with_unique_keyword(r: u8, g: u8, b: u8) -> SyntaxPalette {
+        SyntaxPalette {
+            keyword: Some(Color::Rgb { r, g, b }),
+            ..SyntaxPalette::default()
+        }
+    }
+
+    /// The global cache's entry for `palette` (`None` = `highlight()` never touched the cache for this palette).
+    fn global_cached_theme(palette: &SyntaxPalette) -> Option<Arc<Theme>> {
+        SYNTECT_THEME_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .get(palette)
+            .map(Arc::clone)
+    }
+
+    /// The global cache's build count for `palette`.
+    fn global_builds_of(palette: &SyntaxPalette) -> u32 {
+        SYNTECT_THEME_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .builds_of(palette)
+    }
+
+    #[test]
+    fn test_theme_cache_reuses_same_palette() {
+        let mut cache = SyntectThemeCache::new();
+        let palette = palette_with_unique_keyword(11, 22, 33);
+        let first = cache.theme(&palette);
+        let second = cache.theme(&palette);
+        let third = cache.theme(&palette);
+        assert_eq!(cache.builds_of(&palette), 1, "one build for three lookups");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second, &third));
+    }
+
+    #[test]
+    fn test_theme_cache_keys_by_content_not_identity() {
+        // Two independently constructed palettes with identical content must share one entry: the key is the
+        // palette's data, not its address (the same reason `SyntaxPalette` derives `Hash`).
+        let mut cache = SyntectThemeCache::new();
+        let a = palette_with_unique_keyword(7, 8, 9);
+        let b = palette_with_unique_keyword(7, 8, 9);
+        let theme_a = cache.theme(&a);
+        let theme_b = cache.theme(&b);
+        assert!(Arc::ptr_eq(&theme_a, &theme_b));
+        assert_eq!(cache.builds_of(&a), 1);
+        assert_eq!(cache.builds_of(&b), 1, "both keys are the same bucket");
+    }
+
+    #[test]
+    fn test_theme_cache_distinguishes_palettes() {
+        let mut cache = SyntectThemeCache::new();
+        let red = palette_with_unique_keyword(201, 1, 1);
+        let blue = palette_with_unique_keyword(1, 1, 201);
+        let theme_red = cache.theme(&red);
+        let theme_blue = cache.theme(&blue);
+        assert!(!Arc::ptr_eq(&theme_red, &theme_blue));
+        assert_eq!(cache.builds_of(&red), 1);
+        assert_eq!(cache.builds_of(&blue), 1);
+    }
+
+    #[test]
+    fn test_theme_cache_entry_matches_fresh_build() {
+        // Guards "right key, wrong value": a cached theme must be indistinguishable from one built on the spot.
+        let mut cache = SyntectThemeCache::new();
+        let palette = palette_with_unique_keyword(31, 41, 59);
+        let cached = cache.theme(&palette);
+        let fresh = build_syntect_theme(&palette);
+        assert_eq!(cached.settings.foreground, fresh.settings.foreground);
+        assert_eq!(cached.name, fresh.name);
+        assert_eq!(cached.scopes.len(), fresh.scopes.len());
+    }
+
+    #[test]
+    fn test_highlight_wires_global_theme_cache() {
+        // The only test that walks the real path: markdown → `highlight()` → global cache. Reverting `highlight()`
+        // to `build_syntect_theme(palette)` leaves every other test green, so this assertion is what actually
+        // proves the cache is connected (and that a hit is not "build anyway, then throw it away").
+        let palette = palette_with_unique_keyword(1, 2, 3);
+        highlight("fn main() {}\n", Some("rust"), &palette);
+        let first = global_cached_theme(&palette).expect("highlight must populate the theme cache");
+        highlight("fn main() {}\n", Some("rust"), &palette);
+        let second =
+            global_cached_theme(&palette).expect("cache entry must survive the second call");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second highlight must reuse the cached theme instead of rebuilding and replacing it"
+        );
+        assert_eq!(
+            global_builds_of(&palette),
+            1,
+            "exactly one theme build for this palette through the real highlight() path"
+        );
+    }
+
+    #[test]
+    fn test_syntect_theme_shared_across_threads() {
+        // Also locks in `Theme: Send + Sync` (required for the singleton) and "one build wins, others reuse it".
+        let palette = palette_with_unique_keyword(97, 89, 83);
+        let handles: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(move || syntect_theme(&palette)))
+            .collect();
+        let themes: Vec<Arc<Theme>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker must not panic"))
+            .collect();
+        for theme in &themes[1..] {
+            assert!(Arc::ptr_eq(&themes[0], theme));
+        }
+        assert_eq!(
+            global_builds_of(&palette),
+            1,
+            "concurrent misses must not double-build"
+        );
+    }
+
+    #[test]
+    fn test_highlight_repeated_same_palette_is_stable() {
+        let palette = palette_with_unique_keyword(140, 150, 160);
+        let code = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let first = highlight(code, Some("rust"), &palette);
+        let second = highlight(code, Some("rust"), &palette);
+        assert_eq!(
+            first, second,
+            "cached vs. first-built theme must render identically"
         );
     }
 }

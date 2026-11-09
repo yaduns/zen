@@ -36,3 +36,9 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio-util = { workspace = true }
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+# PF-01 markdown frame benchmark: criterion brings its own main, so the default harness must be off.
+[[bench]]
+name = "markdown_frame"
+harness = false

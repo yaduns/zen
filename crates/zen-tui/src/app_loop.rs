@@ -1,26 +1,44 @@
+use crate::metrics::{CountingWriter, FrameProbe, FrameStats, DEFAULT_BUDGET};
 use crate::screen::ScreenBuffer;
 use crate::terminal::{Terminal, TerminalError};
 use crate::viewport::ScrollbackCanvas;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// TUI main loop orchestrator. Owns the output canvas (Terminal + ScreenBuffer) and render state (merge flag, animation flag, render throttle timer, start/stop flags).
+/// Default animation cadence while the animation tick is armed: 80 ms (aligned with pi loader `DEFAULT_INTERVAL_MS`).
+///
+/// Single source of truth: in pi the loader's frame-derivation period and its `requestRender` cadence are the same knob; zen hands
+/// the pacing to the loop, so the two places must reference this constant or they drift (the spinner would appear to stall or skip).
+/// Consumers: [`TuiLoop::set_animation`]'s default arming period (zen-app maps `AgentStart` → `Animate(Some(this))` via
+/// `modes::interactive::animation_wake_intent`), [`crate::components::Loader`]'s default interval.
+pub const DEFAULT_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Floor for an animation period (a zero period would make the deadline "always due" = busy loop).
+const MIN_ANIMATION_INTERVAL: Duration = Duration::from_millis(1);
+
+/// TUI main loop orchestrator. Owns the output canvas (Terminal + ScreenBuffer) and render state (request merge flag, animation
+/// clock, throttle timestamp, lifecycle flags).
 /// External contract aligned with zen TUI's caller perspective:
-/// Application calls start() to enter raw mode → run() runs the event loop (forwards events + timer tick drives differential refresh) → stop() restores the terminal.
+/// Application calls start() to enter raw mode → run()/run_scrollback() drive the event loop → stop() restores the terminal.
+/// **Repaint policy (PF-03, aligned with pi `requestRender`/`scheduleRender`)**: there is no free-running ticker — a frame is painted
+/// only when something asked for it (terminal event, external wake, or an armed animation deadline). With nothing armed the loop does
+/// not wake at all, so "model is thinking, nothing on screen changes" costs zero frames instead of 8 fps.
 /// Events are forwarded as-is via the on_event callback (key parsing semantics belong to T-TU-03);
 /// Redraws write the current frame to the buffer via the draw callback; the loop performs a unified flush of differential output.
 /// The loop handles Resize itself (buffer.resize + redraw request).
 pub struct TuiLoop {
-    terminal: Terminal,                 // Output sink; start/stop enter/exit raw mode
-    buffer: ScreenBuffer,               // Current frame buffer; resize/flush inside run
-    render_requested: bool, // Render merge flag: set by request_render(), reset after being consumed by tick
-    animation_enabled: bool, // Timed refresh mode: when set, tick continuously repaints (loader animation) — no event driving needed
-    last_render_at: std::time::Instant, // Last render timestamp, for coalescing/throttling reference (mainly for debugging/stats when tick interval is fixed)
-    min_render_interval: std::time::Duration, // Minimum render interval, default 16ms; the tick interval takes this value
-    started: bool, // Set after start(); used for precondition checks before run()
-    stopped: bool, // Lifecycle termination flag
+    terminal: Terminal,                // Output sink; start/stop enter/exit raw mode
+    buffer: ScreenBuffer,              // Current frame buffer; resize/flush inside run
+    render_requested: bool, // Render merge flag: set by request_render() from loop callbacks, cleared by finish_frame()
+    animation: Option<AnimationClock>, // Armed animation cadence (Some = periodic frames, None = no animation); replaces the former `animation_enabled` bool
+    last_render_at: Instant, // Completion time of the last painted frame; the throttling baseline for min_render_interval
+    min_render_interval: Duration, // Minimum gap between two painted frames (merge floor), default 16ms (pi MIN_RENDER_INTERVAL_MS)
+    started: bool,                 // Set after start(); used for precondition checks before run()
+    stopped: bool,                 // Lifecycle termination flag
     wake_stream: Option<Pin<Box<dyn futures::Stream<Item = WakeOutcome> + Send>>>, // /// Fourth external wake path (T-AP-11-1 patch): the "message → WakeOutcome" stream registered at assembly; None if unregistered. Items are already erased to `WakeOutcome`, so TuiLoop needs no generics.
+    stats: Arc<FrameStats>, // PF-01: per-frame metrics accumulator (records nothing unless ZEN_TUI_TRACE_FRAMES is set); shared with the app layer for the exit summary.
 }
 
 pub enum EventOutcome {
@@ -38,14 +56,57 @@ pub enum TuiError {
     NotStarted,
 }
 
-/// Rendering intent for external wakes: `Render` = request a repaint; `Animate(bool)` = turn continuous animation on/off
-/// (loader scenarios); both set the merged bit.
+/// Rendering intent declared by an external wake: `Render` = request one frame; `Animate(Some(interval))` = arm the animation
+/// cadence, `Animate(None)` = disarm it.
+///
+/// The payload became an `Option<Duration>` in PF-03: the repetition rate belongs to the intent (pi's loader owns
+/// `DEFAULT_INTERVAL_MS`), so a wake source that animates at a non-default rate can say so instead of hard-coding 16 ms inside the loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
-    /// Repaint once as needed after an external event.
+    /// Repaint once as needed after an external event (merged into the throttle floor).
     Render,
-    /// Turn on/off 16ms continuous repaint (streaming loader animation).
-    Animate(bool),
+    /// Arm (`Some(period)`) or disarm (`None`) the animation cadence — the zen counterpart of pi's loader
+    /// `setInterval`/`clearInterval`. Arming also requests a frame, mirroring pi's «loader.start → updateDisplay → requestRender»,
+    /// so the spinner does not wait a whole period for its first frame.
+    /// Periods shorter than the merge floor are raised to it (see [`next_frame_deadline`]).
+    Animate(Option<Duration>),
+}
+
+/// Animation cadence owned by the loop: an armed period plus the next-due instant.
+///
+/// Wrapping both facts in one `Option` (the field is `Option<AnimationClock>`) makes "armed implies a deadline" a type invariant;
+/// the former `animation_enabled: bool` could describe an inconsistent state (armed without a deadline) and needed the free-running
+/// tick to notice it was armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnimationClock {
+    interval: Duration, // Period between two animation frames
+    next_at: Instant,   // Instant at which the next frame becomes due
+}
+
+impl AnimationClock {
+    /// Arm the clock: the first deadline is `now + interval`. A zero period is clamped to 1 ms — a zero interval is always due,
+    /// which would spin the loop.
+    fn armed(interval: Duration, now: Instant) -> AnimationClock {
+        let interval = interval.max(MIN_ANIMATION_INTERVAL);
+        AnimationClock {
+            interval,
+            next_at: now + interval,
+        }
+    }
+
+    /// Re-anchor by one period: the frame just finished painting at `now`, so the next one is due at `now + interval`.
+    ///
+    /// This is a re-anchor, **not** an accumulation (intentional deviation from pi's fixed-phase `setInterval`): slow frames must
+    /// not queue up catch-up frames. The period therefore stays `frame cost + interval` (124 ms cost ⇒ 204 ms cadence), whereas a
+    /// fixed phase would degenerate into back-to-back rendering (124 ms ⇒ 100% CPU).
+    fn advance_to(&mut self, now: Instant) {
+        self.next_at = now + self.interval;
+    }
+
+    /// Next-due instant (read by [`TuiLoop::frame_deadline`]).
+    fn deadline(&self) -> Instant {
+        self.next_at
+    }
 }
 
 impl TuiLoop {
@@ -60,13 +121,25 @@ impl TuiLoop {
             terminal,
             buffer,
             render_requested: false,
-            animation_enabled: false,
-            last_render_at: std::time::Instant::now(),
+            animation: None,
+            last_render_at: Instant::now(),
             min_render_interval: Duration::from_millis(16), // Aligned with pi MIN_RENDER_INTERVAL_MS
             started: false,
             stopped: false,
             wake_stream: None,
+            stats: Arc::new(FrameStats::new(DEFAULT_BUDGET)),
         })
+    }
+
+    /// Frame metrics accumulated by this loop (shared `Arc`). Read once by the application layer on exit to
+    /// print the summary; nothing is recorded unless `ZEN_TUI_TRACE_FRAMES` was set at construction.
+    ///
+    /// **Do not call this inside the frame closures**: they only need `&this.stats` (a `Deref` borrow) — going
+    /// through this accessor there would hand out a temporary `Arc` that drops while still borrowed.
+    ///
+    /// Consumer: `zen-app` `modes/interactive/mod.rs` (after `tui.stop()`).
+    pub fn frame_stats(&self) -> Arc<FrameStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Enter raw mode and hide the cursor (Terminal::start), request first-frame render.
@@ -103,25 +176,46 @@ impl TuiLoop {
         Ok(())
     }
 
-    /// Request a repaint (set the coalescing flag). Multiple calls within a single tick merge into one render; the minimum interval is
-    /// controlled by `set_min_render_interval` (default 16ms).
+    /// Request one frame (set the merge flag).
+    ///
+    /// Only valid from inside a loop callback (`on_event` / `on_wake` / `frame`): the frame deadline is computed before `select!`,
+    /// so setting this flag from another task or thread neither wakes the loop nor recomputes the deadline — such a request is
+    /// silently dropped. (Before PF-03 it only worked because the free-running 16 ms tick happened to read the flag.)
+    /// Cross-task triggers must go through [`TuiLoop::set_external_wakeup`] or the cancellation token.
+    /// Multiple requests within `min_render_interval` merge into one frame.
     pub fn request_render(&mut self) {
         self.render_requested = true
     }
 
-    /// Toggle "timed refresh animation mode": when enabled, tick keeps triggering repaints even without events/requests
-    /// (loader animation scenario — the loader component's owner sets it while active, resets it when the loader ends).
-    pub fn set_animation(&mut self, enabled: bool) {
-        self.animation_enabled = enabled
+    /// Arm (`Some(period)`) or disarm (`None`) the animation cadence from code; arming also requests the first frame.
+    ///
+    /// Same semantics as [`WakeOutcome::Animate`]; it is the loop's programming surface for hosts that drive it without a wake
+    /// channel (zen-app itself goes through the wake channel). Re-arming re-anchors the clock (pi `setIndicator → start()`: frame
+    /// sequence and cadence restart); a zero period is clamped to 1 ms so the deadline can never be "always due".
+    pub fn set_animation(&mut self, interval: Option<Duration>) {
+        self.set_animation_at(interval, Instant::now())
     }
 
-    /// Set the minimum render interval (i.e. the tick period), default 16ms (aligned with pi `MIN_RENDER_INTERVAL_MS`).
-    /// Consumer: T-AP-11-1 (optional tuning; can keep the default value and mark as "experimental" when there is no consumer).
+    /// [`TuiLoop::set_animation`] with an injected clock reading (unit tests; production always goes through the wrapper).
+    fn set_animation_at(&mut self, interval: Option<Duration>, now: Instant) {
+        self.animation = interval.map(|period| AnimationClock::armed(period, now));
+        if self.animation.is_some() {
+            // Arming is a visible state change: paint it now instead of waiting a whole period (pi: loader.start → requestRender).
+            self.request_render();
+        }
+    }
+
+    /// Set the minimum gap between two painted frames (default 16ms, aligned with pi `MIN_RENDER_INTERVAL_MS`).
+    ///
+    /// Semantics changed in PF-03: this is no longer "the tick period" (there is no ticker) but the merge floor for
+    /// request-driven frames, measured from the previous frame's **completion** time. It is unrelated to [`DEFAULT_BUDGET`]
+    /// (the per-frame cost budget) — do not conflate the two.
     pub fn set_min_render_interval(&mut self, interval: Duration) {
         self.min_render_interval = interval
     }
 
-    /// TUI main event loop (cell-level diff mode): multiplexes four async sources: polled event stream / timed tick / cancellation signal / external wakeup.
+    /// TUI main event loop (cell-level diff mode): multiplexes four async sources: polled event stream / conditional frame timer /
+    /// cancellation signal / external wakeup.
     /// Prerequisite: [`TuiLoop::start`] must be called first; see `run_loop` for the exit path.
     /// draw renders the current frame into `ScreenBuffer` (`run_loop` calls `render_frame` each frame to output diffs).
     /// Default path for interactive mode; use [`TuiLoop::run_scrollback`] for scrollback mode.
@@ -147,8 +241,8 @@ impl TuiLoop {
         .await
     }
 
-    /// Drives the TUI main loop in scrollback rendering mode: uses the same four-way select as [`TuiLoop::run`] (events/timed
-    /// tick/cancel/external wakeup), but the draw contract changes from 「render into the ScreenBuffer grid」 to 「push content rows into
+    /// Drives the TUI main loop in scrollback rendering mode: uses the same four-way select as [`TuiLoop::run`] (events/conditional
+    /// frame timer/cancel/external wakeup), but the draw contract changes from 「render into the ScreenBuffer grid」 to 「push content rows into
     /// `ScrollbackCanvas` — change per-frame diff output to line-level diffing + real terminal scrolling when content overflows the screen (write
     /// scrollback), allowing chat history to be viewed via native terminal scrolling. Coexists with `run` and does not affect it by default.
     /// # Behavior
@@ -176,14 +270,27 @@ impl TuiLoop {
             on_event,
             // scrollback frame: synchronize the terminal size first each frame (if changed → reset diff baseline → full redraw),
             // Then clear the current frame's line stream, draw, and flush line-level diffs to the terminal.
+            // PF-01: the probe brackets clear+draw (draw cost) and the flush (flush cost); the size sync above stays
+            // outside the measurement because it is geometry bookkeeping, not rendering.
             |this| {
                 let (cols, rows) = (this.terminal.columns(), this.terminal.rows());
                 canvas.set_size(cols, rows);
+                let mut probe = FrameProbe::start(&this.stats);
                 canvas.clear();
                 (draw)(&mut canvas);
-                canvas
-                    .flush(this.terminal.out_mut())
-                    .map_err(TuiError::from)?;
+                probe.mark_draw();
+                let (result, bytes) = {
+                    let mut out = CountingWriter::new(this.terminal.out_mut());
+                    let result = canvas.flush(&mut out).map_err(TuiError::from);
+                    (result, out.bytes())
+                };
+                probe.finish(
+                    bytes,
+                    canvas.last_repaint_span(),
+                    canvas.content_height(),
+                    canvas.fixed_rows(),
+                );
+                result?;
                 Ok(())
             },
             // scrollback mode handles sizing/full redraw within the frame (canvas size sync); this callback is a no-op.
@@ -192,11 +299,12 @@ impl TuiLoop {
         .await
     }
 
-    /// Shared skeleton for the TUI main event loop: four asynchronous sources (event stream polling / timed tick / cancellation signal / external wakeup),
+    /// Shared skeleton for the TUI main event loop: four asynchronous sources (event stream polling / conditional frame timer / cancellation
+    /// signal / external wakeup),
     /// Drives `frame` (per-frame rendering) and `on_resize` (size changes). `run`/`run_scrollback` only provide different
-    /// frame and resize callbacks; event forwarding / coalescing bits / tick throttling semantics are identical in both modes.
+    /// frame and resize callbacks; event forwarding / merge flag / throttle floor semantics are identical in both modes.
     /// # Prerequisites
-    /// [`TuiLoop::start`] must be called first; precondition checks occur before any IO (EventStream/interval), so no real terminal is required.
+    /// [`TuiLoop::start`] must be called first; precondition checks occur before any IO (EventStream/sleep), so no real terminal is required.
     /// # Exit paths
     /// - `on_event` returns `EventOutcome::Stop`;
     /// - The event stream ends (stdin is closed);
@@ -230,20 +338,18 @@ impl TuiLoop {
 
         let mut event_stream = EventStream::new();
 
-        // Timer: fires a tick every min_render_interval (default 16ms);
-        // serves as the metronome for "render coalescing" and the "loader animation"
-        let mut tick = tokio::time::interval(self.min_render_interval);
-        // When ticks are missed due to event floods (e.g. holding down a key), Delay lets the backlog fire late,
-        // rather than compensating for all missed ticks at once — avoids render storms
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Frame pacing (PF-03): there is no free-running ticker. Each iteration derives the next frame deadline from the current
+        // state (pending request / armed animation clock, `None` = nothing to paint) and waits for exactly that instant; while
+        // nothing is armed the timer branch stays pending, so an idle loop costs zero wakeups instead of 62.5 per second.
 
         // ── First-frame render: draw one frame before entering the loop to avoid a blank screen ──
-        // start() already set the coalescing flag via request_render(); honor it here directly
+        // start() already set the merge flag via request_render(); honor it here directly
         frame(&mut *self)?; // draw writes to the buffer → flush emits the diff; on failure, loop startup fails entirely
-        self.render_requested = false; // First frame drawn; clear the coalescing flag
-        self.last_render_at = std::time::Instant::now(); // Record this render's timestamp for throttling reference
+        self.finish_frame(); // First frame painted: clear the merge flag + stamp the completion time (and re-anchor any animation)
 
         loop {
+            // Computed before `select!` so the immutable borrow ends here (the branches below need `&mut self`).
+            let deadline = self.frame_deadline();
             // ── Monitor four asynchronous sources concurrently: the first ready source runs (tokio uses random fairness, with no source favored)──
             tokio::select! {
                 // ① Event stream: user input arrives (key press, mouse, paste, window resize, etc.)
@@ -261,8 +367,8 @@ impl TuiLoop {
                             // Key semantics (shortcut mapping etc., part of T-TU-03) are resolved in on_event
                             match on_event(event) {
                                 EventOutcome::Stop => break,
-                                // Event handling may have mutated application state → set the coalescing flag,
-                                // to be honored on the next tick (aligns with pi handleInput → requestRender contract)
+                                // Event handling may have mutated application state → set the merge flag; the next iteration
+                                // recomputes the deadline from it (aligns with pi handleInput → requestRender contract)
                                 EventOutcome::Continue => self.request_render(),
                             }
                         }
@@ -271,15 +377,12 @@ impl TuiLoop {
                     }
                 }
 
-                // (2) periodic tick: render the ticker
-                _ = tick.tick() => {
-                    // actually draw only when a redraw was requested or animation mode is on; other ticks idle —
-                    // this is render coalescing: high-frequency events do not produce one frame per event; screen updates are coalesced at tick granularity (≤16ms latency)
-                    if self.render_requested || self.animation_enabled {
-                        frame(&mut *self)?; // Render the current frame → flush the diff output
-                        self.render_requested = false; // frame already realized, clear the coalescing flag (the next event will set it again)
-                        self.last_render_at = std::time::Instant::now(); // record the render time
-                    }
+                // (2) conditional frame timer: fires only at the instant derived from the current state (nothing armed ⇒ never).
+                //     Render coalescing: high-frequency events do not produce one frame per event — they all collapse into this one
+                //     frame, which never comes sooner than `min_render_interval` after the previous frame finished.
+                _ = sleep_until_opt(deadline) => {
+                    frame(&mut *self)?; // Render the current frame → flush the diff output
+                    self.finish_frame(); // clear the merge flag, stamp the time, re-anchor the animation cadence
                 }
 
                 // (3) cancellation signal: triggered when the caller invokes cancel.cancel()
@@ -303,16 +406,29 @@ impl TuiLoop {
 
     /// Internal: perform one render — call `draw` to render the current frame into the buffer, then `buffer.flush(terminal.out_mut())`
     /// differentially output to the terminal. Private, called only by `run`.
+    ///
+    /// PF-01: measured like the scrollback frame, except that the cell-level path has no line stream — it reports
+    /// `repaint_span: None`, `line_total` = buffer rows and `line_fixed` = 0 (the fixed region only exists in
+    /// scrollback mode).
     fn render_frame<D>(&mut self, draw: &mut D) -> Result<(), TuiError>
     where
         D: FnMut(&mut ScreenBuffer),
     {
+        let mut probe = FrameProbe::start(&self.stats);
         // Start each frame from a clean frame: cells not redrawn are judged as "content→empty" in the subsequent flush diff and erased,
         // Components need not self-clear (the zen-grid-level counterpart of pi composite layer clear-extra-lines);
         // Identical cells across two frames are still not written after diff, so differential efficiency is unaffected.
         self.buffer.clear();
         (draw)(&mut self.buffer);
-        self.buffer.flush(self.terminal.out_mut())?;
+        probe.mark_draw();
+        let (result, bytes) = {
+            let mut out = CountingWriter::new(self.terminal.out_mut());
+            let result = self.buffer.flush(&mut out);
+            (result, out.bytes())
+        };
+        let (_, rows) = self.buffer.size();
+        probe.finish(bytes, None, rows as usize, 0);
+        result?;
         Ok(())
     }
 
@@ -348,12 +464,91 @@ impl TuiLoop {
         stream.next().await
     }
 
-    /// Set render flags per wake intent: Render → merge into one redraw; Animate(v) → toggle 16ms continuous rendering.
+    /// Set render flags per wake intent: Render → merge into one frame; Animate(v) → arm/disarm the animation cadence.
     fn apply_wake_outcome(&mut self, outcome: WakeOutcome) {
         match outcome {
             WakeOutcome::Render => self.request_render(),
-            WakeOutcome::Animate(v) => self.animation_enabled = v,
+            WakeOutcome::Animate(interval) => self.set_animation(interval),
         }
+    }
+
+    /// Next instant at which a frame must be painted; `None` = nothing armed (the loop stays asleep this round).
+    ///
+    /// Instance wrapper of [`next_frame_deadline`]: pulls the four inputs out of the fields so the decision itself stays a pure
+    /// function that unit tests can drive with injected instants.
+    fn frame_deadline(&self) -> Option<Instant> {
+        next_frame_deadline(
+            self.last_render_at,
+            self.min_render_interval,
+            self.render_requested,
+            self.animation.map(|clock| clock.deadline()),
+        )
+    }
+
+    /// Book-keeping after a frame was painted: clear the merge flag, stamp the completion time, re-anchor the animation clock.
+    fn finish_frame(&mut self) {
+        self.finish_frame_at(Instant::now())
+    }
+
+    /// [`TuiLoop::finish_frame`] with an injected clock reading (unit tests).
+    ///
+    /// Three steps in this order: clear the merge flag → `last_render_at = now` (the **completion** anchor, deliberately different
+    /// from pi's pre-render anchor: the cadence becomes `frame cost + interval` and slow frames never compound) → advance the
+    /// animation clock to `now + interval` (re-anchor; never catch up on missed periods).
+    ///
+    /// Invariant asserted by the tests (exactly this, never `> Instant::now()` — a slow CI pause would fake it): after this call an
+    /// armed animation is due exactly at `now + interval`.
+    ///
+    /// ⚠️ PF-08 interface note: clearing **after** drawing is currently equivalent to pi's "clear first, draw, re-schedule",
+    /// because `frame(&mut *self)` holds the exclusive borrow for the whole call. If PF-08 moves rendering off the event loop that
+    /// premise breaks, and this must become "clear first + re-check after the frame", otherwise requests arriving mid-frame are lost.
+    fn finish_frame_at(&mut self, now: Instant) {
+        self.render_requested = false;
+        self.last_render_at = now;
+        if let Some(clock) = self.animation.as_mut() {
+            clock.advance_to(now);
+        }
+    }
+}
+
+/// Decide when the next frame must be painted; `None` = nothing to paint (the loop must not wake at all).
+///
+/// Rules, in this order:
+/// 1. merge floor `floor = last_render_at + min_render_interval` (the earliest a request-driven frame may be painted);
+/// 2. a pending request wants `floor` (already in the past ⇒ due immediately); an armed animation wants
+///    `max(animation_deadline, floor)`, so a custom period shorter than the floor cannot cause a repaint storm;
+/// 3. return the earliest of the armed candidates; both disarmed ⇒ `None`.
+///
+/// Pure (no clock reads, no IO), which is what makes "cadence = frame cost + interval" and "idle ⇒ zero frames" assertable, and is
+/// where a future streaming throttle would plug in (see the PF-08 seam note).
+fn next_frame_deadline(
+    last_render_at: Instant,
+    min_render_interval: Duration,
+    render_requested: bool,
+    animation_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let floor = last_render_at + min_render_interval;
+    let requested = render_requested.then_some(floor);
+    let animated = animation_deadline.map(|at| at.max(floor));
+    match (requested, animated) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Wait until `deadline`; with `None`, never wake — the conditional-timer branch that replaced the old free-running ticker.
+///
+/// Must stay a free function: the other `select!` branches in [`TuiLoop::run_loop`] hold `&mut self`, so a method here would not
+/// borrow-check. A deadline already in the past returns immediately. This is the single place where the std clock domain converts to
+/// tokio's (`from_std`); everything else in this module stays `std::time::Instant`, so the policy functions remain runtime-free
+/// (corollary: unit tests here must not use `tokio::time::pause()` — that would only pause the tokio clock while `std::Instant`
+/// keeps running).
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -370,12 +565,14 @@ mod tests {
     #[test]
     fn test_new_initial_state() {
         let loop_ = TuiLoop::new().unwrap();
-        // default state: raw not enabled, no redraw request, no animation, default 16ms interval
+        // default state: raw not enabled, no redraw request, no animation, default 16ms merge floor
         assert!(!loop_.render_requested);
-        assert!(!loop_.animation_enabled);
+        assert!(loop_.animation.is_none());
         assert!(!loop_.started);
         assert!(!loop_.stopped);
         assert_eq!(loop_.min_render_interval, Duration::from_millis(16));
+        // Nothing armed ⇒ no frame is due at all (the idle loop stays asleep)
+        assert_eq!(loop_.frame_deadline(), None);
         // buffer size comes from the current terminal (falls back to 80x24 on non-tty), always > 0
         let (cols, rows) = loop_.buffer.size();
         assert!(cols > 0 && rows > 0);
@@ -442,13 +639,39 @@ mod tests {
     }
 
     #[test]
-    fn test_set_animation_toggles_flag() {
+    fn test_set_animation_arms_and_disarms() {
         let mut loop_ = TuiLoop::new().unwrap();
-        assert!(!loop_.animation_enabled);
-        loop_.set_animation(true);
-        assert!(loop_.animation_enabled);
-        loop_.set_animation(false);
-        assert!(!loop_.animation_enabled);
+        let t0 = Instant::now();
+        assert!(loop_.animation.is_none());
+        // Arming: the clock is due one period later, and the first frame is requested immediately
+        loop_.set_animation_at(Some(DEFAULT_ANIMATION_INTERVAL), t0);
+        assert_eq!(
+            loop_.animation.map(|clock| clock.deadline()),
+            Some(t0 + DEFAULT_ANIMATION_INTERVAL)
+        );
+        assert!(loop_.render_requested);
+        // Disarming: no clock left, and a pending request is left untouched
+        loop_.render_requested = false;
+        loop_.set_animation_at(None, t0);
+        assert!(loop_.animation.is_none());
+        assert!(!loop_.render_requested);
+    }
+
+    #[test]
+    fn test_rearming_animation_reanchors_like_pi_set_indicator() {
+        // pi `setIndicator → start()`: arming again restarts the cadence from the new instant with the new period.
+        let mut loop_ = TuiLoop::new().unwrap();
+        let t0 = Instant::now();
+        loop_.last_render_at = t0;
+        loop_.set_animation_at(Some(Duration::from_millis(80)), t0);
+        loop_.set_animation_at(Some(Duration::from_millis(50)), t0 + Duration::from_secs(1));
+        // Neither the old 80 ms period nor the old anchor survives the re-arm.
+        assert_eq!(
+            loop_.animation.map(|clock| clock.deadline()),
+            Some(t0 + Duration::from_secs(1) + Duration::from_millis(50))
+        );
+        // The first frame still goes out immediately (arming requested it): the merge floor, not the new clock, is due first.
+        assert_eq!(loop_.frame_deadline(), Some(t0 + Duration::from_millis(16)));
     }
 
     #[test]
@@ -456,11 +679,204 @@ mod tests {
         let mut loop_ = TuiLoop::new().unwrap();
         // default 16ms
         assert_eq!(loop_.min_render_interval, Duration::from_millis(16));
-        // override with an arbitrary value (including 0 — tokio interval's panic boundary only triggers at runtime, here we only verify storage)
+        // override with an arbitrary value (0 = no merge floor at all: every request paints on the next iteration)
         loop_.set_min_render_interval(Duration::from_millis(100));
         assert_eq!(loop_.min_render_interval, Duration::from_millis(100));
         loop_.set_min_render_interval(Duration::ZERO);
         assert_eq!(loop_.min_render_interval, Duration::ZERO);
+    }
+
+    // ── PF-03: request-driven scheduling (no free-running ticker) ──
+
+    #[test]
+    fn test_next_frame_deadline_rules() {
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(16);
+        // Nothing armed → nothing to paint (the loop does not wake at all)
+        assert_eq!(next_frame_deadline(t0, floor, false, None), None);
+        // Pending request only → merged at the throttle floor
+        assert_eq!(next_frame_deadline(t0, floor, true, None), Some(t0 + floor));
+        // Animation only (period well above the floor) → the animation deadline wins
+        assert_eq!(
+            next_frame_deadline(t0, floor, false, Some(t0 + DEFAULT_ANIMATION_INTERVAL)),
+            Some(t0 + DEFAULT_ANIMATION_INTERVAL)
+        );
+        // Both armed → the earlier one
+        assert_eq!(
+            next_frame_deadline(t0, floor, true, Some(t0 + DEFAULT_ANIMATION_INTERVAL)),
+            Some(t0 + floor)
+        );
+        // A sub-floor animation period is raised to the floor (a tiny custom period cannot cause a repaint storm)
+        assert_eq!(
+            next_frame_deadline(t0, floor, false, Some(t0 + Duration::from_millis(1))),
+            Some(t0 + floor)
+        );
+    }
+
+    #[test]
+    fn test_animation_zero_period_is_clamped() {
+        // A zero period would always be due (= busy loop) → clamped to the 1 ms floor
+        let t0 = Instant::now();
+        let clock = AnimationClock::armed(Duration::ZERO, t0);
+        assert_eq!(clock.deadline(), t0 + MIN_ANIMATION_INTERVAL);
+    }
+
+    #[test]
+    fn test_advance_to_reanchors_and_does_not_catch_up() {
+        let t0 = Instant::now();
+        let mut clock = AnimationClock::armed(DEFAULT_ANIMATION_INTERVAL, t0);
+        // A frame that took 124 ms completes at t0+124 ⇒ next due 80 ms after that (204 ms) — not at the fixed phase
+        // (160 ms) and never as a batch of catch-up frames (240 ms).
+        clock.advance_to(t0 + Duration::from_millis(124));
+        assert_eq!(
+            clock.deadline(),
+            t0 + Duration::from_millis(124) + DEFAULT_ANIMATION_INTERVAL
+        );
+    }
+
+    #[test]
+    fn test_finish_frame_at_reanchors_to_exact_deadline() {
+        let mut loop_ = TuiLoop::new().unwrap();
+        let t0 = Instant::now();
+        loop_.last_render_at = t0;
+        loop_.set_animation_at(Some(DEFAULT_ANIMATION_INTERVAL), t0);
+        loop_.render_requested = true;
+        loop_.finish_frame_at(t0 + Duration::from_millis(124));
+        assert!(!loop_.render_requested);
+        assert_eq!(loop_.last_render_at, t0 + Duration::from_millis(124));
+        // Exact value (not `> Instant::now()`): armed animation is due `now + interval` after the frame, so the loop
+        // cannot wake up already-due (which would be a busy loop).
+        assert_eq!(
+            loop_.frame_deadline(),
+            Some(t0 + Duration::from_millis(124) + DEFAULT_ANIMATION_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn test_finish_frame_disarmed_leaves_nothing_due() {
+        let mut loop_ = TuiLoop::new().unwrap();
+        let t0 = Instant::now();
+        loop_.last_render_at = t0;
+        loop_.render_requested = true;
+        loop_.finish_frame_at(t0 + Duration::from_millis(5));
+        assert!(loop_.animation.is_none());
+        assert_eq!(loop_.frame_deadline(), None);
+    }
+
+    /// Frames painted inside `window` when every frame costs `cost` and only the animation drives repaints.
+    /// Mirrors the loop: the due instant comes from [`next_frame_deadline`], then the clock is re-anchored at completion.
+    fn simulated_animation_frames(window: Duration, cost: Duration) -> u64 {
+        let t0 = Instant::now();
+        let end = t0 + window;
+        let mut last_render_at = t0;
+        let mut clock = AnimationClock::armed(DEFAULT_ANIMATION_INTERVAL, t0);
+        let mut frames = 0u64;
+        while let Some(due) = next_frame_deadline(
+            last_render_at,
+            Duration::from_millis(16),
+            false,
+            Some(clock.deadline()),
+        ) {
+            if due > end {
+                break;
+            }
+            frames += 1;
+            last_render_at = due + cost; // the frame completes `cost` after it became due
+            clock.advance_to(last_render_at);
+        }
+        frames
+    }
+
+    #[test]
+    fn test_animation_cadence_is_cost_plus_interval() {
+        let window = Duration::from_secs(60);
+        // Cadence = frame cost + 80 ms ⇒ 80 / 204 / 100 ms per frame ⇒ 750 / 294 / 600 frames in 60 s.
+        assert_eq!(simulated_animation_frames(window, Duration::ZERO), 750);
+        assert_eq!(
+            simulated_animation_frames(window, Duration::from_millis(124)),
+            294
+        );
+        assert_eq!(
+            simulated_animation_frames(window, Duration::from_millis(20)),
+            600
+        );
+        // For comparison: the removed free-running 16 ms ticker painted this many frames in the same window.
+        assert_eq!(window.as_millis() / 16, 3750);
+    }
+
+    /// Runtime smoke of the frame pacing through the **real** loop (not just the pure decision): verifies the wiring that
+    /// animation-armed ⇒ ≈1 frame per 80 ms, and disarmed ⇒ zero frames (idle loop does not wake).
+    ///
+    /// Requires a real tty (raw mode); run it manually under a pty:
+    /// `script -q /dev/null cargo test -p zen-tui tuiloop_frame_pacing_smoke -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires a real tty (raw mode); run under a pty via `script`"]
+    async fn tuiloop_frame_pacing_smoke() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut tui = TuiLoop::new().unwrap();
+        tui.start().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WakeOutcome>();
+        tui.set_external_wakeup(rx, Box::new(|outcome: &WakeOutcome| *outcome));
+        let cancel = CancellationToken::new();
+
+        let drawn = Rc::new(Cell::new(0u32));
+        let drawn_in_frame = Rc::clone(&drawn);
+        let cancel_driver = cancel.clone();
+        let local = tokio::task::LocalSet::new();
+        let (armed_frames, idle_frames) = local
+            .run_until(async move {
+                let run = tui.run_scrollback(
+                    &cancel,
+                    |_| EventOutcome::Continue,
+                    move |_| drawn_in_frame.set(drawn_in_frame.get() + 1),
+                );
+                let driver = async move {
+                    // Let run() paint its first frame, then arm the cadence for 1 s and measure.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tx.send(WakeOutcome::Animate(Some(DEFAULT_ANIMATION_INTERVAL)))
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    let armed = drawn.get();
+                    // Disarm: an idle loop must not paint (nor wake) at all.
+                    tx.send(WakeOutcome::Animate(None)).unwrap();
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    let idle = drawn.get() - armed;
+                    cancel_driver.cancel();
+                    (armed, idle)
+                };
+                let (run_result, measured) = tokio::join!(run, driver);
+                run_result.unwrap();
+                // `run` no longer borrows the loop here, so the terminal can be restored inside the local set.
+                tui.stop().unwrap();
+                measured
+            })
+            .await;
+
+        println!(
+            "pacing smoke: armed(1s) = {armed_frames} frames, idle(1s) = {idle_frames} frames"
+        );
+        // 80 ms cadence ⇒ 12–13 frames per second (allow scheduler jitter on both sides).
+        assert!(
+            (8..=20).contains(&armed_frames),
+            "armed 1s painted {armed_frames} frames, expected ~12 (80 ms cadence)"
+        );
+        assert!(
+            idle_frames <= 1,
+            "idle 1s painted {idle_frames} frames, expected 0 (no free-running ticker)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sleep_until_opt_is_pending_when_nothing_is_armed() {
+        // Nothing armed ⇒ the timer branch must never become ready (an idle loop costs zero wakeups).
+        let pending = tokio::time::timeout(Duration::from_millis(10), sleep_until_opt(None)).await;
+        assert!(pending.is_err(), "None must never wake the loop");
+        // A deadline already in the past is due immediately.
+        let past = Some(Instant::now() - Duration::from_millis(1));
+        let ready = tokio::time::timeout(Duration::from_millis(500), sleep_until_opt(past)).await;
+        assert!(ready.is_ok(), "a past deadline must be due immediately");
     }
 
     #[test]
@@ -479,6 +895,21 @@ mod tests {
         assert_eq!(seen_size, loop_.buffer.size());
         // flush promotes the current frame to previous frame so it can render again (idempotency smoke test)
         assert!(loop_.render_frame(&mut |_| {}).is_ok());
+    }
+
+    #[test]
+    fn test_frame_stats_is_the_same_arc_and_records_nothing_by_default() {
+        // PF-01: `frame_stats()` hands out a clone of the loop's `Arc` (same allocation), and unless
+        // ZEN_TUI_TRACE_FRAMES is set at construction the accumulator stays empty — frame rendering must
+        // not start costing a clock read just because the accessor exists.
+        let mut loop_ = TuiLoop::new().unwrap();
+        let stats = loop_.frame_stats();
+        assert!(Arc::ptr_eq(&stats, &loop_.frame_stats()));
+        let _ = loop_.render_frame(&mut |_| {});
+        if !stats.enabled() {
+            assert_eq!(stats.frames(), 0);
+            assert_eq!(stats.bytes_total(), 0);
+        }
     }
 
     #[tokio::test]
@@ -507,22 +938,25 @@ mod tests {
     #[test]
     fn test_apply_wake_outcome_sets_flags() {
         let mut loop_ = TuiLoop::new().unwrap();
-        // By default neither flag is set
+        // By default neither state is set
         assert!(!loop_.render_requested);
-        assert!(!loop_.animation_enabled);
-        // Render → request one redraw
+        assert!(loop_.animation.is_none());
+        // Render → request one frame
         loop_.apply_wake_outcome(WakeOutcome::Render);
         assert!(loop_.render_requested);
         assert!(
-            !loop_.animation_enabled,
+            loop_.animation.is_none(),
             "Render does not affect animation state"
         );
-        // Animate(true) → start continuous animation
-        loop_.apply_wake_outcome(WakeOutcome::Animate(true));
-        assert!(loop_.animation_enabled);
-        // Animate(false) → stop continuous animation (redraw flag stays set)
-        loop_.apply_wake_outcome(WakeOutcome::Animate(false));
-        assert!(!loop_.animation_enabled);
+        // Animate(Some(period)) → arm the cadence
+        loop_.apply_wake_outcome(WakeOutcome::Animate(Some(DEFAULT_ANIMATION_INTERVAL)));
+        assert_eq!(
+            loop_.animation.map(|clock| clock.interval),
+            Some(DEFAULT_ANIMATION_INTERVAL)
+        );
+        // Animate(None) → disarm (the merge flag stays set)
+        loop_.apply_wake_outcome(WakeOutcome::Animate(None));
+        assert!(loop_.animation.is_none());
     }
 
     #[tokio::test]
@@ -532,20 +966,21 @@ mod tests {
         // Generic channel: zen-tui is unaware of the concrete type (here u8 verifies the callback still yields intents after erasure)
         loop_.set_external_wakeup(
             rx,
-            Box::new(|msg: &u8| {
-                if *msg == 1 {
-                    WakeOutcome::Render
-                } else {
-                    WakeOutcome::Animate(*msg == 2)
-                }
+            Box::new(|msg: &u8| match msg {
+                1 => WakeOutcome::Render,
+                2 => WakeOutcome::Animate(Some(DEFAULT_ANIMATION_INTERVAL)),
+                _ => WakeOutcome::Animate(None),
             }),
         );
         tx.send(1).unwrap();
         assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Render));
         tx.send(2).unwrap();
-        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Animate(true)));
+        assert_eq!(
+            loop_.next_wake().await,
+            Some(WakeOutcome::Animate(Some(DEFAULT_ANIMATION_INTERVAL)))
+        );
         tx.send(3).unwrap();
-        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Animate(false)));
+        assert_eq!(loop_.next_wake().await, Some(WakeOutcome::Animate(None)));
     }
 
     #[tokio::test]
