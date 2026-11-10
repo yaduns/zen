@@ -236,6 +236,7 @@ Configuration splits along the same seam, and that split is deliberate:
 | `settings.json` | `zen-app::config::settings` | zen-app | global ← project |
 | `keybindings.json` | `zen-app::keybindings` | zen-app | global |
 | `skills/`, `prompts/`, `themes/` | `zen-app::resources` | zen-app | global ← project |
+| `.agents/skills/` (cross-tool, read-only) | `zen-app::resources` | zen-app | `~/.agents/skills` + project ancestor chain up to the git root |
 | `AGENTS.md` / `CLAUDE.md` | `zen-app::resources` | zen-app | project root |
 | `SYSTEM.md`, `APPEND_SYSTEM.md` | `zen-app::resources` | zen-app | project `.zen/` ← global |
 | `sessions/*.jsonl` | `zen-app::session` | zen-app | global, or `--session-dir` |
@@ -360,6 +361,7 @@ Two scopes, one layout. Everything global lives under the agent directory (`~/.z
 default, relocatable via `ZEN_CODING_AGENT_DIR`):
 
 ```
+~/.agents/skills/             # cross-tool shared skills (read-only; shared with pi/codex & co.)
 ~/.zen/agent/                 # global scope
 ├── settings.json     # user preferences (partial; missing keys fall back to defaults)
 ├── models.json       # providers, endpoints, credentials, model definitions
@@ -376,9 +378,11 @@ A repository can override the same surfaces next to its own code, which is handy
 model or theme per project:
 
 ```
-<your-repo>/                  # project scope (wins over global, key by key)
+<your-repo>/                  # project scope
 ├── AGENTS.md         # project instructions, injected into the system prompt
-└── .zen/
+├── .agents/          # cross-tool shared resources, read-only (zen never writes here)
+│   └── skills/       #   shared with pi/codex & co.; ancestors up to the git root are scanned
+└── .zen/             # zen-private resources (wins over global, key by key)
     ├── settings.json
     ├── SYSTEM.md
     ├── skills/
