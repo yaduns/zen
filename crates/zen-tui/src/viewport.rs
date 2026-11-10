@@ -6,12 +6,18 @@
 // instead of only seeing the last screen as with cell-level fixed-line diffs. Remaining visible lines / bottom fixed region are repainted line by line.
 // Complementary to `ScreenBuffer` (cell-level grid): this type is the rendering target for "line-level + terminal-scroll carrying".
 // Pure runtime canvas, no serialization needs (implementation choices for T-TU-01-5 open questions 1/2/3 are explained in the comments below).
+//
+// **PF-05 (line-stream convergence)**: lines are stored as shared handles ([`LineSegs`]), not owned vectors. pi keeps its diff baseline as a
+// plain reference alias (`this.previousLines = newLines`, `tui.ts:1616`), i.e. O(N) pointer moves; carrying `Vec<Vec<StyledSegment>>` here forced
+// two deep copies per frame (row cache → canvas at `ui.rs:2236`, canvas → baseline in `flush`) — a porting regression this module now reverts
+// ([`ScrollbackCanvas::promote_frame`] + `Rc::ptr_eq` in the row diff).
 
-use crate::highlight::StyledSegment;
+use crate::highlight::{LineSegs, StyledSegment};
 use crate::screen::Style;
 use crate::terminal::TerminalError;
 use crossterm::queue;
 use std::io::Write;
+use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Line-stream canvas: in scrollback mode the interactive mode pushes each frame's content here line by line; on flush `TuiLoop`
@@ -29,9 +35,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// `first_changed < prev_viewport_top → full repaint` (pi fullRender); see [`Self::flush`] for the boundary.
 pub struct ScrollbackCanvas {
     /// All content lines for this frame (including the fixed region's trailing lines); call `clear()` before draw.
-    lines: Vec<Vec<StyledSegment>>,
+    ///
+    /// Shared handles (PF-05): the draw side pushes the very same allocations its row caches hold, so a cache hit costs one refcount bump.
+    lines: Vec<LineSegs>,
     /// Previous frame's line-stream snapshot (line-level diff base; lines scrolled out of the terminal no longer participate in the diff).
-    prev_lines: Vec<Vec<StyledSegment>>,
+    /// Promoted from `lines` by [`Self::promote_frame`] (a `swap`, never a copy).
+    prev_lines: Vec<LineSegs>,
     /// Content row number of the current viewport top (terminal row = `content_row - viewport_top`).
     viewport_top: usize,
     /// Previous frame's viewport top (to decide whether to advance more / do a full repaint).
@@ -55,6 +64,10 @@ pub struct ScrollbackCanvas {
     /// PF-01: content rows actually written by the most recent flush, as an inclusive `[first, last]` span.
     /// Reset to `None` at the start of every flush so a no-change frame never reports a stale span.
     last_repaint_span: Option<(usize, usize)>,
+    /// PF-05: net advancement of the viewport top during the most recent flush (= content rows that left the screen into the scrollback).
+    /// Reset to 0 at the start of every flush (not only in `clear`/`set_size`: a frame that returns early would otherwise republish the previous
+    /// frame's value). See [`Self::last_scroll_rows`] for the exact semantics, including the deliberate 0 on the full-redraw path.
+    last_scroll_rows: usize,
 }
 
 impl ScrollbackCanvas {
@@ -73,6 +86,7 @@ impl ScrollbackCanvas {
             cursor_hint: None,
             fixed_rows: 0,
             last_repaint_span: None,
+            last_scroll_rows: 0,
         }
     }
 
@@ -84,22 +98,35 @@ impl ScrollbackCanvas {
         self.lines.clear();
         self.cursor_hint = None;
         self.last_repaint_span = None;
+        self.last_scroll_rows = 0;
     }
 
     /// Append a screen line to the end of the line stream (shared entry point for consecutive message-area lines and fixed-area tail lines).
     /// Styles/text of each segment in the line are preserved as-is; if total width exceeds `width`, truncate by column width (never split wide characters).
     /// Consumer: `InteractiveUi::render_scrollback`.
     pub fn push_line(&mut self, line: Vec<StyledSegment>) {
-        self.lines.push(truncate_line(line, self.width));
+        self.lines.push(Rc::new(truncate_line(line, self.width)));
+    }
+
+    /// Append a line that the caller has **already truncated** to the canvas width — the cache-hit path, where the whole point is to
+    /// skip the per-character width scan that [`ScrollbackCanvas::push_line`] performs on every segment.
+    ///
+    /// Precondition (caller's duty): every line must already fit `width()`. A cached row line satisfies this because the render width is
+    /// part of the cache key (`CacheKey::width`) — rendering at another width simply misses and re-renders. Unlike `push_line`, an
+    /// over-wide line is **not** truncated here (that would hide a broken caller and desynchronise the line geometry); the
+    /// non-truncating precedent already exists in [`ScrollbackCanvas::push_text`].
+    /// Consumer: zen-app `modes::interactive::ui::push_row_lines` (cache hit); planned PF-06 (fixed-region cached rows).
+    pub fn push_line_pre_truncated(&mut self, line: LineSegs) {
+        self.lines.push(line);
     }
 
     /// Convenience entry: push plain text as a single-segment line (default/specified style; used for fixed-area space padding, etc.).
     /// Consumer: `render_scrollback` (fixed-area placeholder lines, pending lines).
     pub fn push_text(&mut self, text: impl Into<String>, style: Style) {
-        self.lines.push(vec![StyledSegment {
+        self.lines.push(Rc::new(vec![StyledSegment {
             style,
             text: text.into(),
-        }]);
+        }]));
     }
 
     /// Total content rows this frame (= `lines.len()`); used by TuiLoop to decide whether to trigger scroll advance.
@@ -148,6 +175,22 @@ impl ScrollbackCanvas {
         self.fixed_rows
     }
 
+    /// How many content rows **left the screen into the scrollback** during the most recent flush, i.e. the net advance of the viewport top.
+    ///
+    /// Scenario: a streaming frame appends `k` lines while the tail `F` rows sit at the bottom; the tail keeps its *target screen rows*, so the
+    /// real advancement is performed by the terminal while the write loop walks past the bottom of the screen. The local `"\r\n".repeat(scroll)`
+    /// count is **0 in the assembled case** (`F >= 1` ⇒ `first = prev_len - F` ⇒ not an append-start frame ⇒ `move_row <= prev_viewport_bottom`),
+    /// which is why this accessor reports the viewport delta instead: on the diff path the delta equals `k`, the quantity tests and PF-06 can assert.
+    ///
+    /// Boundaries: (1) 0 when the content still fits the screen (viewport top stays 0) — expected, do not assert `k` there;
+    /// (2) **0 on the full-redraw path by fiat** — there the advancement is the terminal's natural overflow while replaying the whole stream, not
+    /// canvas advancement (a deliberate inconsistency; do not read it as a per-frame advancement budget);
+    /// (3) reset at flush entry (next to `last_repaint_span = None`) and by [`Self::clear`] / [`Self::set_size`].
+    /// Consumers: unit tests (append-scroll assertions); planned PF-06 (assertion input only — PF-06 computes its own `height - F` budget).
+    pub fn last_scroll_rows(&self) -> usize {
+        self.last_scroll_rows
+    }
+
     /// Content rows **written** by the most recent flush, as an inclusive `[first, last]` span.
     ///
     /// `None` when the flush found nothing to write (reset at flush entry, so a no-change frame can never
@@ -188,6 +231,7 @@ impl ScrollbackCanvas {
             // flush is a full redraw, so a stale value would mislead the frame metrics.
             self.fixed_rows = 0;
             self.last_repaint_span = None;
+            self.last_scroll_rows = 0;
         }
         changed
     }
@@ -201,6 +245,12 @@ impl ScrollbackCanvas {
     /// 2. Otherwise line-level diff: if the target line is below the previous viewport bottom, first move the cursor to the screen bottom, then advance into scrollback with `"\r\n".repeat(scroll)`
     ///    then move the cursor to the first changed line and emit each line with `\r`/`\r\n` + `\x1b[2K` + content;
     /// 3. If old content has more lines than new content, clear the extra lines and move back; wrap everything in synchronized output.
+    ///
+    /// # Cost model (PF-05)
+    /// The diff walks `0..max(prev_len, new_len)` (iteration count is O(rows), unchanged), but each iteration is a `Rc::ptr_eq` for rows the
+    /// row cache served unchanged and only falls back to a content comparison when a handle changed ([`changed_range`]). The previous frame's
+    /// stream is promoted with [`Self::promote_frame`] (`mem::swap`, zero allocations/copies) — pi does the same thing with
+    /// `this.previousLines = newLines` (`tui.ts:1616`).
     pub(crate) fn flush<W: Write>(&mut self, out: &mut W) -> Result<(), TerminalError> {
         let height = (self.height as usize).max(1);
         let width = self.width as usize;
@@ -209,30 +259,27 @@ impl ScrollbackCanvas {
         // PF-01: this span always describes the *current* flush only; clearing it here means the early-return
         // paths below (nothing changed, or a redraw that fails) can never leave a stale window behind.
         self.last_repaint_span = None;
+        // PF-05: same rule for the advancement metric — reset at the entry (not only in `clear`/`set_size`) so a frame that returns early
+        // or takes the full-redraw path can never republish the previous frame's value.
+        self.last_scroll_rows = 0;
+        let entry_viewport_top = self.prev_viewport_top;
 
-        // Find first / last changed lines (total-order comparison of Vec<StyledSegment>).
-        let max_lines = new_len.max(prev_len);
-        let mut first: Option<usize> = None;
-        let mut last: Option<usize> = None;
-        for i in 0..max_lines {
-            let old = self.prev_lines.get(i);
-            let new = self.lines.get(i);
-            if old != new {
-                if first.is_none() {
-                    first = Some(i);
-                }
-                last = Some(i);
-            }
-        }
+        // First / last changed content row (`ptr_eq` fast path, content fallback; index-wise, missing rows count as changed).
+        let changed = changed_range(&self.prev_lines, &self.lines);
 
-        let Some(first) = first else {
-            // No visible change: keep previous frame state (leave prev_lines untouched).
+        let Some((first, last)) = changed else {
+            // No visible change: promote anyway (semantically a no-op, keeps the "after flush `lines` is empty" invariant) and return.
+            self.promote_frame();
             return Ok(());
         };
-        let last = last.unwrap();
 
         // Full redraw path: first frame / changed region above the previous viewport (already scrolled away) / content shrank overall.
-        if prev_len == 0 || first < self.prev_viewport_top || first >= new_len {
+        if needs_full_render(
+            changed,
+            &self.prev_lines,
+            &self.lines,
+            self.prev_viewport_top,
+        ) {
             self.full_render(out, width, height)?;
             return Ok(());
         }
@@ -310,8 +357,10 @@ impl ScrollbackCanvas {
         self.hardware_cursor_row = final_cursor_row;
         self.prev_viewport_top = prev_vpt.max(final_cursor_row.saturating_sub(height - 1));
         self.viewport_top = self.prev_viewport_top;
-        self.prev_lines = self.lines.clone();
+        self.promote_frame();
         self.prev_height = height as u16;
+        // PF-05: content rows that left the screen this frame = net viewport advance (equals `k` for an append of `k` rows).
+        self.last_scroll_rows = self.prev_viewport_top.saturating_sub(entry_viewport_top);
         // IME cursor anchor: after content and state finalization, position the (hidden) hardware cursor at the editor caret (line diff
         // finalization is on the last line; the anchor row may move up/down; overrides final_cursor_row for the next frame's diff).
         self.position_cursor_hint(out)?;
@@ -363,16 +412,93 @@ impl ScrollbackCanvas {
         self.hardware_cursor_row = new_len.saturating_sub(1);
         self.prev_viewport_top = new_len.saturating_sub(height);
         self.viewport_top = self.prev_viewport_top;
-        self.prev_lines = self.lines.clone();
+        self.promote_frame();
         self.prev_height = height as u16;
         // PF-01: a full redraw writes **every** content row (cleared screen + one `\x1b[2K` + line per row; the
         // overflow scrolls into scrollback), so the span covers the whole line stream rather than just the
         // visible window. Empty stream ⇒ nothing written ⇒ None.
         self.last_repaint_span = new_len.checked_sub(1).map(|last| (0, last));
+        // PF-05: `last_scroll_rows` stays 0 here **by fiat** — the advancement on this path is the terminal's natural overflow while the whole
+        // stream is replayed, not canvas advancement (do not read it as a per-frame advancement budget).
         // IME cursor anchor: the full redraw path also positions after finalization (terminal-ime-anchor-fix).
         self.position_cursor_hint(out)?;
         Ok(())
     }
+
+    /// Promote this frame's line stream to next frame's diff baseline: the Rust equivalent of pi's `this.previousLines = newLines`.
+    ///
+    /// `mem::swap` + `clear` hands the whole buffer over (capacity swapped, not dropped) — zero allocations, zero copies. Do **not** use
+    /// `mem::take`: it replaces `lines` with `Vec::new()`, losing the capacity, so the next frame re-grows it and the "a cache-hit frame allocates
+    /// nothing" property is lost. Do not `extend_from_slice` either (N refcount ops, and promote stops being O(1)).
+    /// Residual: dropping the old baseline is N refcount decrements (no allocation; measured by `bench_promote_cost`).
+    /// Safe on the no-change early-return path: that path leaves `hardware_cursor_row` / `prev_viewport_top` / `prev_height` untouched, i.e. they
+    /// already agree with the stream, so promoting an identical stream is a semantic no-op.
+    /// ⚠️ Ordering constraint with the frame metrics: `TuiLoop::run_scrollback` reads `content_height()` **after** flush, so `app_loop` captures
+    /// `line_total` before calling flush. Never "fix" that by making `lines` survive the promote.
+    fn promote_frame(&mut self) {
+        std::mem::swap(&mut self.prev_lines, &mut self.lines);
+        // `lines` now holds the previous baseline; keep its capacity for the next frame's push loop.
+        self.lines.clear();
+    }
+}
+
+/// Are two line handles the same line? Pointer equality first, content equality as the fallback.
+///
+/// The scrollback canvas rebuilds its stream from the row caches every frame, so an unchanged row arrives as the very same `Rc` (cache hit)
+/// ⇒ one pointer compare. A re-rendered row gets a fresh `Rc`, which only disqualifies the fast path: the content comparison then decides, so a
+/// row that re-rendered to identical text is still reported unchanged (same result as pi's line-string comparison — this saves *work*, not
+/// *writes*).
+fn same_line(a: &LineSegs, b: &LineSegs) -> bool {
+    Rc::ptr_eq(a, b) || a == b
+}
+
+/// First and last content row that differ between the previous frame and this one, or `None` when the streams are equal.
+///
+/// Iterates `0..max(prev.len(), new.len())`; a missing row on either side counts as a change, so growth and shrink are both detected here.
+/// Cost: iteration count is O(rows); what PF-05 changes is the per-iteration cost — `ptr_eq` for unchanged rows, content comparison only when a
+/// handle changed.
+/// ⚠️ Implementation trap: never express this as `prev.get(i) != new.get(i)` — `Option<&LineSegs>::ne` compiles and silently delegates to `Rc`'s
+/// *content* `PartialEq`, bypassing [`same_line`] and restoring the old full-order comparison ("not faster, and nobody can tell why").
+/// Boundary: content differences only. Rows that must be rewritten merely because a growth shifted them stay the caller's concern (`flush` extends
+/// to the end when the tail moved).
+fn changed_range(prev: &[LineSegs], new: &[LineSegs]) -> Option<(usize, usize)> {
+    let max_len = prev.len().max(new.len());
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    for i in 0..max_len {
+        let unchanged = match (prev.get(i), new.get(i)) {
+            (Some(old), Some(new)) => same_line(old, new),
+            _ => false,
+        };
+        if !unchanged {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i;
+        }
+    }
+    first.map(|first| (first, last))
+}
+
+/// Does this frame have to take the full-redraw path instead of the row diff?
+///
+/// The cheap row diff assumes the screen still shows the previous frame's rows at the same positions. That stops being true when there is no
+/// baseline yet (first frame), when the content shrank below the changed rows (the change is "all deletions", nothing left to repaint), or when
+/// the first changed row is **above** the previous viewport top — those rows are already in the scrollback and can only be repaired by replaying
+/// the whole stream (pi `tui.ts:1457`, kept verbatim per the performance plan §PF-05 item 3).
+/// Takes the already-computed diff plus both slices (slice lengths are read internally): four same-typed `usize` parameters would let a swapped
+/// argument compile silently, and `changed` is passed in so the caller does not pay for a second scan.
+/// Boundary: a resize never reaches here — `set_size` clears the baseline, so `prev.is_empty()` routes to the full redraw anyway.
+fn needs_full_render(
+    changed: Option<(usize, usize)>,
+    prev: &[LineSegs],
+    new: &[LineSegs],
+    prev_viewport_top: usize,
+) -> bool {
+    let Some((first, _)) = changed else {
+        return false;
+    };
+    prev.is_empty() || first < prev_viewport_top || first >= new.len()
 }
 
 /// Truncate a line to the canvas column width: count display columns across segments; if remaining space is less than a wide char's full width, drop it (never split in half).
@@ -511,7 +637,177 @@ mod tests {
         assert_eq!(c3.lines[0][0].text, "ab");
     }
 
+    /// PF-05 measurement (ignored): the per-line diff scan in `flush` **after** the shared-handle change.
+    ///
+    /// History: PF-04 measured this probe at 0.07 ms / 2500 lines and it was documented as "exactly the `old != new` total-order comparison
+    /// over a full history"; `docs/performance-optimization-plan.md` quotes that number. PF-05 replaced the comparison with a `Rc::ptr_eq`
+    /// fast path, so the same code now times a **different quantity** at a different order of magnitude (the plan's quoted figure must be
+    /// re-recorded, otherwise someone will later cite "still 0.07 ms after PF-05" as evidence).
+    /// Run with: `cargo test -p zen-tui --release -- --ignored --nocapture bench_flush_diff`
+    #[test]
+    #[ignore = "manual timing check (release): cargo test -p zen-tui --release -- --ignored"]
+    fn bench_flush_diff_after_row_cache() {
+        let (width, rows, lines) = (80u16, 40u16, 2500usize);
+        let mut canvas = ScrollbackCanvas::new(width, rows);
+        // Shared handles, re-pushed identically every frame: this is the all-hit frame (the row cache serves the same allocations).
+        let base: Vec<LineSegs> = (0..lines)
+            .map(|i| {
+                Rc::new(vec![
+                    plain(&format!("line {i}: ")),
+                    seg("inline_code", Style::fg(crossterm::style::Color::Yellow)),
+                    plain(" the session tree is the core of the product, "),
+                    seg("every message", Style::fg(crossterm::style::Color::Cyan)),
+                ])
+            })
+            .collect();
+        for line in &base {
+            canvas.push_line_pre_truncated(line.clone());
+        }
+        let mut sink: Vec<u8> = Vec::new();
+        // First flush establishes `prev_lines` (the diff base); afterwards the streams are identical = the all-hit frame.
+        canvas
+            .flush(&mut sink)
+            .expect("flush into a Vec never fails");
+        let iterations = 10u32;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            canvas.clear();
+            for line in &base {
+                canvas.push_line_pre_truncated(line.clone());
+            }
+            sink.clear();
+            canvas
+                .flush(&mut sink)
+                .expect("flush into a Vec never fails");
+        }
+        let per = (started.elapsed() / iterations).as_secs_f64() * 1000.0;
+        println!("bench_flush_diff: lines={lines} per_flush={per:.3}ms");
+        if !cfg!(debug_assertions) {
+            // Sanity ceiling only (the real budget lives with the frame metrics, not this probe).
+            assert!(per <= 16.0, "diff scan for {lines} lines took {per:.3}ms");
+        }
+    }
+
+    /// PF-05 measurement (ignored): the two shapes the diff baseline can take — a deep copy vs a shared-handle bump.
+    ///
+    /// Step 0 of the task: the canvas used to keep its diff baseline by `prev_lines = lines.clone()` (one deep copy of the whole history per
+    /// frame, the same shape as the row cache → canvas copy in `ui.rs::push_row_lines`). This probe times the two alternatives on a realistic
+    /// 2500-line stream, so the implementation record has a measured "cost of the two clones" instead of an estimate.
+    /// Run with: `cargo test -p zen-tui --release -- --ignored --nocapture bench_promote_cost`
+    #[test]
+    #[ignore = "manual timing check (release): cargo test -p zen-tui --release -- --ignored"]
+    fn bench_promote_cost() {
+        let lines: Vec<Vec<StyledSegment>> = (0..2500)
+            .map(|i| {
+                vec![
+                    plain(&format!("line {i}: ")),
+                    seg("inline_code", Style::fg(crossterm::style::Color::Yellow)),
+                    plain(" the session tree is the core of the product, "),
+                    seg("every message", Style::fg(crossterm::style::Color::Cyan)),
+                ]
+            })
+            .collect();
+        let shared: Vec<LineSegs> = lines.iter().cloned().map(Rc::new).collect();
+        let iterations = 20u32;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let copy = lines.clone();
+            std::hint::black_box(&copy);
+        }
+        let deep = (started.elapsed() / iterations).as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let bump = shared.clone();
+            std::hint::black_box(&bump);
+        }
+        let shallow = (started.elapsed() / iterations).as_secs_f64() * 1000.0;
+        println!(
+            "bench_promote_cost: lines={} deep_clone={deep:.3}ms handle_bump={shallow:.3}ms ratio={:.1}x",
+            lines.len(),
+            deep / shallow
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                shallow <= deep,
+                "a handle bump must never be slower than a deep copy"
+            );
+        }
+    }
+
+    /// PF-05 measurement (ignored): one appended line on top of a 2500-line history — the frame shape the task is about.
+    ///
+    /// The draw side rebuilds the whole stream every frame (that is the draw contract), so the rebuild happens outside the timer and only
+    /// `flush` is measured: baseline promote (`mem::swap`) + diff scan (`ptr_eq`) + the one written line.
+    /// Run with: `cargo test -p zen-tui --release -- --ignored --nocapture bench_append_frame_flush`
+    #[test]
+    #[ignore = "manual timing check (release): cargo test -p zen-tui --release -- --ignored"]
+    fn bench_append_frame_flush() {
+        let (width, rows, lines) = (80u16, 40u16, 2500usize);
+        let mut canvas = ScrollbackCanvas::new(width, rows);
+        let base: Vec<LineSegs> = (0..lines)
+            .map(|i| {
+                Rc::new(vec![
+                    plain(&format!("line {i}: ")),
+                    seg("inline_code", Style::fg(crossterm::style::Color::Yellow)),
+                    plain(" the session tree is the core of the product, "),
+                    seg("every message", Style::fg(crossterm::style::Color::Cyan)),
+                ])
+            })
+            .collect();
+        for line in &base {
+            canvas.push_line_pre_truncated(line.clone());
+        }
+        let mut sink: Vec<u8> = Vec::new();
+        canvas
+            .flush(&mut sink)
+            .expect("flush into a Vec never fails");
+        let iterations = 10u32;
+        let mut total = std::time::Duration::ZERO;
+        for k in 0..iterations {
+            // Rebuild the frame (untimed): identical history + one appended line.
+            canvas.clear();
+            for line in &base {
+                canvas.push_line_pre_truncated(line.clone());
+            }
+            // Append cumulatively: each measured frame adds one row to the previous frame's stream (a real append, not "rewrite the last line").
+            for extra in 0..=k {
+                canvas.push_line_pre_truncated(Rc::new(vec![plain(&format!("appended {extra}"))]));
+            }
+            sink.clear();
+            let started = std::time::Instant::now();
+            canvas
+                .flush(&mut sink)
+                .expect("flush into a Vec never fails");
+            total += started.elapsed();
+        }
+        let per = (total / iterations).as_secs_f64() * 1000.0;
+        println!(
+            "bench_append_frame_flush: lines={lines} per_flush={per:.3}ms bytes={} span={:?} scroll_rows={}",
+            sink.len(),
+            canvas.last_repaint_span(),
+            canvas.last_scroll_rows()
+        );
+        if !cfg!(debug_assertions) {
+            assert!(per <= 16.0, "append frame flush took {per:.3}ms");
+        }
+    }
+
     // ── flush: full repaint (first frame) ──
+
+    #[test]
+    fn test_push_line_pre_truncated_keeps_the_line_verbatim() {
+        // Cache-hit path: the caller already truncated to the cached width, so this entry must NOT scan/truncate again
+        // (that per-character scan is exactly what PF-04 removes from the steady-state frame).
+        let mut c = ScrollbackCanvas::new(4, 10);
+        c.push_line_pre_truncated(Rc::new(vec![plain("abcd"), red("e")]));
+        assert_eq!(c.content_height(), 1);
+        assert_eq!(c.lines[0].len(), 2, "segments preserved as-is");
+        assert_eq!(c.lines[0][0].text, "abcd");
+        assert_eq!(
+            c.lines[0][1].text, "e",
+            "not truncated here (caller's duty)"
+        );
+    }
 
     #[test]
     fn test_first_flush_writes_all_lines_and_sets_viewport() {
@@ -553,9 +849,25 @@ mod tests {
         let mut c = ScrollbackCanvas::new(10, 3);
         c.push_line(vec![plain("a")]);
         c.flush(&mut Vec::new()).unwrap();
+        // PF-05: a flush promotes the stream and leaves `lines` empty for the next draw, so "no change" means the draw side pushes the
+        // identical stream again (not "flush twice without drawing").
+        c.clear();
+        c.push_line(vec![plain("a")]);
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
         assert!(out.is_empty(), "Diff should output no bytes when unchanged");
+        assert_eq!(c.last_repaint_span(), None);
+        assert_eq!(c.last_scroll_rows(), 0);
+        assert_eq!(
+            c.content_height(),
+            0,
+            "flush clears the stream for the next draw"
+        );
+        assert_eq!(
+            c.prev_lines.len(),
+            1,
+            "the baseline is what survives a flush"
+        );
     }
 
     #[test]
@@ -654,6 +966,8 @@ mod tests {
         c.push_line(vec![plain("a")]);
         c.flush(&mut Vec::new()).unwrap();
         c.set_size(10, 3);
+        c.clear();
+        c.push_line(vec![plain("a")]);
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
         assert!(out.is_empty());
@@ -845,6 +1159,10 @@ mod tests {
         let mut out = Vec::new();
         c.flush(&mut out).unwrap();
         assert_eq!(c.last_repaint_span(), Some((0, 1)));
+        // PF-05: the draw side rebuilds the (identical) stream before the next flush.
+        c.clear();
+        c.push_line(vec![plain("a")]);
+        c.push_line(vec![plain("b")]);
         out.clear();
         c.flush(&mut out).unwrap();
         assert!(out.is_empty(), "steady-state frame must write nothing");
@@ -906,5 +1224,237 @@ mod tests {
         assert_eq!(c.fixed_rows(), 7);
         assert!(c.set_size(41, 10));
         assert_eq!(c.fixed_rows(), 0);
+    }
+
+    // ── PF-05: shared handles, copy-free promote, converged write span ──
+
+    fn shared(text: &str) -> LineSegs {
+        Rc::new(vec![plain(text)])
+    }
+
+    #[test]
+    fn promote_frame_aliases_the_stream_and_empties_it_for_the_next_draw() {
+        // The Rust equivalent of pi's `this.previousLines = newLines`: the baseline shares the very same allocations (no deep copy), and
+        // `lines` is left empty (with its capacity) for the next draw.
+        let line = shared("a");
+        let mut c = ScrollbackCanvas::new(20, 5);
+        c.push_line_pre_truncated(line.clone());
+        c.flush(&mut Vec::new()).unwrap();
+        assert_eq!(c.prev_lines.len(), 1);
+        assert!(
+            Rc::ptr_eq(&c.prev_lines[0], &line),
+            "promote must alias the pushed handle, not copy it"
+        );
+        assert_eq!(c.content_height(), 0, "lines is cleared for the next draw");
+    }
+
+    #[test]
+    fn same_line_uses_pointer_equality_then_content_equality() {
+        let a = shared("a");
+        let same_allocation = a.clone();
+        let same_content = shared("a");
+        assert!(same_line(&a, &same_allocation));
+        assert!(
+            same_line(&a, &same_content),
+            "a re-rendered row with identical content is still the same line"
+        );
+        assert!(!same_line(&a, &shared("b")));
+    }
+
+    #[test]
+    fn changed_range_reports_first_and_last_content_difference() {
+        let (a, b, c) = (shared("a"), shared("b"), shared("c"));
+        let one = std::slice::from_ref(&a);
+        assert_eq!(changed_range(&[], &[]), None);
+        assert_eq!(changed_range(one, one), None);
+        // Re-rendered but identical content: not a change.
+        assert_eq!(changed_range(one, &[shared("a")]), None);
+        // Append / mid change / shrink (the vanished row counts as changed).
+        assert_eq!(changed_range(one, &[a.clone(), b.clone()]), Some((1, 1)));
+        assert_eq!(
+            changed_range(&[a.clone(), b.clone()], &[a.clone(), c.clone()]),
+            Some((1, 1))
+        );
+        assert_eq!(changed_range(&[a.clone(), b.clone()], &[a]), Some((1, 1)));
+    }
+
+    #[test]
+    fn needs_full_render_covers_first_frame_shrink_and_change_above_viewport() {
+        let (a, b) = (shared("a"), shared("b"));
+        let empty: [LineSegs; 0] = [];
+        let one = [a.clone()];
+        let two = [a.clone(), b.clone()];
+        // First frame (no baseline).
+        assert!(needs_full_render(Some((0, 0)), &empty, &two, 0));
+        // Plain append inside the viewport.
+        assert!(!needs_full_render(Some((1, 1)), &one, &two, 0));
+        // Change above the previous viewport top → replay the whole stream (pi `tui.ts:1457`).
+        assert!(needs_full_render(
+            Some((1, 1)),
+            &two,
+            &[a.clone(), shared("c")],
+            2
+        ));
+        // All deletions (`first >= new.len()`).
+        assert!(needs_full_render(Some((1, 1)), &two, &one, 0));
+        // No diff at all never triggers a full render.
+        assert!(!needs_full_render(None, &two, &two, 99));
+    }
+
+    #[test]
+    fn append_frame_does_not_reprint_history_and_advances_by_the_new_rows() {
+        let mut c = ScrollbackCanvas::new(20, 3);
+        let base: Vec<LineSegs> = (0..5).map(|i| shared(&format!("hist{i}"))).collect();
+        for line in &base {
+            c.push_line_pre_truncated(line.clone());
+        }
+        c.flush(&mut Vec::new()).unwrap();
+
+        c.clear();
+        for line in &base {
+            c.push_line_pre_truncated(line.clone());
+        }
+        c.push_line_pre_truncated(shared("brand new"));
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("hist0"),
+            "an append frame must not reprint history: {text:?}"
+        );
+        assert!(text.contains("brand new"));
+        assert_eq!(c.last_repaint_span(), Some((5, 5)));
+        assert_eq!(
+            c.last_scroll_rows(),
+            1,
+            "5 rows history + 1 appended, height 3"
+        );
+    }
+
+    #[test]
+    fn append_bytes_are_independent_of_history_length() {
+        fn append_bytes(history: usize) -> usize {
+            let mut c = ScrollbackCanvas::new(40, 3);
+            let base: Vec<LineSegs> = (0..history).map(|i| shared(&format!("h{i}"))).collect();
+            for line in &base {
+                c.push_line_pre_truncated(line.clone());
+            }
+            c.flush(&mut Vec::new()).unwrap();
+            c.clear();
+            for line in &base {
+                c.push_line_pre_truncated(line.clone());
+            }
+            c.push_line_pre_truncated(shared("appended row"));
+            let mut out = Vec::new();
+            c.flush(&mut out).unwrap();
+            assert_eq!(c.last_repaint_span(), Some((history, history)));
+            out.len()
+        }
+        let small = append_bytes(200);
+        let large = append_bytes(2500);
+        let ratio = large as f64 / small as f64;
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "append bytes must not scale with history: 200 rows = {small}B, 2500 rows = {large}B"
+        );
+    }
+
+    #[test]
+    fn anchored_tail_append_writes_only_new_rows_plus_the_tail() {
+        // The assembled shape (interactive mode): `F` fixed-region rows trail the message area, so the growth does **not** start at
+        // `prev_len` — `append_start` is false, yet the write span is exactly `k + F` rows and the advancement is `k`.
+        let (height, tail_rows, new_rows) = (10u16, 3usize, 2usize);
+        // Enough message rows that the viewport is already pinned to the bottom (`vpt = len - height`) in both frames — otherwise the
+        // first `k` rows are consumed by filling the screen and the advancement is smaller than `k`.
+        let messages: Vec<LineSegs> = (0..20).map(|i| shared(&format!("msg{i}"))).collect();
+        let tail: Vec<LineSegs> = (0..tail_rows)
+            .map(|i| shared(&format!("tail{i}")))
+            .collect();
+        let mut c = ScrollbackCanvas::new(20, height);
+        for line in messages.iter().chain(tail.iter()) {
+            c.push_line_pre_truncated(line.clone());
+        }
+        c.flush(&mut Vec::new()).unwrap();
+
+        c.clear();
+        for line in &messages {
+            c.push_line_pre_truncated(line.clone());
+        }
+        for i in 0..new_rows {
+            c.push_line_pre_truncated(shared(&format!("new{i}")));
+        }
+        for line in &tail {
+            c.push_line_pre_truncated(line.clone());
+        }
+        let line_total = c.content_height();
+        let mut out = Vec::new();
+        c.flush(&mut out).unwrap();
+        let span = c.last_repaint_span().expect("growth must write something");
+        assert_eq!(
+            span,
+            (messages.len(), line_total - 1),
+            "write span = insertion point..end = k + F rows (the minimum before PF-06)"
+        );
+        assert_eq!(
+            span.1 - span.0 + 1,
+            new_rows + tail_rows,
+            "exactly the new rows plus the shifted tail"
+        );
+        assert_eq!(c.last_scroll_rows(), new_rows);
+    }
+
+    #[test]
+    fn non_overflow_append_does_not_advance_the_viewport() {
+        // Content still fits the screen: nothing leaves for the scrollback, so the advancement is 0 (do not assert `k` here).
+        let mut c = ScrollbackCanvas::new(20, 10);
+        c.push_line_pre_truncated(shared("a"));
+        c.flush(&mut Vec::new()).unwrap();
+        c.clear();
+        c.push_line_pre_truncated(shared("a"));
+        c.push_line_pre_truncated(shared("b"));
+        c.flush(&mut Vec::new()).unwrap();
+        assert_eq!(c.last_scroll_rows(), 0);
+    }
+
+    #[test]
+    fn full_redraw_reports_zero_advancement_by_fiat() {
+        let mut c = ScrollbackCanvas::new(20, 2);
+        for i in 0..5 {
+            c.push_line_pre_truncated(shared(&format!("l{i}")));
+        }
+        c.flush(&mut Vec::new()).unwrap();
+        assert_eq!(c.last_repaint_span(), Some((0, 4)));
+        assert_eq!(
+            c.last_scroll_rows(),
+            0,
+            "full redraw reports 0 by fiat: its advancement is terminal overflow, not canvas advancement"
+        );
+    }
+
+    #[test]
+    fn clear_and_set_size_reset_the_advancement_report() {
+        let mut c = ScrollbackCanvas::new(20, 2);
+        let base: Vec<LineSegs> = (0..4).map(|i| shared(&format!("l{i}"))).collect();
+        for line in &base {
+            c.push_line_pre_truncated(line.clone());
+        }
+        // First flush is a full redraw ⇒ 0 by fiat.
+        c.flush(&mut Vec::new()).unwrap();
+        assert_eq!(c.last_scroll_rows(), 0);
+        // An append frame on the diff path does advance.
+        c.clear();
+        for line in &base {
+            c.push_line_pre_truncated(line.clone());
+        }
+        c.push_line_pre_truncated(shared("x"));
+        c.flush(&mut Vec::new()).unwrap();
+        assert!(c.last_scroll_rows() > 0);
+        c.clear();
+        assert_eq!(c.last_scroll_rows(), 0, "clear resets the report");
+        c.push_line_pre_truncated(shared("x"));
+        c.flush(&mut Vec::new()).unwrap();
+        c.set_size(30, 4);
+        assert_eq!(c.last_scroll_rows(), 0, "a resize resets the report");
     }
 }

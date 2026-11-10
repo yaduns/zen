@@ -279,6 +279,10 @@ impl TuiLoop {
                 canvas.clear();
                 (draw)(&mut canvas);
                 probe.mark_draw();
+                // PF-05: `flush` promotes the stream with `mem::swap` and leaves `lines` empty, so `content_height()` must be read
+                // **before** the flush (otherwise `FrameMetrics::line_total` would be 0 every frame and PF-01's `written_fixed`
+                // derivation would collapse the fixed-region interval to the empty set).
+                let line_total = canvas.content_height();
                 let (result, bytes) = {
                     let mut out = CountingWriter::new(this.terminal.out_mut());
                     let result = canvas.flush(&mut out).map_err(TuiError::from);
@@ -287,7 +291,7 @@ impl TuiLoop {
                 probe.finish(
                     bytes,
                     canvas.last_repaint_span(),
-                    canvas.content_height(),
+                    line_total,
                     canvas.fixed_rows(),
                 );
                 result?;

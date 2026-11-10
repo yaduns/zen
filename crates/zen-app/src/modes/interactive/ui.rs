@@ -51,19 +51,77 @@ use zen_tui::autocomplete::{
     is_at_attachment_context, AutocompleteProvider, AutocompleteSuggestions,
     CombinedAutocompleteProvider, SlashCommand,
 };
+use zen_tui::components::cache::{CacheKey, LineCache};
 use zen_tui::components::input::Input;
 use zen_tui::components::select_list::SelectAction;
 use zen_tui::components::Component;
 use zen_tui::editor::EditorAction;
+use zen_tui::highlight::{LineSegs, StyledSegment};
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
 use zen_tui::screen::{ScreenBuffer, Style};
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 use zen_tui::viewport::ScrollbackCanvas;
 
-/// Height cap for single-line metrics of message blocks (the measure stage enlarges the cap and takes the real height; lines exceeding it are truncated by this value for scroll computation;
-/// the vast majority of lines in the chat window are far below this value, and truncating giant lines (e.g. very long bash output) is an acceptable v1 approximation).
+/// Height cap for a single row's measurement/render (`ScreenBuffer` height cap).
+/// Chat lines are far below this value in the vast majority of cases; truncating giant lines (e.g. very long bash output) to this value
+/// keeps the measured height bounded for scroll computation and is an acceptable v1 approximation (PF-04 reuses it for the row cache).
 const MEASURE_HEIGHT_CAP: u16 = 300;
+
+/// One `ChatRow`'s render state (PF-04): its content generation plus its own line cache, one-to-one and co-lived with `chat_rows[i]`.
+///
+/// It deliberately holds **no component instance**: row components borrow `&self.theme` / `&self.kb` (`Box<dyn Component + '_>`), so keeping
+/// them alive across frames would force owned theme snapshots plus a hand-written rebuild matrix — while what actually costs 49 µs/row is
+/// markdown + highlighting, not component construction. Caching the rendered lines saves exactly that, and the component is still built
+/// transiently on a miss (see `render_row_lines`).
+#[derive(Debug, Default)]
+struct RowView {
+    /// Content generation; bumped only through the five row helpers (`push_row`/`replace_row`/`update_row`/`clear_rows`/`bump_row`).
+    version: u64,
+    /// Rendered lines of this row, keyed by `(width, version, global_epoch)`.
+    cache: LineCache,
+}
+
+/// UI-level generation of the inputs shared by **every** row (PF-04): theme / thinking collapse / output padding.
+///
+/// It folds those inputs into one `u64` that goes into every cache key, so "global invalidation" has the same automatic semantics as the
+/// per-row content version — there is no "remember to call `invalidate_all`" step any more.
+///
+/// The two `Copy + Eq` inputs are compared against last frame's snapshot on every frame ([`RenderEpoch::current`]), which makes the settings
+/// panel's per-keypress write-back (`handle_panel_key`) free: the value is unchanged ⇒ no epoch bump ⇒ zero re-renders.
+/// The theme cannot be compared (`Theme` derives only `Debug + Clone`; comparing `theme.name` would miss a same-name hot reload whose colors
+/// changed), so it is advanced explicitly by [`RenderEpoch::bump`] at the single theme assignment site.
+#[derive(Debug, Default)]
+struct RenderEpoch {
+    /// Current generation; both progression paths share this counter.
+    epoch: u64,
+    /// Snapshot of `hide_thinking_block` as of the last frame (change detection only, never used for rendering).
+    hide_thinking_block: bool,
+    /// Snapshot of `output_pad` as of the last frame.
+    output_pad: u16,
+}
+
+impl RenderEpoch {
+    /// Fold this frame's live inputs into the current generation and return the epoch to put into every cache key.
+    ///
+    /// If `hide_thinking_block` or `output_pad` differs from last frame's snapshot the epoch advances by one, so every row cache misses
+    /// exactly once and then settles again. This is what makes the settings panel cheap: `handle_panel_key` writes both fields back on
+    /// every keypress, and an unchanged value now costs nothing.
+    fn current(&mut self, hide_thinking_block: bool, output_pad: u16) -> u64 {
+        if hide_thinking_block != self.hide_thinking_block || output_pad != self.output_pad {
+            self.hide_thinking_block = hide_thinking_block;
+            self.output_pad = output_pad;
+            self.epoch += 1;
+        }
+        self.epoch
+    }
+
+    /// Advance unconditionally — for changes that cannot be detected by comparison (a theme switch: `Theme` is only `Debug + Clone`).
+    fn bump(&mut self) -> u64 {
+        self.epoch += 1;
+        self.epoch
+    }
+}
 
 /// Initial preference injection carrier at startup (T-AP-02-3-fix): reads once from the merged settings view,
 /// supplying UI field initialization for `InteractiveUi::new`; runtime changes (Ctrl+T etc.) do not go through this struct and do not flow back to settings
@@ -81,7 +139,12 @@ pub(crate) struct UiPrefs {
 
 /// Shared rendering/interaction state on the UI task side (`Rc<RefCell<InteractiveUi>>` shared by the on_event/on_wake/draw closures);
 /// Holds owned Theme and editor; data snapshot rendered line by line (components are constructed transiently, not stored in 'static containers;
-/// the status line is the exception — its `status_indicator` persistent instance is reused across frames, see apply_status).
+/// the status line's `status_indicator` persistent instance is reused across frames to keep the animation clock, see apply_status).
+///
+/// **PF-04 render cache**: what persists per row is not a component but its rendered **lines** (`RowView::cache`, keyed by
+/// `width + content version + global render epoch`), so an unchanged row costs no markdown/highlight/component work. The epoch is derived
+/// once per frame from the inputs shared by all rows (`RenderEpoch`), which is why a theme switch / thinking toggle / padding change needs no
+/// manual "invalidate everything" call.
 ///
 /// **Send note**: this type contains `Rc<RefCell<EditorRoute>>` and `CustomEditor` (which holds !Send callbacks),
 /// so it is inherently non-Send—the UI task does not cross threads and the main task never holds this type (it only communicates via channels), so `Rc` is safe.
@@ -92,7 +155,9 @@ pub struct InteractiveUi {
     // SelectAction domain keymap (T-AP-06-2): clone-injected components when open_settings_panel opens the panel
     select_kb: KeybindingsManager<SelectAction>,
     editor: CustomEditor, // owned; contains on_action/on_escape/on_exit/on_submit/on_change callbacks—callbacks fire inside handle_key and are routed as InputCommand
-    chat_rows: Vec<ChatRow>, // Message/tool/bash/summary line data snapshot
+    chat_rows: Vec<ChatRow>, // Message/tool/bash/summary line data snapshot (mutations go through the 5 row helpers; PF-04)
+    row_views: Vec<RowView>, // PF-04: per-row render state (content generation + line cache); index space == chat_rows
+    render_epoch: RenderEpoch, // PF-04: generation of the row-shared render inputs (theme / thinking collapse / output padding)
     pending_rows: Vec<String>, // Snapshot of queued follow-up message texts (strictly aligned with UiEvent::PendingChanged(Vec<String>))
     streaming_index: Option<usize>, // Index of the current streaming assistant line (wholesale replacement of the snapshot on update)
     bash_index: Option<usize>, // Current streaming user bash row index (T-AP-04-2-fix: located via BashUpdate/BashEnd)
@@ -523,6 +588,8 @@ impl InteractiveUi {
             select_kb,
             editor,
             chat_rows: Vec::new(),
+            row_views: Vec::new(),
+            render_epoch: RenderEpoch::default(),
             pending_rows: Vec::new(),
             streaming_index: None,
             bash_index: None,
@@ -1448,6 +1515,8 @@ impl InteractiveUi {
     /// Localization: ToolsExpand flips the expanded state (`folded` set) of all tool/bash/summary lines at once.
     /// Aligns with pi `toggleToolOutputExpansion` (v1 component expansion differs little under fallback layout; semantic interface preserved).
     fn toggle_rows_expanded(&mut self) {
+        // Collect first, bump afterwards: `bump_row` needs `&mut self` while the iteration above holds `&self.chat_rows`.
+        let mut flipped: Vec<usize> = Vec::new();
         for (idx, row) in self.chat_rows.iter().enumerate() {
             match row {
                 ChatRow::Tool { .. }
@@ -1460,9 +1529,14 @@ impl InteractiveUi {
                     } else {
                         self.folded.insert(idx);
                     }
+                    flipped.push(idx);
                 }
                 _ => {}
             }
+        }
+        // PF-04: `folded` lives outside `ChatRow`, so each flipped row's cache must be told to re-render.
+        for idx in flipped {
+            self.bump_row(idx);
         }
     }
 
@@ -1495,7 +1569,7 @@ impl InteractiveUi {
             } => {
                 // T-AP-04-3: append summary line after compaction (consumes the ChatRow slot reserved by T-AP-11-2;
                 // aligned with pi compaction_end → addMessageToChat(createCompactionSummaryMessage))
-                self.chat_rows.push(ChatRow::CompactionSummary {
+                self.push_row(ChatRow::CompactionSummary {
                     summary,
                     tokens_before,
                 });
@@ -1535,7 +1609,9 @@ impl InteractiveUi {
                 // No local state change (producer for at-attachment trigger fix = trigger_autocomplete spawn task).
             }
             UiEvent::ThemeChanged(theme) => {
-                self.theme = theme;
+                // PF-04: the new theme is not detectable by comparison, so the setter advances the render epoch
+                // unconditionally — every row cache misses once and the whole screen repaints in the new colors.
+                self.set_theme(theme);
                 // Border color rebuilt from theme tokens (aligned with pi onThemeChange → updateEditorBorderColor).
                 let token = if self.is_bash_mode {
                     ColorToken::BashMode
@@ -1590,10 +1666,11 @@ impl InteractiveUi {
             }
             UiEvent::BranchSummaryRow { summary } => {
                 // Append-only UI deviation (same type as T-AP-04-3): after navigation completes, append a summary line without rebuilding the chat
-                self.chat_rows.push(ChatRow::BranchSummary { summary });
+                self.push_row(ChatRow::BranchSummary { summary });
             }
             UiEvent::ChatReset => {
-                self.chat_rows.clear();
+                // PF-04: also clears row render state and the `folded` set (previously leaked into the next conversation — existing bug).
+                self.clear_rows();
                 self.pending_rows.clear();
                 self.streaming_index = None;
                 self.bash_index = None;
@@ -1608,7 +1685,7 @@ impl InteractiveUi {
             UiEvent::CacheMissNotice { text } => {
                 // T-OB-01-3: cache miss notice lines (producer = bridge MessageEnd / resume stream re-injection;
                 // Warning semantic color drawn directly, aligned with pi addCacheMissNotice's theme warning coloring).
-                self.chat_rows.push(ChatRow::Info {
+                self.push_row(ChatRow::Info {
                     text,
                     kind: InfoKind::Warning,
                 });
@@ -1751,10 +1828,10 @@ impl InteractiveUi {
             match msg {
                 Message::User(user) => {
                     let text = extract_user_text(&user);
-                    self.chat_rows.push(ChatRow::User { text });
+                    self.push_row(ChatRow::User { text });
                 }
                 Message::Assistant(a) => {
-                    self.chat_rows.push(ChatRow::Assistant(a));
+                    self.push_row(ChatRow::Assistant(a));
                 }
                 Message::ToolResult(_) => {}
             }
@@ -1762,7 +1839,7 @@ impl InteractiveUi {
                 .iter()
                 .find_map(|(idx, t)| (*idx == i).then(|| t.clone()))
             {
-                self.chat_rows.push(ChatRow::Info {
+                self.push_row(ChatRow::Info {
                     text,
                     kind: InfoKind::Warning,
                 });
@@ -1776,12 +1853,12 @@ impl InteractiveUi {
         match msg {
             Message::User(user) => {
                 let text = extract_user_text(&user);
-                self.chat_rows.push(ChatRow::User { text });
+                self.push_row(ChatRow::User { text });
             }
             Message::Assistant(a) => {
                 let idx = self.chat_rows.len();
                 self.streaming_index = Some(idx);
-                self.chat_rows.push(ChatRow::Assistant(a));
+                self.push_row(ChatRow::Assistant(a));
             }
             Message::ToolResult(_) => {}
         }
@@ -1791,9 +1868,7 @@ impl InteractiveUi {
     fn apply_message_update(&mut self, msg: Message) {
         if let Message::Assistant(a) = msg {
             if let Some(idx) = self.streaming_index {
-                if idx < self.chat_rows.len() {
-                    self.chat_rows[idx] = ChatRow::Assistant(a);
-                }
+                self.replace_row(idx, ChatRow::Assistant(a));
             }
         }
     }
@@ -1804,16 +1879,16 @@ impl InteractiveUi {
             Message::Assistant(a) => {
                 if let Some(idx) = self.streaming_index {
                     if idx < self.chat_rows.len() {
-                        self.chat_rows[idx] = ChatRow::Assistant(a);
+                        self.replace_row(idx, ChatRow::Assistant(a));
                     } else {
-                        self.chat_rows.push(ChatRow::Assistant(a));
+                        self.push_row(ChatRow::Assistant(a));
                     }
                 } else {
                     // No active streaming row (e.g., missing prior event before an error): append a row directly to avoid losing the message.
-                    self.chat_rows.push(ChatRow::Assistant(a));
+                    self.push_row(ChatRow::Assistant(a));
                 }
                 if let Some(err) = error_text {
-                    self.chat_rows.push(ChatRow::Info {
+                    self.push_row(ChatRow::Info {
                         text: err,
                         kind: InfoKind::Error,
                     });
@@ -1827,7 +1902,7 @@ impl InteractiveUi {
     /// User `!` bash start (T-AP-04-2-fix): lay down an empty `ChatRow::Bash` row and record
     /// `bash_index`; subsequent `BashUpdate`/`BashEnd` locate it and backfill.
     fn apply_bash_start(&mut self, command: String, exclude_from_context: bool) {
-        self.chat_rows.push(ChatRow::Bash {
+        self.push_row(ChatRow::Bash {
             command,
             exclude_from_context,
             output: String::new(),
@@ -1842,11 +1917,12 @@ impl InteractiveUi {
 
     /// User bash output incremental chunk (pushed block by block via `on_chunk`): append to the `bash_index` row's output.
     fn apply_bash_update(&mut self, output: String) {
-        if let Some(ChatRow::Bash { output: o, .. }) =
-            self.bash_index.and_then(|idx| self.chat_rows.get_mut(idx))
-        {
-            o.push_str(&output);
-        }
+        let Some(idx) = self.bash_index else { return };
+        self.update_row(idx, |row| {
+            if let ChatRow::Bash { output: o, .. } = row {
+                o.push_str(&output);
+            }
+        });
     }
 
     /// User bash completion (T-AP-04-2-fix): backfill exit code/cancel/truncation/full output path, close the streaming row.
@@ -1857,18 +1933,22 @@ impl InteractiveUi {
         truncated: bool,
         full_output_path: Option<String>,
     ) {
-        if let Some(ChatRow::Bash {
-            exit_code: ec,
-            cancelled: c,
-            truncated: t,
-            full_output_path: f,
-            ..
-        }) = self.bash_index.and_then(|idx| self.chat_rows.get_mut(idx))
-        {
-            *ec = exit_code;
-            *c = cancelled;
-            *t = Some(truncated);
-            *f = full_output_path;
+        if let Some(idx) = self.bash_index {
+            self.update_row(idx, |row| {
+                if let ChatRow::Bash {
+                    exit_code: ec,
+                    cancelled: c,
+                    truncated: t,
+                    full_output_path: f,
+                    ..
+                } = row
+                {
+                    *ec = exit_code;
+                    *c = cancelled;
+                    *t = Some(truncated);
+                    *f = full_output_path;
+                }
+            });
         }
         self.bash_index = None;
     }
@@ -1877,7 +1957,7 @@ impl InteractiveUi {
     fn apply_tool_start(&mut self, id: String, name: String, args: Value) {
         let idx = self.chat_rows.len();
         self.tool_indices.insert(id.clone(), idx);
-        self.chat_rows.push(ChatRow::Tool {
+        self.push_row(ChatRow::Tool {
             tool_call_id: id,
             tool_name: name,
             args,
@@ -1890,9 +1970,11 @@ impl InteractiveUi {
     /// Streaming argument update: locate the row by tool_call_id and replace the argument snapshot.
     fn apply_tool_update(&mut self, id: String, args: Value) {
         if let Some(&idx) = self.tool_indices.get(&id) {
-            if let Some(ChatRow::Tool { args: a, .. }) = self.chat_rows.get_mut(idx) {
-                *a = args;
-            }
+            self.update_row(idx, |row| {
+                if let ChatRow::Tool { args: a, .. } = row {
+                    *a = args;
+                }
+            });
         }
     }
 
@@ -1905,16 +1987,101 @@ impl InteractiveUi {
     ) {
         if let Some(&idx) = self.tool_indices.get(&id) {
             self.tool_indices.remove(&id);
-            if let Some(ChatRow::Tool {
-                result: r,
-                is_partial,
-                ..
-            }) = self.chat_rows.get_mut(idx)
-            {
-                *r = Some(convert_tool_result(&result, is_error));
-                *is_partial = false;
-            }
+            self.update_row(idx, |row| {
+                if let ChatRow::Tool {
+                    result: r,
+                    is_partial,
+                    ..
+                } = row
+                {
+                    *r = Some(convert_tool_result(&result, is_error));
+                    *is_partial = false;
+                }
+            });
         }
+    }
+
+    // ── PF-04: row mutation choke points (every write to `chat_rows` goes through these) ──
+
+    /// Append a row together with a fresh render state, keeping `row_views.len() == chat_rows.len()`.
+    ///
+    /// Every `chat_rows.push` goes through here: a raw push would leave the row without a cache slot, and — worse — after a raw clear the
+    /// next push would inherit the *previous* row's cache and render someone else's lines. Consumers: message/tool/bash/summary/info paths,
+    /// including `apply_restore_history` (which only appends).
+    fn push_row(&mut self, row: ChatRow) {
+        let idx = self.chat_rows.len();
+        self.chat_rows.push(row);
+        self.ensure_row_view(idx);
+    }
+
+    /// Replace a row's data in place and bump its content generation (streaming delta, tool/bash back-fill, message end).
+    fn replace_row(&mut self, idx: usize, row: ChatRow) {
+        if idx >= self.chat_rows.len() {
+            return;
+        }
+        self.chat_rows[idx] = row;
+        self.ensure_row_view(idx);
+        self.row_views[idx].version += 1;
+    }
+
+    /// Mutate a row in place (bash output append, tool argument/result back-fill) and bump its content generation.
+    /// No-op when `idx` is out of range, mirroring the previous `if let Some(..) = get_mut(..)` guards.
+    fn update_row<F: FnOnce(&mut ChatRow)>(&mut self, idx: usize, f: F) {
+        match self.chat_rows.get_mut(idx) {
+            Some(row) => f(row),
+            None => return, // Stale index (row cleared or never created): leave caches untouched.
+        }
+        self.ensure_row_view(idx);
+        self.row_views[idx].version += 1;
+    }
+
+    /// Drop all rows, their render state, **and the `folded` set** (`ChatReset`).
+    ///
+    /// `folded` is indexed by row number, so leaving it behind makes the next conversation inherit the previous one's collapse states —
+    /// an existing bug fixed here in passing. Never call this from `apply_restore_history` (that path only appends; clearing would
+    /// delete live rows).
+    fn clear_rows(&mut self) {
+        self.chat_rows.clear();
+        self.row_views.clear();
+        self.folded.clear();
+    }
+
+    /// Force row `idx` to re-render next frame without touching its data (`folded` lives outside `ChatRow` but changes the rendered shape).
+    fn bump_row(&mut self, idx: usize) {
+        if idx < self.chat_rows.len() {
+            self.ensure_row_view(idx);
+            self.row_views[idx].version += 1;
+        }
+    }
+
+    /// Make sure `row_views[idx]` exists (lazily grows; never shrinks — that is `clear_rows`'s job).
+    fn ensure_row_view(&mut self, idx: usize) {
+        while self.row_views.len() <= idx {
+            self.row_views.push(RowView::default());
+        }
+    }
+
+    /// Epoch for this frame's cache keys (once per frame; see [`RenderEpoch::current`]).
+    fn current_global_epoch(&mut self) -> u64 {
+        self.render_epoch
+            .current(self.hide_thinking_block, self.output_pad)
+    }
+
+    /// Replace the theme and advance the render epoch.
+    ///
+    /// A theme switch changes every row's colors but no row's content, so without the bump the whole screen would keep the old colors
+    /// forever (pi's `Box.invalidate()` recursion). Unconditional by design: `Theme` has no `PartialEq`, and comparing `theme.name` would
+    /// miss a same-name hot reload whose colors changed.
+    fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.render_epoch.bump();
+    }
+
+    /// Total real renders across all row caches (diagnostics/acceptance; a steady-state frame must leave this unchanged).
+    /// Consumers: `ui.rs` unit tests only, hence test-gated (a lib build would otherwise flag it as dead code).
+    #[cfg(test)]
+    fn row_cache_renders(&self) -> u64 {
+        self.row_views.iter().map(|view| view.cache.renders()).sum()
     }
 
     /// Per-frame composited rendering (**cell-level diff mode**): top-down cursor advance — message area (chat_rows scrolling window + pending
@@ -1984,13 +2151,113 @@ impl InteractiveUi {
         let _ = footer.render(buf, 0, editor_y + editor_h, width, footer_h);
     }
 
+    /// Render one row to styled lines **without touching the cache** (pure read): the single place that knows
+    /// 「`Info` rows are drawn by direct text wrapping, all other rows by a transient component」.
+    ///
+    /// Lines are filtered exactly like the pre-PF-04 streaming path (`line_segments` non-empty ⇒ kept), so the resulting line stream is
+    /// byte-identical. They are also **already truncated to `width`** (they come out of the width-bounded `ScreenBuffer`), which is the
+    /// precondition for pushing them through the non-truncating canvas entry on a cache hit.
+    /// The theme borrow happens inside this method on purpose: it must not be hoisted into the caller's loop (which holds `&mut self`).
+    /// Consumer: [`InteractiveUi::push_row_lines`] on a cache miss.
+    fn render_row_lines(
+        &self,
+        index: usize,
+        scratch: &mut ScreenBuffer,
+        width: u16,
+    ) -> Vec<Vec<StyledSegment>> {
+        let Some(row) = self.chat_rows.get(index) else {
+            return Vec::new();
+        };
+        // Info rows do not use a component: semantic-colored text drawn directly (aligned with the cell path's paint_row).
+        if let ChatRow::Info { text, kind } = row {
+            let token = match kind {
+                InfoKind::Error => ColorToken::Error,
+                InfoKind::Warning => ColorToken::Warning,
+                InfoKind::Status => ColorToken::Muted,
+            };
+            let style = Style::fg(self.theme.fg(token));
+            // Long messages (e.g. full API error bodies) are wrapped to the visible width, then streamed line by line.
+            return zen_tui::wrap::word_wrap_line(text, width.max(1) as usize)
+                .into_iter()
+                .map(|chunk| {
+                    vec![StyledSegment {
+                        style: style.clone(),
+                        text: chunk.text,
+                    }]
+                })
+                .collect();
+        }
+        // Measure-as-render into the scratch buffer, then extract per row into style segments for streaming.
+        let used = {
+            let mut comp = self.build_row_component(row, index);
+            comp.render(scratch, 0, 0, width, MEASURE_HEIGHT_CAP)
+        };
+        let mut lines = Vec::with_capacity(used as usize);
+        for r in 0..used {
+            let segs = scratch.line_segments(r);
+            if !segs.is_empty() {
+                lines.push(segs);
+            }
+        }
+        scratch.clear();
+        lines
+    }
+
+    /// Append row `index`'s lines to the canvas: cache hit ⇒ straight from the cache through the non-truncating entry (no component,
+    /// no markdown, no width scan), miss ⇒ [`InteractiveUi::render_row_lines`] + `store`, then append. The per-row body of
+    /// `render_scrollback`.
+    ///
+    /// `epoch` is computed once per frame by the caller ([`InteractiveUi::current_global_epoch`]) — recomputing it per row would be
+    /// wasteful and could theoretically split one frame across two epochs.
+    /// Borrow shape (a hard requirement, not style): the lines are produced as an owned value first, because `render_row_lines` borrows
+    /// `&self` while storing needs `&mut self.row_views[index]`.
+    /// **PF-05**: both paths share allocations instead of copying them — a hit hands the cached line handles to the canvas (one refcount bump,
+    /// the Rust equivalent of pi's `this.previousLines = newLines` reference alias), and a miss wraps the freshly rendered lines once via
+    /// [`InteractiveUi::share_lines`].
+    fn push_row_lines(
+        &mut self,
+        index: usize,
+        epoch: u64,
+        scratch: &mut ScreenBuffer,
+        canvas: &mut ScrollbackCanvas,
+    ) {
+        let width = canvas.width();
+        self.ensure_row_view(index);
+        let key = CacheKey {
+            width,
+            content_version: self.row_views[index].version,
+            global_epoch: epoch,
+        };
+        if self.row_views[index].cache.get(&key).is_none() {
+            let lines = Self::share_lines(self.render_row_lines(index, scratch, width));
+            self.row_views[index].cache.store(key, lines);
+        }
+        // Hit (either it already was, or we just stored): push the cached line handles verbatim — already truncated to `width` and
+        // shared, so this is one refcount bump per line (no allocation).
+        if let Some(lines) = self.row_views[index].cache.get(&key) {
+            for line in lines {
+                canvas.push_line_pre_truncated(line.clone());
+            }
+        }
+    }
+
+    /// Turn one row's freshly rendered lines into shared handles, once per cache miss.
+    ///
+    /// The miss path is the only place that owns brand-new line vectors; wrapping them here is what lets every later reader (row cache →
+    /// canvas → next frame's diff baseline) share one allocation instead of copying it (PF-05).
+    /// One `Rc` allocation per line, misses only.
+    fn share_lines(lines: Vec<Vec<StyledSegment>>) -> Vec<LineSegs> {
+        lines.into_iter().map(Rc::new).collect()
+    }
+
     /// The message area and other bottom fixed regions render as a "content line stream" (scrollback mode): chat lines are pushed into the canvas continuously
     /// (off-screen content is carried by the terminal scrollback, so render's hard-cropped window is no longer needed); status line/editor/footer act as
     /// the tail of the fixed-region line stream — users can scroll the terminal to review the full history. Scrollback-mode assembly is selected by `init` in mod.rs
     /// （`tui.run_scrollback` + `draw = |c| ui.render_scrollback(c)`）。
-    /// Reuses render_chat's measurement/component construction logic, but renders each row into a temporary ScreenBuffer and then extracts it for streaming via
-    /// `ScreenBuffer::line_segments` (components unchanged); fixed regions are still drawn into a screen-height ScreenBuffer
-    /// and then bridged wholesale as the line stream tail.
+    /// **PF-04**: each row is served from its line cache ([`LineCache`]) when `(width, version, global_epoch)` is unchanged, so a frame in which nothing changed
+    /// performs **no** markdown/highlight/component work at all — only the line-stream rebuild (one clone per line, the residual cost handed to PF-05).
+    /// A changed row is rendered once (transient component into a temporary `ScreenBuffer`, extracted via `ScreenBuffer::line_segments`) and stored back;
+    /// fixed regions are still drawn into a screen-height `ScreenBuffer` and bridged wholesale as the line-stream tail.
     pub(crate) fn render_scrollback(&mut self, canvas: &mut ScrollbackCanvas) {
         let width = canvas.width();
         if width == 0 {
@@ -2023,41 +2290,20 @@ impl InteractiveUi {
             }
             return;
         }
-        let theme = &self.theme;
-
         // ── 1. Message area content line stream: all chat rows (no window, full history; off-screen content carried by scrollback) ──
+        // PF-04: unchanged rows are served from their line cache (no component construction, no markdown/highlight, no width scan);
+        // only a changed row is rendered again. One epoch for the whole frame (it must not change mid-frame).
+        let epoch = self.current_global_epoch();
         let mut scratch = ScreenBuffer::new(width, MEASURE_HEIGHT_CAP);
-        for (i, row) in self.chat_rows.iter().enumerate() {
-            // Info line does not use a component: semantic-colored text drawn directly (aligned with paint_row).
-            if let ChatRow::Info { text, kind } = row {
-                let token = match kind {
-                    InfoKind::Error => ColorToken::Error,
-                    InfoKind::Warning => ColorToken::Warning,
-                    InfoKind::Status => ColorToken::Muted,
-                };
-                let style = Style::fg(theme.fg(token));
-                // Long messages (e.g. full API error bodies) are wrapped to the visible width, then streamed line by line,
-                let content_width = width.max(1) as usize;
-                for chunk in zen_tui::wrap::word_wrap_line(text, content_width) {
-                    canvas.push_text(chunk.text, style.clone());
-                }
-                continue;
-            }
-            // Measure-as-render (same temporary buffer), then extract per row into style segments for streaming.
-            let used = self.measure_row(row, i, &mut scratch, width);
-            for r in 0..used {
-                let segs = scratch.line_segments(r);
-                if !segs.is_empty() {
-                    canvas.push_line(segs);
-                }
-            }
-            scratch.clear();
+        // Indexed loop is mandatory: `push_row_lines` needs `&mut self` while `iter()` would hold `&self` for the whole loop.
+        for i in 0..self.chat_rows.len() {
+            self.push_row_lines(i, epoch, &mut scratch, canvas);
         }
         // Pending queue rows (dim, appended at the end of the message area, aligned with render_chat).
+        let dim_style = Style::fg(self.theme.fg(ColorToken::Dim));
         for text in &self.pending_rows {
-            let style = Style::fg(theme.fg(ColorToken::Dim));
             let line = format!("↳ Follow-up: {text}");
-            canvas.push_text(line, style);
+            canvas.push_text(line, dim_style.clone());
         }
 
         // ── 2. Fixed-region tail (status line + editor + footer) drawn into a screen-height buffer → bridged wholesale into the line stream ──
@@ -2148,7 +2394,10 @@ impl InteractiveUi {
         let mut scratch = ScreenBuffer::new(width, MEASURE_HEIGHT_CAP);
         let mut heights: Vec<u16> = Vec::with_capacity(self.chat_rows.len());
         for (i, row) in self.chat_rows.iter().enumerate() {
-            let h = self.measure_row(row, i, &mut scratch, width);
+            // PF-04: the former `measure_row` folded in here — its scrollback caller was replaced by the row cache, so this dead
+            // cell-level path is the only remaining user (keeping the helper would leave a `dead_code` warning).
+            let mut comp = self.build_row_component(row, i);
+            let h = comp.render(&mut scratch, 0, 0, width, MEASURE_HEIGHT_CAP);
             heights.push(h);
         }
         // Pending queue rows counted at 1 row each (text truncation handled at draw time)
@@ -2196,18 +2445,6 @@ impl InteractiveUi {
             buf.write(0, y, &style, &line);
             y += 1;
         }
-    }
-
-    /// Measure a single row's actual render height (temporary buffer + height cap).
-    fn measure_row(
-        &self,
-        row: &ChatRow,
-        row_index: usize,
-        scratch: &mut ScreenBuffer,
-        width: u16,
-    ) -> u16 {
-        let mut comp = self.build_row_component(row, row_index);
-        comp.render(scratch, 0, 0, width, MEASURE_HEIGHT_CAP)
     }
 
     /// Draw a single row: construct the component → render into the real buffer (height limited to the remaining area; multi-row truncation is handled by the component/buffer).
@@ -2656,21 +2893,15 @@ mod tests {
             StopReason::Stop,
         );
         u.apply(UiEvent::MessageStart(Message::Assistant(m)));
+        // PF-04: goes through `render_row_lines` (the former `measure_row` was folded into the dead cell path).
         let mut scratch = ScreenBuffer::new(100, 300);
-        for (i, row) in u.chat_rows.iter().enumerate() {
-            let used = u.measure_row(row, i, &mut scratch, 100);
-            for r in 0..used {
-                let segs = scratch.line_segments(r);
-                if !segs.is_empty() {
-                    let text: String = segs.iter().map(|s| s.text.as_str()).collect();
-                    let fgs: Vec<String> =
-                        segs.iter().map(|s| format!("{:?}", s.style.fg)).collect();
-                    let bgs: Vec<String> =
-                        segs.iter().map(|s| format!("{:?}", s.style.bg)).collect();
-                    eprintln!("row {r}: {text:?}\n   fg={fgs:?} bg={bgs:?}");
-                }
+        for i in 0..u.chat_rows.len() {
+            for (r, segs) in u.render_row_lines(i, &mut scratch, 100).iter().enumerate() {
+                let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+                let fgs: Vec<String> = segs.iter().map(|s| format!("{:?}", s.style.fg)).collect();
+                let bgs: Vec<String> = segs.iter().map(|s| format!("{:?}", s.style.bg)).collect();
+                eprintln!("row {r}: {text:?}\n   fg={fgs:?} bg={bgs:?}");
             }
-            scratch.clear();
         }
     }
 
@@ -2994,6 +3225,497 @@ mod tests {
         let _ = buf.size();
     }
 
+    // ── PF-04: per-row render cache (steady-state frames re-render nothing) ──────────
+
+    /// Per-row real-render counts (`LineCache::renders` of every `RowView`).
+    fn row_renders(u: &InteractiveUi) -> Vec<u64> {
+        u.row_views.iter().map(|v| v.cache.renders()).collect()
+    }
+
+    /// Apply one assistant streaming snapshot so that a row exists with `streaming_index` pointing at it.
+    fn start_streaming_assistant(u: &mut InteractiveUi, text: &str) {
+        u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+            vec![text_block(text)],
+            StopReason::Stop,
+        ))));
+    }
+
+    // ── PF-05: line-stream convergence (assembled, reused canvas) ──
+
+    /// Render one frame into a canvas that is **reused** across frames (the real loop shape) and return the frame's line total.
+    ///
+    /// ⚠️ `render_scrollback` does **not** clear the canvas — that is `run_scrollback`'s job — so a reused canvas must be cleared here.
+    /// Forgetting it would push the previous frame's rows a second time and make every assertion below meaningless.
+    ///
+    /// Deviation (registered in `tasks/PF-05-implemented.md`): `ScrollbackCanvas::flush` is `pub(crate)` in zen-tui, so the byte/span-level
+    /// assertions of this frame cannot be made from zen-app; they live in `zen-tui` with an assembled-shape fixture
+    /// (`viewport::tests::anchored_tail_append_writes_only_new_rows_plus_the_tail`). Here we assert the *draw-side* half: which line stream
+    /// the canvas sees (that half is what PF-04's row cache and PF-05's `share_lines` produce).
+    fn render_frame_lines(u: &mut InteractiveUi, canvas: &mut ScrollbackCanvas) -> usize {
+        canvas.clear();
+        u.render_scrollback(canvas);
+        canvas.content_height()
+    }
+
+    #[test]
+    fn test_scrollback_steady_frame_rebuilds_an_identical_line_stream() {
+        // PF-05 T9 (draw-side half): on a reused canvas, a frame with no content change must produce exactly the same stream (same length),
+        // which is the precondition for "the flush writes 0 bytes" that zen-tui asserts at the canvas level.
+        // (Every pre-existing `render_scrollback` test builds a *fresh* canvas, so the cross-frame stream was never compared.)
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("hello"))));
+        start_streaming_assistant(&mut u, "world");
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        let first = render_frame_lines(&mut u, &mut canvas);
+        assert!(first > 0);
+        let renders_before = u.row_cache_renders();
+        let second = render_frame_lines(&mut u, &mut canvas);
+        assert_eq!(
+            second, first,
+            "the identical frame rebuilds the same stream"
+        );
+        assert_eq!(
+            u.row_cache_renders() - renders_before,
+            0,
+            "and it re-renders nothing (PF-04 cache hit)"
+        );
+    }
+
+    #[test]
+    fn test_scrollback_append_frame_grows_before_the_fixed_tail() {
+        // PF-05 T4 (draw-side half): appending a row inserts lines **before** the fixed tail, so the tail's content rows shift by `k` — the
+        // reason a pre-PF-06 append frame must repaint `k + F` rows (deviation D2) instead of `k`.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("hello"))));
+        start_streaming_assistant(&mut u, "world");
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        let prev_total = render_frame_lines(&mut u, &mut canvas);
+        let fixed = canvas.fixed_rows();
+        assert!(fixed >= 6, "status + editor + footer rows, got {fixed}");
+
+        u.apply(UiEvent::MessageStart(Message::User(user_message(
+            "second question",
+        ))));
+        let line_total = render_frame_lines(&mut u, &mut canvas);
+        assert!(
+            line_total > prev_total,
+            "the new row must add lines: {prev_total} -> {line_total}"
+        );
+        assert_eq!(
+            canvas.fixed_rows(),
+            fixed,
+            "the fixed tail keeps its row count; only its content-row index shifts"
+        );
+    }
+
+    #[test]
+    fn test_row_cache_steady_state_rerenders_nothing() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("hello"))));
+        start_streaming_assistant(&mut u, "world");
+        let mut first = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut first);
+        let base = u.row_cache_renders();
+        assert!(base >= 2, "the first frame renders every row (got {base})");
+        let height_first = first.content_height();
+
+        let mut second = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut second);
+        assert_eq!(
+            u.row_cache_renders() - base,
+            0,
+            "a steady-state frame must not re-render any row (no markdown, no highlight)"
+        );
+        assert_eq!(
+            second.content_height(),
+            height_first,
+            "the cached line stream must be identical"
+        );
+    }
+
+    #[test]
+    fn test_row_cache_lines_are_already_truncated_to_canvas_width() {
+        // Precondition of `push_line_pre_truncated`: cached lines never exceed the key width, otherwise a cache hit would
+        // silently overflow the canvas geometry (the non-truncating entry does not clip).
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message(
+            &"supercalifragilisticexpialidocious ".repeat(6),
+        ))));
+        let width = 40;
+        let mut canvas = ScrollbackCanvas::new(width, 24);
+        u.render_scrollback(&mut canvas);
+        let epoch = u.render_epoch.epoch;
+        let mut checked = 0;
+        for view in &u.row_views {
+            let key = CacheKey {
+                width,
+                content_version: view.version,
+                global_epoch: epoch,
+            };
+            let Some(lines) = view.cache.get(&key) else {
+                panic!("every rendered row must have a cache entry under the current key");
+            };
+            for line in lines {
+                let cols: usize = line
+                    .iter()
+                    .map(|seg| zen_tui::screen::visible_width(&seg.text))
+                    .sum();
+                assert!(cols <= width as usize, "line wider than key width: {cols}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the wrapped user row must have produced lines");
+    }
+
+    #[test]
+    fn test_row_cache_message_update_rerenders_only_the_streaming_row() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("first"))));
+        start_streaming_assistant(&mut u, "partial");
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let before = row_renders(&u);
+        assert_eq!(before.len(), 2);
+
+        u.apply(UiEvent::MessageUpdate(Message::Assistant(assistant(
+            vec![text_block("partial more")],
+            StopReason::Stop,
+        ))));
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let after = row_renders(&u);
+        assert_eq!(after[0] - before[0], 0, "the user row is unchanged");
+        assert_eq!(after[1] - before[1], 1, "the streaming row re-renders once");
+    }
+
+    #[test]
+    fn test_row_cache_tool_end_rerenders_only_that_row() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("run it"))));
+        u.apply(UiEvent::ToolStart {
+            id: "t1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let before = row_renders(&u);
+        assert_eq!(before.len(), 2);
+
+        u.apply(UiEvent::ToolEnd {
+            id: "t1".into(),
+            result: zen_ai::tool::ToolExecutionResult {
+                message: ToolResultMessage {
+                    tool_call_id: "t1".into(),
+                    tool_name: "bash".into(),
+                    content: vec![text_block("total 0")],
+                    details: None,
+                    usage: None,
+                    is_error: false,
+                    added_tool_names: None,
+                    timestamp: 0,
+                },
+                terminate: false,
+            },
+            is_error: false,
+        });
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let after = row_renders(&u);
+        assert_eq!(after[0] - before[0], 0, "the user row is unchanged");
+        assert_eq!(
+            after[1] - before[1],
+            1,
+            "the completed tool row re-renders once"
+        );
+    }
+
+    #[test]
+    fn test_row_cache_tools_expand_rerenders_only_tool_rows() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("run it"))));
+        u.apply(UiEvent::ToolStart {
+            id: "t1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let before = row_renders(&u);
+
+        // `folded` lives outside `ChatRow`; toggling it must bump exactly the affected rows.
+        u.toggle_rows_expanded();
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let after = row_renders(&u);
+        assert_eq!(after[0] - before[0], 0, "user rows are not foldable");
+        assert_eq!(after[1] - before[1], 1, "the tool row re-renders");
+    }
+
+    #[test]
+    fn test_row_cache_thinking_toggle_invalidates_without_any_setter() {
+        // The render epoch must detect the two `Copy + Eq` inputs by itself — a plain field assignment (here: the Ctrl+T path
+        // and the settings panel write-back) is enough, no setter call to forget.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+            vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "deep thought line one\nline two\nline three".into(),
+                    thinking_signature: None,
+                    redacted: None,
+                }),
+                text_block("answer body"),
+            ],
+            StopReason::Stop,
+        ))));
+        let mut first = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut first);
+        let before = row_renders(&u);
+        let height_before = first.content_height();
+
+        u.hide_thinking_block = true; // direct assignment: no setter involved
+        let mut second = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut second);
+        let after = row_renders(&u);
+        assert_eq!(
+            after[0] - before[0],
+            1,
+            "the row re-renders under the new epoch"
+        );
+        assert!(
+            second.content_height() < height_before,
+            "collapsed thinking must actually be rendered collapsed ({} < {})",
+            second.content_height(),
+            height_before
+        );
+    }
+
+    #[test]
+    fn test_row_cache_same_value_writeback_is_free() {
+        // The settings panel writes both fields back on every keypress (`handle_panel_key`); unchanged values must cost nothing.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("hello"))));
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let base = u.row_cache_renders();
+
+        u.output_pad = u.output_pad;
+        u.hide_thinking_block = u.hide_thinking_block;
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        assert_eq!(
+            u.row_cache_renders() - base,
+            0,
+            "same-value write-back must not invalidate"
+        );
+    }
+
+    #[test]
+    fn test_row_cache_theme_change_invalidates_every_row() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("hello"))));
+        start_streaming_assistant(&mut u, "world");
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let before = row_renders(&u);
+
+        u.apply(UiEvent::ThemeChanged(
+            zen_tui::theme::builtin_light_theme().clone(),
+        ));
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        let after = row_renders(&u);
+        for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+            assert_eq!(*a - *b, 1, "row {i} must re-render in the new theme");
+        }
+    }
+
+    #[test]
+    fn test_row_cache_width_change_invalidates_every_row() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message("hello"))));
+        let mut wide = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut wide);
+        let before = row_renders(&u);
+
+        // Width is part of the key ⇒ a resize needs no explicit invalidation path.
+        let mut narrow = ScrollbackCanvas::new(40, 24);
+        u.render_scrollback(&mut narrow);
+        let after = row_renders(&u);
+        assert_eq!(after[0] - before[0], 1, "resize must re-render the row");
+    }
+
+    #[test]
+    fn test_chat_reset_clears_row_views_and_folded() {
+        let mut u = ui();
+        u.apply(UiEvent::ToolStart {
+            id: "t1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        u.toggle_rows_expanded(); // fills `folded`
+        assert!(!u.folded.is_empty());
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        assert_eq!(u.row_views.len(), u.chat_rows.len());
+
+        u.apply(UiEvent::ChatReset);
+        assert!(u.chat_rows.is_empty());
+        assert!(
+            u.row_views.is_empty(),
+            "row render state must be dropped together with the rows"
+        );
+        assert!(
+            u.folded.is_empty(),
+            "PF-04 fixes the pre-existing leak: `folded` must not survive a reset"
+        );
+        // Rendering after the reset must not resurrect anything.
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+        assert_eq!(u.row_views.len(), 0);
+    }
+
+    /// PF-04 measurement (ignored): cold frame (every row misses) vs warm frame (every row hits), **plus the split** between the
+    /// row-stream rebuild (the residual per-line `clone` into the canvas) and the canvas diff (`flush`), for two transcript sizes.
+    ///
+    /// The split matters: a single "warm frame = X ms" number cannot tell PF-05 whether to attack the clone or the diff.
+    /// Run with: `cargo test -p zen-app --release -- --ignored --nocapture frame_render_with_row_cache`
+    #[test]
+    #[ignore = "manual frame benchmark (release): cargo test -p zen-app --release -- --ignored"]
+    fn frame_render_with_row_cache_bench() {
+        // Segment 1+2 of the hit path (render/pipe into the canvas) vs segment 3 (frontier diff in `flush`). The truncation scan
+        // (formerly segment 2a) is gone by construction — cached lines go through `push_line_pre_truncated`.
+        let code = "```rust\nfn f(x: u32) -> u32 {\n    // comment\n    x + 1\n}\n```\n";
+        let prose = "The session tree is the core of the product: every message hangs off the previous one.\n\n";
+        let (width, rows) = (80, 40);
+        for messages in [1usize, 20] {
+            let mut blocks: Vec<ContentBlock> = Vec::new();
+            for i in 0..12 {
+                blocks.push(text_block(&format!(
+                    "{prose}Paragraph {i} of the synthetic transcript.\n"
+                )));
+                blocks.push(text_block(code));
+            }
+            let mut u = ui();
+            for m in 0..messages {
+                u.apply(UiEvent::MessageStart(Message::User(user_message(
+                    &format!("message {m}"),
+                ))));
+                u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+                    blocks.clone(),
+                    StopReason::Stop,
+                ))));
+            }
+            // Cold: every row misses.
+            let mut cold_canvas = ScrollbackCanvas::new(width, rows);
+            let cold_started = std::time::Instant::now();
+            u.render_scrollback(&mut cold_canvas);
+            let cold = cold_started.elapsed().as_secs_f64() * 1000.0;
+            let lines = cold_canvas.content_height();
+            let renders_after_cold = u.row_cache_renders();
+
+            // Warm: every row hits — this is what an animation frame "with nothing changed" costs.
+            let iterations = 10;
+            let mut warm_canvas = ScrollbackCanvas::new(width, rows);
+            let warm_started = std::time::Instant::now();
+            for _ in 0..iterations {
+                let mut canvas = ScrollbackCanvas::new(width, rows);
+                u.render_scrollback(&mut canvas);
+                warm_canvas = canvas;
+            }
+            let warm = (warm_started.elapsed() / iterations).as_secs_f64() * 1000.0;
+            assert_eq!(
+                u.row_cache_renders(),
+                renders_after_cold,
+                "warm frames must not render anything"
+            );
+
+            // `render_scrollback` only rebuilds the row stream (the canvas diff happens later, inside `TuiLoop`'s frame closure),
+            // so `warm` **excludes** `flush`. The diff cost for the same line count is measured on the zen-tui side
+            // (`viewport.rs::bench_flush_diff_after_row_cache`, ignored) because `flush` is crate-private there.
+            let _ = &warm_canvas;
+            println!(
+                "frame_render_with_row_cache: messages={messages} lines={lines} cold={cold:.2}ms \
+                 warm={warm:.2}ms (row-stream clone+push only; flush measured in zen-tui)"
+            );
+            if !cfg!(debug_assertions) {
+                assert!(
+                    warm <= 16.0,
+                    "steady-state (all-hit) frame must fit the 16 ms budget, got {warm:.2}ms"
+                );
+            }
+        }
+    }
+
+    /// PF-05 measurement (ignored): the draw-side line-stream cost on a **reused** canvas — cold / steady / append.
+    ///
+    /// PF-04 measured the warm (all-hit) frame at `frame_render_with_row_cache_bench`; PF-05's claim is that the per-line deep copies are gone,
+    /// so this probe reports the same shape after the change (steerable comparison: same synthetic transcript, same 2247-line scale).
+    /// It measures `render_scrollback` only — `flush` is crate-private in zen-tui and is measured there
+    /// (`viewport::bench_append_frame_flush`, `bench_flush_diff_after_row_cache`, `bench_promote_cost`).
+    /// Run with: `cargo test -p zen-app --release -- --ignored --nocapture perf05_`
+    #[test]
+    #[ignore = "manual frame benchmark (release): cargo test -p zen-app --release -- --ignored"]
+    fn perf05_append_frame_cost() {
+        let code = "```rust\nfn f(x: u32) -> u32 {\n    // comment\n    x + 1\n}\n```\n";
+        let prose = "The session tree is the core of the product: every message hangs off the previous one.\n\n";
+        let (width, rows) = (80, 40);
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        for i in 0..12 {
+            blocks.push(text_block(&format!(
+                "{prose}Paragraph {i} of the synthetic transcript.\n"
+            )));
+            blocks.push(text_block(code));
+        }
+        let mut u = ui();
+        for m in 0..20 {
+            u.apply(UiEvent::MessageStart(Message::User(user_message(
+                &format!("message {m}"),
+            ))));
+            u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+                blocks.clone(),
+                StopReason::Stop,
+            ))));
+        }
+        let mut canvas = ScrollbackCanvas::new(width, rows);
+
+        let started = std::time::Instant::now();
+        canvas.clear();
+        u.render_scrollback(&mut canvas);
+        let cold = started.elapsed().as_secs_f64() * 1000.0;
+        let lines = canvas.content_height();
+
+        let iterations = 10u32;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            canvas.clear();
+            u.render_scrollback(&mut canvas);
+        }
+        let steady = (started.elapsed() / iterations).as_secs_f64() * 1000.0;
+
+        // Append one short row, then keep appending while measuring: the append frame re-renders only the streaming row and shares every
+        // other row's handles with the canvas.
+        let started = std::time::Instant::now();
+        for k in 0..iterations {
+            u.apply(UiEvent::MessageStart(Message::User(user_message(
+                &format!("appended {k}"),
+            ))));
+            canvas.clear();
+            u.render_scrollback(&mut canvas);
+        }
+        let append = (started.elapsed() / iterations).as_secs_f64() * 1000.0;
+        println!(
+            "perf05_append_frame_cost: lines={lines} cold={cold:.2}ms steady={steady:.2}ms append={append:.2}ms \
+             (draw side only; flush measured in zen-tui)"
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                steady <= 16.0,
+                "steady-state draw must fit the budget, got {steady:.2}ms"
+            );
+        }
+    }
+
     // ── render_scrollback: line stream output + fixed-region tail ──────────────────
 
     #[test]
@@ -3125,6 +3847,9 @@ mod tests {
 
     /// Manual whole-frame benchmark (PF-01): synthesizes a transcript with code blocks and times one
     /// `render_scrollback` pass, which is the per-frame cost the performance plan measures on real sessions.
+    ///
+    /// **PF-04 note**: its warm-up frame now populates the row caches, so what this test times is the *all-hit* (warm) frame —
+    /// use `frame_render_with_row_cache_bench` for the cold/warm split.
     ///
     /// Ignored by default (it is a measurement, not an assertion). Run with:
     /// `cargo test -p zen-app --release -- --ignored --nocapture frame_render`

@@ -28,6 +28,22 @@ pub struct StyledSegment {
     pub text: String,
 }
 
+/// A rendered line, shared between its producers and the frame line stream: bumping the refcount replaces a deep copy.
+///
+/// Scenario: the scrollback canvas is rebuilt from the row cache on every frame (`zen-app`'s `render_scrollback`) and keeps the previous
+/// frame's stream as its diff baseline. With `Vec<StyledSegment>` that is **two deep copies per line per frame** — the opposite of pi, whose
+/// `this.previousLines = newLines` (`reference/pi-original/packages/tui/src/tui.ts:1616`) hands over an array reference, i.e. O(1) with zero
+/// per-line work. Sharing makes both steps O(1) refcount bumps and restores pi's cost model (PF-05).
+///
+/// Invariant: the payload is immutable by convention (`Rc` only hands out `&Vec<..>`), so nobody can mutate a line another holder is still
+/// diffing against. A re-render allocates a **fresh** `Rc`; that alone does not mean "changed" — it means the row falls back from the
+/// `ptr_eq` fast path to a content comparison (`viewport::same_line`), and only a real content difference gets written.
+/// Not `Arc`: the whole UI path runs inside a `LocalSet` (`!Send`). Consequence for the API surface: `ScrollbackCanvas` and `LineCache` become
+/// `!Send` too — any future consumer that needs `Send` (e.g. PF-08 moving rendering onto another thread) must switch **this alias** to `Arc`
+/// instead of wrapping at the call site.
+/// Consumers: `viewport::ScrollbackCanvas::{push_line, push_line_pre_truncated}`、`components::cache::LineCache`、zen-app `push_row_lines`.
+pub type LineSegs = std::rc::Rc<Vec<StyledSegment>>;
+
 /// Language alias mapping: languages missing from syntect's built-in syntax set (75) → covered by their (superset) equivalent syntax.
 /// Rationale: highlight.js's `typescript` grammar is essentially the `javascript` grammar plus a handful of TS keywords—
 /// mapping ts→js gives highlighting strength equivalent to hljs. Of the Rust/TS/Python/Go/JSON/YAML/Markdown requirement list,
