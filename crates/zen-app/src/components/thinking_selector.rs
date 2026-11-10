@@ -10,7 +10,7 @@ use zen_tui::components::select_list::{
 };
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Thinking level → display description (aligned with pi LEVEL_DESCRIPTIONS, for the description column of the selection list).
@@ -115,7 +115,14 @@ fn level_to_value(level: ThinkingLevel) -> String {
 }
 
 impl Component for ThinkingSelectorComponent {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let mut row = y;
         let mut painted = 0u16;
         let mut remaining = height;
@@ -155,6 +162,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

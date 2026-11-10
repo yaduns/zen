@@ -361,7 +361,14 @@ impl<'a> StartupSelectorComponent<'a> {
 
 impl Component for StartupSelectorComponent<'_> {
     /// render option dialog (multiline title + option list + key hints).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let theme = self.theme;
         let accent = Style::fg(theme.fg(ColorToken::Accent));
         let muted = Style::fg(theme.fg(ColorToken::Muted));

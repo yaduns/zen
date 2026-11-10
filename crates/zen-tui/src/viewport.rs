@@ -134,6 +134,19 @@ impl ScrollbackCanvas {
         self.lines.len()
     }
 
+    /// Read back the **current frame's** line stream by line number (REQ-TUI-01 / REQ-APP-11, long-row-clip-fix): acceptance/diagnostics need to answer
+    /// whether the tail of this 700-line long answer really made it into the canvas, whereas `content_height` only gives the total and cannot show content.
+    ///
+    /// ⚠️ Read window = after `draw`, **before** `flush`: `promote_frame()` at the end of `flush` swaps the current frame's line stream into `prev_lines`
+    /// and clears `lines` (PF-05 invariant) ⇒ always `None` after flush, `content_height()` always 0.
+    /// **Deliberately does not fall back to `prev_lines`**: falling back would hide this invariant, letting a test that casually adds a flush silently read the previous frame.
+    ///
+    /// Edge case: `index` out of bounds ⇒ `None`. Returns a shared handle (`LineSegs`, PF-05); callers must treat it as read-only.
+    /// **pub, but the only current consumer is tests** (`zen-app`'s long-line acceptance test + this module's unit tests); the production path does not read line-stream contents (flush iterates the internal `lines` directly).
+    pub fn line(&self, index: usize) -> Option<&LineSegs> {
+        self.lines.get(index)
+    }
+
     /// Set this frame's IME cursor anchor (editor caret's content line number + absolute column; pass None when no focus).
     /// flush finalization positions the (hidden) hardware cursor at this anchor, so system IME spelling string/candidate window
     /// draw in place (aligned with pi CURSOR_MARKER → positionHardwareCursor, see terminal-ime-anchor-fix).
@@ -617,6 +630,24 @@ mod tests {
         // Can push again after clear and rebuild
         c.push_line(vec![plain("again")]);
         assert_eq!(c.content_height(), 1);
+    }
+
+    #[test]
+    fn test_line_reads_only_the_current_frame_stream() {
+        // long-row-clip-fix acceptance vehicle: the line stream is readable after draw and BEFORE flush;
+        // `flush` promotes the stream to `prev_lines` and clears `lines` (PF-05 invariant), so after flush
+        // the accessor must return None on every index — it deliberately does not fall back to `prev_lines`.
+        let mut c = ScrollbackCanvas::new(20, 5);
+        c.push_line(vec![plain("first")]);
+        c.push_line(vec![plain("second")]);
+        assert!(c.line(2).is_none(), "out of range ⇒ None");
+        assert_eq!(c.line(0).unwrap()[0].text, "first");
+        assert_eq!(c.line(1).unwrap()[0].text, "second");
+
+        c.flush(&mut Vec::new()).unwrap();
+        assert_eq!(c.content_height(), 0);
+        assert!(c.line(0).is_none());
+        assert!(c.line(1).is_none());
     }
 
     #[test]

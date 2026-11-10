@@ -1,4 +1,4 @@
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 
 /// Single-line truncated text component: take content before the first newline, truncate by display columns + ellipsis, with horizontal/vertical padding.
 /// Always one line; if it does not fit, truncate and add an ellipsis. The user sees a "single-line hint bar that does not fear length".
@@ -34,7 +34,14 @@ impl TruncatedText {
 impl super::Component for TruncatedText {
     /// Single-line output: padding_y blank lines + truncated line (left/right padding, padded to width) + padding_y blank lines;
     /// Returns 1 + 2*padding_y (capped at height).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         // Take content before the first newline
         let first_line = self.text.split('\n').next().unwrap_or("");
 

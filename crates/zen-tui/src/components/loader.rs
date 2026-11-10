@@ -4,7 +4,7 @@
 // have all been eliminated: repaint scheduling belongs to TuiLoop animation mode; the component has no cyclic back-reference and no style cache).
 
 use crate::app_loop::DEFAULT_ANIMATION_INTERVAL;
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 use std::time::{Duration, Instant};
 
 /// Default animation frames (aligned with pi `DEFAULT_FRAMES`, ten braille frames).
@@ -107,7 +107,14 @@ impl super::Component for Loader {
     /// first frame) + space + message; when frames is empty (hide indicator), draw only the message (align pi empty frame → no indicator).
     /// Frame grapheme is a narrow character, no special width handling needed. Returns 1 (returns 0 when height is 0).
     /// The leading blank line of pi render is not emitted (spacing is handled by the container/Spacer).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         if height == 0 {
             return 0;
         }
@@ -145,6 +152,7 @@ impl super::Component for Loader {
 mod tests {
     use super::*;
     use crate::components::Component;
+    use crate::screen::ScreenBuffer;
 
     #[test]
     fn new_defaults() {

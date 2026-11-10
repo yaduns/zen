@@ -14,7 +14,7 @@ use zen_tui::components::loader::Loader;
 use zen_tui::components::Component;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Preview line limit (collapsed state; aligns with pi PREVIEW_LINES).
@@ -228,7 +228,14 @@ impl<'a> BashExecutionComponent<'a> {
 }
 
 impl Component for BashExecutionComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let mut row = y;
         let mut painted = 0u16;
         let mut remaining = height;
@@ -388,6 +395,7 @@ mod tests {
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
     use zen_core::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

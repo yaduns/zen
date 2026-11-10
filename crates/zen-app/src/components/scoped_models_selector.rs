@@ -15,7 +15,7 @@ use zen_tui::components::select_list::SelectAction;
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 use crate::components::dynamic_border::DynamicBorder;
@@ -365,7 +365,14 @@ impl ScopedModelsSelectorComponent {
 
 impl Component for ScopedModelsSelectorComponent {
     /// Render panel: border + title/hint + search box + checkbox list + scroll info + footer keybindings and count.
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         if width == 0 || height == 0 {
             return 0;
         }
@@ -670,6 +677,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

@@ -22,9 +22,7 @@ use crate::components::settings_selector::{
     DoubleEscapeAction, SettingsCallbacks, SettingsConfig, SettingsSelectorComponent,
 };
 use crate::components::skill_invocation_message::SkillInvocationMessageComponent;
-use crate::components::status_indicator::{
-    CompactionStatusReason, IdleStatus, StatusIndicator, StatusIndicatorKind,
-};
+use crate::components::status_indicator::{IdleStatus, StatusIndicator, StatusIndicatorKind};
 use crate::components::tool_execution::{ToolExecutionComponent, ToolExecutionResult};
 use crate::components::tree_selector::{FilterMode, TreeSelectorComponent};
 use crate::components::user_message::UserMessageComponent;
@@ -59,14 +57,12 @@ use zen_tui::editor::EditorAction;
 use zen_tui::highlight::{LineSegs, StyledSegment};
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::{LineBuffer, ScreenBuffer, Style};
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 use zen_tui::viewport::ScrollbackCanvas;
 
-/// Height cap for a single row's measurement/render (`ScreenBuffer` height cap).
-/// Chat lines are far below this value in the vast majority of cases; truncating giant lines (e.g. very long bash output) to this value
-/// keeps the measured height bounded for scroll computation and is an acceptable v1 approximation (PF-04 reuses it for the row cache).
-const MEASURE_HEIGHT_CAP: u16 = 300;
+// long-row-clip-fix: the per-line render height budget no longer exists — `render_row_lines` goes through `LineBuffer` (line contract), and the line count is determined by content.
+// The old "300-line measurement cap for a single row" has been removed: thinking consumed it first and dropped the entire body, causing user-visible content loss.
 
 /// One `ChatRow`'s render state (PF-04): its content generation plus its own line cache, one-to-one and co-lived with `chat_rows[i]`.
 ///
@@ -238,7 +234,14 @@ impl SelectorOverlay {
     }
 
     /// Render to buffer (full-screen overlay; x/y/width/height are provided by the caller with full-screen dimensions).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         match self {
             SelectorOverlay::Session(c) => c.render(buf, x, y, width, height),
             SelectorOverlay::Tree(c) => c.render(buf, x, y, width, height),
@@ -308,7 +311,14 @@ impl ChoiceOverlay {
         }
     }
 
-    fn render(&self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let border = Style::fg(self.theme.fg(ColorToken::Border));
         let mut painted = 0u16;
         if height > painted {
@@ -389,7 +399,14 @@ impl CustomInputOverlay {
         self.input.handle_key(key)
     }
 
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let border = Style::fg(self.theme.fg(ColorToken::Border));
         let mut painted = 0u16;
         if height > painted {
@@ -2154,21 +2171,20 @@ impl InteractiveUi {
     /// Render one row to styled lines **without touching the cache** (pure read): the single place that knows
     /// 「`Info` rows are drawn by direct text wrapping, all other rows by a transient component」.
     ///
-    /// Lines are filtered exactly like the pre-PF-04 streaming path (`line_segments` non-empty ⇒ kept), so the resulting line stream is
-    /// byte-identical. They are also **already truncated to `width`** (they come out of the width-bounded `ScreenBuffer`), which is the
-    /// precondition for pushing them through the non-truncating canvas entry on a cache hit.
+    /// **long-row-clip-fix**: the component writes into a [`LineBuffer`] (line contract, aligned with pi `render(width): string[]`),
+    /// `height` is passed as `u16::MAX` = "no height limit" ⇒ the line count is determined by content; there is no more per-row budget, and no truncation notice (pi likewise has no upper bound).
+    /// The line set has been horizontally truncated to `width` and empty lines have been filtered out (same extraction kernel as `line_segments`); this is the precondition for the cache hit path
+    /// `push_line_pre_truncated`.
     /// The theme borrow happens inside this method on purpose: it must not be hoisted into the caller's loop (which holds `&mut self`).
-    /// Consumer: [`InteractiveUi::push_row_lines`] on a cache miss.
-    fn render_row_lines(
-        &self,
-        index: usize,
-        scratch: &mut ScreenBuffer,
-        width: u16,
-    ) -> Vec<Vec<StyledSegment>> {
+    /// Consumer: [`InteractiveUi::push_row_lines`] on a cache miss; `render_chat` for height measurement.
+    fn render_row_lines(&self, index: usize, width: u16) -> Vec<Vec<StyledSegment>> {
         let Some(row) = self.chat_rows.get(index) else {
             return Vec::new();
         };
-        // Info rows do not use a component: semantic-colored text drawn directly (aligned with the cell path's paint_row).
+        if width == 0 {
+            return Vec::new();
+        }
+        // Info rows do not use a component: semantic-colored text drawn directly.
         if let ChatRow::Info { text, kind } = row {
             let token = match kind {
                 InfoKind::Error => ColorToken::Error,
@@ -2177,7 +2193,7 @@ impl InteractiveUi {
             };
             let style = Style::fg(self.theme.fg(token));
             // Long messages (e.g. full API error bodies) are wrapped to the visible width, then streamed line by line.
-            return zen_tui::wrap::word_wrap_line(text, width.max(1) as usize)
+            return zen_tui::wrap::word_wrap_line(text, width as usize)
                 .into_iter()
                 .map(|chunk| {
                     vec![StyledSegment {
@@ -2187,20 +2203,13 @@ impl InteractiveUi {
                 })
                 .collect();
         }
-        // Measure-as-render into the scratch buffer, then extract per row into style segments for streaming.
-        let used = {
+        // Render-to-lines: the component writes into an unbounded line target; `u16::MAX` is pi's "no height limit".
+        let mut lb = LineBuffer::new(width);
+        {
             let mut comp = self.build_row_component(row, index);
-            comp.render(scratch, 0, 0, width, MEASURE_HEIGHT_CAP)
-        };
-        let mut lines = Vec::with_capacity(used as usize);
-        for r in 0..used {
-            let segs = scratch.line_segments(r);
-            if !segs.is_empty() {
-                lines.push(segs);
-            }
+            comp.render(&mut lb, 0, 0, width, u16::MAX);
         }
-        scratch.clear();
-        lines
+        lb.into_lines()
     }
 
     /// Append row `index`'s lines to the canvas: cache hit ⇒ straight from the cache through the non-truncating entry (no component,
@@ -2214,13 +2223,7 @@ impl InteractiveUi {
     /// **PF-05**: both paths share allocations instead of copying them — a hit hands the cached line handles to the canvas (one refcount bump,
     /// the Rust equivalent of pi's `this.previousLines = newLines` reference alias), and a miss wraps the freshly rendered lines once via
     /// [`InteractiveUi::share_lines`].
-    fn push_row_lines(
-        &mut self,
-        index: usize,
-        epoch: u64,
-        scratch: &mut ScreenBuffer,
-        canvas: &mut ScrollbackCanvas,
-    ) {
+    fn push_row_lines(&mut self, index: usize, epoch: u64, canvas: &mut ScrollbackCanvas) {
         let width = canvas.width();
         self.ensure_row_view(index);
         let key = CacheKey {
@@ -2229,7 +2232,7 @@ impl InteractiveUi {
             global_epoch: epoch,
         };
         if self.row_views[index].cache.get(&key).is_none() {
-            let lines = Self::share_lines(self.render_row_lines(index, scratch, width));
+            let lines = Self::share_lines(self.render_row_lines(index, width));
             self.row_views[index].cache.store(key, lines);
         }
         // Hit (either it already was, or we just stored): push the cached line handles verbatim — already truncated to `width` and
@@ -2293,11 +2296,11 @@ impl InteractiveUi {
         // ── 1. Message area content line stream: all chat rows (no window, full history; off-screen content carried by scrollback) ──
         // PF-04: unchanged rows are served from their line cache (no component construction, no markdown/highlight, no width scan);
         // only a changed row is rendered again. One epoch for the whole frame (it must not change mid-frame).
+        // long-row-clip-fix: line rendering goes through `LineBuffer` (line contract), with **no more** temporary cell buffer / height budget / truncation.
         let epoch = self.current_global_epoch();
-        let mut scratch = ScreenBuffer::new(width, MEASURE_HEIGHT_CAP);
         // Indexed loop is mandatory: `push_row_lines` needs `&mut self` while `iter()` would hold `&self` for the whole loop.
         for i in 0..self.chat_rows.len() {
-            self.push_row_lines(i, epoch, &mut scratch, canvas);
+            self.push_row_lines(i, epoch, canvas);
         }
         // Pending queue rows (dim, appended at the end of the message area, aligned with render_chat).
         let dim_style = Style::fg(self.theme.fg(ColorToken::Dim));
@@ -2382,8 +2385,10 @@ impl InteractiveUi {
     }
 
     /// Message area rendering: measure each row's actual height → bottom-following scroll window → draw sequentially.
-    /// Measurement goes through a temporary buffer `render` up to `MEASURE_HEIGHT_CAP` height; rows outside the window are not rendered (scroll semantics aligned with pi
-    /// `setScrollFromBottom`). Pending queue text is appended as dim rows at the end of the message area.
+    /// Measurement goes through the same `render_row_lines` the scrollback path uses (line contract, no height limit);
+    /// Lines outside the window are not drawn (scroll semantics aligned with pi `setScrollFromBottom`).
+    /// Pending queue text is appended as dim rows at the end of the message area.
+    /// Known cost (accepted, not a regression): this method takes `&self` and cannot borrow a UI-level buffer, so it allocates one `LineBuffer` per line; this path is unreachable in production (`render` carries `#[allow(dead_code)]`).
     fn render_chat(&self, buf: &mut ScreenBuffer, area_h: u16) {
         let (width, _) = buf.size();
         if area_h == 0 {
@@ -2391,14 +2396,12 @@ impl InteractiveUi {
         }
 
         // Measure all rows (reuse a single temporary buffer to avoid per-row allocation)
-        let mut scratch = ScreenBuffer::new(width, MEASURE_HEIGHT_CAP);
         let mut heights: Vec<u16> = Vec::with_capacity(self.chat_rows.len());
-        for (i, row) in self.chat_rows.iter().enumerate() {
-            // PF-04: the former `measure_row` folded in here — its scrollback caller was replaced by the row cache, so this dead
-            // cell-level path is the only remaining user (keeping the helper would leave a `dead_code` warning).
-            let mut comp = self.build_row_component(row, i);
-            let h = comp.render(&mut scratch, 0, 0, width, MEASURE_HEIGHT_CAP);
-            heights.push(h);
+        for (i, _row) in self.chat_rows.iter().enumerate() {
+            // long-row-clip-fix: measurement and the line-stream path share the same implementation (line contract) and no longer have their own height cap;
+            // High line counts naturally overflow upward: the bottom-following window takes only the tail, and the rest is left to terminal scrolling (the dead alt-screen path does not accept scrollback).
+            let lines = self.render_row_lines(i, width);
+            heights.push(lines.len().min(u16::MAX as usize) as u16);
         }
         // Pending queue rows counted at 1 row each (text truncation handled at draw time)
         let pending_heights: Vec<u16> = self.pending_rows.iter().map(|_| 1u16).collect();
@@ -2428,11 +2431,12 @@ impl InteractiveUi {
 
         // Draw: chat rows inside the window (only the window is drawn; measured heights are used only for scroll computation)
         let mut y = 0u16;
-        for (i, row) in self.chat_rows.iter().enumerate().skip(start) {
+        for i in start..self.chat_rows.len() {
             if y >= area_h {
                 break;
             }
-            let painted = self.paint_row(row, i, buf, y, width, area_h - y);
+            let lines = self.render_row_lines(i, width);
+            let painted = Self::paint_row_lines(buf, 0, y, width, area_h - y, &lines);
             y += painted;
         }
         // Pending rows (dim text)
@@ -2447,32 +2451,34 @@ impl InteractiveUi {
         }
     }
 
-    /// Draw a single row: construct the component → render into the real buffer (height limited to the remaining area; multi-row truncation is handled by the component/buffer).
-    fn paint_row(
-        &self,
-        row: &ChatRow,
-        row_index: usize,
+    /// Writes a set of styled lines into a fixed-height grid (the draw step of `render_chat`): writes segments line by line in order, writes at most `height` lines, and returns the number of lines written.
+    ///
+    /// Rationale: the line-stream path produces a "line set", while the alt-screen path targets a screen grid — this is the only bridge between them.
+    /// Boundary: the line set is already truncated to width (guaranteed by `LineBuffer`), so it cannot go out of bounds; `height == 0` ⇒ returns 0.
+    fn paint_row_lines(
         buf: &mut ScreenBuffer,
+        x: u16,
         y: u16,
         width: u16,
         height: u16,
+        lines: &[Vec<StyledSegment>],
     ) -> u16 {
-        match row {
-            ChatRow::Info { text, kind } => {
-                let token = match kind {
-                    InfoKind::Error => ColorToken::Error,
-                    InfoKind::Warning => ColorToken::Warning,
-                    InfoKind::Status => ColorToken::Muted,
-                };
-                let style = Style::fg(self.theme.fg(token));
-                buf.write(0, y, &style, text);
-                1
+        let mut painted = 0u16;
+        for line in lines {
+            if painted >= height {
+                break;
             }
-            _ => {
-                let mut comp = self.build_row_component(row, row_index);
-                comp.render(buf, 0, y, width, height)
+            let mut col = x;
+            for seg in line {
+                buf.write(col, y + painted, &seg.style, &seg.text);
+                col = col.saturating_add(zen_tui::screen::visible_width(&seg.text) as u16);
+                if col >= x + width {
+                    break;
+                }
             }
+            painted += 1;
         }
+        painted
     }
 
     /// Construct the row component on the fly (borrows `&self.theme`/`&self.kb`, kept only for this frame).
@@ -2689,6 +2695,7 @@ pub(crate) enum InfoKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::status_indicator::CompactionStatusReason;
     use crate::keybindings::app_default_bindings;
     use crossterm::event::{KeyCode, KeyModifiers};
     use zen_ai::types::{
@@ -2893,10 +2900,9 @@ mod tests {
             StopReason::Stop,
         );
         u.apply(UiEvent::MessageStart(Message::Assistant(m)));
-        // PF-04: goes through `render_row_lines` (the former `measure_row` was folded into the dead cell path).
-        let mut scratch = ScreenBuffer::new(100, 300);
+        // PF-04: goes through `render_row_lines` (now the line-contract path: no scratch, no height cap).
         for i in 0..u.chat_rows.len() {
-            for (r, segs) in u.render_row_lines(i, &mut scratch, 100).iter().enumerate() {
+            for (r, segs) in u.render_row_lines(i, 100).iter().enumerate() {
                 let text: String = segs.iter().map(|s| s.text.as_str()).collect();
                 let fgs: Vec<String> = segs.iter().map(|s| format!("{:?}", s.style.fg)).collect();
                 let bgs: Vec<String> = segs.iter().map(|s| format!("{:?}", s.style.bg)).collect();
@@ -4892,5 +4898,249 @@ mod tests {
             _ => panic!("After index 1 should be Info hint line"),
         }
         assert!(matches!(&u.chat_rows[3], ChatRow::Assistant(_)));
+    }
+
+    // ── long-row-clip-fix: line contract (no per-row height cap) ──────────────────────────
+
+    /// Constructs an assistant message whose thinking + body both exceed the old 300-line cap.
+    fn long_assistant(thinking_lines: usize, body_lines: usize, tail: &str) -> AssistantMessage {
+        let thinking = (0..thinking_lines)
+            .map(|i| format!("thinking line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut body = (0..body_lines.saturating_sub(1))
+            .map(|i| format!("body line {i}"))
+            .collect::<Vec<_>>();
+        body.push(tail.to_string());
+        assistant(
+            vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking,
+                    thinking_signature: None,
+                    redacted: None,
+                }),
+                text_block(&body.join("\n")),
+            ],
+            StopReason::Stop,
+        )
+    }
+
+    /// The line set must contain a line whose text contains `needle`.
+    fn lines_contain(lines: &[Vec<StyledSegment>], needle: &str) -> bool {
+        lines.iter().any(|line| {
+            let text: String = line.iter().map(|s| s.text.as_str()).collect();
+            text.contains(needle)
+        })
+    }
+
+    #[test]
+    fn test_long_row_render_is_not_capped() {
+        // The old implementation clipped a single row's rendering to 300 lines (thinking consumed the budget first, and the entire body disappeared). Under the line contract there is no cap.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(long_assistant(
+            600,
+            400,
+            "BODY-TAIL-400",
+        ))));
+        let charts = u.chat_rows.len();
+        assert!(charts >= 1);
+        let lines = u.render_row_lines(charts - 1, 80);
+        // Lower-bound assertion: think 600 + body 400 lines must both be rendered (not asserting equality: empty lines are filtered out)
+        assert!(
+            lines.len() >= 900,
+            "long assistant row should render all lines, got {}",
+            lines.len()
+        );
+        assert!(
+            lines_contain(&lines, "BODY-TAIL-400"),
+            "the tail of the 400-line body must be rendered"
+        );
+    }
+
+    #[test]
+    fn test_long_row_streams_fully_into_scrollback() {
+        // Plan acceptance criteria: after render_scrollback, content_height covers all lines, and the body tail sentinel can be read from the canvas.
+        // ⚠️ The assertion must come before flush: after flush, `content_height() == 0` (PF-05 promote_frame invariant),
+        // Do not add a flush here just to "also verify the write-out".
+        // ⚠️ The last line is **not** the body: the order of render_scrollback is chat rows → pending → fixed-area tail (status/editor/footer),
+        // The fixed area always draws non-empty lines and is always last, so scan here instead of taking content_height - 1.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(long_assistant(
+            600,
+            400,
+            "BODY-TAIL-400",
+        ))));
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+
+        let total = canvas.content_height();
+        assert!(
+            total >= 900 + 7,
+            "line stream must carry the whole message plus the fixed tail, got {total}"
+        );
+        let found = (0..total).filter_map(|i| canvas.line(i)).any(|line| {
+            line.iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+                .contains("BODY-TAIL-400")
+        });
+        assert!(
+            found,
+            "body tail must be reachable in the canvas line stream"
+        );
+    }
+
+    #[test]
+    fn test_collapsed_thinking_keeps_the_whole_body() {
+        // After thinking is collapsed into a one-line label, the 500-line body must still be complete (in the old implementation the budget was eaten by thinking and the body disappeared).
+        let mut u = ui();
+        u.hide_thinking_block = true;
+        u.apply(UiEvent::MessageStart(Message::Assistant(long_assistant(
+            500,
+            500,
+            "BODY-TAIL-500",
+        ))));
+        let idx = u.chat_rows.len() - 1;
+        let lines = u.render_row_lines(idx, 80);
+        assert!(
+            lines.len() >= 500,
+            "body must stay complete, got {}",
+            lines.len()
+        );
+        assert!(lines_contain(&lines, "BODY-TAIL-500"));
+    }
+
+    #[test]
+    fn test_blank_rows_are_filtered_as_before() {
+        // Existing convention (legacy behavior, locked to prevent regression): empty lines do not enter the line set; no "empty line" entry should appear in the output.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+            vec![text_block("para one\n\npara two\n\npara three")],
+            StopReason::Stop,
+        ))));
+        let idx = u.chat_rows.len() - 1;
+        let lines = u.render_row_lines(idx, 60);
+        assert!(lines.iter().all(|line| !line.is_empty()));
+        assert!(lines_contain(&lines, "para three"));
+        // Blank lines between paragraphs do not occupy line-set entries: 3 text paragraphs ⇒ significantly fewer lines than the form where "every paragraph carries a blank line"
+        assert!(
+            lines.len() <= 8,
+            "blank rows must be filtered, got {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn test_row_cache_stores_the_full_line_set() {
+        // PF-04 contract: the cache holds the **full** line set (the old implementation could only cache ≤300 lines), and steady-state frames do not re-render.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(long_assistant(
+            600,
+            400,
+            "BODY-TAIL-400",
+        ))));
+        let mut canvas = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas);
+
+        let idx = u.chat_rows.len() - 1;
+        let key = CacheKey {
+            width: 80,
+            content_version: u.row_views[idx].version,
+            global_epoch: u.render_epoch.epoch,
+        };
+        let cached = u.row_views[idx]
+            .cache
+            .get(&key)
+            .expect("the long row must be cached");
+        assert!(
+            cached.len() > 300,
+            "row cache must hold the full line set, got {}",
+            cached.len()
+        );
+
+        let renders_before = u.row_cache_renders();
+        let mut canvas2 = ScrollbackCanvas::new(80, 24);
+        u.render_scrollback(&mut canvas2);
+        assert_eq!(
+            u.row_cache_renders() - renders_before,
+            0,
+            "steady-state frame must not re-render"
+        );
+    }
+
+    #[test]
+    fn test_short_rows_are_unchanged() {
+        // Changing the contract must not incidentally change short-message layout: one paragraph of plain text is one line, with its content unchanged.
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::User(user_message(
+            "hello world",
+        ))));
+        let lines = u.render_row_lines(0, 60);
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|line| line.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        // A user message is a "background box": one line of background padding above and below (the spaces are explicit content, consistent with the old grid path), with the body in between.
+        assert_eq!(
+            joined.len(),
+            3,
+            "top pad + text + bottom pad, got {joined:?}"
+        );
+        assert_eq!(joined[1].trim(), "hello world");
+        assert!(joined[0].trim().is_empty() && joined[2].trim().is_empty());
+    }
+
+    /// Performance probe (not part of regular CI): a single 600-line entry, cold frame (cache miss).
+    #[test]
+    #[ignore = "perf probe: run manually with --ignored"]
+    fn perf_long_row_first_frame() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(long_assistant(
+            300,
+            300,
+            "BODY-TAIL",
+        ))));
+        let idx = u.chat_rows.len() - 1;
+        let started = std::time::Instant::now();
+        let lines = u.render_row_lines(idx, 100);
+        let elapsed = started.elapsed();
+        eprintln!(
+            "perf_long_row_first_frame: {} lines in {:?}",
+            lines.len(),
+            elapsed
+        );
+    }
+
+    /// Performance probe (not part of regular CI): 60 frames of streaming growth, recording per-frame render time p50/p95.
+    #[test]
+    #[ignore = "perf probe: run manually with --ignored"]
+    fn perf_long_row_streaming() {
+        let mut u = ui();
+        let mut body: Vec<String> = Vec::new();
+        let mut frame_times: Vec<std::time::Duration> = Vec::new();
+        for frame in 0..60 {
+            body.push(format!("stream frame {frame} body line"));
+            let msg = assistant(vec![text_block(&body.join("\n"))], StopReason::Stop);
+            if frame == 0 {
+                u.apply(UiEvent::MessageStart(Message::Assistant(msg)));
+            } else {
+                u.apply(UiEvent::MessageUpdate(Message::Assistant(msg)));
+            }
+            let idx = u.chat_rows.len() - 1;
+            let started = std::time::Instant::now();
+            let _ = u.render_row_lines(idx, 100);
+            frame_times.push(started.elapsed());
+        }
+        let mut times = frame_times;
+        times.sort();
+        let p50 = times[times.len() / 2];
+        let p95 = times[(times.len() * 95) / 100];
+        eprintln!(
+            "perf_long_row_streaming: {} frames, p50={:?} p95={:?} max={:?}",
+            times.len(),
+            p50,
+            p95,
+            times.last().copied().unwrap()
+        );
     }
 }

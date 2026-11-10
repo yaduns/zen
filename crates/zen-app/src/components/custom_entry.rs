@@ -6,7 +6,7 @@
 use crate::components::{paint_fold_rows, Component, FoldRow};
 use crossterm::style::Attribute;
 use serde_json::Value;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 
 /// Fallback rendering for extension custom session entries (`Custom` entry, JSONL compatibility only, not produced in v1):
@@ -70,7 +70,14 @@ impl<'a> CustomEntryComponent<'a> {
 }
 
 impl Component for CustomEntryComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let bg = Style::bg(self.theme.bg(BgToken::CustomMessageBg));
         let rows = self.plan();
         paint_fold_rows(buf, x, y, width, height, &rows, 1, Some(&bg))
@@ -81,6 +88,7 @@ impl Component for CustomEntryComponent<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

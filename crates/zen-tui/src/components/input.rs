@@ -1,4 +1,4 @@
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -185,7 +185,14 @@ impl super::Component for Input {
     /// Pad the remaining spaces at the end of the line to the full width. Record the window's starting column (in value-column units) for `cursor_position()`.
     /// Returns 1 (has content) or 0 (does not render when the available width is ≤ prompt width or height is 0).
     /// Consumers: T-AP-11-2 (session/settings-selector search box), T-AP-08-6.
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         const PROMPT: &str = "> ";
         let prompt_w = crate::screen::visible_width(PROMPT);
 
@@ -276,7 +283,7 @@ mod tests {
     const CJK_SAMPLE_3: &str = "你a";
     use super::*;
     use crate::components::Component;
-    use crate::screen::{ScreenBuffer, Style};
+    use crate::screen::ScreenBuffer;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::RefCell;
     use std::rc::Rc;

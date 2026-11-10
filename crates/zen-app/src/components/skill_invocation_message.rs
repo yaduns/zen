@@ -7,7 +7,7 @@ use crate::keybindings::AppAction;
 use crossterm::style::Attribute;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 
 /// Skill invocation message (the skill block only; the user message is rendered separately): when collapsed, `[skill] name (… to expand)`,
@@ -90,7 +90,14 @@ impl<'a> SkillInvocationMessageComponent<'a> {
 }
 
 impl Component for SkillInvocationMessageComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let bg = Style::bg(self.theme.bg(BgToken::CustomMessageBg));
         let rows = self.plan();
         paint_fold_rows(buf, x, y, width, height, &rows, 1, Some(&bg))
@@ -102,6 +109,7 @@ mod tests {
     use super::*;
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

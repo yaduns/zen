@@ -18,7 +18,7 @@ use zen_tui::components::input::Input;
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Session tree filter mode (pi FilterMode). Pure discriminated enum, not serialized.
@@ -631,7 +631,14 @@ fn entry_index(entries: &[SessionTreeEntry], e: &SessionTreeEntry) -> usize {
 }
 
 impl Component for TreeSelectorComponent {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let theme = &self.theme;
         let accent = Style::fg(theme.fg(ColorToken::Accent));
         let muted = Style::fg(theme.fg(ColorToken::Muted));
@@ -954,6 +961,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use zen_ai::types::{TextContent, Usage, UserMessage};
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> Theme {
         zen_tui::theme::builtin_dark_theme().clone()

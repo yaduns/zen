@@ -9,7 +9,7 @@ use zen_ai::types::{AssistantMessage, ContentBlock, StopReason};
 use zen_tui::components::Component;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::markdown::{render_markdown, render_markdown_with_override, MarkdownTheme};
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Plan block: rendering unit the message body is split into (equivalent of pi's addChild sequence).
@@ -217,7 +217,7 @@ impl<'a> AssistantMessageComponent<'a> {
     /// Write plan blocks into the buffer (shared by render and tests).
     fn paint_plan(
         &self,
-        buf: &mut ScreenBuffer,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
         x: u16,
         y: u16,
         width: u16,
@@ -300,7 +300,7 @@ fn thinking_override(thinking_fg: Color) -> impl Fn(Style) -> Style {
 
 /// Single-line segment write (left padding + segment sequence), for markdown lines of assistant messages.
 fn write_row(
-    buf: &mut ScreenBuffer,
+    buf: &mut dyn zen_tui::screen::RenderTarget,
     x: u16,
     y: u16,
     width: u16,
@@ -321,7 +321,14 @@ fn write_row(
 }
 
 impl Component for AssistantMessageComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let plan = self.plan_blocks();
         self.paint_plan(buf, x, y, width, height, &plan)
     }
@@ -331,6 +338,7 @@ impl Component for AssistantMessageComponent<'_> {
 mod tests {
     use super::*;
     use zen_ai::types::{AssistantMessage, TextContent, ThinkingContent, Usage};
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

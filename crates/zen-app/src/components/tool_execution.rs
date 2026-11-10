@@ -12,7 +12,7 @@ use serde_json::Value;
 use zen_tui::components::Component;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 
 /// Number of preview lines shown for output when not expanded (aligned with pi `BASH_PREVIEW_LINES = 5`, bash.ts:174; for tail semantics see
@@ -208,7 +208,14 @@ impl<'a> ToolExecutionComponent<'a> {
 }
 
 impl Component for ToolExecutionComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let bg_token = self.bg_token();
         let bg = Style::bg(self.theme.bg(bg_token));
 
@@ -283,6 +290,7 @@ mod tests {
     use crate::keybindings::app_default_bindings;
     use serde_json::json;
     use std::collections::HashMap;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

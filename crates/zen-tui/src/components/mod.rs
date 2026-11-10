@@ -9,20 +9,30 @@ pub mod spacer;
 pub mod text;
 pub mod truncated_text;
 
-use crate::screen::ScreenBuffer;
+use crate::screen::RenderTarget;
 use crossterm::event::KeyEvent;
 
-/// Unified abstraction for common components
-/// `render` draws the component into the screen buffer within the given rectangle and returns the number of rows actually occupied (≤ height),
-/// for row-based stacked layout by containers (Box) and the chat composition (T-AP-11-1); out-of-bounds content outside the rectangle is left to
-/// `ScreenBuffer::write` for silent truncation.
+/// Unified abstraction for common components (REQ-TUI-01; since long-row-clip-fix changed to "render-target-oriented"):
+/// `render` draws the component into any [`RenderTarget`] and returns the **number of lines occupied** (≤ `height`) for stacked layout budgeting; out-of-bounds content is clipped by the target itself.
+///
+/// **Two kinds of targets**: `ScreenBuffer` (fixed-height grid, bounded screen consumer) and `LineBuffer` (grows on demand, line-stream consumer).
+/// `height` is only the **caller's budget**, not the component's contract: the screen side passes the remaining screen lines, and the line-stream side passes `u16::MAX` (= the "no height limit" of pi `render(width)`).
+/// Components should treat it only as a stopping condition and must not hard-code any line cap into themselves (this is exactly why the old "300-line cap for a single row" was retired).
+///
 /// `handle_key` returns true if the key is consumed (short-circuiting later components/application layer); default is not consumed.
 /// `invalidate` clears internal caches for scenarios such as theme switching. Components themselves still hold no cross-frame cache
 /// (they are constructed transiently per line); the cross-frame cache lives on the UI side as a per-row [`cache::LineCache`] (PF-04).
-/// Consumers: all components in this task; planned consumers: T-AP-11-2 (application components implementing this trait),
-/// T-AP-11-1 (composition), T-AP-08-6 (startup UI).
+/// Side-effect note: `render` is not guaranteed to be idempotent (`StatusIndicator` advances its countdown), so it should be called only once per visible frame.
+/// Consumers: all components (`zen-tui` + `zen-app`); line-stream entry point `zen-app` `render_row_lines`.
 pub trait Component {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16;
+    fn render(
+        &mut self,
+        target: &mut dyn RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16;
     fn handle_key(&mut self, _key: &KeyEvent) -> bool {
         false
     }

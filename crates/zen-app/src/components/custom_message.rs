@@ -6,7 +6,7 @@
 use crate::components::{paint_fold_rows, Component, FoldRow};
 use crossterm::style::Attribute;
 use zen_tui::markdown::MarkdownTheme;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 
 /// Custom message (zen-core `SessionTreeEntry::CustomMessage`) rendering: customMessageBg background +
@@ -56,7 +56,14 @@ impl<'a> CustomMessageComponent<'a> {
 }
 
 impl Component for CustomMessageComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let bg = Style::bg(self.theme.bg(BgToken::CustomMessageBg));
         let rows = self.plan();
         paint_fold_rows(buf, x, y, width, height, &rows, 1, Some(&bg))
@@ -66,6 +73,7 @@ impl Component for CustomMessageComponent<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

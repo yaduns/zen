@@ -4,7 +4,7 @@
 
 use crate::keybindings::KeybindingsManager;
 use crate::keys::KeyId;
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 use crossterm::event::KeyEvent;
 
 use super::input::Input;
@@ -268,7 +268,7 @@ impl SettingsList {
     /// Content varies depending on whether search is enabled (align with pi `addHintLine`).
     fn write_hint_line(
         &self,
-        buf: &mut ScreenBuffer,
+        buf: &mut dyn crate::screen::RenderTarget,
         x: u16,
         width: u16,
         bottom: u16,
@@ -292,7 +292,14 @@ impl super::Component for SettingsList {
     /// When a submenu is active → render only the subcomponent; otherwise render the main list: search row (Input + blank line),
     /// Empty/no-match notice, scrolling window rows (pad label to min(30, maximum label width) + truncate value),
     /// Scrolling info line, selected-item description (wrapped), and hint line. Keep all content within the given rectangle, truncate on overflow, and return the actual line count.
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         // Submenu active: delegate the entire frame to the child component (pi-isomorphic)
         if let Some(comp) = self.submenu_component.as_mut() {
             return comp.render(buf, x, y, width, height);

@@ -5,7 +5,7 @@
 use crate::components::dynamic_border::DynamicBorder;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zen_tui::components::Component;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 use zen_tui::wrap::truncate_to_width;
 
@@ -76,7 +76,14 @@ impl UserMessageSelectorComponent {
 }
 
 impl Component for UserMessageSelectorComponent {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let theme = &self.theme;
         let accent = Style::fg(theme.fg(ColorToken::Accent));
         let muted = Style::fg(theme.fg(ColorToken::Muted));
@@ -224,6 +231,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> Theme {
         zen_tui::theme::builtin_dark_theme().clone()

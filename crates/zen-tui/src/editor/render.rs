@@ -16,7 +16,7 @@ impl Editor {
     /// Consumers: T-AP-11-1 (called once inside the draw callback), T-AP-11-1-fix (the two render paths in ui.rs).
     pub fn render(
         &mut self,
-        buf: &mut crate::screen::ScreenBuffer,
+        buf: &mut dyn crate::screen::RenderTarget,
         x: u16,
         y: u16,
         width: u16,

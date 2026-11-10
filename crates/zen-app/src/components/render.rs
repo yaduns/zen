@@ -5,8 +5,8 @@
 use crossterm::style::Color;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::markdown::{render_markdown, MarkdownTheme};
+use zen_tui::screen::visible_width;
 use zen_tui::screen::Style;
-use zen_tui::screen::{visible_width, ScreenBuffer};
 
 /// Box background merge for boxed-block text: when a segment style's bg is None, merge in the box background — fixes the glyphs falling on the default background caused by the "fill background and text cells
 /// being separated when bg=None"; segments that already carry bg (e.g. a future custom code-block panel) are left untouched.
@@ -28,7 +28,7 @@ pub(crate) fn merge_box_bg(style: &Style, box_bg: Option<Color>) -> Style {
 /// `box_bg` is the background of the enclosing boxed block (merged into text cells, see [`merge_box_bg`]; pass None for non-box).
 /// Returns the number of columns actually written (≤ width).
 pub(crate) fn write_segment_row(
-    buf: &mut ScreenBuffer,
+    buf: &mut dyn zen_tui::screen::RenderTarget,
     x: u16,
     y: u16,
     width: u16,
@@ -64,7 +64,7 @@ pub(crate) fn write_segment_row(
 ///   pass None for non-box components).
 #[allow(clippy::too_many_arguments)]
 pub fn write_markdown(
-    buf: &mut ScreenBuffer,
+    buf: &mut dyn zen_tui::screen::RenderTarget,
     x: u16,
     y: u16,
     width: u16,
@@ -94,6 +94,7 @@ pub fn write_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_tui::screen::ScreenBuffer;
     use zen_tui::screen::Style;
 
     fn seg(style: Style, text: &str) -> StyledSegment {

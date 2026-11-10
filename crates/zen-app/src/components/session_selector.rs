@@ -15,7 +15,7 @@ use zen_tui::components::select_list::SelectAction;
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Synchronous loader callback for session selection (current directory / all directories; with progress callback).
@@ -358,7 +358,14 @@ fn filter_and_sort_sessions_raw<'x>(
 }
 
 impl Component for SessionSelectorComponent {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let theme = &self.theme;
         let mut painted = 0u16;
         // Row advancement macro: remaining always equals height - painted (avoids manual bookkeeping; the macro only advances painted)
@@ -634,6 +641,7 @@ mod tests {
     use super::*;
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> Theme {
         zen_tui::theme::builtin_dark_theme().clone()

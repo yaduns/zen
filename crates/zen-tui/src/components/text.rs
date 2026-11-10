@@ -1,4 +1,4 @@
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 
 /// Multi-line text display — \t expansion (wrap::normalize_tabs)
 /// → word_wrap_line wrapping → per-line left/right padding + content style;
@@ -53,7 +53,14 @@ impl super::Component for Text {
     /// Clipping semantics: total height = 2·padding_y + wrapped line count; actual lines painted this time = min(total height, height),
     /// When budget is insufficient, clip from the tail (bottom padding first, then content lines); the return value comes from the same source as painted line count.
     /// Consumers: T-AP-11-1 (chat text), T-AP-11-2 (custom message).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         // Empty/all-whitespace text is not rendered
         if self.text.trim().is_empty() {
             return 0;
@@ -108,7 +115,8 @@ impl super::Component for Text {
 mod tests {
     use super::*;
     use crate::components::Component;
-    use crate::screen::{ScreenBuffer, Style};
+    use crate::screen::ScreenBuffer;
+    use crate::screen::Style;
 
     #[test]
     fn text_new_and_setters_update_fields() {

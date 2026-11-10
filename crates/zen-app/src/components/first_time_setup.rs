@@ -5,7 +5,7 @@
 use crate::theme::TerminalTheme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zen_tui::components::Component;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// First-time setup result (v1 only theme; analytics step removed because pi-325 telemetry was dropped).
@@ -71,7 +71,14 @@ impl<'a> FirstTimeSetupComponent<'a> {
 
 impl Component for FirstTimeSetupComponent<'_> {
     /// Renders the settings dialog (title + detection info + option list + key hints).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let theme = self.theme;
         let accent = Style::fg(theme.fg(ColorToken::Accent));
         let muted = Style::fg(theme.fg(ColorToken::Muted));
@@ -157,6 +164,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

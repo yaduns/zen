@@ -1,6 +1,6 @@
 // REQ-TUI-01 : CancellableLoader — cancellable loader
 
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio_util::sync::CancellationToken;
 
@@ -82,7 +82,14 @@ impl CancellableLoader {
 
 impl Component for CancellableLoader {
     /// Delegate rendering to the embedded Loader (forward with same signature; see Loader docs).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         self.loader.render(buf, x, y, width, height)
     }
 

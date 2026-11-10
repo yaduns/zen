@@ -5,7 +5,7 @@
 use crate::components::render::write_segment_row;
 use zen_tui::components::Component;
 use zen_tui::markdown::MarkdownTheme;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 
 /// User message rendering: theme userMessageBg background box + markdown content (userMessageText foreground) —
@@ -50,7 +50,14 @@ impl UserMessageComponent {
 }
 
 impl Component for UserMessageComponent {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let content_width = width.saturating_sub(self.output_pad * 2).max(1) as usize;
         let rows =
             zen_tui::markdown::render_markdown(&self.markdown_theme, &self.text, content_width);
@@ -86,6 +93,7 @@ impl Component for UserMessageComponent {
 mod tests {
     use super::*;
     use zen_tui::components::Component;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

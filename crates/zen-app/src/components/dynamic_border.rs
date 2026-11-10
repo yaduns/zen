@@ -2,7 +2,7 @@
 // Corresponding original TS: reference/pi-original/packages/coding-agent/src/modes/interactive/components/dynamic-border.ts.
 
 use zen_tui::components::Component;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 
 /// Used by bordered components such as messages/selectors to draw a horizontal-line border across the full width—
 /// Renders one line of "─" × width (uses 1 when width is less than 1), colored with the given style.
@@ -21,7 +21,14 @@ impl DynamicBorder {
 }
 
 impl Component for DynamicBorder {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         if width == 0 || height == 0 {
             return 0;
         }
@@ -34,6 +41,7 @@ impl Component for DynamicBorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_tui::screen::ScreenBuffer;
 
     fn flush_text(buf: &mut ScreenBuffer) -> String {
         // flush output contains crossterm diff commands (MoveTo/SetColors/Print per cell);

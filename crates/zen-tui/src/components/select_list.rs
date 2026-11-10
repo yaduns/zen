@@ -1,6 +1,6 @@
 use crate::keybindings::KeybindingsManager;
 use crate::keys::KeyId;
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 use crossterm::event::KeyEvent;
 
 /// Input semantics contract for selection-type components
@@ -271,7 +271,14 @@ impl super::Component for SelectList {
     /// Empty after filtering → no_match-styled message `  No matching commands`;
     /// otherwise render the visible window (selection centered, `start..end` sliding), the description column (two columns when width > 40),
     /// and append an `(n/total)` line when scrolling is needed (scroll_info style, truncated to width). Returns the actual number of lines.
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let width = width as usize;
         let height = height as usize;
         if height == 0 {
@@ -434,6 +441,7 @@ impl super::Component for SelectList {
 
 #[cfg(test)]
 mod tests {
+    use crate::screen::ScreenBuffer;
     /// CJK sample kept intentionally: this test verifies wide-character / multibyte behavior.
     const CJK_SAMPLE: &str = "你好";
     const CJK_SAMPLE_2: &str = "再见";
@@ -449,7 +457,7 @@ mod tests {
     }
     use super::*;
     use crate::components::Component;
-    use crate::screen::{ScreenBuffer, Style};
+    use crate::screen::Style;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -486,7 +494,7 @@ mod tests {
 
     #[test]
     fn new_mirrors_items_and_starts_at_first() {
-        let mut l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
+        let l = SelectList::new(items(&["a", "b", "c"]), 3, theme(), layout(), kb());
         assert_eq!(l.items.len(), 3);
         assert_eq!(l.filtered_items.len(), 3);
         assert_eq!(l.selected_index, 0);

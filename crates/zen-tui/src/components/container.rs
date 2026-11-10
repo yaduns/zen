@@ -1,5 +1,5 @@
 use crate::components::Component;
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 
 /// Container component — fill the entire rectangle (including padding) with bg; children render sequentially inside the inset rectangle and stack vertically by returned line count;
 /// Empty children → 0 lines; no cache fields (ScreenBuffer diffing is the cache).
@@ -48,7 +48,14 @@ impl Container {
 impl super::Component for Container {
     /// No children → 0 lines (aligned with pi empty box); otherwise fill the background (including padding), child components according to
     /// Returned line counts are stacked vertically within the indented rectangle; returns the total line count (capped at height).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         if self.children.is_empty() || height == 0 {
             return 0;
         }
@@ -111,7 +118,7 @@ mod tests {
     impl Component for RecordingChild {
         fn render(
             &mut self,
-            _buf: &mut ScreenBuffer,
+            _buf: &mut dyn crate::screen::RenderTarget,
             x: u16,
             y: u16,
             width: u16,

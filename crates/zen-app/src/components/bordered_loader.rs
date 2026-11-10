@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use zen_tui::components::cancellable_loader::CancellableLoader;
 use zen_tui::components::Component;
 use zen_tui::highlight::StyledSegment;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Bordered cancellable loader block (top/bottom DynamicBorder + CancellableLoader + cancel-key hint) —
@@ -73,7 +73,14 @@ impl BorderedLoader {
 }
 
 impl Component for BorderedLoader {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let mut row = y;
         let mut painted = 0u16;
         let mut remaining = height;
@@ -121,6 +128,7 @@ impl Component for BorderedLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

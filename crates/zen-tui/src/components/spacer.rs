@@ -1,4 +1,4 @@
-use crate::screen::{ScreenBuffer, Style};
+use crate::screen::Style;
 
 /// Blank-line component. Stateless, no cache.
 pub struct Spacer {
@@ -19,7 +19,14 @@ impl Spacer {
 
 impl super::Component for Spacer {
     /// Output min(lines, height) blank lines (fill with default-style spaces).
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn crate::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let painted = self.lines.min(height);
         for row in y..y + painted {
             //  Style::default() is exactly the terminal default color (no foreground/background/attributes), which is precisely the semantics of "blank".

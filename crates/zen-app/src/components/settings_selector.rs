@@ -22,7 +22,7 @@ use zen_tui::components::settings_list::{
 };
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Message delivery mode (pi "all" | "one-at-a-time"; discriminator for settings item values).
@@ -237,7 +237,14 @@ struct SelectSubmenu {
 }
 
 impl Component for SelectSubmenu {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let mut row = y;
         let mut painted = 0u16;
         let mut remaining = height;
@@ -616,7 +623,14 @@ fn bool_values() -> Vec<String> {
 }
 
 impl Component for SettingsSelectorComponent {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let mut row = y;
         let mut painted = 0u16;
         let mut remaining = height;
@@ -658,6 +672,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use zen_tui::components::select_list::SelectItem;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

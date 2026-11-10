@@ -9,7 +9,7 @@ use crate::output::usage_totals::{add_usage_to_totals, UsageTotals};
 use zen_ai::types::Message;
 use zen_core::session::tree::SessionTreeEntry;
 use zen_tui::components::Component;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 use zen_tui::wrap::truncate_to_width;
 
@@ -140,7 +140,14 @@ impl<'a> FooterComponent<'a> {
 }
 
 impl Component for FooterComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let Some(data) = &self.data else {
             return 0;
         };
@@ -256,6 +263,7 @@ fn stw(s: &str) -> usize {
 mod tests {
     use super::*;
     use zen_ai::types::{Cost, Usage};
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

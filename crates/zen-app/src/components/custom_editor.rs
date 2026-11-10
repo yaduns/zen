@@ -9,7 +9,7 @@ use zen_tui::components::Component;
 use zen_tui::editor::{Editor, EditorAction};
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 
 /// Chat input editor: mounts app-level key routing (interrupt/exit/clear/tools.expand etc.) on top of the zen-tui `Editor`——
 /// Shared by T-AP-11-1 main input; when Esc hits Interrupt and no completion is active, call on_escape; Ctrl+D with an
@@ -125,7 +125,7 @@ impl CustomEditor {
     /// Interactive editor render entry (called by T-AP-11-1 inside the draw callback).
     pub fn render_editor(
         &mut self,
-        buf: &mut ScreenBuffer,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
         x: u16,
         y: u16,
         width: u16,
@@ -160,7 +160,14 @@ impl CustomEditor {
 }
 
 impl Component for CustomEditor {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         if width < 2 || height < 3 {
             return 0;
         }
@@ -228,6 +235,7 @@ mod tests {
     use std::collections::HashMap;
     use std::rc::Rc;
     use zen_tui::keybindings::editor_default_bindings;
+    use zen_tui::screen::ScreenBuffer;
 
     fn kb() -> KeybindingsManager<AppAction> {
         KeybindingsManager::new(app_default_bindings(), HashMap::new())

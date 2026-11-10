@@ -9,7 +9,7 @@ use crate::keybindings::AppAction;
 use zen_tui::components::loader::Loader;
 use zen_tui::components::Component;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{ColorToken, Theme};
 
 /// Status-line indicator kind (pi StatusIndicatorKind). Pure discriminator enum, not serialized.
@@ -167,7 +167,14 @@ fn retry_message(attempt: u32, max_attempts: u32, seconds: u32, retry_key: &str)
 }
 
 impl Component for StatusIndicator {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         // The render frame is the countdown driver (seconds on the Retry status line are refreshed here)
         if let Some(cd) = &mut self.countdown {
             cd.tick();
@@ -194,7 +201,14 @@ impl Component for StatusIndicator {
 pub struct IdleStatus;
 
 impl Component for IdleStatus {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let style = Style::default();
         let painted = 2u16.min(height);
         for row in 0..painted {
@@ -209,6 +223,7 @@ mod tests {
     use super::*;
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

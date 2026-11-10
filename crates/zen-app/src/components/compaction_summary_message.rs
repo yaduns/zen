@@ -7,7 +7,7 @@ use crate::keybindings::AppAction;
 use crossterm::style::Attribute;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::keybindings::KeybindingsManager;
-use zen_tui::screen::{ScreenBuffer, Style};
+use zen_tui::screen::Style;
 use zen_tui::theme::{BgToken, ColorToken, Theme};
 
 /// integer → thousands-separated string (pi `toLocaleString()` counterpart; pure function, for collapsed text).
@@ -108,7 +108,14 @@ impl<'a> CompactionSummaryMessageComponent<'a> {
 }
 
 impl Component for CompactionSummaryMessageComponent<'_> {
-    fn render(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16, height: u16) -> u16 {
+    fn render(
+        &mut self,
+        buf: &mut dyn zen_tui::screen::RenderTarget,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> u16 {
         let bg = Style::bg(self.theme.bg(BgToken::CustomMessageBg));
         let rows = self.plan();
         paint_fold_rows(buf, x, y, width, height, &rows, 1, Some(&bg))
@@ -120,6 +127,7 @@ mod tests {
     use super::*;
     use crate::keybindings::app_default_bindings;
     use std::collections::HashMap;
+    use zen_tui::screen::ScreenBuffer;
 
     fn theme() -> &'static Theme {
         zen_tui::theme::builtin_dark_theme()

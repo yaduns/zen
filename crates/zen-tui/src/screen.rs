@@ -58,6 +58,31 @@ enum CellKind {
     Continuation,
 }
 
+/// Unified entry point of the render target (REQ-TUI-01 / REQ-APP-11, long-row-clip-fix): components write lines into "a target" instead of being bound to "the screen" — aligned with pi
+/// Essence of `Component.render(width): string[]` (height is not a contract; line count is determined by content).
+///
+/// Only two methods (intentionally minimal): outside these two, no component in the repo touches any surface of the render target (verified: no calls to `size()`/`resize()`/
+/// `line_segments()`; components use the input `width` to wrap lines themselves).
+///
+/// Two implementations: [`ScreenBuffer`] (fixed-height grid, serving **screen-bounded** consumers such as the status line/editor/footer/panels/alt-screen windows) and
+/// [`LineBuffer`] (grows in height on demand, serving **line-stream** consumers such as `ChatRow`). Both are fixed-width horizontally, and write semantics are cell-for-cell identical
+/// (both share the same cell-writing kernel [`write_row_cells`]), so the same component written into both targets yields the same visual result.
+///
+/// ⚠️ `fill`'s `height` is the number of rows to fill; the caller's budget `height` **must not** be passed in directly: the budget for the line-stream path is
+/// `u16::MAX`; treating it as the `fill` height would fill tens of thousands of blank rows in [`LineBuffer`]. Verified: except for the grid-specific `Container`, all other components
+/// pass a `fill` height that is always `1` or `painted` (the number of content rows).
+///
+/// Consumer: all `Component::render` implementations in `zen-tui`/`zen-app` (35 impls = 34 production + 1 test),
+/// `zen-app` row rendering (`render_row_lines`).
+pub trait RenderTarget {
+    /// Positioned single-line write: width-aware (CJK occupies two cells), right edge truncates by display width without splitting wide characters, out-of-bounds coordinates are silently ignored.
+    /// Semantics are **cell-for-cell identical** to [`ScreenBuffer::write`] (same kernel).
+    fn write(&mut self, x: u16, y: u16, style: &Style, text: &str);
+
+    /// Rectangular fill (background/blank rows): equivalent to writing same-style spaces row by row; wide-character boundary handling matches [`RenderTarget::write`].
+    fn fill(&mut self, x: u16, y: u16, width: u16, height: u16, style: &Style);
+}
+
 /// Memory buffer for the whole frame. Holds the current frame grid and size; components write content into the current frame via write;
 /// flush compares the current frame with the previous one cell by cell, generating crossterm commands only for changed cells (differential refresh); after writing, the current frame is promoted to become the new previous frame.
 /// resize handles terminal size changes (including clearing extra rows when content shrinks).
@@ -133,75 +158,11 @@ impl ScreenBuffer {
     /// zen-app `modes/interactive/ui.rs::render_scrollback`
     pub fn line_segments(&self, row: u16) -> Vec<StyledSegment> {
         let w = self.width as usize;
-        let h = self.height as usize;
-        let row = row as usize;
-        if row >= h {
+        if row as usize >= self.height as usize {
             return Vec::new();
         }
-        let row_offset = row * w;
-
-        // 1. Determine extent: the column after the last "non-empty" cell (explicit space / wide-char start or continuation).
-        let mut end = 0usize;
-        for col in 0..w {
-            if !matches!(self.cells[row_offset + col].kind, CellKind::Empty) {
-                end = col + 1;
-            }
-        }
-        if end == 0 {
-            return Vec::new();
-        }
-
-        // 2. Scan columns in order, merging adjacent segments with the same style.
-        let mut out: Vec<StyledSegment> = Vec::new();
-        let mut cur_style: Option<Style> = None;
-        let mut cur_text = String::new();
-        for col in 0..end {
-            let cell = &self.cells[row_offset + col];
-            match cell.kind {
-                CellKind::Char => {
-                    let ch = cell
-                        .content
-                        .as_deref()
-                        .and_then(|s| s.chars().next())
-                        .unwrap_or(' ');
-                    if cur_style.as_ref() == Some(&cell.style) {
-                        cur_text.push(ch);
-                    } else {
-                        if let Some(s) = cur_style.take() {
-                            if !cur_text.is_empty() {
-                                out.push(StyledSegment {
-                                    style: s,
-                                    text: std::mem::take(&mut cur_text),
-                                });
-                            }
-                        }
-                        cur_style = Some(cell.style.clone());
-                        cur_text.push(ch);
-                    }
-                }
-                CellKind::Continuation => {
-                    // Wide-char continuation cell: the start cell already covers two columns, so skip it (do not print the placeholder).
-                }
-                CellKind::Empty => {
-                    // Interior gap: append a space to the current segment to preserve position; an empty segment starts with the default style.
-                    if cur_style.is_some() {
-                        cur_text.push(' ');
-                    } else {
-                        cur_style = Some(Style::default());
-                        cur_text.push(' ');
-                    }
-                }
-            }
-        }
-        if let Some(s) = cur_style.take() {
-            if !cur_text.is_empty() {
-                out.push(StyledSegment {
-                    style: s,
-                    text: cur_text,
-                });
-            }
-        }
-        out
+        let offset = row as usize * w;
+        row_segments(&self.cells[offset..offset + w], w)
     }
 
     /// Write text at (x,y) with the given style; out-of-range coordinates are silently ignored (or the implementation may choose to panic — must be documented).
@@ -220,65 +181,13 @@ impl ScreenBuffer {
         }
 
         let row_offset = y * w;
-        let mut col = x;
-
-        for ch in text.chars() {
-            let char_width = match ch.width() {
-                Some(w) if w > 0 => w,
-                _ => continue, // Zero-width chars (control characters, combining marks, etc.) are skipped; they occupy no cell
-            };
-
-            // Truncation never splits a wide char: stop when the remaining space is less than a full character width (discard the extra half-cell)
-            if col + char_width > w {
-                break;
-            }
-
-            // --- Orphaned continuation-cell cleanup (three scenarios, see table above) ---
-
-            // Scenario 1: current cell is a continuation cell of some wide char → clear that wide char's starting cell
-            // Look back at most 1 cell (max wide char width is 2) to find the starting cell with Char(width=2)
-            if col > 0 && matches!(self.cells[row_offset + col].kind, CellKind::Continuation) {
-                let prev = col - 1;
-                if matches!(self.cells[row_offset + prev].kind, CellKind::Char)
-                    && self.cells[row_offset + prev]
-                        .content
-                        .as_ref()
-                        .map_or(false, |c| c.width() == 2)
-                {
-                    self.cells[row_offset + prev] = Cell::default();
-                }
-            }
-
-            // Scenario 2+3: current cell is the starting cell of some wide char → clear its continuation cell (only left over by narrow chars; overwriting a wide char needs no extra clearing)
-            // Also covers the edge case where clearing the starting cell in scenario 1 makes the continuation cell the new starting cell
-            if matches!(self.cells[row_offset + col].kind, CellKind::Char)
-                && self.cells[row_offset + col]
-                    .content
-                    .as_ref()
-                    .map_or(false, |c| c.width() == 2)
-                && col + 1 < w
-            {
-                self.cells[row_offset + col + 1] = Cell::default();
-            }
-
-            // --- Place new character ---
-            self.cells[row_offset + col] = Cell {
-                kind: CellKind::Char,
-                content: Some(ch.to_string()),
-                style: style.clone(),
-            };
-
-            // Wide char continuation cell: occupies the cell but prints nothing, content is None
-            if char_width == 2 {
-                self.cells[row_offset + col + 1] = Cell {
-                    kind: CellKind::Continuation,
-                    content: None,
-                    style: Style::default(),
-                };
-            }
-
-            col += char_width;
-        }
+        write_row_cells(
+            &mut self.cells[row_offset..row_offset + w],
+            w,
+            x,
+            style,
+            text,
+        );
     }
 
     /// Fill a width×height rectangle starting at (x,y) with style (full-row background fill).
@@ -296,7 +205,6 @@ impl ScreenBuffer {
             self.write(x, y + dy, style, &row);
         }
     }
-
     /// Differential refresh: compare the current frame with the previous frame cell by cell, writing crossterm commands (MoveTo + style + content) for changed cells to `out`;
     /// Cells whose content became empty/cleared are written as blanks to overwrite; afterwards promote the current frame to the previous frame. Returns io errors.
     /// Consumer: T-TU-01-1 (called after each render in the main loop).
@@ -431,6 +339,225 @@ impl ScreenBuffer {
 /// Consumer: this task's `write`/`flush`; **planned consumer: T-TU-03-6 (pi-408 utils, counterpart of `visibleWidth`)**.
 pub fn visible_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
+}
+
+impl RenderTarget for ScreenBuffer {
+    fn write(&mut self, x: u16, y: u16, style: &Style, text: &str) {
+        ScreenBuffer::write(self, x, y, style, text);
+    }
+
+    fn fill(&mut self, x: u16, y: u16, width: u16, height: u16, style: &Style) {
+        ScreenBuffer::fill(self, x, y, width, height, style);
+    }
+}
+
+/// Line-stream render target (REQ-TUI-01 / REQ-APP-11, long-row-clip-fix): when PF-04's line cache misses, `render_row_lines` uses it to catch the component output's
+/// entire line stream—the problem solved is that a 700-line assistant message must be fully displayed, not that a height cap should be chosen for the grid.
+///
+/// Line count has **no upper limit and no budget parameter** (aligned with pi: line count is determined by content). Writing to `y` beyond the current line count automatically appends blank rows; rows never written are just empty `Vec`
+/// (they occupy no width space), so memory ≈ actually drawn rows × width × `Cell`, and no `previous` mirror is needed (line streams do not do per-frame diff; that is
+/// `ScrollbackCanvas`'s job).
+///
+/// Width is still fixed (constructor parameter `width`); [`LineBuffer::into_lines`] output is **already truncated to width and blank rows are filtered out**—exactly
+/// the precondition contract for `LineCache` and `ScrollbackCanvas::push_line_pre_truncated`.
+///
+/// Consumer: `zen-app` `modes::interactive::ui::render_row_lines`。
+pub struct LineBuffer {
+    width: u16,
+    /// Row set that grows in height on demand; an empty `Vec` = the row exists but has no allocated cells (equivalent to all defaults).
+    rows: Vec<Vec<Cell>>,
+}
+
+impl LineBuffer {
+    /// Create an empty line buffer with width `width` (0 rows; rows are appended on demand as writes occur).
+    /// Consumer: `zen-app` `render_row_lines`。
+    pub fn new(width: u16) -> LineBuffer {
+        LineBuffer {
+            width,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Current line count (= deepest row written by the component + 1; `usize`, the line-stream side is not affected by the count boundary of the component's `u16` return value).
+    /// Consumer: diagnostics/probes and unit tests for `render_row_lines`.
+    pub fn line_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Take the full row set: adjacent same-style cells merged into segments, internal spaces preserved, wide-character continuation cells skipped, **blank rows filtered out**
+    /// (same extraction logic `row_segments` as [`ScreenBuffer::line_segments`]).
+    /// Consumer: `render_row_lines` (the result goes directly into `LineCache` and the line stream).
+    pub fn into_lines(self) -> Vec<Vec<StyledSegment>> {
+        let width = self.width as usize;
+        self.rows
+            .into_iter()
+            .map(|cells| {
+                if cells.is_empty() {
+                    Vec::new()
+                } else {
+                    row_segments(&cells, width)
+                }
+            })
+            .filter(|segs| !segs.is_empty())
+            .collect()
+    }
+
+    /// Ensure row `y` has cells (grow height + allocate by width when the row is first written).
+    fn ensure_row(&mut self, y: usize) {
+        if y >= self.rows.len() {
+            self.rows.resize(y + 1, Vec::new());
+        }
+        if self.rows[y].is_empty() {
+            self.rows[y] = vec![Cell::default(); self.width as usize];
+        }
+    }
+}
+
+impl RenderTarget for LineBuffer {
+    fn write(&mut self, x: u16, y: u16, style: &Style, text: &str) {
+        let w = self.width as usize;
+        if x as usize >= w {
+            return;
+        }
+        self.ensure_row(y as usize);
+        write_row_cells(&mut self.rows[y as usize], w, x as usize, style, text);
+    }
+
+    fn fill(&mut self, x: u16, y: u16, width: u16, height: u16, style: &Style) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let row = " ".repeat(width as usize);
+        for dy in 0..height {
+            let yy = y as usize + dy as usize;
+            if yy > u16::MAX as usize {
+                break; // Line number exceeds the range expressible by u16: the line-stream side does not accept a larger y (unreachable in practice)
+            }
+            self.write(x, yy as u16, style, &row);
+        }
+    }
+}
+
+/// Single-line cell-writing kernel: shared by [`ScreenBuffer::write`] and [`LineBuffer`] — width-aware, wide characters occupy two cells, right-edge truncation does not split wide characters,
+/// cleans up orphaned continuation cells when overwriting wide characters. `cells` must be **a full row** (length = `width`); out-of-bounds `x` is filtered by the caller.
+fn write_row_cells(cells: &mut [Cell], width: usize, x: usize, style: &Style, text: &str) {
+    let mut col = x;
+
+    for ch in text.chars() {
+        let char_width = match ch.width() {
+            Some(w) if w > 0 => w,
+            _ => continue, // Zero-width chars (control characters, combining marks, etc.) are skipped; they occupy no cell
+        };
+
+        // Truncation never splits a wide char: stop when the remaining space is less than a full character width (discard the extra half-cell)
+        if col + char_width > width {
+            break;
+        }
+
+        // --- Orphaned continuation-cell cleanup (three scenarios, see the CellKind table above) ---
+
+        // Scenario 1: current cell is a continuation cell of some wide char → clear that wide char's starting cell
+        if col > 0 && matches!(cells[col].kind, CellKind::Continuation) {
+            let prev = col - 1;
+            if matches!(cells[prev].kind, CellKind::Char)
+                && cells[prev].content.as_ref().is_some_and(|c| c.width() == 2)
+            {
+                cells[prev] = Cell::default();
+            }
+        }
+
+        // Scenario 2+3: current cell is the starting cell of some wide char → clear its continuation cell
+        if matches!(cells[col].kind, CellKind::Char)
+            && cells[col].content.as_ref().is_some_and(|c| c.width() == 2)
+            && col + 1 < width
+        {
+            cells[col + 1] = Cell::default();
+        }
+
+        // --- Place new character ---
+        cells[col] = Cell {
+            kind: CellKind::Char,
+            content: Some(ch.to_string()),
+            style: style.clone(),
+        };
+
+        // Wide char continuation cell: occupies the cell but prints nothing, content is None
+        if char_width == 2 {
+            cells[col + 1] = Cell {
+                kind: CellKind::Continuation,
+                content: None,
+                style: Style::default(),
+            };
+        }
+
+        col += char_width;
+    }
+}
+
+/// Row-extraction kernel: shared by [`ScreenBuffer::line_segments`] and [`LineBuffer::into_lines`] — adjacent same-style cells merged, in-row spaces preserved,
+/// wide-character continuation cells skipped, rows with no content return an empty `Vec`. `cells` must be **a full row** (length = `width`).
+fn row_segments(cells: &[Cell], width: usize) -> Vec<StyledSegment> {
+    let w = width.min(cells.len());
+
+    // 1. Determine extent: the column after the last "non-empty" cell (explicit space / wide-char start or continuation).
+    let end = cells[..w]
+        .iter()
+        .rposition(|c| !matches!(c.kind, CellKind::Empty))
+        .map_or(0, |i| i + 1);
+    if end == 0 {
+        return Vec::new();
+    }
+
+    // 2. Scan columns in order, merging adjacent segments with the same style.
+    let mut out: Vec<StyledSegment> = Vec::new();
+    let mut cur_style: Option<Style> = None;
+    let mut cur_text = String::new();
+    for cell in &cells[..end] {
+        match cell.kind {
+            CellKind::Char => {
+                let ch = cell
+                    .content
+                    .as_deref()
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or(' ');
+                if cur_style.as_ref() == Some(&cell.style) {
+                    cur_text.push(ch);
+                } else {
+                    if let Some(s) = cur_style.take() {
+                        if !cur_text.is_empty() {
+                            out.push(StyledSegment {
+                                style: s,
+                                text: std::mem::take(&mut cur_text),
+                            });
+                        }
+                    }
+                    cur_style = Some(cell.style.clone());
+                    cur_text.push(ch);
+                }
+            }
+            CellKind::Continuation => {
+                // Wide-char continuation cell: the start cell already covers two columns, so skip it (do not print the placeholder).
+            }
+            CellKind::Empty => {
+                // Interior gap: append a space to the current segment to preserve position; an empty segment starts with the default style.
+                if cur_style.is_some() {
+                    cur_text.push(' ');
+                } else {
+                    cur_style = Some(Style::default());
+                    cur_text.push(' ');
+                }
+            }
+        }
+    }
+    if let Some(s) = cur_style.take() {
+        if !cur_text.is_empty() {
+            out.push(StyledSegment {
+                style: s,
+                text: cur_text,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -879,5 +1006,98 @@ mod tests {
         let mut out = Vec::new();
         buf.flush(&mut out).unwrap();
         assert!(out.contains(&b'A'));
+    }
+
+    // ── LineBuffer（REQ-TUI-01 / REQ-APP-11，long-row-clip-fix）──
+
+    /// Shared drawing sequence for diff cases: two preconditions (see test comments below)—
+    /// ① all y < grid height; ② when comparing, the grid side also filters blank rows.
+    fn paint_sequence(target: &mut dyn RenderTarget, width: u16) {
+        let bg = Style::bg(crossterm::style::Color::Blue);
+        let fg = Style::fg(crossterm::style::Color::Red);
+        // full-row background → in-row gaps → wide characters → right-edge truncation → multi-row fill
+        target.fill(0, 0, width, 1, &bg);
+        target.write(0, 0, &fg, "hello");
+        target.write(0, 1, &fg, CJK_SAMPLE_2);
+        target.write(6, 2, &fg, "x");
+        target.write(width - 2, 3, &fg, "abcdefgh");
+        target.fill(0, 4, width, 2, &bg);
+        target.write(2, 6, &fg, "tail");
+    }
+
+    #[test]
+    fn test_line_buffer_matches_screen_buffer_for_the_same_paint_sequence() {
+        // Differential test (the single most important one for LineBuffer): the same paint sequence must produce
+        // identical lines on both targets ⇒ "no second rendering logic".
+        // Two prerequisites are baked into `paint_sequence`:
+        //   ① every y is < the grid height (20) — the grid silently drops out-of-range y while LineBuffer grows,
+        //      and *that difference is the whole point of the fix*, so the diff can only compare inside the grid;
+        //   ② the grid side applies the same `!segs.is_empty()` filter as `into_lines` (grid `line_segments` keeps
+        //      empty rows as empty Vecs, `into_lines` drops them).
+        const W: u16 = 20;
+        const H: u16 = 20;
+        let mut grid = ScreenBuffer::new(W, H);
+        let mut lines = LineBuffer::new(W);
+        paint_sequence(&mut grid, W);
+        paint_sequence(&mut lines, W);
+
+        let grid_rows: Vec<Vec<StyledSegment>> = (0..H)
+            .map(|r| grid.line_segments(r))
+            .filter(|segs| !segs.is_empty())
+            .collect();
+        assert_eq!(grid_rows, lines.into_lines());
+    }
+
+    #[test]
+    fn test_line_buffer_fill_densifies_only_the_rows_it_writes() {
+        // Locks the precondition of RenderTarget::fill's doc warning: a small rect grows the buffer only up to the
+        // rows it actually touches (not to some huge budget).
+        let mut lines = LineBuffer::new(10);
+        lines.fill(0, 500, 10, 2, &color_style());
+        assert_eq!(lines.line_count(), 502);
+        assert_eq!(lines.into_lines().len(), 2);
+    }
+
+    #[test]
+    fn test_line_buffer_grows_without_a_height_budget() {
+        // No height parameter exists: writing far down just grows the buffer (the anti-fixed-height-cap property).
+        let mut lines = LineBuffer::new(10);
+        assert_eq!(lines.line_count(), 0);
+        lines.write(0, 2000, &color_style(), "deep");
+        assert_eq!(lines.line_count(), 2001);
+        let only = lines.into_lines();
+        assert_eq!(only.len(), 1, "untouched rows are empty and filtered out");
+        assert_eq!(only[0][0].text, "deep");
+    }
+
+    #[test]
+    fn test_line_buffer_filters_blank_rows_like_the_grid_path() {
+        // Existing convention (shared with the pre-PF-04 streaming path): rows that were **never written** are dropped
+        // from the line set. Note the contrast (also locked here): a row that was only `fill`ed with spaces IS content
+        // (spaces are explicit cells), and both targets keep it.
+        let mut lines = LineBuffer::new(6);
+        lines.write(0, 0, &color_style(), "a");
+        // row 1 untouched → filtered out
+        lines.write(0, 2, &color_style(), "b");
+        let out = lines.into_lines();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][0].text, "a");
+        assert_eq!(out[1][0].text, "b");
+
+        let mut filled = LineBuffer::new(6);
+        filled.fill(0, 0, 6, 1, &Style::default());
+        assert_eq!(filled.into_lines().len(), 1);
+    }
+
+    #[test]
+    fn test_line_buffer_lines_never_exceed_width() {
+        // PF-04 contract: cached/pushed lines must already fit the width (no per-character width scan downstream).
+        let mut lines = LineBuffer::new(8);
+        lines.write(0, 0, &color_style(), "abcdefghijkl");
+        lines.write(0, 1, &color_style(), "中文中文中文");
+        for row in lines.into_lines() {
+            let cols: usize = row.iter().map(|s| visible_width(&s.text)).sum();
+            assert!(cols <= 8, "line wider than width: {cols}");
+        }
     }
 }

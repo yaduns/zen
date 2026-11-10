@@ -34,14 +34,14 @@ pub mod visual_truncate;
 use crossterm::style::Color;
 use zen_tui::highlight::StyledSegment;
 use zen_tui::markdown::MarkdownTheme;
-use zen_tui::screen::{self, ScreenBuffer, Style};
+use zen_tui::screen::{self, Style};
 
 pub use zen_tui::components::Component;
 
 /// Inline segment sequence write (truncates when too wide), used by FoldRow::Segments etc. `box_bg` is the background of the containing box
 /// (merged into bg-None segments, see render::merge_box_bg; pass None for non-boxes).
 fn write_segments_row(
-    buf: &mut ScreenBuffer,
+    buf: &mut dyn zen_tui::screen::RenderTarget,
     x: u16,
     y: u16,
     width: u16,
@@ -86,7 +86,7 @@ pub(crate) enum FoldRow {
 /// Each row leaves `pad` columns blank on the left; truncated from the bottom when the height budget is insufficient. Returns the number of rows actually drawn.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_fold_rows(
-    buf: &mut ScreenBuffer,
+    buf: &mut dyn zen_tui::screen::RenderTarget,
     x: u16,
     y: u16,
     width: u16,
@@ -161,6 +161,7 @@ pub(crate) fn paint_fold_rows(
 mod tests {
     use super::*;
     use crossterm::style::Color;
+    use zen_tui::screen::ScreenBuffer;
 
     fn seg(text: &str) -> StyledSegment {
         StyledSegment {
