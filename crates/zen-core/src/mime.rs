@@ -26,7 +26,8 @@ const IMAGE_TYPE_SNIFF_BYTES: usize = 4100;
 ///
 /// Boundary: if `buffer` is too short, return `None` (all reads go through `get`/bounds checks, no panic); if no signature matches, return `None`.
 ///
-/// Current consumer: T-AP-08-4 (`cli/file_processor.rs`). Planned consumer: T-AG-02-8 (image tool).
+/// Current consumers: T-AP-08-4 (`cli/file_processor.rs`, byte-level) and T-AG-02-8
+/// (`tools/read.rs`, file-level).
 pub fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
     if starts_with_bytes(buffer, &[0xFF, 0xD8, 0xFF]) {
         return if buffer.get(3) == Some(&0xF7) {
@@ -54,7 +55,7 @@ pub fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// When the image tool (T-AG-02-8) or a later read tool only knows the file path and wants to avoid reading the whole file, it reads only the first
+/// The read tool (T-AG-02-8) or any later caller that only knows the file path and wants to avoid reading the whole file reads only the first
 /// `IMAGE_TYPE_SNIFF_BYTES` (4100) bytes from disk to determine whether it can be inlined as an image — return the MIME type on a hit, `None` for non-images,
 /// If the file cannot be opened/read, return `io::Error` (analogy: glance at the file header at the door; no need to move the whole book inside).
 ///
@@ -62,8 +63,7 @@ pub fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
 /// takes `&buf[..n]` (tolerating short reads), equivalent to pi's single-read behavior of `fileHandle.read(buffer, 0, 4100, 0)`;
 /// `path` is the file path (aligned with pi's `open` contract; relative or absolute, reachability guaranteed by the caller).
 ///
-/// Currently no consumer; pub but reserved for T-AG-02-8 (image tool) (plan note contract `io::Result<Option<String>>`
-/// refined with `&'static str`, already registered).
+/// Current consumer: T-AG-02-8 (`tools/read.rs::detect_image_mime_type`).
 pub async fn detect_supported_image_mime_type_from_file(
     path: &Path,
 ) -> std::io::Result<Option<&'static str>> {
