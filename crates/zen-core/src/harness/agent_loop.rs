@@ -242,7 +242,10 @@ pub(crate) async fn stream_assistant_response(
                 response_id: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
-                error_message: Some(err.to_string()),
+                // `describe()` (not `to_string()`): a failure during the HTTP send phase only carries the generic
+                // reqwest shell on `Display`; the hyper/io cause lives in `source()` and is needed for retry
+                // classification + a readable error line (turn-auto-retry-fix item ④).
+                error_message: Some(err.describe()),
                 timestamp: now(),
             };
             context.messages.push(Message::Assistant(msg.clone()));

@@ -21,6 +21,7 @@ use crate::observability::frame_report::report_frame_stats;
 use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
 };
+use crate::components::assistant_message::stop_line_text;
 use crate::components::footer::FooterData;
 use crate::components::scoped_models_selector::EnabledModelIds;
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
@@ -227,8 +228,9 @@ pub(crate) enum StatusSpec {
     /// Busy status line (spinner + message, message is updatable).
     Working { message: String },
     /// Request retry countdown (`StatusIndicator::retry` argument).
-    #[allow(dead_code)]
-    // v1 has no retry orchestration (StreamFn-level retry deferred to T-AP-04-2)
+    /// **Producer**: `bridge_agent_event`'s `AutoRetryStart` arm (turn-auto-retry-fix). The countdown advances inside
+    /// the render frame (`StatusIndicator::render` → `CountdownTimer::tick`), so the retry window must arm the frame
+    /// cadence itself (`UiEvent::SetAnimation(true)`) — the previous run already disarmed it via `AgentEnd`.
     Retry {
         attempt: u32,
         max_attempts: u32,
@@ -1094,7 +1096,12 @@ impl InteractiveMode {
             .last_escape_at
             .is_some_and(|t| now.duration_since(t) < Duration::from_millis(500));
         self.last_escape_at = Some(now);
-        if self.runtime.session.is_run() {
+        if self.runtime.session.is_retrying() {
+            // turn-auto-retry-fix: while backing off the engine is idle (`is_run() == false`), so Esc must route to
+            // `abort_retry` first — pi swaps the editor's Esc handler to `abortRetry` for the same window.
+            self.runtime.session.abort_retry();
+            self.show_status("Cancelling retry...");
+        } else if self.runtime.session.is_run() {
             self.runtime.session.abort();
             self.show_status("Aborting...");
         } else if is_double {
@@ -2248,8 +2255,14 @@ fn bridge_agent_event(
             let error_text = match message {
                 Message::Assistant(a) => match a.stop_reason {
                     // Cancellation is already expressed by the message block "Operation aborted" (assistant_message.rs Aborted branch),
-                    // so "Request was aborted" is no longer repeated in the status/Info line (interactive-cancel-fix backfill)
+                    // so "Request was aborted" is no longer repeated in the status/Info line (interactive-cancel-fix backfill).
+                    // This explicit arm is load-bearing: `stop_line_text` carries a `!has_tool_calls()` guard, so it returns
+                    // `None` for an aborted message that *does* carry tool calls — handing Aborted to it would resurrect the
+                    // duplicate line (turn-auto-retry-fix review B3).
                     zen_ai::types::StopReason::Aborted => None,
+                    // Everything else: push the info line only when the message block did not already show it
+                    // (turn-auto-retry-fix item ④ — the block renders `Error: {msg}` by itself).
+                    _ if stop_line_text(a).is_some() => None,
                     _ => stop_error_message(a),
                 },
                 _ => None,
@@ -2323,6 +2336,45 @@ fn bridge_agent_event(
             let _ = tx.send(UiEvent::Status(StatusSpec::Compaction {
                 reason: (*reason).into(),
             }));
+        }
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => {
+            // turn-auto-retry-fix: the retry happens **after** `agent.prompt` returned (RunGuard already reset, `AgentEnd`
+            // already disarmed the frame cadence), so this window has to arm it again — otherwise the countdown renders
+            // its first second once and then freezes until the next `AgentStart`.
+            tracing::info!(
+                target: "ai::retry",
+                attempt,
+                max_attempts,
+                delay_ms,
+                error = error_message.as_str(),
+                "retrying"
+            );
+            let _ = tx.send(UiEvent::Status(StatusSpec::Retry {
+                attempt: *attempt,
+                max_attempts: *max_attempts,
+                delay_ms: *delay_ms,
+            }));
+            let _ = tx.send(UiEvent::SetAnimation(true));
+        }
+        AgentEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error,
+        } => {
+            // Both branches must disarm: a leaked cadence keeps an idle UI repainting every 80 ms after Esc/budget.
+            let _ = tx.send(UiEvent::ClearStatus);
+            let _ = tx.send(UiEvent::SetAnimation(false));
+            if !*success {
+                let reason = final_error.as_deref().unwrap_or("Unknown error");
+                let _ = tx.send(UiEvent::Status(StatusSpec::Error(format!(
+                    "Retry failed after {attempt} attempts: {reason}"
+                ))));
+            }
         }
         AgentEvent::CompactionEnd {
             reason,
@@ -2844,8 +2896,24 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
     }
 
+    /// Assistant message carrying a toolCall block (turn-auto-retry-fix dedupe matrix needs both shapes).
+    fn assistant_with_tool_call(stop: StopReason, error: Option<&str>) -> AssistantMessage {
+        let mut a = assistant_with_usage("", Usage::default());
+        a.content = vec![ContentBlock::ToolCall(zen_ai::types::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+        })];
+        a.stop_reason = stop;
+        a.error_message = error.map(|e| e.to_string());
+        a
+    }
+
     #[test]
-    fn test_bridge_error_message_end_attaches_error_text() {
+    fn test_bridge_error_without_tool_call_suppresses_duplicate_error_text() {
+        // turn-auto-retry-fix item ④: the assistant block already renders `Error: {msg}` for a tool-call-free
+        // message, so pushing the same text as an Info row would print the error twice (the reported symptom).
         let (tx, mut rx) = channel();
         let usage = StdMutex::new(UsageTurnState::default());
         let mut a = assistant_with_usage("x", Usage::default());
@@ -2862,8 +2930,147 @@ mod tests {
         );
         assert!(matches!(
             rx.try_recv(),
+            Ok(UiEvent::MessageEnd {
+                error_text: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_bridge_error_with_tool_call_keeps_error_text() {
+        // With tool calls the block shows no stop line, so the Info row is the only place the error is visible.
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTurnState::default());
+        bridge_agent_event(
+            &AgentEvent::MessageEnd {
+                message: Message::Assistant(assistant_with_tool_call(
+                    StopReason::Error,
+                    Some("provider 500"),
+                )),
+            },
+            &tx,
+            &usage,
+            &test_bridge_footer(),
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(
+            rx.try_recv(),
             Ok(UiEvent::MessageEnd { error_text: Some(e), .. }) if e == "provider 500"
         ));
+    }
+
+    #[test]
+    fn test_bridge_aborted_with_tool_call_still_suppresses_error_text() {
+        // Regression guard (review B3): `stop_line_text` returns None for Aborted+toolCall, so the dedupe rule alone
+        // would resurrect the "Operation aborted" + "Request was aborted" double line fixed by interactive-cancel-fix.
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTurnState::default());
+        bridge_agent_event(
+            &AgentEvent::MessageEnd {
+                message: Message::Assistant(assistant_with_tool_call(
+                    StopReason::Aborted,
+                    Some("Request was aborted"),
+                )),
+            },
+            &tx,
+            &usage,
+            &test_bridge_footer(),
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::MessageEnd {
+                error_text: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_bridge_auto_retry_arms_and_disarms_animation() {
+        let (tx, mut rx) = channel();
+        let usage = StdMutex::new(UsageTurnState::default());
+        let footer = test_bridge_footer();
+
+        // AutoRetryStart → retry status line + animation armed (countdown is driven by render frames).
+        bridge_agent_event(
+            &AgentEvent::AutoRetryStart {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 2000,
+                error_message: "timeout".into(),
+            },
+            &tx,
+            &usage,
+            &footer,
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Status(StatusSpec::Retry {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 2000
+            }))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::SetAnimation(true))));
+
+        // Failure end → clear + disarm + error line.
+        bridge_agent_event(
+            &AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: 1,
+                final_error: Some("boom".into()),
+            },
+            &tx,
+            &usage,
+            &footer,
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::ClearStatus)));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::SetAnimation(false))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Status(StatusSpec::Error(msg))) if msg == "Retry failed after 1 attempts: boom"
+        ));
+
+        // Success end → clear + disarm, no error line; a `None` final_error falls back to "Unknown error".
+        bridge_agent_event(
+            &AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: 2,
+                final_error: None,
+            },
+            &tx,
+            &usage,
+            &footer,
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::ClearStatus)));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::SetAnimation(false))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Status(StatusSpec::Error(msg))) if msg == "Retry failed after 2 attempts: Unknown error"
+        ));
+
+        bridge_agent_event(
+            &AgentEvent::AutoRetryEnd {
+                success: true,
+                attempt: 2,
+                final_error: None,
+            },
+            &tx,
+            &usage,
+            &footer,
+            &CacheMissContext::disabled(),
+        );
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::ClearStatus)));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::SetAnimation(false))));
+        assert!(
+            rx.try_recv().is_err(),
+            "success must not push an error line"
+        );
     }
 
     #[test]

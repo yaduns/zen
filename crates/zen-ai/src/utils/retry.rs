@@ -27,12 +27,42 @@ fn non_retryable_pattern() -> &'static Regex {
 }
 
 /// Retryable error patterns. Matches temporary errors such as provider overload / network timeouts / 5xx.
+///
+/// The table started as a verbatim port of pi's JS-ecosystem wording (`terminated` / `other side closed` /
+/// `socket hang up` / `reset before headers`, all undici/Node-flavoured). The Rust transport stack (reqwest → hyper →
+/// io) phrases the same failures differently, so the Rust-flavoured causes are appended here
+/// (`error decoding response body` / `connection closed before message completed` / `unexpected end of file` /
+/// `incomplete message` / `connection reset`).
+///
+/// Deliberately **not** listed: the generic shell `error sending request for url (...)` — it also wraps deterministic
+/// failures (bad DNS name, invalid header), so retrying on it would amplify 4xx-class errors; the real cause reaches
+/// the message through `utils::error_chain::describe_error_chain` instead.
 fn retryable_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)overloaded|rate.?limit|too many requests|429|500|502|503|504|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|http2 request did not get a response|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted")
+        Regex::new(r"(?i)overloaded|rate.?limit|too many requests|429|500|502|503|504|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?error|connection.?refused|connection.?lost|connection closed before message completed|connection reset|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|error decoding response body|unexpected end of file|incomplete message|http2 request did not get a response|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted")
             .expect("invalid retryable pattern")
     })
+}
+
+/// One retry's backoff wait in milliseconds (pi `baseDelayMs * 2^(attempt-1)`) — the retry loop and the turn-level
+/// orchestrator share this single formula, so a future change cannot silently update only one of them.
+///
+/// # Parameters
+/// - `base_delay_ms`: `RetryPolicy.base_delay_ms` (the user-configured base delay).
+/// - `attempt`: **1-based** retry index (1 = first retry → `base_delay_ms`, 2 → ×2, 3 → ×4, …).
+///
+/// # Edge Cases
+/// - `attempt == 0` is treated as 1 (defensive against 0-based callers).
+/// - Uses saturating arithmetic: a very large `attempt` cannot panic (the previous inline `2u64.pow(attempt - 1)`
+///   overflowed in debug builds).
+///
+/// # Consumers
+/// [`retry_assistant_call`] (compaction / branch-summary path) and
+/// `zen-app/src/session/retry.rs::AgentSession::check_retry_after_run` (turn level).
+pub fn retry_delay_ms(base_delay_ms: u64, attempt: u32) -> u64 {
+    let exponent = attempt.saturating_sub(1).min(63);
+    base_delay_ms.saturating_mul(1u64 << exponent)
 }
 
 /// Retries the `produce` call with exponential backoff until it succeeds, retries are exhausted, or it is cancelled.
@@ -96,7 +126,7 @@ where
 
         // Retryable: exponential backoff
         attempt += 1;
-        let delay_ms = policy.as_ref().unwrap().base_delay_ms * 2u64.pow(attempt - 1);
+        let delay_ms = retry_delay_ms(policy.as_ref().unwrap().base_delay_ms, attempt);
 
         tracing::info!(
             target: "ai::retry",
@@ -518,6 +548,56 @@ mod tests {
         assert!(is_retryable_assistant_error(&make_error_msg(
             "other side closed"
         )));
+    }
+
+    // ── Rust transport-layer wording (turn-auto-retry-fix) ──
+
+    #[test]
+    fn test_retryable_rust_transport_wording() {
+        // Real texts coming from reqwest/hyper/io through the Rust pipeline
+        for text in [
+            "SSE stream error: Transport error: error decoding response body",
+            "connection closed before message completed",
+            "unexpected end of file",
+            "incomplete message",
+            "connection reset by peer",
+            "HTTP request failed: error sending request for url (http://x): connection closed before message completed",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&make_error_msg(text)),
+                "should be retryable: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_retryable_body_error_is_not_matched() {
+        // Guard against re-introducing the over-broad `body error` wording: a malformed request body is a
+        // deterministic 400-class failure, retrying it only burns the budget.
+        assert!(!is_retryable_assistant_error(&make_error_msg(
+            "request body error: invalid JSON"
+        )));
+    }
+
+    // ── retry_delay_ms ──
+
+    #[test]
+    fn test_retry_delay_ms_doubles_per_attempt() {
+        assert_eq!(retry_delay_ms(2_000, 1), 2_000);
+        assert_eq!(retry_delay_ms(2_000, 2), 4_000);
+        assert_eq!(retry_delay_ms(2_000, 3), 8_000);
+    }
+
+    #[test]
+    fn test_retry_delay_ms_treats_zero_attempt_as_first() {
+        assert_eq!(retry_delay_ms(500, 0), 500);
+    }
+
+    #[test]
+    fn test_retry_delay_ms_saturates_instead_of_panicking() {
+        assert_eq!(retry_delay_ms(u64::MAX, 10), u64::MAX);
+        // 200 would have overflowed the old `2u64.pow(attempt - 1)` in debug builds; the exponent is clamped at 63.
+        assert_eq!(retry_delay_ms(1, 200), 1u64 << 63);
     }
 
     // ── case insensitivity ──

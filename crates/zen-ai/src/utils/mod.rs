@@ -1,4 +1,5 @@
 pub mod error_body;
+pub mod error_chain;
 pub mod estimate;
 pub mod hash;
 pub mod headers;

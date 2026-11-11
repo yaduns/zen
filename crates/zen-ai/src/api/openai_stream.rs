@@ -55,6 +55,30 @@ pub enum StreamError {
     Cancelled,
 }
 
+impl StreamError {
+    /// When a request fails before the first byte (DNS / connect / send phase) both the user and the retry classifier
+    /// need the **cause inside the shell** — this renders a `StreamError` as one readable line carrying the source
+    /// chain, instead of the bare `to_string()`.
+    ///
+    /// # Behavior
+    /// - `HttpRequest(e)` → `HTTP request failed: ` + [`crate::utils::error_chain::describe_error_chain`] (keeps the
+    ///   reqwest URL plus the hyper/io cause).
+    /// - Every other variant is **byte-identical to `Display`** (`ApiError` already carries a readable message, so no
+    ///   chain walking is needed). Locked by unit tests to keep the two texts from drifting apart.
+    ///
+    /// # Consumers
+    /// `zen-core/src/harness/agent_loop.rs` (immediate `stream_fn` failure → `AssistantMessage.error_message`).
+    pub fn describe(&self) -> String {
+        match self {
+            StreamError::HttpRequest(err) => format!(
+                "HTTP request failed: {}",
+                crate::utils::error_chain::describe_error_chain(err)
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct Request {
@@ -1432,6 +1456,56 @@ fn handle_events(
 /// Background SSE event loop.
 /// Runs in a dedicated tokio task, reading the SSE event stream from the HTTP response body.
 /// Internal flow:
+/// Flattens an SSE transport error into one line: `EventStreamError` does not implement `source()`, so the
+/// `reqwest::Error` inside the shell has to be unwrapped by hand — otherwise the user only sees
+/// `Transport error: error decoding response body` and the hyper/io cause stays invisible (and unmatched by the retry
+/// wording table).
+///
+/// # Behavior
+/// - `Transport(e)` → `SSE stream error: Transport error: ` + [`crate::utils::error_chain::describe_error_chain`].
+/// - `Utf8(e)` / `Parser(e)` → their own `Display` behind `SSE stream error: `.
+///
+/// # Consumers
+/// The SSE event loop's transport-error branch (3g) in `stream()`; unit tests in this file.
+fn describe_sse_error(err: &eventsource_stream::EventStreamError<reqwest::Error>) -> String {
+    use eventsource_stream::EventStreamError;
+    match err {
+        EventStreamError::Transport(e) => format!(
+            "SSE stream error: Transport error: {}",
+            crate::utils::error_chain::describe_error_chain(e)
+        ),
+        other => format!("SSE stream error: {other}"),
+    }
+}
+
+/// Decides whether a stream ended "quietly" and therefore must not be reported as a success: both `[DONE]` and a
+/// plain EOF can end the loop **without a `finish_reason`**, and pi treats that as a failure at the same point
+/// (`Stream ended without finish_reason`). Kept as a pure function so the judgement can be unit-tested without HTTP.
+///
+/// # Behavior
+/// - An existing `error_message` wins (error paths, including cancellation, are returned untouched).
+/// - No error and `has_finish_reason == false` → `Some("Stream ended without finish_reason")` (the text matches the
+///   `ended without` retry wording, so a cut-off upstream is retried rather than silently accepted).
+/// - No error and a `finish_reason` was seen → `None` (normal termination).
+///
+/// # Known trade-off
+/// Compatibility gateways that only send a trailing usage chunk and never a `finish_reason` will now be classified as
+/// errors (pi behaves identically). Registered in `tasks/turn-auto-retry-fix-implemented.md` with a rollback switch
+/// (judge EOF only, not `[DONE]`) if the wording shows up in the field.
+///
+/// # Consumers
+/// `stream()` Phase 4 (before `finalize_stop_reason`).
+fn missing_finish_reason_error(
+    error_message: Option<String>,
+    has_finish_reason: bool,
+) -> Option<String> {
+    if error_message.is_some() || has_finish_reason {
+        error_message
+    } else {
+        Some("Stream ended without finish_reason".to_string())
+    }
+}
+
 /// Reconciles the final `stop_reason` with `error_message` (pure-function extraction from `sse_event_loop` Phase 4a, for unit tests).
 ///
 /// User cancelled (`cancelled`) and no finish_reason received → `Aborted` (aligned with interactive-cancel-fix acceptance
@@ -1548,7 +1622,7 @@ async fn sse_event_loop(
                     }
                     // 3g. SSE transport-layer error → record and exit
                     Some(Err(e)) => {
-                        error_message = Some(format!("SSE stream error: {}", e));
+                        error_message = Some(describe_sse_error(&e));
                         break;
                     }
                     // 3h. Stream ended normally (EOF)
@@ -1562,6 +1636,12 @@ async fn sse_event_loop(
     // Take all finalized content blocks from the accumulator.
     let mut content = Vec::new();
     std::mem::swap(&mut content, &mut accumulator.content_blocks);
+
+    // 4.0. A stream that ends quietly without ever seeing a `finish_reason` is not a success: both `[DONE]` and a
+    //      plain EOF can end the loop, and pi throws `Stream ended without finish_reason` at the same point. The
+    //      synthesized text carries `ended without`, which the retry wording table classifies as transient, so a
+    //      cut-off upstream gets backed off and retried instead of being reported as a successful turn.
+    let error_message = missing_finish_reason_error(error_message, accumulator.has_finish_reason);
 
     // 4a. Reconcile stop_reason with error_message (pure function finalize_stop_reason, for unit tests):
     //     - User cancelled and no finish_reason → Aborted (aligns with cancel-fix acceptance "partial finalized as aborted")
@@ -3100,6 +3180,174 @@ mod tests {
         let (reason, msg) = finalize_stop_reason(&Some("tail error".to_string()), &acc, false);
         assert_eq!(reason, StopReason::Stop);
         assert_eq!(msg.as_deref(), Some("tail error"));
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  missing_finish_reason_error (turn-auto-retry-fix item ②)
+    // ═════════════════════════════════════════════════════════════
+
+    #[test]
+    fn missing_finish_reason_error_synthesizes_text_on_quiet_end() {
+        assert_eq!(
+            missing_finish_reason_error(None, false).as_deref(),
+            Some("Stream ended without finish_reason")
+        );
+    }
+
+    #[test]
+    fn missing_finish_reason_error_keeps_an_existing_error() {
+        assert_eq!(
+            missing_finish_reason_error(Some("boom".to_string()), false).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            missing_finish_reason_error(Some("tail".to_string()), true).as_deref(),
+            Some("tail")
+        );
+    }
+
+    #[test]
+    fn missing_finish_reason_error_is_none_after_a_finish_reason() {
+        assert_eq!(missing_finish_reason_error(None, true), None);
+    }
+
+    /// The synthesized text must land in the retryable set (otherwise a cut-off upstream would still end the turn).
+    #[test]
+    fn synthesized_missing_finish_reason_text_is_retryable() {
+        use crate::utils::retry::is_retryable_assistant_error;
+        let mut msg = AssistantMessage {
+            content: vec![],
+            api: "openai-completions".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: missing_finish_reason_error(None, false),
+            timestamp: 0,
+        };
+        assert!(is_retryable_assistant_error(&msg));
+        msg.error_message = Some("Stream ended with a terminal event".into());
+        assert!(!is_retryable_assistant_error(&msg));
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  StreamError::describe / describe_sse_error (item ④)
+    // ═════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stream_error_describe_matches_display_for_non_http_variants() {
+        let variants = [
+            StreamError::NoApiKey,
+            StreamError::Cancelled,
+            StreamError::ApiError {
+                status: 400,
+                message: "bad request".into(),
+            },
+            StreamError::SSEError("parse".into()),
+            StreamError::IncompleteStream("incomplete".into()),
+        ];
+        for e in variants {
+            assert_eq!(e.describe(), e.to_string(), "variant drifted: {e:?}");
+        }
+    }
+
+    /// A real refused local connection: `Display` only carries the generic reqwest shell, so `describe()` must add
+    /// at least one non-empty source layer.
+    #[tokio::test]
+    async fn stream_error_describe_includes_a_source_layer_for_http_failures() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the connection");
+        let described = StreamError::HttpRequest(err).describe();
+        assert!(
+            described.starts_with("HTTP request failed: "),
+            "actual: {described}"
+        );
+        // Do not lock the exact wording (kernel/container dependent): require something beyond the shell.
+        let tail = described
+            .trim_start_matches("HTTP request failed: ")
+            .to_string();
+        assert!(
+            tail.len()
+                > "error sending request for url (http://127.0.0.1:1/)"
+                    .len()
+                    .saturating_sub(40),
+            "describe() must carry more than the bare shell: {described}"
+        );
+        assert!(
+            tail.contains(": ")
+                || tail.contains("refused")
+                || tail.contains("reset")
+                || tail.contains("unreachable")
+                || tail.contains("error"),
+            "actual: {described}"
+        );
+    }
+
+    /// Shapes produced by `describe()` on this stack (recorded while implementing turn-auto-retry-fix): a refused
+    /// connection carries the retryable wording, a DNS failure does **not** (it is deterministic).
+    #[test]
+    fn described_http_failures_classify_as_expected() {
+        use crate::utils::retry::is_retryable_assistant_error;
+
+        let refused = "HTTP request failed: error sending request for url (http://127.0.0.1:1/): \
+                       client error (Connect): tcp connect error: Connection refused (os error 61)";
+        let dns = "HTTP request failed: error sending request for url (http://x.invalid/): \
+                   client error (Connect): dns error: failed to lookup address information";
+        let mid_body = "HTTP request failed: error sending request for url (https://x/): \
+                        client error (SendRequest): connection closed before message completed";
+        let classify = |text: &str| {
+            let mut msg = AssistantMessage {
+                content: vec![],
+                api: "openai-completions".into(),
+                provider: "p".into(),
+                model: "m".into(),
+                response_model: None,
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some(text.to_string()),
+                timestamp: 0,
+            };
+            let retryable = is_retryable_assistant_error(&msg);
+            msg.error_message = None;
+            retryable
+        };
+        assert!(classify(refused), "refused should be retryable");
+        assert!(classify(mid_body), "mid-body cut should be retryable");
+        assert!(!classify(dns), "dns failure must stay non-retryable");
+    }
+
+    #[tokio::test]
+    async fn describe_sse_error_unwraps_the_transport_source() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the connection");
+        let wrapped = eventsource_stream::EventStreamError::Transport(err);
+        let described = describe_sse_error(&wrapped);
+        assert!(
+            described.starts_with("SSE stream error: Transport error: "),
+            "actual: {described}"
+        );
+        assert!(described.len() > "SSE stream error: Transport error: ".len());
+    }
+
+    #[test]
+    fn describe_sse_error_keeps_utf8_variant_wording() {
+        let utf8 = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
+        let wrapped: eventsource_stream::EventStreamError<reqwest::Error> =
+            eventsource_stream::EventStreamError::Utf8(utf8);
+        let described = describe_sse_error(&wrapped);
+        assert!(
+            described.starts_with("SSE stream error: UTF8 error: "),
+            "actual: {described}"
+        );
     }
 
     /// Run a set of JSON chunks through `parse_chunk` + `handle_events`; return the collected incremental events and the accumulator's final state.

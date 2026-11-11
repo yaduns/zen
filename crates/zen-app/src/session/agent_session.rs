@@ -5,7 +5,7 @@ use crate::session::session_manager::SessionManagerError;
 use crate::skills::LoadedSkill;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use zen_ai::types::{
@@ -154,6 +154,15 @@ pub struct AgentSession {
     /// one compaction at a time): set to Some when compact()/run_auto_compaction starts, cleared when it ends (including on error);
     /// `abort()` cancels it as well. The other end of the token is consumed by zen-core's `compact(cancel)`.
     pub(crate) compaction_cancel: Mutex<Option<CancellationToken>>,
+    /// Retry attempts used so far in the current retry sequence (turn-auto-retry-fix; pi `_retryAttempt`).
+    /// Cleared whenever a sequence closes (success / non-retryable / budget exhausted / cancelled) so a new prompt
+    /// always starts from zero. `AtomicU32` because the retry orchestration runs behind `&self`.
+    pub(crate) retry_attempt: AtomicU32,
+    /// Cancellation handle for the backoff wait currently in progress (turn-auto-retry-fix; merge of pi's
+    /// `_retryAbortController`): `Some` only while sleeping between attempts, cleared when the wait ends. Esc in the
+    /// interactive layer (`abort_retry`) and `abort()` cancel it. Distinct from the engine's run token — during the
+    /// backoff wait the engine itself is idle.
+    pub(crate) retry_cancel: Mutex<Option<CancellationToken>>,
 }
 
 impl AgentSession {
@@ -236,6 +245,8 @@ impl AgentSession {
             templates,
             overflow_recovery_attempted: overflow_flag,
             compaction_cancel: Mutex::new(None),
+            retry_attempt: AtomicU32::new(0),
+            retry_cancel: Mutex::new(None),
         }
     }
 
@@ -271,9 +282,13 @@ impl AgentSession {
     ///    - Post-run check (aligned with pi :1094 agent_end handling): threshold compaction / overflow
     ///      recovery retry / deliver queued messages — return true → `continue_turn` for another round, its output merged into the return value
     /// 3. Call `self.agent.prompt(&expanded, images)` (the engine refreshes the run token internally; pi exposes no parameter surface; D2/D4)
-    /// 4. A persistent subscription runs during execution to persist in real time (message_end → append_message); consumers
+    /// 4. **Turn-level auto retry (turn-auto-retry-fix)**: while `check_retry_after_run()` reports a retryable transient
+    ///    failure (backoff already waited, abortable via `abort_retry`), continue the turn with
+    ///    `agent.continue_turn()`. A `continue_turn` error closes the retry sequence (`finish_retry_after_error`) and
+    ///    propagates — otherwise the status line would stay on "Retrying..." and the attempt counter would leak.
+    /// 5. A persistent subscription runs during execution to persist in real time (message_end → append_message); consumers
     ///    Events subscribed via `subscribe` are delivered synchronously
-    /// 4. Return all messages newly added this round
+    /// 6. Return all messages newly added this round
     ///
     /// # Parameters
     /// - `text`: user prompt text (interactive mode matches pi: `@path` is not expanded, raw text passes through;
@@ -305,6 +320,19 @@ impl AgentSession {
             let _ = self.check_compaction(last, false).await;
         }
         let mut msgs = self.agent.prompt(&expanded, images).await;
+        // Turn-level auto retry (turn-auto-retry-fix; pi `_runAgentPrompt`'s `while (_handlePostAgentRun())` retry
+        // branch): a retryable transient failure backs off and continues instead of ending the turn and demanding a
+        // manual "continue". Errors from `continue_turn` must still close the retry sequence — otherwise the status
+        // line stays on "Retrying..." and the attempt counter leaks into the next prompt.
+        while self.check_retry_after_run().await {
+            match self.agent.continue_turn().await {
+                Ok(more) => msgs.extend(more),
+                Err(e) => {
+                    self.finish_retry_after_error(&e.to_string());
+                    return Err(e.into());
+                }
+            }
+        }
         // Post-run check (aligned with pi :1094 agent_end handling): return true → continue_turn (overflow
         // recovery retry / deliver queued messages), continued-round output merged into the return value
         let should_continue =
@@ -420,6 +448,8 @@ impl AgentSession {
         {
             token.cancel();
         }
+        // Cancel an in-progress retry backoff as well (turn-auto-retry-fix; pi `abort()` also calls `abortRetry()`).
+        self.abort_retry();
         self.agent.abort();
     }
 

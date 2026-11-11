@@ -139,7 +139,11 @@ impl AgentState {
             // Compaction lifecycle events are injected and consumed by the app-layer scheduler (T-AP-04-3) via Agent::emit,
             // They are outside the engine state-machine reduction surface (streaming_message/pending_tool_calls are unrelated to compaction)
             | AgentEvent::CompactionStart { .. }
-            | AgentEvent::CompactionEnd { .. } => {}
+            | AgentEvent::CompactionEnd { .. }
+            // Turn-level auto-retry events (turn-auto-retry-fix) are injected/consumed by the app-layer session
+            // orchestration; also outside this reduction surface.
+            | AgentEvent::AutoRetryStart { .. }
+            | AgentEvent::AutoRetryEnd { .. } => {}
         }
     }
 }
@@ -201,6 +205,34 @@ pub enum AgentEvent {
         aborted: bool,
         will_retry: bool,
         error_message: Option<String>,
+    },
+    /// Turn-level auto retry is about to back off (turn-auto-retry-fix: injected by the app-layer session orchestration
+    /// via `Agent::emit`, not an engine-generated event). Emitted **before** the backoff sleep, with the same payload as
+    /// pi's `auto_retry_start`; the interactive layer turns it into a countdown status line
+    /// (`StatusSpec::Retry`) and must arm the frame cadence itself (the previous run already disarmed it).
+    ///
+    /// Event contract: emitted once per retry attempt; always paired with exactly one [`AgentEvent::AutoRetryEnd`].
+    AutoRetryStart {
+        /// 1-based retry index.
+        attempt: u32,
+        /// Total budget (`settings.retry.max_retries`).
+        max_attempts: u32,
+        /// Backoff wait in milliseconds.
+        delay_ms: u64,
+        /// Error text that triggered the retry.
+        error_message: String,
+    },
+    /// Turn-level auto retry sequence finished (pi `auto_retry_end`).
+    ///
+    /// Event contract: emitted exactly once for every [`AgentEvent::AutoRetryStart`] (success, budget exhausted,
+    /// non-retryable, or backoff cancelled by Esc). Consumers must disarm the frame cadence on both branches.
+    AutoRetryEnd {
+        /// `true` when a later turn completed normally, `false` for budget exhaustion / non-retryable / cancelled.
+        success: bool,
+        /// Retry index the sequence ended at.
+        attempt: u32,
+        /// Final error text when `success == false`; `None` when the error message was absent.
+        final_error: Option<String>,
     },
 }
 

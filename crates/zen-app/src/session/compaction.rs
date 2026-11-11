@@ -187,10 +187,11 @@ impl AgentSession {
                 .store(true, Ordering::Relaxed);
             // Drop the trailing erroneous assistant message (pi :2002-2006: already persisted to session history, but not kept in the retry context;
             // after compaction the context is rebuilt wholesale, so popping it here clears the way for estimation/retry)
-            let mut messages = self.agent.messages();
+            // Shared with the turn-level retry orchestration (turn-auto-retry-fix) — same rule, same helper.
+            let messages = self.agent.messages();
             if matches!(messages.last(), Some(Message::Assistant(_))) {
-                messages.pop();
-                self.agent.set_messages(messages);
+                self.agent
+                    .set_messages(super::retry::with_trailing_assistant_removed(messages));
             }
             return self
                 .run_auto_compaction(CompactionReason::Overflow, will_retry)

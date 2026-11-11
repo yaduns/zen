@@ -95,39 +95,9 @@ impl<'a> AssistantMessageComponent<'a> {
         &self.message
     }
 
-    /// Whether toolCall blocks are present (TS-level hasToolCalls determination; consumer: own stop-reason branch decision).
-    fn has_tool_calls(&self) -> bool {
-        self.message
-            .content
-            .iter()
-            .any(|c| matches!(c, ContentBlock::ToolCall(_)))
-    }
-
     /// Stop-reason error line (present only when there is no toolCall and reason is not length; always present for length).
     fn stop_line(&self) -> Option<String> {
-        match self.message.stop_reason {
-            StopReason::Length => Some(
-                "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete."
-                    .to_string(),
-            ),
-            StopReason::Aborted if !self.has_tool_calls() => {
-                let msg = self.message.error_message.clone().unwrap_or_default();
-                Some(if msg.is_empty() || msg == "Request was aborted" {
-                    "Operation aborted".to_string()
-                } else {
-                    msg
-                })
-            }
-            StopReason::Error if !self.has_tool_calls() => {
-                let msg = self
-                    .message
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "Unknown error".to_string());
-                Some(format!("Error: {msg}"))
-            }
-            _ => None,
-        }
+        stop_line_text(&self.message)
     }
 
     /// Whether a content block is "visible" (non-empty text / non-empty thinking) — pi hasVisibleContent determination.
@@ -331,6 +301,53 @@ impl Component for AssistantMessageComponent<'_> {
     ) -> u16 {
         let plan = self.plan_blocks();
         self.paint_plan(buf, x, y, width, height, &plan)
+    }
+}
+
+/// The assistant message's "stop line" wording (`Error: {msg}` / `Operation aborted` / the length-truncation notice),
+/// `None` when there is none — the single source of truth for "has the error already been shown inside the message
+/// block": the render side writes it out, and the event bridge uses it to decide whether to push an extra `Info` row
+/// (that duplicate line is exactly what users saw twice).
+///
+/// # Behavior
+/// Same judgement as `AssistantMessageComponent::stop_line`: `Length` always has a line; `Aborted`/`Error` only when the
+/// message carries no toolCall (with tool calls the block shows no stop line, so the error text has to be surfaced
+/// through `MessageEnd.error_text` instead).
+///
+/// # Edge Cases
+/// A caller that must suppress the row unconditionally (e.g. `StopReason::Aborted`, already expressed by
+/// `"Operation aborted"` inside the block) needs its own explicit guard: with a toolCall this function returns `None`
+/// even for `Aborted`, so relying on it alone would resurrect the duplicate line.
+///
+/// # Consumers
+/// `AssistantMessageComponent::stop_line` (rendering) and `modes/interactive/mod.rs::bridge_agent_event`
+/// (deduplicating the `Info` row).
+pub(crate) fn stop_line_text(message: &AssistantMessage) -> Option<String> {
+    let has_tool_calls = message
+        .content
+        .iter()
+        .any(|c| matches!(c, ContentBlock::ToolCall(_)));
+    match message.stop_reason {
+        StopReason::Length => Some(
+            "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete."
+                .to_string(),
+        ),
+        StopReason::Aborted if !has_tool_calls => {
+            let msg = message.error_message.clone().unwrap_or_default();
+            Some(if msg.is_empty() || msg == "Request was aborted" {
+                "Operation aborted".to_string()
+            } else {
+                msg
+            })
+        }
+        StopReason::Error if !has_tool_calls => {
+            let msg = message
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            Some(format!("Error: {msg}"))
+        }
+        _ => None,
     }
 }
 

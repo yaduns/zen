@@ -297,6 +297,30 @@ mod tests {
         assert!(line.ends_with('\n'), "Line should end with newline");
     }
 
+    /// turn-auto-retry-fix: the new injected retry events surface in `--mode json` as their pi literals
+    /// (registered as an intentional machine-readable output change in the task record).
+    #[test]
+    fn test_serialize_event_line_auto_retry_events() {
+        let start = serialize_event_line(&AgentEvent::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2000,
+            error_message: "timeout".into(),
+        })
+        .expect("AutoRetryStart should be serializable");
+        assert!(
+            start.contains(r#""type":"auto_retry_start""#),
+            "actual: {start}"
+        );
+        let end = serialize_event_line(&AgentEvent::AutoRetryEnd {
+            success: false,
+            attempt: 2,
+            final_error: Some("timeout".into()),
+        })
+        .expect("AutoRetryEnd should be serializable");
+        assert!(end.contains(r#""type":"auto_retry_end""#), "actual: {end}");
+    }
+
     #[test]
     fn test_serialize_event_line_uses_snake_case_type_tag() {
         let line = serialize_event_line(&AgentEvent::AgentStart).unwrap();
