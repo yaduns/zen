@@ -15,9 +15,11 @@ use std::path::PathBuf;
 /// then reads the tag; for debugging provenance, print scope directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceScope {
-    /// Loaded from the default directory `<agentDir>/skills|prompts|themes` (pi scope `"user"`).
+    /// Loaded from a user-level default directory — `<agentDir>/skills|prompts|themes`, or the cross-tool shared
+    /// `~/.agents/skills` (skills only; pi scope `"user"`).
     User,
-    /// Loaded from the default directory `<cwd>/.zen/skills|prompts|themes` (pi scope `"project"`).
+    /// Loaded from a project-level default directory — `<cwd>/.zen/skills|prompts|themes`, or the cross-tool shared
+    /// `<cwd>/.agents/skills` ancestor chain up to the git repository root (skills only; pi scope `"project"`).
     Project,
     /// Loaded from explicit paths (CLI `--skill`/`--prompt-template`/`--theme` / settings extension directories)
     /// （pi scope `"temporary"`）。

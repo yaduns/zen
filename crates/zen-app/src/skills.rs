@@ -3,9 +3,10 @@
 //! REQ-APP-03 (pi-309): skill loading (directory discovery + frontmatter).
 //! Application-layer assembly completion form: in-directory discovery / single-file frontmatter / formatting are already covered by zen-core
 //! (T-AG-05-2 `load_skills`/`build_skill`, T-AP-03-5 frontmatter); this module supplies the remaining pi-309
-//! capabilities — default directories (`<agentDir>/skills` + `<cwd>/.zen/skills`) + explicit path assembly,
-//! source provenance (lightweight `SkillSource`, full SourceInfo belongs to T-AP-05-4), name/realpath dedup and
-//! collision diagnostics, validateName/validateDescription length and character warning validation.
+//! capabilities — default directories (`<agentDir>/skills`, `<cwd>/.zen/skills`, the cross-tool shared
+//! `<cwd>/.agents/skills` ancestor chain from T-AP-03-3's `shared-agents-skills-fix` and user-level `~/.agents/skills`)
+//! plus explicit path assembly, source provenance (lightweight `SkillSource`, full SourceInfo belongs to T-AP-05-4),
+//! name/realpath dedup and collision diagnostics, validateName/validateDescription length and character warning validation.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,10 @@ use zen_core::paths::{canonicalize_path, resolve_path, PathInputOptions};
 use zen_core::skills::load::{load_skill_from_file, load_skills as core_load_skills};
 use zen_core::skills::skill::Skill;
 
-use crate::config::CONFIG_DIR_NAME;
+use crate::config::{
+    collect_project_shared_skill_dirs, get_user_shared_skills_dir, shared_skills_dir_for_home,
+    CONFIG_DIR_NAME,
+};
 
 /// Maximum skill name length (pi `MAX_NAME_LENGTH`).
 const MAX_NAME_LENGTH: usize = 64;
@@ -29,9 +33,11 @@ const MAX_DESCRIPTION_LENGTH: usize = 1024;
 /// Then T-AP-05-3 resource loader will map `SkillSource → SourceInfo` uniformly. Pure in-memory assembly product, not serialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
-    /// Skills under the default directory `<agentDir>/skills` (pi scope `"user"`).
+    /// User-level skills — covers **two** directories: the tool-private `<agentDir>/skills` and the cross-tool shared
+    /// `~/.agents/skills` (pi scope `"user"` for both).
     User,
-    /// Skills under the default directory `<cwd>/.zen/skills` (pi scope `"project"`).
+    /// Project-level skills — covers **two** directories: the tool-private `<cwd>/.zen/skills` and the cross-tool shared
+    /// `<cwd>/.agents/skills` ancestor chain up to the git repository root (pi scope `"project"` for both).
     Project,
     /// Skills loaded from explicit paths (CLI `--skill` / settings.skills extension directories) (pi scope `"temporary"`).
     Path,
@@ -84,30 +90,46 @@ pub struct LoadSkillsResult {
 
 /// Assembly input for `load_skills` (pi `LoadSkillsOptions`). Pure input parameters, no behavior.
 pub struct LoadSkillsOptions {
-    /// Session working directory (base for the project skills directory `<cwd>/.zen/skills`).
+    /// Session working directory (base for the project skills directory `<cwd>/.zen/skills` and the start of the
+    /// cross-tool `.agents/skills` ancestor walk).
     pub cwd: PathBuf,
     /// Global agent config directory (base for `<agentDir>/skills`; produced by T-AP-02-1 `get_agent_dir`).
     pub agent_dir: PathBuf,
     /// Explicit skill paths (file or directory); CLI `--skill` + settings.skills are merged and passed in by the caller (T-AP-05-3/assembly chain).
     pub skill_paths: Vec<PathBuf>,
-    /// When true, loads the default directories `<agentDir>/skills` (User) + `<cwd>/.zen/skills` (Project).
+    /// When true, loads the default directories — `<agentDir>/skills` (User), `<cwd>/.zen/skills` (Project),
+    /// the cross-tool `<cwd>/.agents/skills` ancestor chain (Project) and `~/.agents/skills` (User).
     pub include_defaults: bool,
+    /// Home directory base used to resolve the cross-tool shared `~/.agents/skills` directory.
+    ///
+    /// `None` = the real home (production). `Some(dir)` = resolve against `dir` instead — the injection point tests use
+    /// so that **no test mutates `HOME`** (this crate already has four independent env locks — `config`, `session::services`,
+    /// `output::footer_data`, `model_catalog` — and lib unit tests run in one process in parallel, so adding a fifth
+    /// environment-dependent test family would race with them).
+    pub home_dir: Option<PathBuf>,
 }
 
 /// Assembles the skill list from all configuration locations — system prompt assembly (T-AP-03-1's `BuildSystemPromptOptions.skills`),
 /// the resource loader (T-AP-05-3) and slash commands (T-AP-03-2) share this source: it resolves "default directories + explicit paths" in one pass
 /// into a deduplicated skill set, sparing each consumer from repeating directory discovery and collision handling.
 ///
-/// Behavior (aligned with pi loadSkills): when `include_defaults`, first load `<agentDir>/skills` (source=User) and
-/// `<cwd>/.zen/skills` (source=Project), then process `skill_paths` in order (file or directory, source=Path;
-/// non-existent paths record a Warning diagnostic and continue, non-`.md` files record a Warning); directory discovery is delegated to zen-core
-/// `load_skills` (SKILL.md only); a single `.md` file goes through zen-core `load_skill_from_file`.
+/// Behavior (aligned with pi loadSkills + package-manager's `.agents` overlay): when `include_defaults`, the load order is
+/// (first occurrence wins, so earlier entries outrank later ones):
+/// ① `<agentDir>/skills` (User) → ② `<cwd>/.zen/skills` (Project) → ③ cross-tool `<cwd>/.agents/skills` ancestor chain
+/// from cwd up to the git repo root (Project) → ④ cross-tool `~/.agents/skills` (User).
+/// Rationale (pi `resourcePrecedenceRank`, `package-manager.ts:184`): the project block as a whole outranks the user-level
+/// `~/.agents`; inside each block the tool-private directory still outranks the shared one (`.zen` before project `.agents`).
+/// Then `skill_paths` are processed in order (file or directory, source=Path; non-existent paths record a Warning diagnostic
+/// and continue, non-`.md` files record a Warning); directory discovery is delegated to zen-core `load_skills` (SKILL.md only);
+/// a single `.md` file goes through zen-core `load_skill_from_file`.
+/// `include_defaults == false` (CLI `--no-skills`) disables the shared segments as well (pi `resource-loader.ts:416-418`).
+///
 /// Deduplication: same name keeps the first occurrence, later ones record a Collision diagnostic (`SkillCollision`); the same file appearing again via symlink
 /// is detected via `paths::canonicalize_path` and silently skipped (aligned with pi realPathSet).
 /// Loaded skills additionally run `validate_skill_metadata` (name length/character rules, description length; warnings do not abort).
 ///
 /// # Parameters
-/// - `options`: assembly input (cwd/agent_dir/skill_paths/include_defaults).
+/// - `options`: assembly input (cwd/agent_dir/skill_paths/include_defaults/home_dir).
 ///
 /// # Returns
 /// Deduplicated `LoadedSkill` list + non-fatal diagnostics.
@@ -127,6 +149,13 @@ pub async fn load_skills(options: &LoadSkillsOptions) -> LoadSkillsResult {
         let (loaded, diags) = load_skills_from_dir(&project_dir, SkillSource::Project).await;
         result.diagnostics.extend(diags);
         add_skills(loaded, &mut result, &mut seen_real_paths);
+
+        // Default directories ③ ④: cross-tool shared `.agents/skills` (project ancestor chain, then user level)
+        for (dir, source) in shared_skill_dirs(&options.cwd, options.home_dir.as_deref()) {
+            let (loaded, diags) = load_skills_from_dir(&dir, source).await;
+            result.diagnostics.extend(diags);
+            add_skills(loaded, &mut result, &mut seen_real_paths);
+        }
     }
 
     // Explicit paths (source is always Path, aligned with pi includeDefaults=true semantics)
@@ -195,6 +224,42 @@ pub async fn load_skills(options: &LoadSkillsOptions) -> LoadSkillsResult {
     }
 
     result
+}
+
+/// Collects the cross-tool shared skill directories (`.agents/skills`) in load order, each paired with its source —
+/// "one shared skills folder set, readable by every tool": ① the project ancestor chain from cwd up to the git repo
+/// root (`SkillSource::Project`, nearest first, aligned with pi `collectAncestorAgentsSkillDirs`), then ② the user-level
+/// `~/.agents/skills` (`SkillSource::User`).
+///
+/// Exclusion (aligned with pi `filter(dir => resolve(dir) !== resolve(userAgentsSkillsDir))`): the ancestor level that
+/// resolves to the same directory as the user-level one is dropped — otherwise a cwd sitting under home would load the
+/// same `~/.agents/skills` twice and report a phantom collision. Both sides go through `canonicalize_path` because string
+/// comparison is unreliable once `~` expansion, symlinked `/var` vs `/private/var`, or `.`/`..` segments are involved.
+///
+/// # Parameters
+/// - `cwd`: session working directory (start of the ancestor walk);
+/// - `home_dir`: home base for `~/.agents/skills`; `None` = real home (unavailable home → the user segment is skipped
+///   silently, so skill loading never aborts because of a missing HOME).
+fn shared_skill_dirs(cwd: &Path, home_dir: Option<&Path>) -> Vec<(PathBuf, SkillSource)> {
+    let user_shared = match home_dir {
+        Some(home) => Some(shared_skills_dir_for_home(home)),
+        None => get_user_shared_skills_dir().ok(),
+    };
+    let user_canonical = user_shared.as_deref().map(canonicalize_path);
+
+    let mut dirs: Vec<(PathBuf, SkillSource)> = collect_project_shared_skill_dirs(cwd)
+        .into_iter()
+        .filter(|dir| match &user_canonical {
+            Some(user) => &canonicalize_path(dir) != user,
+            None => true,
+        })
+        .map(|dir| (dir, SkillSource::Project))
+        .collect();
+
+    if let Some(user) = user_shared {
+        dirs.push((user, SkillSource::User));
+    }
+    dirs
 }
 
 /// Loads skills from a single directory and attaches source — delegates to zen-core `load_skills` (directory traversal + SKILL.md loading,
@@ -487,6 +552,7 @@ mod tests {
             agent_dir: agent_dir.clone(),
             skill_paths: Vec::new(),
             include_defaults: true,
+            home_dir: Some(tmp.path().to_path_buf()),
         };
         let result = load_skills(&opts).await;
         assert_eq!(result.skills.len(), 2);
@@ -531,6 +597,7 @@ mod tests {
             agent_dir: tmp.path().to_path_buf(),
             skill_paths: vec![extra_dir, single_file],
             include_defaults: false,
+            home_dir: None,
         };
         let result = load_skills(&opts).await;
         assert_eq!(result.skills.len(), 2);
@@ -552,6 +619,7 @@ mod tests {
             agent_dir: tmp.path().to_path_buf(),
             skill_paths: vec![tmp.path().join("missing"), non_md],
             include_defaults: false,
+            home_dir: None,
         };
         let result = load_skills(&opts).await;
         assert!(result.skills.is_empty());
@@ -588,6 +656,7 @@ mod tests {
             agent_dir: agent_dir.clone(),
             skill_paths: vec![extra_dir],
             include_defaults: true,
+            home_dir: Some(tmp.path().to_path_buf()),
         };
         let result = load_skills(&opts).await;
         assert_eq!(result.skills.len(), 1);
@@ -618,6 +687,7 @@ mod tests {
             agent_dir: tmp.path().to_path_buf(),
             skill_paths: vec![extra_dir],
             include_defaults: false,
+            home_dir: None,
         };
         let result = load_skills(&opts).await;
         assert_eq!(result.skills.len(), 1); // Validation warnings do not abort loading
@@ -645,6 +715,7 @@ mod tests {
             agent_dir: tmp.path().to_path_buf(),
             skill_paths: vec![extra_dir],
             include_defaults: false,
+            home_dir: None,
         };
         let result = load_skills(&opts).await;
         assert_eq!(result.skills.len(), 1);
@@ -670,9 +741,277 @@ mod tests {
             agent_dir: tmp.path().to_path_buf(),
             skill_paths: vec![extra_dir],
             include_defaults: false,
+            home_dir: None,
         };
         let result = load_skills(&opts).await;
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.skills[0].skill.name, "crlf-skill");
+    }
+
+    // ─── cross-tool shared `.agents/skills` segments (shared-agents-skills-fix) ─────────
+
+    /// Writes `<dir>/SKILL.md` with the given frontmatter name.
+    fn write_skill(dir: &Path, name: &str, description: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_shared_project_ancestor_chain() {
+        // A repo-root `.agents/skills` is picked up from a nested cwd (project scope)
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let cwd = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_skill(
+            &repo.join(".agents").join("skills").join("shared"),
+            "shared-skill",
+            "d",
+        );
+
+        let opts = LoadSkillsOptions {
+            cwd: cwd.clone(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: Vec::new(),
+            include_defaults: true,
+            home_dir: Some(tmp.path().to_path_buf()),
+        };
+        let result = load_skills(&opts).await;
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].skill.name, "shared-skill");
+        assert_eq!(result.skills[0].source, SkillSource::Project);
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_shared_user_level_dir() {
+        // `~/.agents/skills` (injected home) loads as User source
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_skill(
+            &home.join(".agents").join("skills").join("global"),
+            "global-skill",
+            "d",
+        );
+
+        let opts = LoadSkillsOptions {
+            cwd: cwd.clone(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: Vec::new(),
+            include_defaults: true,
+            home_dir: Some(home.clone()),
+        };
+        let result = load_skills(&opts).await;
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].skill.name, "global-skill");
+        assert_eq!(result.skills[0].source, SkillSource::User);
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_shared_user_dir_not_duplicated_when_cwd_is_under_home() {
+        // cwd under home → the ancestor level equals `~/.agents/skills`; it must load exactly once (as User).
+        // cwd is passed with a `.` segment to prove both sides are canonicalized before comparison.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_skill(
+            &home.join(".agents").join("skills").join("dup"),
+            "home-skill",
+            "d",
+        );
+
+        let opts = LoadSkillsOptions {
+            cwd: cwd.join("."),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: Vec::new(),
+            include_defaults: true,
+            home_dir: Some(home),
+        };
+        let result = load_skills(&opts).await;
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].source, SkillSource::User);
+        assert!(
+            result.diagnostics.is_empty(),
+            "no phantom collision expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_project_agents_beats_user_agents_on_same_name() {
+        // The key new conflict pair: repo `.agents/skills` outranks `~/.agents/skills` (pi rank: project before user)
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let cwd = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_skill(
+            &home.join(".agents").join("skills").join("dup"),
+            "dup",
+            "from user shared",
+        );
+        write_skill(
+            &repo.join(".agents").join("skills").join("dup"),
+            "dup",
+            "from project shared",
+        );
+
+        let opts = LoadSkillsOptions {
+            cwd: cwd.clone(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: Vec::new(),
+            include_defaults: true,
+            home_dir: Some(home),
+        };
+        let result = load_skills(&opts).await;
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].source, SkillSource::Project);
+        assert!(result.skills[0]
+            .skill
+            .file_path
+            .starts_with(&repo.to_string_lossy().to_string()));
+        assert_eq!(result.diagnostics.len(), 1);
+        match &result.diagnostics[0] {
+            SkillLoadDiagnostic::Collision(c) => {
+                assert_eq!(c.name, "dup");
+                assert!(
+                    c.winner_path
+                        .starts_with(&repo.to_string_lossy().to_string()),
+                    "project shared copy must win, got {}",
+                    c.winner_path
+                );
+            }
+            other => panic!("expected collision diagnostic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_zen_beats_project_agents_on_same_name() {
+        // Inside the project block, the tool-private `.zen` copy still wins over the shared `.agents` one
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_skill(
+            &cwd.join(CONFIG_DIR_NAME).join("skills").join("dup"),
+            "dup",
+            "from .zen",
+        );
+        write_skill(
+            &cwd.join(".agents").join("skills").join("dup"),
+            "dup",
+            "from .agents",
+        );
+
+        let opts = LoadSkillsOptions {
+            cwd: cwd.clone(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: Vec::new(),
+            include_defaults: true,
+            home_dir: Some(tmp.path().to_path_buf()),
+        };
+        let result = load_skills(&opts).await;
+        assert_eq!(result.skills.len(), 1);
+        assert!(result.skills[0]
+            .skill
+            .file_path
+            .contains(&format!("{CONFIG_DIR_NAME}/skills")));
+        assert_eq!(result.diagnostics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_no_skills_disables_shared_segments() {
+        // `--no-skills` (include_defaults = false) must also drop the `.agents` segments
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        let cwd = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_skill(
+            &home.join(".agents").join("skills").join("u"),
+            "user-shared",
+            "d",
+        );
+        write_skill(
+            &repo.join(".agents").join("skills").join("p"),
+            "proj-shared",
+            "d",
+        );
+        let explicit = tmp.path().join("explicit");
+        write_skill(&explicit, "explicit-skill", "d");
+
+        let opts = LoadSkillsOptions {
+            cwd: cwd.clone(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: vec![explicit],
+            include_defaults: false,
+            home_dir: Some(home),
+        };
+        let result = load_skills(&opts).await;
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].source, SkillSource::Path);
+    }
+
+    #[tokio::test]
+    async fn test_load_skills_shared_symlink_is_deduplicated() {
+        // The same real file reached through `.agents/skills` and `.zen/skills` loads once (realpath dedup)
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        let zen_skill = cwd.join(CONFIG_DIR_NAME).join("skills").join("linked");
+        write_skill(&zen_skill, "linked-skill", "d");
+        let agents_dir = cwd.join(".agents").join("skills");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&zen_skill, agents_dir.join("linked")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let opts = LoadSkillsOptions {
+                cwd: cwd.clone(),
+                agent_dir: tmp.path().join("agent"),
+                skill_paths: Vec::new(),
+                include_defaults: true,
+                home_dir: Some(tmp.path().to_path_buf()),
+            };
+            let result = load_skills(&opts).await;
+            assert_eq!(result.skills.len(), 1);
+            assert!(result.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_shared_skill_dirs_order_and_exclusion() {
+        // Pure check of the order (project chain first, user last) + same-directory exclusion
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let cwd = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let dirs = shared_skill_dirs(&cwd, Some(tmp.path()));
+        assert_eq!(
+            dirs,
+            vec![
+                (cwd.join(".agents").join("skills"), SkillSource::Project),
+                (repo.join(".agents").join("skills"), SkillSource::Project),
+                (tmp.path().join(".agents").join("skills"), SkillSource::User),
+            ]
+        );
+
+        // cwd directly under home → the ancestor level coincides with the user level and is dropped
+        let dirs = shared_skill_dirs(&cwd, Some(&repo));
+        assert_eq!(
+            dirs,
+            vec![
+                (cwd.join(".agents").join("skills"), SkillSource::Project),
+                (repo.join(".agents").join("skills"), SkillSource::User),
+            ]
+        );
     }
 }

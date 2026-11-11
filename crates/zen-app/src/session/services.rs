@@ -692,6 +692,8 @@ async fn load_assembly_resources(
         no_context_files: options.no_context_files,
         system_prompt: options.system_prompt.clone(),
         append_system_prompt: options.append_system_prompt.clone(),
+        // Production assembly always resolves the real home (`<home>/.agents/skills`); tests inject via options instead.
+        home_dir: None,
     })
     .await
 }
@@ -1256,11 +1258,16 @@ mod tests {
         )
         .unwrap();
 
-        // Control: default discovery finds the fixture skill.
+        // Control: default discovery finds the fixture skill. Asserted by presence, not by total count — the
+        // user-level cross-tool directory (`~/.agents/skills`, read-only shared source) is part of default discovery
+        // and its contents belong to the host machine, not to this fixture.
         let runtime = switch_session(&[], &cwd, &agent_dir).await;
-        assert_eq!(
-            runtime.session.skills().len(),
-            1,
+        assert!(
+            runtime
+                .session
+                .skills()
+                .iter()
+                .any(|s| s.skill.name == "known-skill"),
             "control: the fixture skill is discovered by default"
         );
 

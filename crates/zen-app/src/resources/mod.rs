@@ -36,6 +36,9 @@ pub struct LoadResourcesOptions {
     /// Explicit theme paths (directories or `.json` files); CLI `--theme` + settings.themes are merged by the caller and passed in.
     pub theme_paths: Vec<PathBuf>,
     /// When true, skip default skill directories (explicit paths are still kept; pi `noSkills ? mergePaths(cli, additional)` semantics).
+    /// The cross-tool shared segments (`<cwd>/.agents/skills` ancestor chain + `~/.agents/skills`, from
+    /// `shared-agents-skills-fix`) are gated by the same flag — pi `resource-loader.ts:416-418` excludes every default
+    /// directory when `noSkills` is set.
     pub no_skills: bool,
     /// When true, skip the entire template loading path (including default directories and explicit paths; aligns with the pi `noPromptTemplates` branch).
     pub no_prompt_templates: bool,
@@ -48,6 +51,10 @@ pub struct LoadResourcesOptions {
     pub system_prompt: Option<String>,
     /// Repeatable values for CLI `--append-system-prompt`: non-empty entries take precedence over APPEND_SYSTEM.md discovery; empty entries are removed.
     pub append_system_prompt: Vec<String>,
+    /// Home directory base for the cross-tool shared `~/.agents/skills` (passed through to `skills::LoadSkillsOptions`).
+    /// `None` = real home (production); `Some(dir)` = resolve against `dir` (test injection — tests must never mutate `HOME`,
+    /// see `LoadSkillsOptions::home_dir`).
+    pub home_dir: Option<PathBuf>,
 }
 
 /// One-shot output aggregate for `load_resources` — session assembly (services.rs) takes all resources from the same result
@@ -127,6 +134,7 @@ pub async fn load_resources(options: &LoadResourcesOptions) -> LoadResourcesResu
         agent_dir: options.agent_dir.clone(),
         skill_paths: options.skill_paths.clone(),
         include_defaults: !options.no_skills,
+        home_dir: options.home_dir.clone(),
     })
     .await;
     let skills = skills_result.skills;
@@ -490,6 +498,7 @@ mod tests {
             no_context_files: false,
             system_prompt: None,
             append_system_prompt: Vec::new(),
+            home_dir: Some(tmp.path().to_path_buf()),
         })
         .await;
 
@@ -528,6 +537,7 @@ mod tests {
             no_context_files: false,
             system_prompt: Some("cli sp".to_string()),
             append_system_prompt: vec!["cli append".to_string()],
+            home_dir: Some(tmp.path().to_path_buf()),
         })
         .await;
 
@@ -554,6 +564,7 @@ mod tests {
             // explicit empty string: no file discovery and no injection (matching pi `!input` short-circuit)
             system_prompt: Some(String::new()),
             append_system_prompt: vec![String::new(), "keep me".to_string()],
+            home_dir: Some(tmp.path().to_path_buf()),
         })
         .await;
 
@@ -578,6 +589,7 @@ mod tests {
             no_context_files: true,
             system_prompt: None,
             append_system_prompt: Vec::new(),
+            home_dir: Some(tmp.path().to_path_buf()),
         })
         .await;
 
@@ -611,6 +623,7 @@ mod tests {
             no_context_files: false,
             system_prompt: None,
             append_system_prompt: Vec::new(),
+            home_dir: Some(tmp.path().to_path_buf()),
         })
         .await;
 
@@ -660,6 +673,7 @@ mod tests {
             no_context_files: true,
             system_prompt: None,
             append_system_prompt: Vec::new(),
+            home_dir: Some(tmp.path().to_path_buf()),
         })
         .await;
 
