@@ -9,6 +9,22 @@
 /// The modifyOtherKeys fallback is not implemented in v1; see tasks/T-AP-11-1-fix-implemented.md.
 pub(crate) struct Terminal {
     out: std::io::Stdout, // target for writing crossterm commands (tail of queue!/execute!)
+    /// PF-06: the frame's output sink. Frame content (crossterm diff commands + line bytes) accumulates here and is
+    /// delivered to `out` exactly once per frame by [`Terminal::flush_out`] — the Rust counterpart of pi's
+    /// `buffer: string` -> `terminal.write(buffer)` (`packages/tui/src/tui.ts:1604`).
+    ///
+    /// Why a `Vec` instead of writing straight to `out`: `Stdout` is a `LineWriter` that flushes on every `\n`, so
+    /// writing frame content directly reaches the terminal in ~8-10 chunks per frame; unsynchronized terminals that
+    /// ignore `?2026` then repaint chunk by chunk (visible flicker). A `Vec` also makes a frame's bytes *readable*
+    /// in tests, which `Stdout` never was (see `flush_frame`).
+    ///
+    /// **Two write ends, do not mix**: only frame content goes here; control paths (`write`/`set_title`/
+    /// `set_progress`/`start`/`stop`/`handover_to_shell` and every `execute!(self.out, …)`) write `self.out` directly.
+    frame_buf: Vec<u8>,
+    /// PF-06: number of successful frame deliveries (one `write_all` + `flush` each). Read as a per-frame delta by
+    /// [`Terminal::write_calls`] to feed `FrameMetrics::writes`. Control-path writes are deliberately not counted:
+    /// this counter answers "how many times did this frame reach the terminal", not "how many syscalls happened".
+    write_calls: u64,
     raw_mode_active: bool, // Record raw mode state across start/stop for idempotent restoration by stop
     cursor_hidden: bool,   // record cursor visibility state to avoid sending Hide/Show repeatedly
     // Keyboard protocol pairing flag (idempotent: do not resend commands when already enabled/disabled; mirrors raw_mode_active)
@@ -35,6 +51,8 @@ impl Terminal {
     pub fn new() -> Result<Terminal, TerminalError> {
         Ok(Terminal {
             out: std::io::stdout(), // Get the standard output handle
+            frame_buf: Vec::new(),
+            write_calls: 0,
             raw_mode_active: false,
             cursor_hidden: false,
             keyboard_enhancement_active: false,
@@ -123,6 +141,9 @@ impl Terminal {
     }
 
     /// Write raw bytes to the terminal, for verbatim output and debugging that is neither buffered nor a command.
+    ///
+    /// Control/non-frame path: goes straight to `self.out` (never through the frame buffer), so it cannot disturb
+    /// frame delivery. Not counted by [`Terminal::write_calls`].
     pub fn write(&mut self, data: &str) -> Result<(), TerminalError> {
         use std::io::Write;
         self.out
@@ -239,10 +260,66 @@ impl Terminal {
         self.out.flush().map_err(TerminalError::Io)
     }
 
-    /// Expose the stdout write end so the main loop can write out ScreenBuffer::flush diff commands. Internal crate seam, not public.
-    /// Consumer: this task's `render_frame` (sole consumer).
-    pub(crate) fn out_mut(&mut self) -> &mut std::io::Stdout {
-        &mut self.out
+    /// PF-06: start a frame — clears the frame output buffer.
+    ///
+    /// `flush_out` is the only delivery point, but a frame that bails out early (IO error, panic in a draw callback)
+    /// would otherwise leave residue that the next frame appends to and re-delivers. Clearing here is a cheap safety
+    /// net; the buffer's capacity is retained so a steady-state frame allocates nothing.
+    /// # Consumers
+    /// `TuiLoop::run_scrollback` and `TuiLoop::render_frame` (first statement of each frame).
+    pub(crate) fn begin_frame(&mut self) {
+        self.frame_buf.clear();
+    }
+
+    /// PF-06: deliver the whole frame to the terminal in **one** `write_all` — the only delivery point per frame
+    /// (the Rust counterpart of pi's `terminal.write(buffer)`, `packages/tui/src/tui.ts:1604`).
+    ///
+    /// Why this exists at all: `queue!`/`write_all` calls accumulate in [`Terminal::frame_buf`], and `Stdout`'s
+    /// `LineWriter` would otherwise flush per line. One `write_all` means the terminal receives the frame (including
+    /// the `?2026h`/`?2026l` pair and the IME cursor positioning, which both live inside the canvas flush) as a single
+    /// chunk, so terminals without synchronized-update support cannot repaint it piecewise.
+    /// # Behaviour
+    /// - delegates to [`flush_frame`] (write_all + flush + clear); the buffer is cleared whether the write succeeds or
+    ///   fails, so a retry never re-sends half a frame;
+    /// - `write_calls` is incremented **only on success** (it counts deliveries, not attempts);
+    /// - an oversized frame (e.g. the ~403 KB first full redraw) still goes out in one `write_all`: there is no
+    ///   artificial capacity split (kernel/pty may still split, which is out of our hands);
+    /// - after delivery, a buffer that grew past [`FRAME_BUF_SHRINK_THRESHOLD`] is shrunk back to
+    ///   [`FRAME_BUF_RETAIN`] so a single huge frame does not pin hundreds of KB for the session's lifetime.
+    /// # Consumers
+    /// `TuiLoop::run_scrollback` and `TuiLoop::render_frame`. **Must be called before** `FrameProbe::finish`, otherwise
+    /// `FrameMetrics::flush` (= elapsed - draw, frozen inside `finish`) only measures the in-memory copy.
+    pub(crate) fn flush_out(&mut self) -> Result<(), TerminalError> {
+        flush_frame(&mut self.frame_buf, &mut self.out)?;
+        self.write_calls += 1;
+        if self.frame_buf.capacity() > FRAME_BUF_SHRINK_THRESHOLD {
+            self.frame_buf.shrink_to(FRAME_BUF_RETAIN);
+        }
+        Ok(())
+    }
+
+    /// PF-06: successful frame deliveries since startup (monotonic).
+    ///
+    /// Consumers read a per-frame **delta** to fill `FrameMetrics::writes`, so "did this frame reach the terminal
+    /// exactly once" becomes observable on a real terminal (a unit test can only prove the buffer behaviour).
+    /// Boundary: counts [`Terminal::flush_out`] successes only; `execute!(self.out, …)` control sequences and
+    /// [`Terminal::write`] are not counted, and one delivery is not necessarily one syscall (kernel/pty may split).
+    /// # Consumers
+    /// `TuiLoop::run_scrollback`, `TuiLoop::render_frame`.
+    pub(crate) fn write_calls(&self) -> u64 {
+        self.write_calls
+    }
+
+    /// PF-06: expose the **frame** write end (crossterm diff commands and line bytes land here, not on stdout).
+    ///
+    /// Returns `&mut Vec<u8>` so a frame's bytes are readable in tests and so the delivery step can be factored out
+    /// into [`flush_frame`]. Callers only use it as `W: Write` (`CountingWriter::new(terminal.out_mut())`,
+    /// `canvas.flush(out)`), so no call site changes.
+    /// ⚠️ Frame content only — control paths keep writing `self.out`.
+    /// # Consumers
+    /// `TuiLoop::run_scrollback`, `TuiLoop::render_frame`.
+    pub(crate) fn out_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.frame_buf
     }
 }
 
@@ -257,6 +334,41 @@ impl Drop for Terminal {
             let _ = self.stop();
         }));
     }
+}
+
+/// PF-06: capacity above which the frame buffer is shrunk after delivery (~403 KB first full redraw would otherwise
+/// pin half a megabyte for the whole session). Below this threshold the capacity is deliberately retained so that
+/// steady-state frames allocate nothing.
+pub(crate) const FRAME_BUF_SHRINK_THRESHOLD: usize = 1024 * 1024;
+
+/// PF-06: capacity the frame buffer is shrunk back to after an oversized frame.
+pub(crate) const FRAME_BUF_RETAIN: usize = 64 * 1024;
+
+/// PF-06: deliver one frame's bytes in a single `write_all`, then flush, and clear the buffer **whether the write
+/// succeeded or failed**.
+///
+/// Why a free function instead of inlining this in [`Terminal::flush_out`]: `Terminal`'s write end is a concrete
+/// `std::io::Stdout` created by `Terminal::new`, so a test cannot inject a spy writer into it. Factoring the delivery
+/// step out leaves it generic over `W: Write`, which is what makes "a frame reaches the terminal exactly once"
+/// mechanically assertable (see the tests: `flush_frame(&mut buf, &mut spy)`).
+/// # Parameters
+/// - `buf`: the frame's accumulated bytes (cleared afterwards; capacity retained)
+/// - `out`: the real write end (production: `Stdout`; tests: a spy/`Vec<u8>`)
+/// # Boundaries
+/// - empty buffer → still one `flush` (no actual write);
+/// - failure → the error is propagated **and** the buffer is cleared (a retry must not resend half a frame).
+/// # Consumers
+/// `Terminal::flush_out` (production); unit tests T1/T2/T3/T5/T7.
+pub(crate) fn flush_frame<W: std::io::Write>(
+    buf: &mut Vec<u8>,
+    out: &mut W,
+) -> Result<(), TerminalError> {
+    let result = out
+        .write_all(buf)
+        .and_then(|_| out.flush())
+        .map_err(TerminalError::Io);
+    buf.clear();
+    result
 }
 
 #[cfg(test)]
@@ -430,5 +542,165 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {:?}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_delivery_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Sink that records how many `write` calls it received (and the total bytes), optionally failing.
+    ///
+    /// Counting `Write::write` calls is the point: `write_all` loops until satisfied, so a single delivery shows up as
+    /// exactly one call here. This is the "≈syscall" quantity the acceptance talks about (the kernel/pty may split
+    /// further, which no in-process test can observe).
+    #[derive(Default)]
+    struct SpyWriter {
+        writes: usize,
+        bytes: usize,
+        payload: Vec<u8>,
+        fail: bool,
+    }
+
+    impl Write for SpyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom"));
+            }
+            self.writes += 1;
+            self.bytes += buf.len();
+            self.payload.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One steady-state frame (~400 B, what PF-01 measured) reaches the sink in exactly one write.
+    #[test]
+    fn frame_delivery_is_one_write_for_a_steady_state_frame() {
+        let mut buf = Vec::new();
+        for i in 0..8 {
+            buf.extend_from_slice(b"\r\n\x1b[2K");
+            buf.extend_from_slice(format!("line {i} with some padding to reach ~50 B").as_bytes());
+        }
+        let len = buf.len();
+        let mut spy = SpyWriter::default();
+
+        // Nothing reaches the sink while the frame is being built.
+        assert_eq!(spy.writes, 0);
+
+        flush_frame(&mut buf, &mut spy).unwrap();
+        assert_eq!(spy.writes, 1, "a frame must be delivered in one write");
+        assert_eq!(spy.bytes, len);
+        assert_eq!(spy.payload.len(), len, "payload is byte-identical");
+    }
+
+    /// An oversized frame (the ~403 KB first full redraw) is still a single write: no artificial capacity split.
+    #[test]
+    fn frame_delivery_is_one_write_for_an_oversized_frame() {
+        let mut buf = Vec::with_capacity(450 * 1024);
+        for i in 0..4_000 {
+            buf.extend_from_slice(
+                format!("\x1b[2Kline {i:05} of a full-screen redraw\r\n").as_bytes(),
+            );
+        }
+        assert!(
+            buf.len() > 100 * 1024,
+            "fixture should be large: {}",
+            buf.len()
+        );
+        let len = buf.len();
+        let mut spy = SpyWriter::default();
+
+        flush_frame(&mut buf, &mut spy).unwrap();
+        assert_eq!(spy.writes, 1, "no capacity-driven split");
+        assert_eq!(spy.bytes, len);
+    }
+
+    /// The buffer is cleared after delivery (success path) so the next frame starts empty.
+    #[test]
+    fn flush_frame_clears_the_buffer_after_success() {
+        let mut buf = b"\x1b[?2026hhello\x1b[?2026l".to_vec();
+        let mut spy = SpyWriter::default();
+        flush_frame(&mut buf, &mut spy).unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(spy.writes, 1);
+    }
+
+    /// A failed delivery propagates the IO error **and** still clears the buffer (a retry must not resend half a frame).
+    #[test]
+    fn flush_frame_clears_the_buffer_and_propagates_on_failure() {
+        let mut buf = b"partial frame".to_vec();
+        let mut spy = SpyWriter {
+            fail: true,
+            ..Default::default()
+        };
+        let err = flush_frame(&mut buf, &mut spy).unwrap_err();
+        assert!(matches!(err, TerminalError::Io(_)));
+        assert!(buf.is_empty(), "residue must not survive a failed delivery");
+        assert_eq!(spy.writes, 0);
+    }
+
+    /// `begin_frame` drops residue left by a frame that bailed out before delivery.
+    #[test]
+    fn begin_frame_discards_residue_and_keeps_capacity() {
+        let mut t = Terminal::new().unwrap();
+        t.out_mut().extend_from_slice(b"half a frame");
+        let capacity_before = t.out_mut().capacity();
+        t.begin_frame();
+        assert!(t.out_mut().is_empty(), "begin_frame clears the frame sink");
+        assert_eq!(t.out_mut().capacity(), capacity_before, "capacity retained");
+    }
+
+    /// `out_mut` is the frame sink, not stdout: bytes stay readable until `flush_out` delivers them.
+    #[test]
+    fn out_mut_accumulates_without_touching_the_terminal() {
+        let mut t = Terminal::new().unwrap();
+        let base = t.write_calls();
+        {
+            let buf = t.out_mut();
+            buf.extend_from_slice(b"\x1b[?2026h");
+            buf.extend_from_slice(b"content");
+            buf.extend_from_slice(b"\x1b[?2026l");
+        }
+        assert_eq!(t.out_mut().len(), 8 + 7 + 8, "all bytes are still buffered");
+        assert_eq!(t.write_calls(), base, "no delivery happened yet");
+    }
+
+    /// `flush_out` delivers exactly once and bumps the delivery counter by one.
+    #[test]
+    fn flush_out_counts_one_delivery_per_frame() {
+        let mut t = Terminal::new().unwrap();
+        let base = t.write_calls();
+        t.begin_frame();
+        t.out_mut().extend_from_slice(b"frame 1");
+        t.flush_out().unwrap();
+        assert_eq!(t.write_calls(), base + 1);
+        assert!(t.out_mut().is_empty(), "delivered bytes leave the buffer");
+
+        // A second frame is a second delivery.
+        t.begin_frame();
+        t.out_mut().extend_from_slice(b"frame 2");
+        t.flush_out().unwrap();
+        assert_eq!(t.write_calls(), base + 2);
+    }
+
+    /// The synchronous-update wrapper and the frame content travel in the same buffer, in order.
+    #[test]
+    fn synchronized_update_markers_share_the_frame_buffer() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b[?2026h");
+        buf.extend_from_slice(b"\r\n\x1b[2Kline");
+        buf.extend_from_slice(b"\x1b[?2026l");
+        let mut spy = SpyWriter::default();
+        flush_frame(&mut buf, &mut spy).unwrap();
+
+        assert_eq!(spy.writes, 1);
+        assert!(spy.payload.starts_with(b"\x1b[?2026h"));
+        assert!(spy.payload.ends_with(b"\x1b[?2026l"));
     }
 }

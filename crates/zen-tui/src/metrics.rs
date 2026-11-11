@@ -90,9 +90,15 @@ pub struct FrameMetrics {
     /// Rows of the bottom fixed region (status + editor + dropdown + footer) that were **actually pushed**
     /// into the line stream — not the theoretical `fixed_h` upper bound; unpainted trailing rows do not count.
     ///
-    /// Before PF-06 this is the tail length of the line stream; after PF-06 it becomes the height of the
-    /// bottom anchored region (`BottomRegion`).
+    /// PF-06 kept the fixed region in the line stream (it only changed *delivery* granularity), so this value is
+    /// unchanged by PF-06; the `written_fixed = repaint_span ∩ tail` derivation stays valid.
     pub line_fixed: usize,
+    /// PF-06: how many times this frame reached the terminal (`Terminal::flush_out` successes, normally exactly 1).
+    ///
+    /// The whole point of the delivery change is that one frame = one `write_all`; this counter is the only
+    /// run-time evidence for that on a real terminal (a unit test can prove the buffer behaviour, not the fd side).
+    /// Boundary: counts deliveries, not syscalls — the kernel/pty may split a single `write_all` further.
+    pub writes: usize,
 }
 
 impl FrameMetrics {
@@ -124,6 +130,7 @@ struct StatsInner {
     bytes_total: u64,
     line_total_sum: u64,
     line_fixed_sum: u64,
+    writes_sum: u64,
     totals: VecDeque<Duration>,
     draws: VecDeque<Duration>,
     flushes: VecDeque<Duration>,
@@ -208,6 +215,7 @@ impl FrameStats {
         inner.bytes_total += metrics.bytes_written;
         inner.line_total_sum += metrics.line_total as u64;
         inner.line_fixed_sum += metrics.line_fixed as u64;
+        inner.writes_sum += metrics.writes as u64;
         push_sample(&mut inner.totals, total, self.capacity);
         push_sample(&mut inner.draws, metrics.draw, self.capacity);
         push_sample(&mut inner.flushes, metrics.flush, self.capacity);
@@ -275,9 +283,10 @@ impl FrameStats {
             inner.bytes_total / frames,
         ));
         out.push_str(&format!(
-            "  lines: avg {:.1} total, avg {:.1} fixed",
+            "  lines: avg {:.1} total, avg {:.1} fixed, avg {:.2} writes/frame (deliveries)",
             inner.line_total_sum as f64 / frames as f64,
             inner.line_fixed_sum as f64 / frames as f64,
+            inner.writes_sum as f64 / frames as f64,
         ));
         out
     }
@@ -369,13 +378,18 @@ impl<'a> FrameProbe<'a> {
     }
 
     /// Close the frame and record it. `line_fixed` must be the rows **actually pushed**, not the theoretical
-    /// `fixed_h` bound.
+    /// `fixed_h` bound; `writes` is the number of frame deliveries (`Terminal::flush_out` successes, normally 1).
+    ///
+    /// ⚠️ PF-06 ordering constraint: callers must invoke `Terminal::flush_out()` **before** this method — `flush`
+    /// is derived from `started_at.elapsed()` frozen here, so a delivery that happens afterwards would not be
+    /// measured at all (it would not even be part of `total`).
     pub(crate) fn finish(
         self,
         bytes_written: u64,
         repaint_span: Option<(usize, usize)>,
         line_total: usize,
         line_fixed: usize,
+        writes: usize,
     ) {
         let (Some(stats), Some(started_at)) = (self.stats, self.started_at) else {
             return;
@@ -389,6 +403,7 @@ impl<'a> FrameProbe<'a> {
             repaint_span,
             line_total,
             line_fixed,
+            writes,
         };
         stats.record(&mut metrics);
     }
@@ -469,6 +484,7 @@ mod tests {
             repaint_span: Some((0, 9)),
             line_total: 10,
             line_fixed: 3,
+            writes: 1,
         }
     }
 
@@ -602,6 +618,10 @@ mod tests {
             "unexpected summary: {summary}"
         );
         assert!(
+            summary.contains("avg 1.00 writes/frame"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
             summary.contains("avg 3.0 fixed"),
             "unexpected summary: {summary}"
         );
@@ -644,7 +664,7 @@ mod tests {
         let stats = FrameStats::new_with_enabled(DEFAULT_BUDGET, false);
         let mut probe = FrameProbe::start(&stats);
         probe.mark_draw();
-        probe.finish(42, Some((0, 1)), 2, 1);
+        probe.finish(42, Some((0, 1)), 2, 1, 1);
         assert_eq!(stats.frames(), 0);
     }
 
@@ -653,7 +673,7 @@ mod tests {
         let stats = FrameStats::new_with_enabled(Duration::from_secs(60), true);
         let mut probe = FrameProbe::start(&stats);
         probe.mark_draw();
-        probe.finish(1234, Some((5, 9)), 20, 4);
+        probe.finish(1234, Some((5, 9)), 20, 4, 1);
         assert_eq!(stats.frames(), 1);
         assert_eq!(stats.bytes_total(), 1234);
         let summary = stats.summary();

@@ -275,6 +275,10 @@ impl TuiLoop {
             |this| {
                 let (cols, rows) = (this.terminal.columns(), this.terminal.rows());
                 canvas.set_size(cols, rows);
+                // PF-06: open the frame (clears the frame buffer) and remember the delivery-counter baseline so
+                // `FrameMetrics::writes` reports this frame's deliveries, not a cumulative total.
+                this.terminal.begin_frame();
+                let writes_before = this.terminal.write_calls();
                 let mut probe = FrameProbe::start(&this.stats);
                 canvas.clear();
                 (draw)(&mut canvas);
@@ -288,13 +292,19 @@ impl TuiLoop {
                     let result = canvas.flush(&mut out).map_err(TuiError::from);
                     (result, out.bytes())
                 };
+                // PF-06: the frame's only delivery point — one `write_all` for everything the canvas just produced
+                // (line diff + `?2026h/l` + IME cursor positioning). It must run **before** `probe.finish`, whose
+                // `flush` metric is `elapsed - draw` frozen at that moment; a later delivery would not be measured.
+                let delivered = this.terminal.flush_out().map_err(TuiError::from);
                 probe.finish(
                     bytes,
                     canvas.last_repaint_span(),
                     line_total,
                     canvas.fixed_rows(),
+                    (this.terminal.write_calls() - writes_before) as usize,
                 );
                 result?;
+                delivered?;
                 Ok(())
             },
             // scrollback mode handles sizing/full redraw within the frame (canvas size sync); this callback is a no-op.
@@ -418,6 +428,9 @@ impl TuiLoop {
     where
         D: FnMut(&mut ScreenBuffer),
     {
+        // PF-06: open the frame (clears the frame buffer) + record the delivery-counter baseline.
+        self.terminal.begin_frame();
+        let writes_before = self.terminal.write_calls();
         let mut probe = FrameProbe::start(&self.stats);
         // Start each frame from a clean frame: cells not redrawn are judged as "content→empty" in the subsequent flush diff and erased,
         // Components need not self-clear (the zen-grid-level counterpart of pi composite layer clear-extra-lines);
@@ -430,9 +443,18 @@ impl TuiLoop {
             let result = self.buffer.flush(&mut out);
             (result, out.bytes())
         };
+        // PF-06: single delivery point, before `probe.finish` (see `run_scrollback` for the ordering rationale).
+        let delivered = self.terminal.flush_out();
         let (_, rows) = self.buffer.size();
-        probe.finish(bytes, None, rows as usize, 0);
+        probe.finish(
+            bytes,
+            None,
+            rows as usize,
+            0,
+            (self.terminal.write_calls() - writes_before) as usize,
+        );
         result?;
+        delivered?;
         Ok(())
     }
 
@@ -899,6 +921,44 @@ mod tests {
         assert_eq!(seen_size, loop_.buffer.size());
         // flush promotes the current frame to previous frame so it can render again (idempotency smoke test)
         assert!(loop_.render_frame(&mut |_| {}).is_ok());
+    }
+
+    #[test]
+    fn test_frame_delivers_exactly_once_and_after_the_canvas_flush() {
+        // PF-06 (T8): one frame ⇒ exactly one delivery, and the delivery counter must be read **after**
+        // `flush_out` (otherwise `FrameMetrics::writes` would be 0). Enabling the accumulator for this loop makes
+        // the recorded metric observable without a tty.
+        let mut loop_ = TuiLoop::new().unwrap();
+        loop_.stats = Arc::new(FrameStats::new_with_enabled(
+            crate::metrics::DEFAULT_BUDGET,
+            true,
+        ));
+        let before = loop_.terminal.write_calls();
+
+        loop_
+            .render_frame(&mut |buf: &mut ScreenBuffer| {
+                buf.write(0, 0, &Default::default(), "frame one");
+            })
+            .unwrap();
+        assert_eq!(
+            loop_.terminal.write_calls(),
+            before + 1,
+            "a frame must reach the terminal exactly once"
+        );
+
+        let summary = loop_.stats.summary();
+        assert!(
+            summary.contains("1 frames"),
+            "the frame must be recorded: {summary}"
+        );
+        assert!(
+            summary.contains("avg 1.00 writes/frame"),
+            "writes must be counted after flush_out (ordering trap): {summary}"
+        );
+
+        // A second frame is a second delivery (the counter is per frame, not cumulative).
+        loop_.render_frame(&mut |_| {}).unwrap();
+        assert_eq!(loop_.terminal.write_calls(), before + 2);
     }
 
     #[test]

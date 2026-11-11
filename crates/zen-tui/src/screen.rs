@@ -325,8 +325,9 @@ impl ScreenBuffer {
             }
         }
 
-        // queue! only writes to the buffer without flush; at the end a single flush() sends everything in one syscall
-        out.flush().map_err(TerminalError::Io)?;
+        // PF-06: no flush here. `queue!` only writes into `out` (the frame's `Vec<u8>` in both render paths); the whole
+        // frame leaves in a single `write_all` at the end of the frame (`Terminal::flush_out`). Flushing here would
+        // put the diff on the wire in pieces — exactly the chunked delivery PF-06 removes.
 
         // ── Promote current frame to previous frame ──
         self.previous = self.cells.clone();

@@ -364,7 +364,8 @@ impl ScrollbackCanvas {
         }
 
         out.write_all(b"\x1b[?2026l")?; // End synchronized output
-        out.flush().map_err(TerminalError::Io)?;
+                                        // PF-06: no flush here — the frame's bytes accumulate in `Terminal::frame_buf` and leave in one `write_all`
+                                        // at the end of the frame (`Terminal::flush_out`). Flushing here would re-introduce per-line delivery.
 
         // ── Finalize state update ──
         self.hardware_cursor_row = final_cursor_row;
@@ -395,7 +396,7 @@ impl ScrollbackCanvas {
             out.write_all(format!("\x1b[{}A", -delta).as_bytes())?;
         }
         out.write_all(format!("\x1b[{}G", col + 1).as_bytes())?;
-        out.flush().map_err(TerminalError::Io)?;
+        // PF-06: no flush (see `flush`) — the anchor travels in the same frame buffer as the content.
         self.hardware_cursor_row = row;
         Ok(())
     }
@@ -419,7 +420,7 @@ impl ScrollbackCanvas {
             write_segments(out, line, width).map_err(TerminalError::Io)?;
         }
         out.write_all(b"\x1b[?2026l")?;
-        out.flush().map_err(TerminalError::Io)?;
+        // PF-06: no flush here (see `flush`).
 
         let new_len = self.lines.len();
         self.hardware_cursor_row = new_len.saturating_sub(1);
