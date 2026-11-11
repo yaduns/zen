@@ -65,10 +65,14 @@ mod tests {
     use zen_ai::api::openai_stream::{StreamConfig, StreamError};
     use zen_ai::types::{AssistantMessageEvent, Context};
 
+    /// Attribution keys off the provider name (`opencode-go`); the model id is taken from the loaded catalog so a
+    /// model rename never breaks this file.
     fn opencode_model() -> Model {
         zen_ai::catalog::Catalog::embedded()
-            .model("opencode-go", "deepseek-v4-flash")
-            .expect("Built-in catalog contains opencode-go/deepseek-v4-flash")
+            .models()
+            .into_iter()
+            .find(|m| m.provider == "opencode-go")
+            .expect("built-in catalog enumerates an opencode-go model")
     }
 
     #[test]

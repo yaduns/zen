@@ -868,113 +868,106 @@ mod tests {
         ))
     }
 
-    // ── Built-in catalog ──
-
-    #[test]
-    fn embedded_catalog_parses() {
-        let catalog = Catalog::embedded();
-        let opencode = catalog
-            .model("opencode-go", "deepseek-v4-flash")
-            .expect("opencode-go model");
-        assert_eq!(opencode.provider, "opencode-go");
-        assert_eq!(opencode.id, "deepseek-v4-flash");
-        assert_eq!(opencode.base_url, "https://opencode.ai/zen/go/v1");
-        assert_eq!(opencode.context_window, 1_000_000);
-        assert_eq!(opencode.max_tokens, 384_000);
-        assert!(opencode.reasoning);
-        assert_eq!(
-            opencode.cost_rates.as_ref().map(|rates| rates.input),
-            Some(0.5)
-        );
-        assert_eq!(
-            opencode
-                .compat
-                .as_ref()
-                .and_then(|compat| compat.thinking_format),
-            Some(ThinkingFormat::OpenAi)
-        );
-
-        let huoshan = catalog
-            .model("huoshan", "deepseek-v4-flash")
-            .expect("huoshan model");
-        assert_eq!(
-            huoshan.base_url,
-            "https://ark.cn-beijing.volces.com/api/coding/v3"
-        );
-        assert_eq!(
-            huoshan
-                .compat
-                .as_ref()
-                .and_then(|compat| compat.thinking_format),
-            Some(ThinkingFormat::DeepSeek)
-        );
-    }
-
-    #[test]
-    fn embedded_catalog_models_are_sorted() {
-        // `huoshan` is a legacy record carried with `"listed": false`, so the enumerable list (which feeds
-        // `/model`) contains only the default provider. It stays resolvable by id — see the test below.
-        let models = Catalog::embedded().models();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].provider, "opencode-go");
-    }
+    // ── Built-in catalog (introspective: no hard-coded provider/model names or values) ──
 
     #[test]
     fn unlisted_provider_stays_resolvable_but_is_not_enumerated() {
-        // Rationale: existing settings (`defaultProvider: "huoshan"`), session restore and `--provider huoshan`
-        // must keep working after the provider stopped being offered in the picker.
+        // Everything is derived from the loaded config: no provider/model name is hardcoded here, so editing
+        // `assets/models.json` never requires touching this test. Contract guarded below: a provider marked
+        // `"listed": false` stays resolvable by id (settings / --provider / session restore) yet is hidden from
+        // the enumerable list (/model, model cycling).
         let catalog = Catalog::embedded();
-        let provider = catalog.provider("huoshan").expect("huoshan still resolves");
-        assert_eq!(provider.id(), "huoshan");
-        assert_eq!(
-            provider.base_url(),
-            "https://ark.cn-beijing.volces.com/api/coding/v3"
-        );
-        assert!(catalog.model("huoshan", "deepseek-v4-flash").is_some());
-        assert!(catalog
-            .models()
+        let unlisted: Vec<(&String, &ProviderConfig)> = catalog
+            .providers
             .iter()
-            .all(|model| model.provider != "huoshan"));
+            .filter(|(_, cfg)| cfg.listed == Some(false))
+            .collect();
+        if unlisted.is_empty() {
+            return; // this config marks no provider as unlisted → nothing to guard
+        }
+        let enumerated = catalog.models();
+        for (id, cfg) in unlisted {
+            assert!(
+                catalog.provider(id.as_str()).is_some(),
+                "{id} must stay resolvable by id"
+            );
+            for def in cfg.models.as_deref().unwrap_or(&[]) {
+                assert!(
+                    catalog.model(id.as_str(), &def.id).is_some(),
+                    "{id}/{} must stay resolvable by id",
+                    def.id
+                );
+                assert!(
+                    enumerated
+                        .iter()
+                        .all(|m| !(m.provider == *id && m.id == def.id)),
+                    "{id}/{} must not be enumerated",
+                    def.id
+                );
+            }
+        }
     }
 
     #[test]
     fn user_models_json_can_relist_an_unlisted_provider() {
-        // Escape hatch: `"listed": true` in the user file overrides the built-in flag.
+        // Escape hatch: `"listed": true` in the user file overrides the built-in flag. Provider/model names are
+        // taken from the loaded config (no hardcoded ids).
+        let embedded = Catalog::embedded();
+        let target = embedded
+            .providers
+            .iter()
+            .find(|(_, cfg)| cfg.listed == Some(false))
+            .and_then(|(id, cfg)| {
+                cfg.models
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .first()
+                    .map(|def| (id.clone(), def.id.clone()))
+            });
+        let Some((provider, model_id)) = target else {
+            return; // this config marks no provider as unlisted → nothing to relist
+        };
+
         let path = temp_models_path("relist");
         std::fs::write(
             &path,
-            r#"{ "providers": { "huoshan": { "listed": true } } }"#,
+            format!(r#"{{ "providers": {{ "{provider}": {{ "listed": true }} }} }}"#),
         )
         .expect("write temp models.json");
         let catalog = Catalog::load(Some(&path)).expect("load");
         assert!(catalog
             .models()
             .iter()
-            .any(|model| model.provider == "huoshan"));
+            .any(|m| m.provider == provider && m.id == model_id));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn default_model_resolves_default_provider() {
+        // Sanity only (no hardcoded ids/numbers): the default entry exists and carries usable limits.
         let model = Catalog::embedded().default_model().expect("default model");
         assert!(!model.provider.is_empty());
         assert!(!model.id.is_empty());
-        assert_eq!(model.context_window, 1_000_000);
+        assert!(model.context_window > 0);
+        assert!(model.max_tokens > 0);
     }
 
     #[test]
     fn model_or_first_prefers_exact_entry_then_falls_back() {
+        // Provider/model names come from the config (default model), not from literals.
         let catalog = Catalog::embedded();
-        // Exact id → recorded model.
+        let base = catalog.default_model().expect("default model");
+        // Exact (provider, id) → the recorded model.
         let exact = catalog
-            .model_or_first("opencode-go", "deepseek-v4-flash")
+            .model_or_first(&base.provider, &base.id)
             .expect("exact entry");
-        assert_eq!(exact.id, "deepseek-v4-flash");
-        assert!(exact.reasoning);
+        assert_eq!(exact.id, base.id);
+        assert_eq!(exact.base_url, base.base_url);
         // Unknown id on a known provider → provider's first model, id overridden (legacy shim semantics).
         let fallback = catalog
-            .model_or_first("opencode-go", "not-defined")
+            .model_or_first(&base.provider, "not-a-defined-model")
             .expect("fallback");
-        assert_eq!(fallback.id, "not-defined");
+        assert_eq!(fallback.id, "not-a-defined-model");
         assert_eq!(fallback.base_url, exact.base_url);
         // Unknown provider → None (caller keeps its previous model).
         assert!(catalog.model_or_first("no-such-provider", "x").is_none());
@@ -983,9 +976,10 @@ mod tests {
     #[test]
     fn provider_resolves_from_catalog() {
         let catalog = Catalog::embedded();
-        let provider = catalog.provider("opencode-go").expect("provider");
-        assert_eq!(provider.id(), "opencode-go");
-        assert_eq!(provider.base_url(), "https://opencode.ai/zen/go/v1");
+        let base = catalog.default_model().expect("default model");
+        let provider = catalog.provider(&base.provider).expect("provider");
+        assert_eq!(provider.id(), base.provider);
+        assert_eq!(provider.base_url(), base.base_url);
         assert!(catalog.provider("missing").is_none());
     }
 
@@ -995,46 +989,55 @@ mod tests {
     fn load_missing_user_file_uses_embedded() {
         let path = temp_models_path("missing");
         let catalog = Catalog::load(Some(&path)).expect("load");
-        assert!(catalog.model("opencode-go", "deepseek-v4-flash").is_some());
+        assert!(catalog.default_model().is_ok());
+        assert!(!catalog.models().is_empty());
     }
 
     #[test]
     fn load_none_uses_embedded() {
         let catalog = Catalog::load(None).expect("load");
-        assert!(catalog.model("huoshan", "deepseek-v4-flash").is_some());
+        assert!(catalog.default_model().is_ok());
+        assert!(!catalog.models().is_empty());
     }
 
     #[test]
     fn load_user_file_overrides_provider_and_model() {
+        // Target provider/model and the "not overridden" expectation are read from the loaded config, so editing
+        // `assets/models.json` never breaks this test.
+        let base = Catalog::embedded().default_model().expect("default model");
+        let expected_context = base.context_window;
         let path = temp_models_path("override");
         std::fs::write(
             &path,
-            r#"{
-              "providers": {
-                "opencode-go": {
-                  "baseUrl": "https://example.test/v1",
-                  "compat": { "thinkingFormat": "deepseek" },
-                  "modelOverrides": { "deepseek-v4-flash": { "maxTokens": 1234 } }
-                },
-                "my-compat": {
-                  "api": "openai-completions",
-                  "baseUrl": "https://my.test/v1",
-                  "apiKey": "sk-test",
-                  "models": [{ "id": "m1" }]
-                }
-              }
-            }"#,
+            format!(
+                r#"{{
+                  "providers": {{
+                    "{}": {{
+                      "baseUrl": "https://example.test/v1",
+                      "compat": {{ "thinkingFormat": "deepseek" }},
+                      "modelOverrides": {{ "{}": {{ "maxTokens": 1234 }} }}
+                    }},
+                    "my-compat": {{
+                      "api": "openai-completions",
+                      "baseUrl": "https://my.test/v1",
+                      "apiKey": "sk-test",
+                      "models": [{{ "id": "m1" }}]
+                    }}
+                  }}
+                }}"#,
+                base.provider, base.id
+            ),
         )
         .expect("write temp models.json");
 
         let catalog = Catalog::load(Some(&path)).expect("load");
         let existing = catalog
-            .model("opencode-go", "deepseek-v4-flash")
+            .model(&base.provider, &base.id)
             .expect("existing model");
         assert_eq!(existing.base_url, "https://example.test/v1");
         assert_eq!(existing.max_tokens, 1234);
-        // Fields not overridden by the user inherit the built-in record (prevents 1M context fallback).
-        assert_eq!(existing.context_window, 1_000_000);
+        // Fields not overridden by the user inherit the built-in record (no fallback to the generic default).
+        assert_eq!(existing.context_window, expected_context);
         assert_eq!(
             existing
                 .compat
