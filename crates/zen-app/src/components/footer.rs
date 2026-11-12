@@ -52,8 +52,10 @@ pub fn format_cwd_for_footer(cwd: &str, home: Option<&str>) -> String {
 }
 
 /// Iterate over session entries, accumulating token usage (summing usage from each of the
-/// assistant/toolResult/branch_summary/compaction entries), and return the cache hit rate of the most recent assistant (cacheRead/(input+cacheRead+cacheWrite)).
-/// Pure function; called by T-AP-11-1 each frame when assembling FooterData.
+/// assistant/toolResult/branch_summary/compaction entries), and return the cache hit rate of the **most recent**
+/// assistant (cacheRead/(input+cacheRead+cacheWrite)) — `None` when that assistant's prompt is empty (pi sets
+/// `latestCacheHitRate = undefined` in that case, i.e. it **overwrites** the previous value rather than keeping it).
+/// Pure function; called on every footer invalidation (`modes::interactive::footer_data`).
 pub fn compute_usage_totals(entries: &[SessionTreeEntry]) -> (UsageTotals, Option<f64>) {
     let mut totals = UsageTotals::default();
     let mut latest_cache_hit_rate: Option<f64> = None;
@@ -65,9 +67,8 @@ pub fn compute_usage_totals(entries: &[SessionTreeEntry]) -> (UsageTotals, Optio
             } => {
                 add_usage_to_totals(&mut totals, &a.usage);
                 let prompt = a.usage.input + a.usage.cache_read + a.usage.cache_write;
-                if prompt > 0 {
-                    latest_cache_hit_rate = Some(a.usage.cache_read as f64 / prompt as f64 * 100.0);
-                }
+                latest_cache_hit_rate =
+                    (prompt > 0).then(|| a.usage.cache_read as f64 / prompt as f64 * 100.0);
             }
             SessionTreeEntry::Message {
                 message: Message::ToolResult(t),
@@ -335,6 +336,55 @@ mod tests {
         assert_eq!(totals.cache_read, 80);
         // hit = 80/(10+80+0)*100 = 88.9
         assert!((hit.unwrap() - 88.888).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_usage_totals_overwrites_hit_rate_with_none_for_empty_prompt() {
+        // pi: `latestCacheHitRate = prompt > 0 ? ... : undefined` — the last assistant always wins, even when it
+        // reports no prompt tokens (previously zen kept the older value).
+        let with_prompt = Message::Assistant(zen_ai::types::AssistantMessage {
+            content: vec![],
+            api: "openai".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: usage(10, 5, 80),
+            stop_reason: zen_ai::types::StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+        let empty_prompt = Message::Assistant(zen_ai::types::AssistantMessage {
+            content: vec![],
+            api: "openai".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: usage(0, 0, 0),
+            stop_reason: zen_ai::types::StopReason::Error,
+            error_message: Some("boom".into()),
+            timestamp: 0,
+        });
+        let entries = vec![
+            SessionTreeEntry::Message {
+                id: "a1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                message: with_prompt,
+            },
+            SessionTreeEntry::Message {
+                id: "a2".into(),
+                parent_id: Some("a1".into()),
+                timestamp: "t2".into(),
+                message: empty_prompt,
+            },
+        ];
+        let (_, hit) = compute_usage_totals(&entries);
+        assert!(
+            hit.is_none(),
+            "the last assistant's empty prompt overwrites the earlier hit rate with None"
+        );
     }
 
     #[test]

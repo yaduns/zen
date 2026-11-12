@@ -359,11 +359,10 @@ impl AgentSession {
     /// - An entry timestamp that fails to parse is treated as false (prefer not skipping over stalling the compaction path on a bad timestamp).
     fn assistant_precedes_latest_compaction(&self, assistant: &AssistantMessage) -> bool {
         let entries = self.session_store.branch_entries();
-        let Some(SessionTreeEntry::Compaction { timestamp, .. }) = entries
-            .iter()
-            .rev()
-            .find(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
-        else {
+        let Some(index) = zen_core::session::context::latest_compaction_index(&entries) else {
+            return false;
+        };
+        let SessionTreeEntry::Compaction { timestamp, .. } = &entries[index] else {
             return false;
         };
         match chrono::DateTime::parse_from_rfc3339(timestamp) {

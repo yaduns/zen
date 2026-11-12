@@ -2,6 +2,18 @@ use crate::session::tree::{SessionContext, SessionModel, SessionTree, SessionTre
 use std::fmt::Write;
 use zen_ai::types::{ContentBlock, ContentBlockList, Message, TextContent, UserMessage};
 
+/// Returns the index of the most recent `Compaction` entry in the path (`root -> leaf` order), or `None` when the
+/// path has never been compacted.
+///
+/// Consumers: [`default_context_entry_transform`] (window start), `zen-app` context-usage derivation
+/// (`session/context_usage.rs`, compaction boundary) and the compaction scheduler's stale-usage check — all of them
+/// need "where does the current world begin".
+pub fn latest_compaction_index(path_entries: &[SessionTreeEntry]) -> Option<usize> {
+    path_entries
+        .iter()
+        .rposition(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+}
+
 /// Default context entry transform: handles `Compaction` entries, replacing history messages with a summary.
 ///
 /// Input: pathEntries — ordered list of entries from root to leaf ([entry₀, entry₁, ..., entryₙ])
@@ -13,11 +25,7 @@ use zen_ai::types::{ContentBlock, ContentBlockList, Message, TextContent, UserMe
 /// 4. If compaction.firstKeptEntryId exists → scan pathEntries from the head up to before compaction; once firstKeptEntryId is found, also add the entries between that ID and compaction to the result
 pub fn default_context_entry_transform(path_entries: &[SessionTreeEntry]) -> Vec<SessionTreeEntry> {
     // 1. Find the last Compaction entry
-    let last_compaction_idx = path_entries
-        .iter()
-        .rposition(|e| matches!(e, SessionTreeEntry::Compaction { .. }));
-
-    let Some(compaction_idx) = last_compaction_idx else {
+    let Some(compaction_idx) = latest_compaction_index(path_entries) else {
         // No Compaction → return as-is
         return path_entries.to_vec();
     };
@@ -789,5 +797,37 @@ mod tests {
         let tree = make_tree(vec![msg_entry("e1", None, "user")], Some("e1"));
         let ctx = build_context(&tree, Some("nonexistent"));
         assert!(ctx.messages.is_empty());
+    }
+
+    // ─── latest_compaction_index ─────────────────────────────────────────────
+
+    #[test]
+    fn test_latest_compaction_index_none_without_compaction() {
+        let entries = vec![
+            msg_entry("e1", None, "user"),
+            msg_entry("e2", Some("e1"), "assistant"),
+        ];
+        assert_eq!(latest_compaction_index(&entries), None);
+    }
+
+    #[test]
+    fn test_latest_compaction_index_single() {
+        let entries = vec![
+            msg_entry("e1", None, "user"),
+            compaction_entry("c1", Some("e1"), false, None),
+            msg_entry("e3", Some("c1"), "user"),
+        ];
+        assert_eq!(latest_compaction_index(&entries), Some(1));
+    }
+
+    #[test]
+    fn test_latest_compaction_index_picks_the_last_one() {
+        let entries = vec![
+            compaction_entry("c1", None, false, None),
+            msg_entry("e2", Some("c1"), "user"),
+            compaction_entry("c3", Some("e2"), false, None),
+            msg_entry("e4", Some("c3"), "user"),
+        ];
+        assert_eq!(latest_compaction_index(&entries), Some(2));
     }
 }

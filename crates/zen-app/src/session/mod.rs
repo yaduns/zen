@@ -1,6 +1,7 @@
 pub mod agent_session;
 pub mod assembly_options;
 pub mod compaction;
+pub mod context_usage;
 pub mod jsonl;
 pub mod navigation;
 mod provider_attribution;

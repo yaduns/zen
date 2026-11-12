@@ -22,7 +22,7 @@ use crate::commands::{
     build_slash_command_list, parse_slash_command, resolve_builtin, BuiltinSlashCommand,
 };
 use crate::components::assistant_message::stop_line_text;
-use crate::components::footer::FooterData;
+use crate::components::footer::{compute_usage_totals, FooterData};
 use crate::components::scoped_models_selector::EnabledModelIds;
 use crate::components::settings_selector::{DeliveryMode, DoubleEscapeAction, SettingsConfig};
 use crate::components::status_indicator::CompactionStatusReason;
@@ -34,8 +34,8 @@ use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, Setti
 use crate::modes::interactive::ui::{InteractiveUi, UiPrefs};
 use crate::modes::print_mode::stop_error_message;
 use crate::output::footer_data::{BranchArm, BranchWake, FooterDataProvider};
-use crate::output::usage_totals::{add_usage_to_totals, UsageTotals};
 use crate::session::agent_session::{AgentSession, AgentSessionError};
+use crate::session::context_usage::get_context_usage;
 use crate::session::jsonl::CreateSessionOptions;
 use crate::session::navigation::NavigateTreeOptions;
 use crate::session::runtime::{AgentSessionRuntime, SessionStartReason};
@@ -386,9 +386,6 @@ pub struct InteractiveMode {
     /// Current run task handle (plan D): set synchronously at spawn time (sticky guard, at most one run in flight at any instant);
     /// The RunDone branch / shutdown own the reset point.
     run_task: Option<tokio::task::JoinHandle<()>>,
-    /// Footer usage state (mutable within the subscription callback; std Mutex guarantees callback thread safety).
-    /// T-AP-06-4 split: session-cumulative totals + last turn's last_input carried under the same lock (see `UsageTurnState`).
-    usage_totals: Arc<Mutex<UsageTurnState>>,
     /// SIGTERM/SIGHUP listener task (register/unregister lifecycle pair).
     signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Exit code written by the signal task (0 = no signal received; SIGTERM→143 / SIGHUP→129).
@@ -466,7 +463,6 @@ impl InteractiveMode {
             last_ctrl_c_at: None,
             exit_requested: false,
             run_task: None,
-            usage_totals: Arc::new(Mutex::new(UsageTurnState::default())),
             signal_task: None,
             signal_exit_code: Arc::new(AtomicI32::new(0)),
             active_selector: None,
@@ -1004,20 +1000,19 @@ impl InteractiveMode {
     ///
     /// **Deviation from stub signature notes**: the subscription closure is `'static + Send + Sync` and cannot capture `&mut self`
     /// to call `handle_agent_event(&mut self, ...)` — the mapping logic is extracted into the free function `bridge_agent_event`;
-    /// the closure only captures channel/usage accumulator/FooterCtx snapshots (all 'static and clonable).
+    /// the closure only captures the channel / footer source / cache-miss context (all 'static and clonable).
     fn subscribe_to_agent(&mut self) -> Box<dyn FnOnce() + Send> {
         let tx = self.ui_event_tx.clone();
-        let usage = Arc::clone(&self.usage_totals);
         // T-AP-06-3: footer branch subscription (owned Receiver is clonable, 'static-safe)
         let branch_rx = self
             .footer_data
             .as_ref()
             .expect("init idempotent guard ensures footer_data is constructed")
             .branch_rx();
-        // Footer source instead of a FooterCtx snapshot: the bridge rebuilds the footer context per event, so a
-        // model switch made after subscribing (e.g. `/model`) is reflected while the run is streaming — a captured
-        // snapshot used to send the footer back to the old model until the run finished (fixture: footer showed
-        // deepseek during the run after switching to mimo, then reverted to mimo once the run ended).
+        // Footer source: the bridge recomputes the footer from session state per event, so a model switch made after
+        // subscribing (e.g. `/model`) is reflected while the run is streaming — a captured snapshot used to send the
+        // footer back to the old model until the run finished (fixture: footer showed deepseek during the run after
+        // switching to mimo, then reverted to mimo once the run ended).
         let footer = BridgeFooter {
             session: Arc::clone(&self.runtime.session),
             auto_compact: self.settings.auto_compact,
@@ -1031,7 +1026,7 @@ impl InteractiveMode {
         self.runtime
             .session
             .subscribe(Box::new(move |event: &AgentEvent| {
-                bridge_agent_event(event, &tx, &usage, &footer, &cache);
+                bridge_agent_event(event, &tx, &footer, &cache);
             }))
     }
 
@@ -1044,10 +1039,11 @@ impl InteractiveMode {
         let Some(provider) = self.footer_data.as_ref() else {
             return;
         };
-        let ctx =
-            FooterCtx::from_session(&self.runtime.session, &self.settings, provider.branch_rx());
-        let usage = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = self.ui_event_tx.send(UiEvent::Footer(ctx.footer(&usage)));
+        let _ = self.ui_event_tx.send(UiEvent::Footer(footer_data(
+            &self.runtime.session,
+            self.settings.auto_compact,
+            provider.git_branch(),
+        )));
     }
 
     /// Main-task-side pending queue refresh (follow-up text snapshot → UI pending line).
@@ -2138,102 +2134,47 @@ impl ArmStats {
     }
 }
 
-/// Assemble the immutable context snapshot needed by the footer inside the subscription callback (model/thinking level/cwd do not change with the event stream during the session run;
-/// v1 has no model switching; thinking level switching refreshes via the main task's `push_footer`).
-#[derive(Clone)]
-/// Footer usage state (private, product of the T-AP-06-4 split): session-cumulative totals (monotonically accumulated on MessageEnd)
-/// and the most recent turn's prompt input (overwritten each turn, used for the footer context ratio) — kept separate because the two have different lifecycles
-/// `UsageTotals` (pi's five fields), carried by the consumer side (T-AP-11-1's interaction state); same-lock mutual exclusion preserves ordering.
-#[derive(Debug, Default)]
-struct UsageTurnState {
-    /// Session-level token/cost accumulation (spec defined in `output::usage_totals`).
-    totals: UsageTotals,
-    /// Input tokens of the most recent full request (including cache-hit portion; the context% semantics fixed in a3a02b6).
-    last_input: u64,
-}
-
-struct FooterCtx {
-    /// Working directory.
-    pwd: String,
-    /// Model id.
-    model_id: String,
-    /// Provider name (footer `(provider) model` display, aligned with pi; added in T-AP-02-3-fix).
-    model_provider: String,
-    /// Thinking level.
-    thinking_level: ThinkingLevel,
-    /// Context window token count.
-    context_window: u64,
-    /// Auto-compaction switch (footer `(auto)` marker).
+/// Assembles the footer snapshot from the live session — the single place the footer's numbers come from.
+///
+/// Usage totals come from `compute_usage_totals(session.session_store.entries())` (all entries, including
+/// compacted-away history, matching pi's `getEntries()`), the context ratio from `get_context_usage(session)`
+/// (branch-derived, so it stays fresh while a run is streaming). `None` percent renders as `?` (unknown after
+/// compaction) instead of a fake `0.0%`.
+///
+/// Consumers: [`BridgeFooter::footer`] (event bridge) and [`InteractiveMode::push_footer`] (main task); both push a
+/// `UiEvent::Footer`, and no accumulator is involved — a resumed session therefore shows real numbers on the first
+/// frame.
+fn footer_data(
+    session: &AgentSession,
     auto_compact: bool,
-    /// git branch latest-value subscription (T-AP-06-3; owned is clonable, subscription closure / assembly point synchronously reads via borrow).
-    git_branch_rx: watch::Receiver<Option<String>>,
-}
-
-impl FooterCtx {
-    /// Built from session and settings snapshots. `git_branch_rx` is the watch subscription of the footer branch data provider
-    /// (T-AP-06-3); at footer assembly time the latest branch is read synchronously via `borrow()`.
-    fn from_session(
-        session: &AgentSession,
-        settings: &SettingsConfig,
-        git_branch_rx: watch::Receiver<Option<String>>,
-    ) -> Self {
-        Self::new(session, settings.auto_compact, git_branch_rx)
-    }
-
-    /// Same as [`FooterCtx::from_session`] but taking the only settings bit the footer needs, so the event
-    /// bridge (which has no `SettingsConfig` at hand) can rebuild the context per event.
-    fn new(
-        session: &AgentSession,
-        auto_compact: bool,
-        git_branch_rx: watch::Receiver<Option<String>>,
-    ) -> Self {
-        FooterCtx {
-            pwd: session.cwd().to_string(),
-            model_id: session.model().id.clone(),
-            model_provider: session.model().provider.clone(),
-            thinking_level: session.thinking_level(),
-            context_window: session.model().context_window,
-            auto_compact,
-            git_branch_rx,
-        }
-    }
-
-    /// Assemble `FooterData`: context ratio = most recent prompt tokens (last_input) / window;
-    /// cache hit rate = cumulative cache_read / cumulative input.
-    fn footer(&self, usage: &UsageTurnState) -> FooterData {
-        // context_percent uses the current turn's input tokens
-        let context_percent = if self.context_window > 0 {
-            Some((usage.last_input as f64 / self.context_window as f64) * 100.0)
-        } else {
-            None
-        };
-
-        // Cache hit rate computed from cumulative values
-        let cache_hit_rate = if usage.totals.input > 0 {
-            Some(usage.totals.cache_read as f64 / usage.totals.input as f64 * 100.0)
-        } else {
-            None
-        };
-
-        FooterData {
-            pwd: self.pwd.clone(),
-            git_branch: (*self.git_branch_rx.borrow()).clone(),
-            session_name: None, // Hook up session name after T-AP-08-5 lands
-            model_provider: self.model_provider.clone(),
-            model_id: self.model_id.clone(),
-            thinking_level: Some(self.thinking_level),
-            usage: usage.totals,
-            context_percent,
-            context_window: self.context_window,
-            cache_hit_rate,
-            auto_compact_enabled: self.auto_compact,
-        }
+    git_branch: Option<String>,
+) -> FooterData {
+    let (usage, cache_hit_rate) = compute_usage_totals(&session.session_store.entries());
+    let context = get_context_usage(session);
+    let model = session.model();
+    let context_percent = context.as_ref().and_then(|c| c.percent);
+    // `get_context_usage` returns the window too; fall back to the model when it bailed out (`window == 0`).
+    let context_window = context
+        .map(|c| c.context_window)
+        .unwrap_or(model.context_window);
+    FooterData {
+        pwd: session.cwd().to_string(),
+        git_branch,
+        session_name: None, // Hook up session name after T-AP-08-5 lands
+        model_provider: model.provider.clone(),
+        model_id: model.id.clone(),
+        thinking_level: Some(session.thinking_level()),
+        usage,
+        context_percent,
+        context_window,
+        cache_hit_rate,
+        auto_compact_enabled: auto_compact,
     }
 }
 
-/// Live footer source for the event bridge: holds what `FooterCtx` needs (session + settings snapshot + branch
-/// subscription) and rebuilds the context on demand. Reading `session.model()` at event time is what keeps the
-/// footer right after an in-session model switch.
+/// Live footer source for the event bridge: holds the session + the only settings bit the footer shows + the branch
+/// subscription, and rebuilds the snapshot on demand. Reading session state at event time is what keeps the footer
+/// right after an in-session model switch.
 struct BridgeFooter {
     /// Session the events come from (model / thinking level / context window are read from it live).
     session: Arc<AgentSession>,
@@ -2244,9 +2185,14 @@ struct BridgeFooter {
 }
 
 impl BridgeFooter {
-    /// Build a fresh [`FooterCtx`] from the current session state.
-    fn ctx(&self) -> FooterCtx {
-        FooterCtx::new(&self.session, self.auto_compact, self.git_branch_rx.clone())
+    /// Rebuilds the footer from the live session (model / thinking level / usage are read at event time, never from
+    /// a subscribe-time snapshot — a `/model` switch must be visible while the run streams).
+    fn footer(&self) -> FooterData {
+        footer_data(
+            &self.session,
+            self.auto_compact,
+            (*self.git_branch_rx.borrow()).clone(),
+        )
     }
 }
 
@@ -2281,7 +2227,6 @@ impl CacheMissContext {
 fn bridge_agent_event(
     event: &AgentEvent,
     tx: &mpsc::UnboundedSender<UiEvent>,
-    usage: &Mutex<UsageTurnState>,
     footer: &BridgeFooter,
     cache: &CacheMissContext,
 ) {
@@ -2307,24 +2252,6 @@ fn bridge_agent_event(
             }
         }
         AgentEvent::MessageEnd { message } => {
-            // Usage accumulation (assistant / toolResult each carry usage): totals accumulates monotonically;
-            // assistant also overwrites last_input (for footer context%, split by T-AP-06-4)
-            match message {
-                Message::Assistant(a) => {
-                    if let Ok(mut u) = usage.lock() {
-                        add_usage_to_totals(&mut u.totals, &a.usage);
-                        u.last_input = a.usage.input; // ← overwritten each turn
-                    }
-                }
-                Message::ToolResult(t) => {
-                    if let Some(u) = &t.usage {
-                        if let Ok(mut state) = usage.lock() {
-                            add_usage_to_totals(&mut state.totals, u);
-                        }
-                    }
-                }
-                Message::User(_) => {}
-            }
             let error_text = match message {
                 Message::Assistant(a) => match a.stop_reason {
                     // Cancellation is already expressed by the message block "Operation aborted" (assistant_message.rs Aborted branch),
@@ -2368,10 +2295,9 @@ fn bridge_agent_event(
                     }
                 }
             }
-            // Footer invalidation per event (pi footer.invalidate()) — rebuilt from the live session, never from a
-            // subscribe-time snapshot (see `BridgeFooter`).
-            let totals = usage.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = tx.send(UiEvent::Footer(footer.ctx().footer(&totals)));
+            // Footer invalidation per event (pi footer.invalidate()) — recomputed from session state (usage from
+            // `entries()`, context% from the branch), never from a subscribe-time snapshot (see `BridgeFooter`).
+            let _ = tx.send(UiEvent::Footer(footer.footer()));
         }
         AgentEvent::ToolExecutionStart {
             tool_call_id,
@@ -2482,6 +2408,9 @@ fn bridge_agent_event(
                     tokens_before: r.tokens_before,
                 });
             }
+            // Compaction rewrites the context: the footer must re-read it now, otherwise the post-compaction `?`
+            // (unknown until the next assistant) only appears after the next message (context-usage-resume-fix).
+            let _ = tx.send(UiEvent::Footer(footer.footer()));
         }
         AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
     }
@@ -2577,10 +2506,24 @@ mod tests {
     struct MockStore {
         session_id_val: String,
         cwd_val: String,
+        /// Session entries served by both `entries()` (all) and `branch_entries()` (branch view) — the footer's
+        /// usage totals *and* its context ratio are derived from here. `append_message` records into it as well, so
+        /// the "persistence listener runs before the event bridge" ordering is observable in tests.
+        entries_val: StdMutex<Vec<SessionTreeEntry>>,
     }
 
     impl SessionStore for MockStore {
-        fn append_message(&self, _message: &Message) {}
+        fn append_message(&self, message: &Message) {
+            let mut entries = self.entries_val.lock().unwrap_or_else(|e| e.into_inner());
+            let id = format!("e{}", entries.len());
+            let parent_id = entries.last().map(|entry| entry.id().to_string());
+            entries.push(SessionTreeEntry::Message {
+                id,
+                parent_id,
+                timestamp: "2024-01-01T00:00:00Z".into(),
+                message: message.clone(),
+            });
+        }
         fn append_model_change(&self, _provider: &str, _model_id: &str) {}
         fn append_thinking_level_change(&self, _level: &str) {}
         fn session_id(&self) -> String {
@@ -2590,7 +2533,10 @@ mod tests {
             &self.cwd_val
         }
         fn branch_entries(&self) -> Vec<SessionTreeEntry> {
-            Vec::new()
+            self.entries_val
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
         fn append_compaction(
             &self,
@@ -2600,10 +2546,14 @@ mod tests {
             "mock-compaction-id".to_string()
         }
         fn entries(&self) -> Vec<SessionTreeEntry> {
-            Vec::new()
+            self.branch_entries()
         }
         fn get_leaf_id(&self) -> Option<String> {
-            None
+            self.entries_val
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .map(|entry| entry.id().to_string())
         }
         fn append_branch_summary(
             &self,
@@ -2706,6 +2656,7 @@ mod tests {
         let store: Arc<dyn SessionStore> = Arc::new(MockStore {
             session_id_val: "s1".into(),
             cwd_val: "/work".into(),
+            ..Default::default()
         });
         let session = AgentSession::new(test_agent(), Arc::clone(&store));
         let services = crate::session::runtime::AgentSessionServices {
@@ -2751,7 +2702,7 @@ mod tests {
         ));
     }
 
-    // ── default_settings / FooterCtx ─────────────────────────────
+    // ── default_settings / footer_data ──────────────────────────
 
     #[test]
     fn test_default_settings_sane_baseline() {
@@ -2781,36 +2732,161 @@ mod tests {
         assert!(config.enable_skill_commands);
     }
 
+    // ── footer_data (context-usage-resume-fix: usage + context from session state) ──
+
+    /// Assistant message entry for footer fixtures. The message timestamp sits after the compaction fixtures below,
+    /// because `estimate_messages` gates usage by timestamp (`latest_prefix_ts`).
+    fn assistant_entry(id: &str, usage: Usage) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: None,
+            timestamp: "2024-01-10T00:00:00Z".into(),
+            message: Message::Assistant(assistant_with_usage("hi", usage)),
+        }
+    }
+
+    fn compaction_entry(id: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Compaction {
+            id: id.into(),
+            parent_id: None,
+            timestamp: "2024-01-02T00:00:00Z".into(),
+            summary: "compacted".into(),
+            first_kept_entry_id: None,
+            tokens_before: 500,
+            retained_tail: None,
+            details: None,
+            usage: None,
+            from_hook: None,
+        }
+    }
+
+    /// Session whose store already holds `entries` — the footer derives both usage and context% from it.
+    fn test_session_with_entries(
+        context_window: u64,
+        entries: Vec<SessionTreeEntry>,
+    ) -> Arc<AgentSession> {
+        let mut state = agent_state();
+        state.model.context_window = context_window;
+        let agent = zen_core::harness::engine::Agent::new(
+            state,
+            ToolExecutionMode::Sequential,
+            Arc::new(MockHooks),
+            mock_stream_fn(),
+            None,
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(MockStore {
+            session_id_val: "s1".into(),
+            cwd_val: "/work".into(),
+            entries_val: StdMutex::new(entries),
+        });
+        Arc::new(AgentSession::new(agent, store))
+    }
+
     #[test]
-    fn test_footer_ctx_computes_percent_and_cache_hit() {
-        // totals is the session cumulative total (for footer stats display, not used in percentage); last_input is the latest turn
-        // (context% = 1000/2000 = 50%); after the T-AP-06-4 split these belong to two UsageTurnState fields.
-        let usage = UsageTurnState {
-            totals: UsageTotals {
-                input: 1000,
-                output: 50,
-                cache_read: 900,
-                cache_write: 0,
-                cost: 0.0,
-            },
-            last_input: 1000,
-        };
-        let ctx = FooterCtx {
-            pwd: "/work".into(),
-            model_id: "m".into(),
-            model_provider: "opencode-go".into(),
-            thinking_level: ThinkingLevel::Off,
-            context_window: 2000,
-            auto_compact: true,
-            git_branch_rx: test_branch_rx(),
-        };
-        let data = ctx.footer(&usage);
-        // prompt = 1000/2000 = 50%；cache hit = 900/1000 = 90%
+    fn footer_data_computes_percent_and_cache_hit_from_session_state() {
+        // usage total 1000 / window 2000 = 50%; cache hit = 900/(100+900) = 90%.
+        let session =
+            test_session_with_entries(2000, vec![assistant_entry("a1", mk_usage(100, 0, 900))]);
+        let data = footer_data(&session, true, None);
         assert!((data.context_percent.unwrap() - 50.0).abs() < 0.01);
         assert!((data.cache_hit_rate.unwrap() - 90.0).abs() < 0.01);
+        assert_eq!(data.usage.input, 100);
+        assert_eq!(data.context_window, 2000);
         assert!(data.auto_compact_enabled);
-        assert_eq!(data.model_id, "m");
         assert_eq!(data.git_branch, None);
+        assert_eq!(data.model_id, "test-model");
+        assert!(
+            data.session_name.is_none(),
+            "T-AP-08-5 placeholder must survive the FooterCtx merge"
+        );
+    }
+
+    #[test]
+    fn footer_data_reports_unknown_context_after_compaction() {
+        let session = test_session_with_entries(
+            2000,
+            vec![
+                assistant_entry("a1", mk_usage(100, 0, 900)),
+                compaction_entry("c1"),
+            ],
+        );
+        let data = footer_data(&session, false, None);
+        assert_eq!(
+            data.context_percent, None,
+            "unknown right after compaction → renders `?`, not a fake low percentage"
+        );
+        assert_eq!(data.usage.input, 100, "usage totals stay known");
+    }
+
+    #[test]
+    fn footer_data_empty_session_shows_zero_percent() {
+        let session = test_session_with_entries(2000, vec![]);
+        let data = footer_data(&session, false, None);
+        assert_eq!(data.context_percent, Some(0.0));
+        assert_eq!(data.usage.input, 0);
+        assert_eq!(data.cache_hit_rate, None);
+    }
+
+    #[test]
+    fn footer_data_uses_latest_assistant_cache_hit_rate() {
+        // pi definition: CH% = the *latest* assistant (90% → 50%), while totals keep accumulating.
+        let session = test_session_with_entries(
+            2000,
+            vec![
+                assistant_entry("a1", mk_usage(100, 0, 900)),
+                assistant_entry("a2", mk_usage(500, 0, 500)),
+            ],
+        );
+        let data = footer_data(&session, false, None);
+        assert!((data.cache_hit_rate.unwrap() - 50.0).abs() < 0.01);
+        assert_eq!(data.usage.input, 600);
+    }
+
+    /// Perf probe (ignored by default): one footer rebuild pays **three** history copies (entries / branch_entries
+    /// / flatten), see the task doc's open question 2. Run with:
+    /// `cargo test -p zen-app --lib probe_footer_data_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_footer_data_cost() {
+        let big_text = "x".repeat(2_000);
+        let mut entries = Vec::new();
+        for i in 0..400 {
+            let mut assistant = assistant_with_usage(&big_text, mk_usage(1_000, 500, 0));
+            assistant.content = vec![ContentBlock::Text(zen_ai::types::TextContent {
+                text: big_text.clone(),
+                text_signature: None,
+            })];
+            entries.push(SessionTreeEntry::Message {
+                id: format!("a{i}"),
+                parent_id: None,
+                timestamp: "2024-01-10T00:00:00Z".into(),
+                message: Message::Assistant(assistant),
+            });
+        }
+        let session = test_session_with_entries(200_000, entries);
+        let iterations = 50;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = std::hint::black_box(footer_data(&session, false, None));
+        }
+        println!(
+            "footer_data: {:?} per call (400 entries x 2KB)",
+            started.elapsed() / iterations
+        );
+    }
+
+    #[test]
+    fn footer_data_is_fresh_while_state_messages_lag() {
+        // context-usage-resume-fix: during a run `state.messages` is a run-start snapshot (engine.rs writes it back
+        // only after the run body completes), so the footer must derive context% from the store instead.
+        let session =
+            test_session_with_entries(2000, vec![assistant_entry("a1", mk_usage(100, 0, 900))]);
+        assert!(
+            session.agent.messages().is_empty(),
+            "state has not been written back yet"
+        );
+        let data = footer_data(&session, false, None);
+        assert!((data.context_percent.unwrap() - 50.0).abs() < 0.01);
     }
 
     /// Branch watch receiver for tests (initial None, not connected to a real provider).
@@ -2864,6 +2940,7 @@ mod tests {
         let store: Arc<dyn SessionStore> = Arc::new(MockStore {
             session_id_val: "s1".into(),
             cwd_val: "/work".into(),
+            ..Default::default()
         });
         BridgeFooter {
             session: Arc::new(AgentSession::new(test_agent(), store)),
@@ -2872,26 +2949,12 @@ mod tests {
         }
     }
 
-    fn test_footer_ctx() -> FooterCtx {
-        FooterCtx {
-            pwd: "/work".into(),
-            model_id: "m".into(),
-            model_provider: "opencode-go".into(),
-            thinking_level: ThinkingLevel::Off,
-            context_window: 8192,
-            auto_compact: false,
-            git_branch_rx: test_branch_rx(),
-        }
-    }
-
     #[test]
     fn test_bridge_agent_start_sets_working_and_animation() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::AgentStart,
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -2921,16 +2984,14 @@ mod tests {
         let mut switched = footer.session.model();
         switched.id = "mimo-v2.6-flash".into();
         footer.session.set_model(switched);
-        assert_eq!(footer.ctx().model_id, "mimo-v2.6-flash");
+        assert_eq!(footer.footer().model_id, "mimo-v2.6-flash");
 
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageEnd {
                 message: Message::Assistant(assistant_with_usage("hi", mk_usage(10, 5, 0))),
             },
             &tx,
-            &usage,
             &footer,
             &CacheMissContext::disabled(),
         );
@@ -2946,27 +3007,112 @@ mod tests {
     }
 
     #[test]
-    fn test_bridge_message_end_accumulates_usage_and_pushes_footer() {
+    fn test_bridge_message_end_pushes_footer_from_session_state() {
+        // context-usage-resume-fix: the footer no longer accumulates from the event — it re-reads the store, so the
+        // assertion is on what the session holds (the bridge only decides *when* to invalidate).
+        let session =
+            test_session_with_entries(2000, vec![assistant_entry("a1", mk_usage(100, 20, 30))]);
+        let footer = BridgeFooter {
+            session,
+            auto_compact: false,
+            git_branch_rx: test_branch_rx(),
+        };
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageEnd {
                 message: Message::Assistant(assistant_with_usage("hi", mk_usage(100, 20, 30))),
             },
             &tx,
-            &usage,
-            &test_bridge_footer(),
+            &footer,
             &CacheMissContext::disabled(),
         );
-        // MessageEnd delivered
         assert!(matches!(rx.try_recv(), Ok(UiEvent::MessageEnd { .. })));
-        // Usage accumulation (totals monotonically accumulates + last_input overwrites) + carried by footer
-        let state = usage.lock().unwrap();
-        assert_eq!(state.totals.input, 100);
-        assert_eq!(state.totals.output, 20);
-        assert_eq!(state.totals.cache_read, 30);
-        assert_eq!(state.last_input, 100);
-        assert!(matches!(rx.try_recv(), Ok(UiEvent::Footer(_))));
+        match rx.try_recv() {
+            Ok(UiEvent::Footer(data)) => {
+                assert_eq!(data.usage.input, 100);
+                assert_eq!(data.usage.output, 20);
+                assert_eq!(data.usage.cache_read, 30);
+                assert!(data.context_percent.is_some());
+            }
+            other => panic!("expected Footer event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footer_sees_the_message_the_persistence_listener_just_appended() {
+        // Ordering premise of the whole design: `AgentSession::new` registers the persistence listener before the
+        // interactive bridge and `Agent::on_event` notifies listeners in registration order, so a MessageEnd's footer
+        // already counts that message. Locked with a real Agent + recording store, not by comment.
+        let session = test_session_with_entries(2000, vec![]);
+        let footer = BridgeFooter {
+            session: Arc::clone(&session),
+            auto_compact: false,
+            git_branch_rx: test_branch_rx(),
+        };
+        let (tx, mut rx) = channel();
+        let tx_bridge = tx.clone();
+        let unsubscribe = session.subscribe(Box::new(move |event| {
+            bridge_agent_event(event, &tx_bridge, &footer, &CacheMissContext::disabled());
+        }));
+        session.agent.emit(AgentEvent::MessageEnd {
+            message: Message::Assistant(assistant_with_usage("hi", mk_usage(100, 20, 30))),
+        });
+        unsubscribe();
+        let mut footer_usage = None;
+        while let Ok(event) = rx.try_recv() {
+            if let UiEvent::Footer(data) = event {
+                footer_usage = Some(data.usage);
+            }
+        }
+        let usage = footer_usage.expect("a footer event must be pushed on MessageEnd");
+        assert_eq!(
+            usage.input, 100,
+            "the footer must already include the message the persistence listener appended"
+        );
+    }
+
+    #[test]
+    fn compaction_end_pushes_a_footer() {
+        // Post-compaction `?` must become visible immediately, not only after the next assistant message.
+        let session = test_session_with_entries(
+            2000,
+            vec![
+                assistant_entry("a1", mk_usage(100, 0, 900)),
+                compaction_entry("c1"),
+            ],
+        );
+        let footer = BridgeFooter {
+            session,
+            auto_compact: false,
+            git_branch_rx: test_branch_rx(),
+        };
+        let (tx, mut rx) = channel();
+        bridge_agent_event(
+            &AgentEvent::CompactionEnd {
+                reason: zen_core::compaction::CompactionReason::Manual,
+                result: None,
+                aborted: false,
+                will_retry: false,
+                error_message: None,
+            },
+            &tx,
+            &footer,
+            &CacheMissContext::disabled(),
+        );
+        let mut context_percent = None;
+        let mut saw_footer = false;
+        while let Ok(event) = rx.try_recv() {
+            if let UiEvent::Footer(data) = event {
+                saw_footer = true;
+                context_percent = Some(data.context_percent);
+            }
+        }
+        assert!(saw_footer, "CompactionEnd must invalidate the footer");
+        assert_eq!(
+            context_percent.expect("footer event"),
+            None,
+            "the post-compaction footer shows `?`"
+        );
     }
 
     /// Assistant message carrying a toolCall block (turn-auto-retry-fix dedupe matrix needs both shapes).
@@ -2988,7 +3134,6 @@ mod tests {
         // turn-auto-retry-fix item ④: the assistant block already renders `Error: {msg}` for a tool-call-free
         // message, so pushing the same text as an Info row would print the error twice (the reported symptom).
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         let mut a = assistant_with_usage("x", Usage::default());
         a.stop_reason = StopReason::Error;
         a.error_message = Some("provider 500".into());
@@ -2997,7 +3142,6 @@ mod tests {
                 message: Message::Assistant(a),
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3014,7 +3158,6 @@ mod tests {
     fn test_bridge_error_with_tool_call_keeps_error_text() {
         // With tool calls the block shows no stop line, so the Info row is the only place the error is visible.
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageEnd {
                 message: Message::Assistant(assistant_with_tool_call(
@@ -3023,7 +3166,6 @@ mod tests {
                 )),
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3038,7 +3180,6 @@ mod tests {
         // Regression guard (review B3): `stop_line_text` returns None for Aborted+toolCall, so the dedupe rule alone
         // would resurrect the "Operation aborted" + "Request was aborted" double line fixed by interactive-cancel-fix.
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageEnd {
                 message: Message::Assistant(assistant_with_tool_call(
@@ -3047,7 +3188,6 @@ mod tests {
                 )),
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3063,7 +3203,6 @@ mod tests {
     #[test]
     fn test_bridge_auto_retry_arms_and_disarms_animation() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         let footer = test_bridge_footer();
 
         // AutoRetryStart → retry status line + animation armed (countdown is driven by render frames).
@@ -3075,7 +3214,6 @@ mod tests {
                 error_message: "timeout".into(),
             },
             &tx,
-            &usage,
             &footer,
             &CacheMissContext::disabled(),
         );
@@ -3097,7 +3235,6 @@ mod tests {
                 final_error: Some("boom".into()),
             },
             &tx,
-            &usage,
             &footer,
             &CacheMissContext::disabled(),
         );
@@ -3116,7 +3253,6 @@ mod tests {
                 final_error: None,
             },
             &tx,
-            &usage,
             &footer,
             &CacheMissContext::disabled(),
         );
@@ -3134,7 +3270,6 @@ mod tests {
                 final_error: None,
             },
             &tx,
-            &usage,
             &footer,
             &CacheMissContext::disabled(),
         );
@@ -3150,7 +3285,6 @@ mod tests {
     fn test_bridge_aborted_message_end_suppresses_error_text() {
         // Cancellation (Aborted) no longer carries error_text: the message block "Operation aborted" already expresses it, avoiding a duplicate status line
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         let mut a = assistant_with_usage("x", Usage::default());
         a.stop_reason = StopReason::Aborted;
         a.error_message = Some("Request was aborted".into());
@@ -3159,7 +3293,6 @@ mod tests {
                 message: Message::Assistant(a),
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3327,7 +3460,6 @@ mod tests {
             session: Some(session),
         };
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         let msg = Message::Assistant(cache_turn(
             0,
             0,
@@ -3341,7 +3473,6 @@ mod tests {
         bridge_agent_event(
             &AgentEvent::MessageEnd { message: msg },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &cache,
         );
@@ -3367,7 +3498,6 @@ mod tests {
                 session: Some(session),
             };
             let (tx, mut rx) = channel();
-            let usage = StdMutex::new(UsageTurnState::default());
             let mut m = cache_turn(
                 0,
                 0,
@@ -3384,7 +3514,6 @@ mod tests {
                     message: Message::Assistant(m),
                 },
                 &tx,
-                &usage,
                 &test_bridge_footer(),
                 &cache,
             );
@@ -3399,7 +3528,6 @@ mod tests {
     #[test]
     fn test_bridge_cache_miss_notice_skipped_when_disabled() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         let msg = Message::Assistant(cache_turn(
             0,
             0,
@@ -3413,7 +3541,6 @@ mod tests {
         bridge_agent_event(
             &AgentEvent::MessageEnd { message: msg },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3509,7 +3636,6 @@ mod tests {
     #[test]
     fn test_bridge_tool_events_map_to_ui_events() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::ToolExecutionStart {
                 tool_call_id: "t1".into(),
@@ -3517,7 +3643,6 @@ mod tests {
                 args: serde_json::json!({"command": "ls"}),
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3550,7 +3675,6 @@ mod tests {
                 is_error: false,
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );
@@ -3563,7 +3687,6 @@ mod tests {
     #[test]
     fn test_bridge_tool_result_message_skipped_for_chat_rows() {
         let (tx, mut rx) = channel();
-        let usage = StdMutex::new(UsageTurnState::default());
         bridge_agent_event(
             &AgentEvent::MessageStart {
                 message: Message::ToolResult(ToolResultMessage {
@@ -3578,7 +3701,6 @@ mod tests {
                 }),
             },
             &tx,
-            &usage,
             &test_bridge_footer(),
             &CacheMissContext::disabled(),
         );

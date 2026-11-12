@@ -2,8 +2,10 @@
 // Corresponds to original TS: reference/pi-original/packages/coding-agent/src/core/usage-totals.ts.
 // `UsageTotals`/`add_usage_to_totals` moved in from the fallback definitions in components/footer.rs (T-AP-11-2
 // registered migration seam, closed by T-AP-06-4); pi `createUsageTotals` factory is eliminated by `Default` derive.
-// In the fallback definitions, `last_input` (latest round's input, overwritten each round) and the other five fields' session-monotonic accumulation
-// have inconsistent lifetimes; split out in T-AP-06-4 — carried independently by the consumer side (interactive/mod.rs `UsageTurnState`).
+// In the fallback definitions, `last_input` (latest round's input, overwritten each round) and the other five fields'
+// session-monotonic accumulation had inconsistent lifetimes; T-AP-06-4 split it out into a consumer-side holder
+// (`UsageTurnState`), which `context-usage-resume-fix` has since **retired**: the footer now recomputes both the totals
+// and the context ratio from session state on every invalidation (no accumulator at all, matching pi).
 
 use std::collections::BTreeMap;
 
