@@ -33,7 +33,7 @@ use crate::config::defaults::{SettingsEffective, DEFAULT_THINKING_LEVEL};
 use crate::config::settings::{DoubleEscapeAction as PersistedDoubleEscape, SettingsManager};
 use crate::modes::interactive::ui::{InteractiveUi, UiPrefs};
 use crate::modes::print_mode::stop_error_message;
-use crate::output::footer_data::FooterDataProvider;
+use crate::output::footer_data::{BranchArm, BranchWake, FooterDataProvider};
 use crate::output::usage_totals::{add_usage_to_totals, UsageTotals};
 use crate::session::agent_session::{AgentSession, AgentSessionError};
 use crate::session::jsonl::CreateSessionOptions;
@@ -790,15 +790,15 @@ impl InteractiveMode {
     ///   when `run_task` is None the whole branch is disabled for the round (no busy-loop). **Do not** move the `is_some()` check inside the async block
     ///   to self-check on return——that would make the branch always Ready when None, degenerating into a busy-loop.
     async fn dispatch_loop(&mut self) -> Result<(), InteractiveModeError> {
-        // git branch change subscription (T-AP-06-3): at subscribe time the current value is already marked as seen, so only real changes are received
-        let mut branch_rx = self
-            .footer_data
-            .as_ref()
-            .expect("init idempotent guard ensures footer_data is constructed")
-            .branch_rx();
+        // git branch change subscription (T-AP-06-3; hardened by interactive-idle-spin-fix): the arm owns the
+        // receiver and **self-disables** when the provider is replaced, so a closed watch channel can never make
+        // this `select!` permanently ready (that used to peg one core after every session switch).
+        let mut branch_arm = BranchArm::new(self.footer_data.as_ref());
+        let mut arm_stats = ArmStats::new();
         loop {
             tokio::select! {
                 cmd = self.input_rx.recv() => {
+                    arm_stats.record(ArmId::Input);
                     match cmd {
                         Some(InputCommand::Submit(text)) => {
                             if let Err(e) = self.handle_submit(text).await {
@@ -855,10 +855,17 @@ impl InteractiveMode {
                         break;
                     }
                 }
-                _ = branch_rx.changed() => {
-                    // git branch change → refresh footer status bar (T-AP-06-3); sender drop
-                    // after (dispose), the Err branch is a no-op (shutdown would break anyway)
-                    self.push_footer();
+                wake = branch_arm.wait() => {
+                    arm_stats.record(ArmId::Branch);
+                    if wake == BranchWake::Closed {
+                        // The provider was replaced (session switch) or torn down. `switch_runtime` already pushed
+                        // a footer built from the new provider, so only re-point the subscription here — a second
+                        // push would be redundant (and pointless when the provider is gone).
+                        branch_arm.resubscribe(self.footer_data.as_ref());
+                    } else {
+                        // Branch value changed → refresh the footer status bar.
+                        self.push_footer();
+                    }
                 }
                 _ = async {
                     if let Some(h) = &mut self.run_task {
@@ -868,11 +875,15 @@ impl InteractiveMode {
                         }
                     }
                 }, if self.run_task.is_some() => {
+                    arm_stats.record(ArmId::RunDone);
                     // ← the only run_task reset point (normal / post-Esc-abort teardown / panic all go through here)
                     self.run_task = None;
                     self.push_footer(); // Refresh the footer after the run finishes (coexists idempotently with the AgentEnd event refresh)
                 }
-                _ = self.cancel.cancelled() => break, // Signal task / shutdown trigger
+                _ = self.cancel.cancelled() => {
+                    arm_stats.record(ArmId::Cancel);
+                    break; // Signal task / shutdown trigger
+                }
             }
             if self.exit_requested {
                 break;
@@ -1024,14 +1035,17 @@ impl InteractiveMode {
             }))
     }
 
-    /// Main-task-side footer refresh (e.g., after switching thinking level): assemble and push based on current session state + usage accumulator.
+    /// Main-task-side footer refresh (e.g., after switching thinking level): assemble and push from the current
+    /// session state.
     fn push_footer(&self) {
-        let branch_rx = self
-            .footer_data
-            .as_ref()
-            .expect("init idempotent guard ensures footer_data is constructed")
-            .branch_rx();
-        let ctx = FooterCtx::from_session(&self.runtime.session, &self.settings, branch_rx);
+        // Defensive (interactive-idle-spin-fix): `footer_data` is None only in the shutdown race — never during
+        // normal operation (init guard, and only `switch_runtime` ever replaces it). A missing provider must not
+        // panic the main loop, so degrade to "no footer" instead.
+        let Some(provider) = self.footer_data.as_ref() else {
+            return;
+        };
+        let ctx =
+            FooterCtx::from_session(&self.runtime.session, &self.settings, provider.branch_rx());
         let usage = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ui_event_tx.send(UiEvent::Footer(ctx.footer(&usage)));
     }
@@ -1784,21 +1798,25 @@ impl InteractiveMode {
             }
         };
 
-        // 3. Unsubscribe old agent + replace runtime (old session drop teardown) + resubscribe
+        // 3. Unsubscribe old agent + replace runtime (old session drop teardown)
         if let Some(sub) = self.subscription.take() {
             sub();
         }
         let old = std::mem::replace(&mut self.runtime, new_runtime);
         drop(old);
-        self.subscription = Some(self.subscribe_to_agent());
 
-        // 3.5 Rebuild the footer branch provider with the new cwd (dispose old watcher + create new)
+        // 3.5 Rebuild the footer branch provider with the new cwd (dispose old watcher + create new).
+        //     **Order is load-bearing** (interactive-idle-spin-fix): the provider resolves git paths from
+        //     `self.runtime.session.cwd()` — i.e. it needs the *new* runtime (hence after `mem::replace`) — and
+        //     `subscribe_to_agent` captures `branch_rx()` into `BridgeFooter`, so it must run *after* this rebuild.
+        //     Subscribing first froze the bridge footer on the old provider's cache (branch name stuck / flickering).
         if let Some(mut fd) = self.footer_data.take() {
             fd.dispose();
         }
         self.footer_data = Some(FooterDataProvider::new(Path::new(
             self.runtime.session.cwd(),
         )));
+        self.subscription = Some(self.subscribe_to_agent());
 
         // 4. UI: clear chat + render new session history + title + footer (T-OB-01-3: payload carries cache miss
         //    notice position, re-injected when the gate is open)
@@ -2062,6 +2080,61 @@ fn default_settings() -> SettingsConfig {
         ],
         current_theme: "dark".into(),
         available_themes: vec!["dark".into(), "light".into()],
+    }
+}
+
+/// Which `select!` arm became ready — the index into [`ArmStats::counts`], used only by the spin-attribution
+/// instrumentation (a pegged core after a session switch is otherwise indistinguishable from other loops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmId {
+    /// `input_rx.recv()` — key/selector commands from the UI task.
+    Input,
+    /// `BranchArm::wait()` — git branch subscription (T-AP-06-3).
+    Branch,
+    /// `run_task` completion (guarded by `is_some`).
+    RunDone,
+    /// Root cancellation token (signal task / shutdown).
+    Cancel,
+}
+
+/// Ready-arm counters for `dispatch_loop`: every `WINDOW` a `trace!` summary reports how often each arm fired, so
+/// a future 100%-CPU report can name the culprit instead of guessing (the 2026-11 spin had no such evidence).
+///
+/// Cost: four saturating increments plus one `enabled!` check per window — TRACE-off is effectively free.
+struct ArmStats {
+    counts: [u64; 4],
+    window_start: Instant,
+}
+
+impl ArmStats {
+    /// Reporting window for the `trace!` summary.
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            counts: [0; 4],
+            window_start: Instant::now(),
+        }
+    }
+
+    /// Records one ready-arm observation (saturating) and emits the window summary when due.
+    fn record(&mut self, arm: ArmId) {
+        let slot = &mut self.counts[arm as usize];
+        *slot = slot.saturating_add(1);
+        if self.window_start.elapsed() < Self::WINDOW {
+            return;
+        }
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
+                input = self.counts[ArmId::Input as usize],
+                branch = self.counts[ArmId::Branch as usize],
+                run_done = self.counts[ArmId::RunDone as usize],
+                cancel = self.counts[ArmId::Cancel as usize],
+                "[interactive] dispatch_loop arm readiness over the last 5s"
+            );
+        }
+        self.counts = [0; 4];
+        self.window_start = Instant::now();
     }
 }
 
@@ -3548,6 +3621,23 @@ mod tests {
         ));
         // cancel token initially not canceled
         assert!(!mode.cancel.is_cancelled());
+    }
+
+    /// interactive-idle-spin-fix: `push_footer` must degrade to "no footer" when the provider is gone (shutdown
+    /// race) instead of panicking on the old `.expect("init idempotent guard …")`.
+    #[test]
+    fn push_footer_is_silent_without_provider() {
+        let mut mode = InteractiveMode::new(test_runtime(), options(), None);
+        assert!(
+            mode.footer_data.is_none(),
+            "new() leaves the provider unset"
+        );
+        mode.push_footer(); // must not panic
+        let rx = mode.ui_event_rx.as_mut().expect("ui_event_rx present");
+        assert!(
+            rx.try_recv().is_err(),
+            "no footer event is emitted when the branch provider is gone"
+        );
     }
 
     // ── dispatch_loop: RunDone reset guard regression (plan D) ──

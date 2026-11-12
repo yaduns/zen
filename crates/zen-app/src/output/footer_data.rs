@@ -425,6 +425,78 @@ impl Drop for FooterDataProvider {
     }
 }
 
+/// Why a branch wait ended — the two-state result that keeps a closed channel from turning the interactive
+/// `select!` into a permanent spin (a closed `watch` channel reports `Err` on *every* poll).
+///
+/// Runtime signal only: never serialized, never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchWake {
+    /// The branch value actually changed (the provider only sends on change).
+    Changed,
+    /// The provider that issued the receiver is gone (session switch / shutdown). The caller must
+    /// re-subscribe to the current provider — the closed receiver is cleared and must never be polled again.
+    Closed,
+}
+
+/// The interactive `dispatch_loop` branch arm as a testable state machine: holds the current subscription
+/// (or none) and guarantees the arm can never be permanently ready.
+///
+/// Why a type instead of a bare `Receiver`: the invariant "closed -> re-subscribe -> never poll the closed
+/// receiver again" is exactly what the 100%-CPU spin violated, and it is only assertable if the arm's state
+/// lives in something a unit test can own.
+pub(crate) struct BranchArm {
+    /// Current subscription; `None` = disabled (no provider, or just closed — revived only by `resubscribe`).
+    rx: Option<watch::Receiver<Option<String>>>,
+}
+
+impl BranchArm {
+    /// Builds the arm from the *current* provider: `Some` starts a subscription, `None` disables the arm
+    /// (its `wait` is pending forever). Called once at loop start and again after every `Closed`.
+    pub(crate) fn new(provider: Option<&FooterDataProvider>) -> Self {
+        Self {
+            rx: provider.map(FooterDataProvider::branch_rx),
+        }
+    }
+
+    /// Awaits the next branch change. **Never ready again once the arm is disabled** — with no receiver it
+    /// returns `std::future::pending()`, so a `select!` arm built from it can never spin (remember `select!`
+    /// evaluates the async expression even when its `if` guard is false).
+    ///
+    /// **Structural guarantee**: on `Err` it clears its own receiver (`self.rx = None`) before returning
+    /// [`BranchWake::Closed`], so a caller that forgets [`Self::resubscribe`] gets a pending arm instead of a
+    /// spin — fail-safe direction: losing branch updates is discoverable, a pegged core is not.
+    ///
+    /// Consumers: `modes::interactive::InteractiveMode::dispatch_loop`'s branch arm.
+    pub(crate) async fn wait(&mut self) -> BranchWake {
+        let Some(rx) = self.rx.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = rx.changed().await;
+        if result.is_ok() {
+            return BranchWake::Changed;
+        }
+        // Sender gone: drop our handle so a forgetful caller cannot re-poll a closed receiver (that is the
+        // 100%-CPU spin). A disabled arm reports Pending forever, so the failure mode becomes "branch updates
+        // stop" instead of "one core pegged".
+        self.rx = None;
+        tracing::debug!(
+            "[footer] branch watch sender dropped; re-subscribing to the current provider"
+        );
+        BranchWake::Closed
+    }
+
+    /// Re-points the arm at the current provider after [`BranchWake::Closed`] (session switch replaced it) —
+    /// `None` disables the arm instead.
+    ///
+    /// **The only trigger is [`BranchWake::Closed`]** (explicit boundary): a `None -> Some` transition of
+    /// `footer_data` without a preceding `Closed` would leave the arm disabled forever. Unreachable today —
+    /// `footer_data` is set once in `init` and only ever replaced by `switch_runtime` (Some -> Some) — but if
+    /// that ever changes, a new wake source must be added alongside this method.
+    pub(crate) fn resubscribe(&mut self, provider: Option<&FooterDataProvider>) {
+        self.rx = provider.map(FooterDataProvider::branch_rx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,5 +1010,92 @@ mod tests {
         assert_eq!((*rx.borrow()).as_deref(), Some("retry-branch"));
         cancel.cancel();
         task.abort();
+    }
+
+    // ── BranchArm (interactive-idle-spin-fix) ────────────────────
+    //
+    // Fixtures use a **non-repo** tempdir on purpose: `find_git_paths` returns None, so no refresh task is spawned
+    // and `branch_tx` lives only inside the provider — dropping it closes the channel synchronously. A repo fixture
+    // would spawn `refresh_loop` (which holds a `branch_tx` clone) and `dispose()` only *schedules* the abort, so a
+    // manual poll could observe `Pending` instead of `Closed` (flaky).
+
+    /// One manual poll with a no-op waker. Only valid for futures that complete or stay `pending()` forever — a
+    /// future that relies on the coop budget would spin here, because a non-task context has no budget limit.
+    fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        use std::task::{Context, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        fut.poll(&mut cx)
+    }
+
+    #[tokio::test]
+    async fn branch_arm_wait_returns_changed_on_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FooterDataProvider::new(dir.path());
+        let mut arm = BranchArm::new(Some(&provider));
+        let task = tokio::spawn(async move { arm.wait().await });
+        // The provider only sends on an actual change.
+        provider.branch_tx.send(Some("main".to_string())).unwrap();
+        assert_eq!(task.await.unwrap(), BranchWake::Changed);
+    }
+
+    #[tokio::test]
+    async fn branch_arm_wait_returns_closed_after_provider_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FooterDataProvider::new(dir.path());
+        let mut arm = BranchArm::new(Some(&provider));
+        drop(provider);
+        assert_eq!(arm.wait().await, BranchWake::Closed);
+    }
+
+    #[tokio::test]
+    async fn branch_arm_wait_is_pending_after_closed_without_resubscribe() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FooterDataProvider::new(dir.path());
+        let mut arm = BranchArm::new(Some(&provider));
+        drop(provider);
+        assert_eq!(arm.wait().await, BranchWake::Closed);
+        // `wait()` cleared its own receiver, so forgetting `resubscribe` yields a disabled (pending) arm —
+        // the fail-safe direction, never the 100%-CPU spin.
+        let mut fut = Box::pin(arm.wait());
+        assert!(poll_once(fut.as_mut()).is_pending());
+        assert!(poll_once(fut.as_mut()).is_pending());
+    }
+
+    #[test]
+    fn branch_arm_disabled_wait_is_pending_forever() {
+        let mut arm = BranchArm::new(None);
+        let mut fut = Box::pin(arm.wait());
+        assert!(poll_once(fut.as_mut()).is_pending());
+        assert!(poll_once(fut.as_mut()).is_pending());
+    }
+
+    #[tokio::test]
+    async fn branch_arm_resubscribe_after_close_rearms_subscription() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let provider_a = FooterDataProvider::new(dir_a.path());
+        let mut arm = BranchArm::new(Some(&provider_a));
+        drop(provider_a);
+        assert_eq!(arm.wait().await, BranchWake::Closed);
+
+        // `None` keeps it disabled.
+        arm.resubscribe(None);
+        let mut fut = Box::pin(arm.wait());
+        assert!(poll_once(fut.as_mut()).is_pending());
+        drop(fut);
+
+        // A live provider re-arms it: pending until a change arrives, then `Changed`.
+        let dir_b = tempfile::tempdir().unwrap();
+        let provider_b = FooterDataProvider::new(dir_b.path());
+        arm.resubscribe(Some(&provider_b));
+        let mut fut = Box::pin(arm.wait());
+        assert!(
+            poll_once(fut.as_mut()).is_pending(),
+            "fresh subscription waits for a change"
+        );
+        provider_b.branch_tx.send(Some("main".to_string())).unwrap();
+        assert!(matches!(
+            poll_once(fut.as_mut()),
+            std::task::Poll::Ready(BranchWake::Changed)
+        ));
     }
 }
