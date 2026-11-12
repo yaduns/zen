@@ -64,12 +64,14 @@ impl CustomEditor {
         self.editor.lines()
     }
 
-    /// Passthrough Editor: logical cursor (line, column) (autocomplete provider input, consumed by autocomplete-wiring-fix).
+    /// Passthrough Editor: logical cursor `(line, column)` — the column is a **character index** (the unit the
+    /// autocomplete provider speaks; see `Editor::cursor`). Consumed by autocomplete-wiring-fix.
     pub fn cursor(&self) -> (usize, usize) {
         self.editor.cursor()
     }
 
-    /// Passthrough Editor: programmatically set logical cursor (positioned after `apply_completion` backfill, consumed by autocomplete-wiring-fix).
+    /// Passthrough Editor: programmatically set the logical cursor (positioned after `apply_completion` backfill;
+    /// `col` is a **character index** — see `Editor::set_cursor`). Consumed by autocomplete-wiring-fix.
     pub fn set_cursor(&mut self, line: usize, col: usize) {
         self.editor.set_cursor(line, col);
     }

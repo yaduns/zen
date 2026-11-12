@@ -1,6 +1,7 @@
 // REQ-TUI-01 (pi-413): editor component — layout and rendering: layout_text / render / cursor_position.
 // render writes ScreenBuffer and computes layout width using effective padding (shares last_width with cursor_position /
 // last_effective_padding / scroll_offset caches); layout_text is private to this module.
+use super::text::snap_to_char_boundary;
 use super::{Editor, LayoutLine};
 use crate::wrap::word_wrap_line;
 
@@ -223,11 +224,16 @@ impl Editor {
                         || (is_last && self.state.cursor_col == chunk.end_index));
 
                 let cursor_pos = if has_cursor {
-                    // Cursor display position within this visual line (grapheme widths accumulated)
+                    // Cursor display position within this visual line (grapheme widths accumulated).
+                    // The offset is snapped to a char boundary: a stale/non-boundary `cursor_col` must degrade to a
+                    // slightly-wrong caret, never panic the render path (that used to kill the whole TUI).
                     use unicode_segmentation::UnicodeSegmentation;
                     use unicode_width::UnicodeWidthStr;
 
-                    let offset_in_chunk = self.state.cursor_col - chunk.start_index;
+                    let offset_in_chunk = snap_to_char_boundary(
+                        &chunk.text,
+                        self.state.cursor_col.saturating_sub(chunk.start_index),
+                    );
                     let pos = chunk.text[..offset_in_chunk]
                         .graphemes(true)
                         .map(|g| UnicodeWidthStr::width(g))
@@ -269,6 +275,23 @@ mod tests {
     use crate::screen::ScreenBuffer;
 
     // ── render ──
+
+    /// Regression (2026-11 TUI crash): a cursor on a multi-byte line must never panic the render path. The crash was
+    /// `chunk.text[..byte]` fed with a character column, slicing inside a 3-byte CJK char; the layout now snaps
+    /// to a char boundary.
+    #[test]
+    fn render_multibyte_line_with_cursor_does_not_panic() {
+        let mut ed = e(0);
+        ed.set_text("告诉我，在我问你之前，你读过 @AGENTS.md ");
+        ed.set_cursor(0, 26); // character column at end of line
+        let mut buf = ScreenBuffer::new(80, 6);
+        ed.render(&mut buf, 0, 0, 80, 6);
+
+        // Deliberately corrupt the internal byte offset (26 falls inside the 3-byte char at bytes 24..27):
+        // degrade, don't panic.
+        ed.state.cursor_col = 26;
+        ed.render(&mut buf, 0, 0, 80, 6);
+    }
 
     #[test]
     fn test_render_too_small_width_is_noop() {

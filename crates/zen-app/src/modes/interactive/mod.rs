@@ -2829,7 +2829,7 @@ mod tests {
 
     #[test]
     fn footer_data_uses_latest_assistant_cache_hit_rate() {
-        // pi definition: CH% = the *latest* assistant (90% → 50%), while totals keep accumulating.
+        // pi semantics: CH% = the *latest* assistant (90% → 50%), while totals keep accumulating.
         let session = test_session_with_entries(
             2000,
             vec![

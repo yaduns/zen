@@ -350,6 +350,21 @@ impl Editor {
     }
 }
 
+/// Snaps a byte offset to the nearest **lower** UTF-8 character boundary (clamped to `text.len()`).
+///
+/// Why: the internal `cursor_col` is a byte offset and must always sit on a boundary, but the render/layout paths
+/// slice strings by it — an out-of-sync cursor (e.g. a character column stored as a byte offset by a caller) must
+/// degrade to a slightly-wrong caret instead of panicking the whole TUI.
+///
+/// Consumers: `Editor::cursor` (byte → char column) and `editor::render::layout_text` (caret offset within a chunk).
+pub(super) fn snap_to_char_boundary(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
 /// Normalize inserted text: \r\n and \r → \n, \t → 4 spaces (aligned with pi `normalizeText`).
 /// Called by `insert_text` as the sole insertion entry point; callers need not normalize themselves;
 /// placed in this module with the text-edit domain (Plan A: not merged into wrap.rs).
@@ -406,7 +421,7 @@ mod tests {
         let mut e = e(0);
         e.insert_char('你');
         assert_eq!(e.text(), CJK_SAMPLE);
-        assert_eq!(e.cursor(), (0, 3)); // 3 UTF-8 bytes
+        assert_eq!(e.cursor(), (0, 1)); // one character (3 UTF-8 bytes internally)
     }
 
     #[test]

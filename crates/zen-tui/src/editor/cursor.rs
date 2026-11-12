@@ -379,12 +379,13 @@ mod tests {
 
     #[test]
     fn test_move_char_multibyte_grapheme_step() {
-        // Two CJK chars = 2 three-byte graphemes; the cursor must step by grapheme, never split one in half
+        // Two CJK chars = 2 three-byte graphemes; the cursor must step by grapheme, never split one in half.
+        // `cursor()` reports a character column (3 bytes = 1 char).
         let mut e = editor_with(&[CJK_SAMPLE], 0, 0, 0, 0);
         e.move_char(1);
-        assert_eq!(e.cursor(), (0, 3));
+        assert_eq!(e.cursor(), (0, 1));
         e.move_char(1); // At end of line: record preferred_visual_col = 4 (each grapheme is 2 columns, accumulated visual column)
-        assert_eq!(e.cursor(), (0, 6));
+        assert_eq!(e.cursor(), (0, 2));
         assert_eq!(e.preferred_visual_col, Some(4));
         assert_eq!(e.snapped_from_cursor_col, None);
     }

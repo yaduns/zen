@@ -4728,6 +4728,76 @@ mod tests {
             .await;
     }
 
+    /// Regression (2026-11 crash in DeerChat): the user typed a CJK sentence ending in `@AGE`, pressed Tab, and the
+    /// TUI panicked (`end byte index 26 is not a char boundary`, the index fell inside a CJK char). Root cause: `Editor::cursor()` /
+    /// `set_cursor` spoke **byte** offsets while the autocomplete provider speaks **character** columns, so the char
+    /// column returned by `apply_completion` was stored as a byte offset (inside a 3-byte CJK char, bytes 24..27)
+    /// and the renderer sliced there.
+    ///
+    /// The line keeps text *after* the completion point, so the character column (14) differs from the byte offset
+    /// (18) — that is what makes this test red under the old byte-based contract.
+    #[tokio::test]
+    async fn test_at_tab_apply_on_cjk_line_uses_character_columns() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("AGENTS.md"), "# agents").unwrap();
+                let mut u = InteractiveUi::new(
+                    theme().clone(),
+                    kb(),
+                    editor_kb(),
+                    select_kb(),
+                    tmp.path().display().to_string(),
+                    UiPrefs::default(),
+                    None,
+                    crate::commands::build_slash_command_list(&[], &[]),
+                    5,
+                );
+                let line = "读过 @AGE 好吗";
+                u.editor.set_text(line);
+                u.editor.set_cursor(0, 7); // character column, right after `@AGE`
+                assert_eq!(u.editor.cursor(), (0, 7));
+
+                // Tab #1 opens the completion (pending), poll until candidates land.
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                for _ in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    if u.poll_autocomplete() {
+                        break;
+                    }
+                }
+                assert!(
+                    u.autocomplete
+                        .as_ref()
+                        .and_then(|o| o.suggestions.as_ref())
+                        .is_some_and(|s| !s.items().is_empty()),
+                    "@AGE should have candidates"
+                );
+
+                // Tab #2 applies the selected item — this used to store a character column as a byte offset.
+                let _ = u.handle_key(&press(KeyCode::Tab));
+                let expected = "读过 @AGENTS.md  好吗";
+                assert_eq!(u.editor.text(), expected);
+                assert_eq!(
+                    u.editor.cursor(),
+                    (0, 14),
+                    "cursor column is a character index (the byte offset would be 18)"
+                );
+
+                // Rendering the applied line must not panic (the original failure mode).
+                let mut buf = zen_tui::screen::ScreenBuffer::new(80, 8);
+                u.editor.render(&mut buf, 0, 0, 80, 8);
+
+                // Behavioral proof of the stored unit: a stale byte offset (14, inside the 3-byte char at 12..15) makes the
+                // next keystroke slice a non-boundary. With character columns the insertion lands right after the
+                // completion's trailing space.
+                let _ = u.handle_key(&press(KeyCode::Char('X')));
+                assert_eq!(u.editor.text(), "读过 @AGENTS.md X 好吗");
+                assert_eq!(u.editor.cursor(), (0, 15));
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn test_at_tab_apply_places_cursor_after_value() {
         // Reproduce user observation: type `@Car` → after Tab selects `@Cargo.toml`, cursor should be after `@Cargo.toml `

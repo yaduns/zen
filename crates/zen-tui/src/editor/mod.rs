@@ -17,6 +17,7 @@ mod text;
 mod undo;
 mod word_navigation;
 
+use text::snap_to_char_boundary;
 use undo::LastAction;
 
 /// Editor text core state: multi-line text + logical cursor (row/column)
@@ -221,20 +222,41 @@ impl Editor {
         &self.state.lines
     }
 
-    /// Return the logical cursor position (line, column).
-    /// Consumers: T-TU-03-3, T-AP-11-2 (IME), unit tests.
+    /// Logical cursor position `(line, column)` — the column is a **character index**, not a byte offset
+    /// (the internal `cursor_col` is a byte offset; this is the public, provider-facing unit).
+    ///
+    /// Why characters: `AutocompleteProvider::apply_completion` / `get_suggestions` speak character columns, so a
+    /// byte column here made multi-byte (CJK) lines produce a non-boundary cursor and panicked the renderer.
+    ///
+    /// Consumers: T-TU-03-3, T-AP-11-2 (IME), autocomplete trigger/apply, unit tests.
     pub fn cursor(&self) -> (usize, usize) {
-        (self.state.cursor_line, self.state.cursor_col)
+        let line = self
+            .state
+            .cursor_line
+            .min(self.state.lines.len().saturating_sub(1));
+        let text = &self.state.lines[line];
+        let byte_col = snap_to_char_boundary(text, self.state.cursor_col);
+        (self.state.cursor_line, text[..byte_col].chars().count())
     }
 
-    /// Programmatically set the logical cursor (line, column); out-of-range values are clamped to valid bounds (line to last line, column to that line's length).
-    /// Use together with `set_text`: after `apply_completion` (autocompletion selection backfill), position the cursor via `AppliedCompletion`'s `cursor_position`
-    /// (T-TU-03-3 contract, consumed by the assembly layer's autocomplete-wiring-fix).
+    /// Programmatically set the logical cursor `(line, column)`; `column` is a **character index** (see
+    /// [`Self::cursor`]). Out-of-range values are clamped (line to the last line, column to that line's character
+    /// count).
+    ///
+    /// Use together with `set_text`: after `apply_completion` (autocompletion selection backfill), position the
+    /// cursor via `AppliedCompletion`'s `cursor_position` (T-TU-03-3 contract, consumed by the assembly layer's
+    /// autocomplete-wiring-fix).
     /// Consumer: autocomplete-wiring-fix (`InteractiveUi::apply_selection`).
     pub fn set_cursor(&mut self, line: usize, col: usize) {
         let line = line.min(self.state.lines.len().saturating_sub(1));
         self.state.cursor_line = line;
-        self.state.cursor_col = col.min(self.state.lines[line].len());
+        let text = &self.state.lines[line];
+        // Character index → byte offset (out-of-range clamps to end of line).
+        self.state.cursor_col = text
+            .char_indices()
+            .nth(col)
+            .map(|(byte, _)| byte)
+            .unwrap_or(text.len());
         self.preferred_visual_col = None;
         self.snapped_from_cursor_col = None;
     }
@@ -322,6 +344,40 @@ mod tests {
 
     fn capture() -> Rc<RefCell<Vec<String>>> {
         Rc::new(RefCell::new(Vec::new()))
+    }
+
+    // ── cursor()/set_cursor(): character columns (multi-byte safe) ──
+
+    /// Regression (zen TUI panic, 2026-11): `cursor()` used to expose the internal **byte** offset while the
+    /// autocomplete provider contract speaks **character** columns. Applying `@AGE` → `@AGENTS.md` on a CJK line then
+    /// stored a char column as a byte offset, and the renderer panicked slicing inside a 3-byte CJK character.
+    #[test]
+    fn test_cursor_and_set_cursor_use_character_columns_on_multibyte_text() {
+        let mut e = Editor::new(
+            0,
+            KeybindingsManager::new(
+                crate::keybindings::editor_default_bindings(),
+                HashMap::new(),
+            ),
+        );
+        let line = "告诉我，在我问你之前，你读过 @AGE";
+        e.set_text(line);
+        assert_eq!(line.chars().count(), 19);
+
+        // set_cursor takes a character column and stores the matching byte offset internally.
+        e.set_cursor(0, 19);
+        assert_eq!(e.cursor(), (0, 19));
+        assert_eq!(e.state.cursor_col, line.len(), "byte offset = line length");
+
+        // Character column 8 starts at byte 24 (a 3-byte CJK char) — a byte offset would have landed inside it.
+        e.set_cursor(0, 8);
+        assert_eq!(e.cursor(), (0, 8));
+        assert_eq!(e.state.cursor_col, 24);
+        assert!(line.is_char_boundary(e.state.cursor_col));
+
+        // Out of range clamps to the end of the line (character count, not byte length).
+        e.set_cursor(0, 999);
+        assert_eq!(e.cursor(), (0, 19));
     }
 
     // ── EditorState::default ──
