@@ -51,14 +51,17 @@ use zen_tui::autocomplete::{
 };
 use zen_tui::components::cache::{CacheKey, LineCache};
 use zen_tui::components::input::Input;
-use zen_tui::components::select_list::SelectAction;
+use zen_tui::components::select_list::{
+    SelectAction, SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme,
+    SelectListTruncatePrimaryContext,
+};
 use zen_tui::components::Component;
 use zen_tui::editor::EditorAction;
 use zen_tui::highlight::{LineSegs, StyledSegment};
 use zen_tui::keybindings::KeybindingsManager;
 use zen_tui::keys::KeyId;
 use zen_tui::screen::{LineBuffer, ScreenBuffer, Style};
-use zen_tui::theme::{BgToken, ColorToken, Theme};
+use zen_tui::theme::{ColorToken, Theme};
 use zen_tui::viewport::ScrollbackCanvas;
 
 // long-row-clip-fix: the per-line render height budget no longer exists — `render_row_lines` goes through `LineBuffer` (line contract), and the line count is determined by content.
@@ -476,6 +479,72 @@ struct EditorRoute {
     commands: Vec<InputCommand>,
     /// Latest bash-mode indicator written by `on_change` (body starts with `!`, aligned with pi's `onChange`).
     bash_mode: bool,
+}
+
+/// pi `getBestAutocompleteMatchIndex`: pick the initial highlight once candidates arrive —
+/// exact `value == prefix` wins, otherwise the first `value` starting with the prefix, otherwise index 0
+/// (pi keeps its default highlight). Case-sensitive, `value` only; an empty prefix keeps 0.
+fn best_autocomplete_match_index(suggestions: &AutocompleteSuggestions) -> usize {
+    let prefix = suggestions.prefix();
+    if prefix.is_empty() {
+        return 0;
+    }
+    let mut first_prefix: Option<usize> = None;
+    for (i, item) in suggestions.items().iter().enumerate() {
+        if item.value() == prefix {
+            return i;
+        }
+        if first_prefix.is_none() && item.value().starts_with(prefix) {
+            first_prefix = Some(i);
+        }
+    }
+    first_prefix.unwrap_or(0)
+}
+
+/// Build the pi-equivalent [`SelectList`] for a completion session — one place owning the dropdown presentation:
+/// shared [`SelectListTheme`] (accent selected text / muted secondary text, exactly pi `getSelectListTheme`), and the
+/// per-context column layout (pi `SLASH_COMMAND_SELECT_LIST_LAYOUT` = 12..32 for `/` commands, default 32 for files/paths).
+/// Primary-column truncation uses an empty suffix (pi `truncateToWidth(..., "")` — no ellipsis).
+fn build_autocomplete_list(
+    suggestions: &AutocompleteSuggestions,
+    selected: usize,
+    max_visible: usize,
+    theme: &Theme,
+    keybindings: KeybindingsManager<SelectAction>,
+) -> SelectList {
+    let items: Vec<SelectItem> = suggestions
+        .items()
+        .iter()
+        .map(|item| {
+            SelectItem::new(
+                item.value(),
+                item.label(),
+                item.description().map(str::to_string),
+            )
+        })
+        .collect();
+    let muted = Style::fg(theme.fg(ColorToken::Muted));
+    let list_theme = SelectListTheme::new(
+        Style::fg(theme.fg(ColorToken::Accent)),
+        muted.clone(),
+        muted.clone(),
+        muted,
+    );
+    let (min_col, max_col) = if suggestions.prefix().starts_with('/') {
+        (Some(12), Some(32))
+    } else {
+        (Some(32), Some(32))
+    };
+    let layout = SelectListLayoutOptions {
+        min_primary_column_width: min_col,
+        max_primary_column_width: max_col,
+        truncate_primary: Some(Box::new(|ctx: &SelectListTruncatePrimaryContext| {
+            zen_tui::wrap::truncate_to_width(ctx.text, ctx.max_width, "")
+        })),
+    };
+    let mut list = SelectList::new(items, max_visible, list_theme, layout, keybindings);
+    list.set_selected_index(selected);
+    list
 }
 
 impl InteractiveUi {
@@ -896,8 +965,10 @@ impl InteractiveUi {
         let result = overlay.pending_result.borrow_mut().take();
         match result {
             Some(suggestions) => {
+                // pi `getBestAutocompleteMatchIndex`: exact value match wins, else the first value starting with the
+                // prefix, else keep index 0 (pi keeps its default highlight).
+                overlay.selected = best_autocomplete_match_index(&suggestions);
                 overlay.suggestions = Some(suggestions);
-                overlay.selected = 0;
                 overlay.pending = None;
                 self.autocomplete = Some(overlay);
             }
@@ -932,10 +1003,11 @@ impl InteractiveUi {
         if len == 0 {
             return;
         }
+        // pi `SelectList.handleInput`: ↓ at the last item wraps to the first, ↑ at the first wraps to the last.
         overlay.selected = if delta > 0 {
-            (overlay.selected + 1).min(len - 1)
+            (overlay.selected + 1) % len
         } else {
-            overlay.selected.saturating_sub(1)
+            (overlay.selected + len - 1) % len
         };
     }
 
@@ -962,7 +1034,7 @@ impl InteractiveUi {
             overlay.cursor.0,
             overlay.cursor.1,
             item,
-            &suggestions.prefix(),
+            suggestions.prefix(),
         );
         let text = applied.lines().join("\n");
         let cursor = applied.cursor_position();
@@ -1002,10 +1074,11 @@ impl InteractiveUi {
         }
     }
 
-    /// Dropdown rendering (called above the editor by `render`/`render_scrollback`): draws the candidate list with theme colors —
-    /// at most `max_visible` items, selected item inverted (Accent fg + SelectedBg bg), `AutocompleteItem.label`
-    /// displayed + secondary `description` line (Dim). Returns the actual drawn height (0 if no candidates / inactive);
-    /// list height = min(items, max_visible) + 2 for top/bottom borders.
+    /// Dropdown rendering (below the editor, aligned with pi `editor.ts`: the list is appended after the editor's bottom border):
+    /// delegates to zen-tui [`SelectList`] — pi's own `SelectList` component — so the presentation matches pi exactly:
+    /// `→ ` accent prefix on the selected row (no row background), accent selected text, muted description column aligned in a
+    /// fixed primary column, muted `(n/total)` scroll row when the list overflows, width-truncated rows and **no borders**.
+    /// Returns the drawn height (0 if no candidates / inactive); see [`Self::autocomplete_list_height`].
     fn render_autocomplete(&mut self, buf: &mut ScreenBuffer, x: u16, y: u16, width: u16) -> u16 {
         let Some(overlay) = self.autocomplete.as_ref() else {
             return 0;
@@ -1013,37 +1086,18 @@ impl InteractiveUi {
         let Some(suggestions) = &overlay.suggestions else {
             return 0;
         };
-        let items = suggestions.items();
-        if items.is_empty() || width < 3 {
+        let height = self.autocomplete_list_height(width);
+        if height == 0 {
             return 0;
         }
-        let visible = items.len().min(overlay.max_visible);
-        let height = visible as u16 + 2; // top/bottom borders
-        let theme = &self.theme;
-        let border = Style::fg(theme.fg(ColorToken::Border));
-        // top/bottom borders (full width, simple list boundary indicator)
-        buf.write(x, y, &border, &"─".repeat(width as usize));
-        buf.write(x, y + height - 1, &border, &"─".repeat(width as usize));
-        for i in 0..visible {
-            let row = y + 1 + i as u16;
-            let item = &items[i];
-            // selected item: Accent fg + SelectedBg bg inverted; others Text fg
-            let style = if i == overlay.selected {
-                Style::new(
-                    Some(theme.fg(ColorToken::Accent)),
-                    Some(theme.bg(BgToken::SelectedBg)),
-                    Vec::new(),
-                )
-            } else {
-                Style::fg(theme.fg(ColorToken::Text))
-            };
-            let mut line = format!(" {}", item.label());
-            if let Some(desc) = item.description() {
-                line.push_str(&format!("  {desc}"));
-            }
-            buf.write(x, row, &style, &line);
-        }
-        height
+        let mut list = build_autocomplete_list(
+            suggestions,
+            overlay.selected,
+            overlay.max_visible,
+            &self.theme,
+            self.select_kb.clone(),
+        );
+        list.render(buf, x, y, width, height)
     }
 
     // ── Settings panel (T-AP-02-3-fix) ─────────────────────────────────────
@@ -2126,7 +2180,10 @@ impl InteractiveUi {
         if items.is_empty() || width < 3 {
             return 0;
         }
-        items.len().min(overlay.max_visible) as u16 + 2
+        // pi `SelectList.render`: visible window rows + one `(n/total)` scroll row when the list is longer than the window.
+        let visible = items.len().min(overlay.max_visible);
+        let scroll_row = usize::from(items.len() > overlay.max_visible);
+        (visible + scroll_row) as u16
     }
 
     /// editor suspend/resume may revert to the old path); not called yet, hence marked allow(dead_code).
@@ -3505,8 +3562,6 @@ mod tests {
         u.render_scrollback(&mut canvas);
         let base = u.row_cache_renders();
 
-        u.output_pad = u.output_pad;
-        u.hide_thinking_block = u.hide_thinking_block;
         let mut canvas = ScrollbackCanvas::new(80, 24);
         u.render_scrollback(&mut canvas);
         assert_eq!(
@@ -4245,6 +4300,163 @@ mod tests {
         )
     }
 
+    /// Renders the dropdown into a fresh buffer and returns the row texts (segments concatenated).
+    fn autocomplete_rows(u: &mut InteractiveUi, width: u16, height: u16) -> (Vec<String>, u16) {
+        let mut buf = ScreenBuffer::new(width, height);
+        let painted = u.render_autocomplete(&mut buf, 0, 0, width);
+        let rows = (0..painted)
+            .map(|row| {
+                buf.line_segments(row)
+                    .iter()
+                    .map(|seg| seg.text.clone())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, painted)
+    }
+
+    #[test]
+    fn test_autocomplete_renders_like_pi_select_list() {
+        // pi presentation (select-list.ts + getSelectListTheme): no border rows, `→ ` accent prefix on the selected
+        // row only, no row background, description in a fixed primary column in muted colour.
+        let mut u = ui();
+        let mut overlay = overlay_with(vec![]);
+        overlay.suggestions = Some(AutocompleteSuggestions::new(
+            vec![
+                AutocompleteItem::new(
+                    "settings",
+                    "settings",
+                    Some("open the settings panel".into()),
+                ),
+                AutocompleteItem::new("session", "session", Some("session info".into())),
+            ],
+            "/",
+        ));
+        u.autocomplete = Some(overlay);
+
+        let (rows, painted) = autocomplete_rows(&mut u, 80, 8);
+        assert_eq!(painted, 2, "no top/bottom border rows in pi's list");
+        assert!(
+            rows[0].starts_with("→ settings"),
+            "selected row carries pi's `→ ` prefix: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("  session"),
+            "unselected rows are indented by two spaces: {:?}",
+            rows[1]
+        );
+        // Slash-command layout: primary column 32 wide → the description starts at column 32.
+        assert_eq!(
+            rows[0].chars().nth(32),
+            Some('o'),
+            "description starts at the primary column (32): {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].chars().count() <= 80,
+            "row must not overflow the terminal width"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_selected_row_uses_accent_without_background() {
+        // pi 1.4 renders the selection with accent foreground only (no SelectedBg band).
+        let mut u = ui();
+        u.autocomplete = Some(overlay_with(vec![("a", "a"), ("b", "b")]));
+        let mut buf = ScreenBuffer::new(40, 4);
+        let _ = u.render_autocomplete(&mut buf, 0, 0, 40);
+        let accent = u.theme.fg(ColorToken::Accent);
+        let selected = buf.line_segments(0);
+        assert!(
+            selected[0].text.starts_with("→ "),
+            "selected row starts with pi's arrow prefix: {:?}",
+            selected[0].text
+        );
+        assert_eq!(
+            selected[0].style.fg,
+            Some(accent),
+            "selected row (arrow + value) is accent-coloured"
+        );
+        for seg in &selected {
+            assert!(
+                seg.style.bg.is_none(),
+                "no row background on the selected row: {:?}",
+                seg
+            );
+        }
+        // Unselected row: plain (no fg) text, indented by two spaces
+        let plain = buf.line_segments(1);
+        assert!(
+            plain[0].text.starts_with("  "),
+            "unselected row is indented: {:?}",
+            plain[0].text
+        );
+        assert_eq!(
+            plain[0].style.fg, None,
+            "unselected row keeps the default fg"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_scroll_info_row_appears_when_overflowing() {
+        // pi appends `(selected+1/total)` when the list is longer than the window.
+        let mut u = ui();
+        let mut overlay = overlay_with(vec![]);
+        overlay.suggestions = Some(AutocompleteSuggestions::new(
+            (0..7)
+                .map(|i| AutocompleteItem::new(format!("c{i}"), format!("c{i}"), None))
+                .collect(),
+            "/",
+        ));
+        overlay.max_visible = 3;
+        u.autocomplete = Some(overlay);
+
+        let (rows, painted) = autocomplete_rows(&mut u, 60, 8);
+        assert_eq!(painted, 4, "3 window rows + 1 scroll-info row");
+        assert_eq!(
+            rows[3].trim(),
+            "(1/7)",
+            "scroll info is `(selected+1/total)`: {:?}",
+            rows[3]
+        );
+        // Selection is centred by the component (pi semantics), so ↓ moves the window.
+        let _ = u.handle_key(&press(KeyCode::Down));
+        let (rows, _) = autocomplete_rows(&mut u, 60, 8);
+        assert_eq!(rows[3].trim(), "(2/7)");
+    }
+
+    #[test]
+    fn test_autocomplete_initial_highlight_uses_pi_best_match() {
+        // pi `getBestAutocompleteMatchIndex`: exact match wins; otherwise the first value starting with the prefix.
+        // Attachment-style values carry the trigger character (the shape pi compares against the prefix).
+        let items = vec![
+            AutocompleteItem::new("@settings", "@settings", None),
+            AutocompleteItem::new("@session", "@session", None),
+            AutocompleteItem::new("@set-model", "@set-model", None),
+        ];
+        // Exact match (prefix == value) → that index
+        assert_eq!(
+            best_autocomplete_match_index(&AutocompleteSuggestions::new(items.clone(), "@session")),
+            1
+        );
+        // Prefix-only match → the first value starting with it
+        assert_eq!(
+            best_autocomplete_match_index(&AutocompleteSuggestions::new(items.clone(), "@se")),
+            0
+        );
+        // No match → default highlight (index 0, pi keeps its default)
+        assert_eq!(
+            best_autocomplete_match_index(&AutocompleteSuggestions::new(items.clone(), "@zzz")),
+            0
+        );
+        // Empty prefix → default highlight
+        assert_eq!(
+            best_autocomplete_match_index(&AutocompleteSuggestions::new(items, "")),
+            0
+        );
+    }
+
     #[test]
     fn test_autocomplete_esc_closes_and_consumes() {
         let mut u = ui();
@@ -4258,10 +4470,10 @@ mod tests {
     }
 
     #[test]
-    fn test_autocomplete_up_down_select_and_clamp() {
+    fn test_autocomplete_up_down_wraps_like_pi() {
+        // pi `SelectList.handleInput`: ↓ on the last item wraps to the first, ↑ on the first wraps to the last.
         let mut u = ui();
         u.autocomplete = Some(overlay_with(vec![("a", "a"), ("b", "b"), ("c", "c")]));
-        // Down 0→1→2 (clamp at end)
         let _ = u.handle_key(&press(KeyCode::Down));
         assert_eq!(u.autocomplete.as_ref().unwrap().selected, 1);
         let _ = u.handle_key(&press(KeyCode::Down));
@@ -4269,20 +4481,17 @@ mod tests {
         let _ = u.handle_key(&press(KeyCode::Down));
         assert_eq!(
             u.autocomplete.as_ref().unwrap().selected,
-            2,
-            "Down clamps at the end"
+            0,
+            "Down wraps from the last item to the first"
         );
-        // Up 2→1→0 (saturate at 0)
-        let _ = u.handle_key(&press(KeyCode::Up));
-        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 1);
-        let _ = u.handle_key(&press(KeyCode::Up));
-        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 0);
         let _ = u.handle_key(&press(KeyCode::Up));
         assert_eq!(
             u.autocomplete.as_ref().unwrap().selected,
-            0,
-            "Up saturates at 0"
+            2,
+            "Up wraps from the first item to the last"
         );
+        let _ = u.handle_key(&press(KeyCode::Up));
+        assert_eq!(u.autocomplete.as_ref().unwrap().selected, 1);
     }
 
     #[test]
@@ -4384,10 +4593,10 @@ mod tests {
         u.autocomplete = Some(overlay_with(vec![("a", "a"), ("b", "b"), ("c", "c")]));
         assert_eq!(
             u.autocomplete_list_height(40),
-            5,
-            "3 items + top and bottom borders 2"
+            3,
+            "pi draws no borders: one row per visible item"
         );
-        // max_visible truncation: 7 candidates, max_visible=3 → 3+2=5
+        // Scroll window: 7 candidates, max_visible=3 → 3 rows + 1 `(n/total)` row
         let mut overlay = overlay_with(vec![]);
         overlay.suggestions = Some(AutocompleteSuggestions::new(
             (0..7)
@@ -4399,8 +4608,8 @@ mod tests {
         u.autocomplete = Some(overlay);
         assert_eq!(
             u.autocomplete_list_height(40),
-            5,
-            "min(items=7, max_visible=3) + 2"
+            4,
+            "min(items=7, max_visible=3) + scroll-info row"
         );
         // No candidates (pending) → no height reserved
         let mut overlay2 = overlay_with(vec![]);
