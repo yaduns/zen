@@ -34,13 +34,31 @@ fn non_retryable_pattern() -> &'static Regex {
 /// (`error decoding response body` / `connection closed before message completed` / `unexpected end of file` /
 /// `incomplete message` / `connection reset`).
 ///
-/// Deliberately **not** listed: the generic shell `error sending request for url (...)` — it also wraps deterministic
-/// failures (bad DNS name, invalid header), so retrying on it would amplify 4xx-class errors; the real cause reaches
-/// the message through `utils::error_chain::describe_error_chain` instead.
+/// # Connect-phase failures (`client error (Connect)` / `client error (SendRequest)`)
+///
+/// pi oracle: pi talks to the gateway through the `openai` npm SDK, which normalises **every** failure before the
+/// first response byte (DNS / TCP / TLS handshake / connection dropped while sending) into `APIConnectionError` with
+/// the message `Connection error.`; pi's table matches that with `connection.?error`, so pi retries the whole class
+/// (e.g. `tls handshake eof`) without ever telling one transport cause from another.
+///
+/// zen has no such normalising SDK, so the same class arrives as reqwest's shell plus the hyper-util legacy client
+/// kind in the source chain: `… client error (Connect): tls handshake eof`. Those two kinds are the Rust analogue of
+/// pi's `Connection error.` — `Connect` (pool/connect phase: TCP, TLS handshake, proxy) and `SendRequest` (request
+/// written but the peer went away before the response) — and are therefore listed. They are **kind names**, not
+/// free-form text, which keeps the match narrow: the sibling kinds stay out of the table on purpose
+/// (`client error (Canceled)` = user abort, `client error (UserUnsupported*)` / `(UserAbsoluteUriRequired)` /
+/// `(ChannelClosed)` = local misuse, all deterministic).
+///
+/// Not listed either: the generic shell `error sending request for url (...)` — it also wraps deterministic failures
+/// (invalid header, unsupported URI scheme), so retrying on it would amplify non-transient errors; the real cause
+/// reaches the message through `utils::error_chain::describe_error_chain` instead. Note that DNS failures
+/// (`… client error (Connect): dns error: …`) do land in the `Connect` kind and are therefore retried — that **is**
+/// pi parity (`Connection error.` covers bad DNS too); an earlier implementation note calling DNS non-retryable was
+/// based on a chain measurement missing the kind layer, corrected by tls-connect-retry-fix.
 fn retryable_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)overloaded|rate.?limit|too many requests|429|500|502|503|504|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?error|connection.?refused|connection.?lost|connection closed before message completed|connection reset|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|error decoding response body|unexpected end of file|incomplete message|http2 request did not get a response|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted")
+        Regex::new(r"(?i)overloaded|rate.?limit|too many requests|429|500|502|503|504|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?error|connection.?refused|connection.?lost|connection closed before message completed|connection reset|client error \(connect\)|client error \(sendrequest\)|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|error decoding response body|unexpected end of file|incomplete message|http2 request did not get a response|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted")
             .expect("invalid retryable pattern")
     })
 }
@@ -568,6 +586,57 @@ mod tests {
                 "should be retryable: {text}"
             );
         }
+    }
+
+    // ── connect-phase failures (hyper-util legacy client kinds, pi `Connection error.` equivalent) ──
+
+    #[test]
+    fn test_retryable_connect_phase_tls_handshake_eof() {
+        // Verbatim text observed in a real session (`StreamError::describe` + `describe_error_chain`):
+        // the gateway dropped the connection during the TLS handshake. pi retries this (openai SDK turns it into
+        // `Connection error.`), so the Rust wording must classify it as retryable too.
+        let text = "HTTP request failed: error sending request for url \
+                    (https://opencode.ai/zen/go/v1/chat/completions): client error (Connect): tls handshake eof";
+        assert!(is_retryable_assistant_error(&make_error_msg(text)));
+    }
+
+    #[test]
+    fn test_retryable_connect_phase_kinds() {
+        for text in [
+            "HTTP request failed: error sending request for url (https://x): client error (Connect): tcp connect error: Connection refused (os error 61)",
+            "HTTP request failed: error sending request for url (https://x): client error (SendRequest): connection closed before message completed",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&make_error_msg(text)),
+                "should be retryable: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_retryable_deterministic_client_error_kinds() {
+        // `Canceled` = user abort, `UserUnsupported*`/`UserAbsoluteUriRequired`/`ChannelClosed` = local misuse:
+        // retrying any of them only burns the budget. Only the two transient kinds are in the table.
+        for text in [
+            "HTTP request failed: error sending request for url (https://x): client error (Canceled)",
+            "HTTP request failed: error sending request for url (https://x): client error (UserUnsupportedRequestMethod)",
+            "HTTP request failed: error sending request for url (https://x): client error (UserAbsoluteUriRequired)",
+            "HTTP request failed: error sending request for url (https://x): client error (ChannelClosed)",
+        ] {
+            assert!(
+                !is_retryable_assistant_error(&make_error_msg(text)),
+                "should not be retryable: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retryable_connect_phase_dns_failure() {
+        // DNS resolution failures also surface as `client error (Connect)` on this stack (measured with a real request
+        // to `.invalid`), and pi retries them too (`Connection error.` covers bad DNS) — so this is parity, not a gap.
+        let text = "HTTP request failed: error sending request for url (http://zen-nonexistent.invalid/): \
+                    client error (Connect): dns error: failed to lookup address information: nodename nor servname provided, or not known";
+        assert!(is_retryable_assistant_error(&make_error_msg(text)));
     }
 
     #[test]

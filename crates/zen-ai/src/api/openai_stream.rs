@@ -3288,16 +3288,24 @@ mod tests {
         );
     }
 
-    /// Shapes produced by `describe()` on this stack (recorded while implementing turn-auto-retry-fix): a refused
-    /// connection carries the retryable wording, a DNS failure does **not** (it is deterministic).
+    /// Shapes produced by `describe()` on this stack: every failure before the response headers — refused TCP connect,
+    /// DNS failure, TLS handshake cut — arrives as `client error (Connect)`, while a connection dropped after the
+    /// request was written arrives as `client error (SendRequest)`. All three are retryable, matching pi (whose openai
+    /// SDK folds the same class into `Connection error.` → `connection.?error`).
+    ///
+    /// The DNS sample was corrected by tls-connect-retry-fix: an earlier record claimed a DNS failure reaches the text
+    /// without the hyper-util kind layer and was therefore non-retryable — measured on this stack it does carry
+    /// `client error (Connect)`, so the classification follows pi and retries it.
     #[test]
     fn described_http_failures_classify_as_expected() {
         use crate::utils::retry::is_retryable_assistant_error;
 
         let refused = "HTTP request failed: error sending request for url (http://127.0.0.1:1/): \
                        client error (Connect): tcp connect error: Connection refused (os error 61)";
-        let dns = "HTTP request failed: error sending request for url (http://x.invalid/): \
-                   client error (Connect): dns error: failed to lookup address information";
+        let dns = "HTTP request failed: error sending request for url (http://zen-nonexistent.invalid/): \
+                   client error (Connect): dns error: failed to lookup address information: nodename nor servname provided, or not known";
+        let tls_handshake = "HTTP request failed: error sending request for url (https://opencode.ai/zen/go/v1/chat/completions): \
+                             client error (Connect): tls handshake eof";
         let mid_body = "HTTP request failed: error sending request for url (https://x/): \
                         client error (SendRequest): connection closed before message completed";
         let classify = |text: &str| {
@@ -3319,7 +3327,11 @@ mod tests {
         };
         assert!(classify(refused), "refused should be retryable");
         assert!(classify(mid_body), "mid-body cut should be retryable");
-        assert!(!classify(dns), "dns failure must stay non-retryable");
+        assert!(
+            classify(tls_handshake),
+            "tls handshake eof should be retryable"
+        );
+        assert!(classify(dns), "dns failure should be retryable (pi parity)");
     }
 
     #[tokio::test]
