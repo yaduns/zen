@@ -2,6 +2,7 @@ pub mod agent_session;
 pub mod assembly_options;
 pub mod compaction;
 pub mod context_usage;
+mod http_idle_timeout;
 pub mod jsonl;
 pub mod navigation;
 mod provider_attribution;

@@ -33,6 +33,11 @@ pub const DEFAULT_AUTOCOMPLETE_MAX_VISIBLE: u32 = 5;
 /// T-AP-02-3-fix already states that "the pi default-1 fallback belongs to T-AP-02-4".
 pub const DEFAULT_OUTPUT_PAD: u8 = 1;
 
+/// Default HTTP idle timeout in milliseconds (pi `DEFAULT_HTTP_IDLE_TIMEOUT_MS`,
+/// `reference/pi-original/packages/coding-agent/src/core/http-dispatcher.ts:4`): applied when the user leaves
+/// `httpIdleTimeoutMs` unset. `0` (an explicit setting) disables the watchdog instead of using this value.
+pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 300_000;
+
 /// Default reserved tokens for branch summary (pi `getBranchSummarySettings`'s `?? 16384`).
 /// Same value as `DEFAULT_COMPACTION_SETTINGS.reserve_tokens`—pi's two settings groups happen to share the same default,
 /// but their semantics are independent (compaction vs branch summary) and can evolve separately, so no cross-group borrowing.
@@ -235,8 +240,8 @@ pub struct SettingsEffective {
     pub output_pad: u8,
     /// Max visible items in completion dropdown (pi default 5, clamp 3..=20)
     pub autocomplete_max_visible: u32,
-    /// HTTP idle timeout in milliseconds, 0 = disabled (pi default 300000, but whether the wiring point is the same location is pending,
-    /// so it stays passed through; see the `http_idle_timeout_ms` comment in settings.rs)
+    /// Resolved HTTP idle timeout in milliseconds; `None` = watchdog disabled (pi `httpIdleTimeoutMs: 0`).
+    /// `None` when unset is impossible after folding — unset resolves to [`DEFAULT_HTTP_IDLE_TIMEOUT_MS`].
     pub http_idle_timeout_ms: Option<u64>,
     /// Compaction scheduling parameters (folds `DEFAULT_COMPACTION_SETTINGS`)
     pub compaction: CompactionSettings,
@@ -257,6 +262,27 @@ pub struct SettingsEffective {
 /// Sole folding entry point for the effective settings view: called internally by `SettingsManager::effective()`; consumers
 /// must not touch it directly. Takes `merged()` (patch form: overrides > project > global) as input, field by field
 /// folds pi defaults + clamp + path filtering to produce the complete effective values consumers need.
+/// Resolve `settings.httpIdleTimeoutMs` into request-boundary form (pi `getHttpIdleTimeoutMs()` +
+/// `sdk.ts:304-308`'s `0 → effectively disabled` mapping).
+///
+/// # Behavior
+/// - unset → [`DEFAULT_HTTP_IDLE_TIMEOUT_MS`] (pi's `?? DEFAULT_HTTP_IDLE_TIMEOUT_MS`)
+/// - `0` → `None` (= no watchdog; pi substitutes an "effectively infinite" timeout for the same intent)
+/// - `n > 0` → `Some(n)`
+///
+/// The returned value is consumed by `session::http_idle_timeout::with_http_idle_timeout`, which writes it into
+/// `zen_ai`'s `StreamConfig.idle_timeout_ms`.
+///
+/// # Consumers
+/// [`fold_effective`]; unit tests.
+pub fn resolve_http_idle_timeout_ms(configured: Option<u64>) -> Option<u64> {
+    match configured {
+        Some(0) => None,
+        Some(ms) => Some(ms),
+        None => Some(DEFAULT_HTTP_IDLE_TIMEOUT_MS),
+    }
+}
+
 pub fn fold_effective(merged: &SettingsData) -> SettingsEffective {
     SettingsEffective {
         default_thinking_level: merged.default_thinking_level,
@@ -284,7 +310,7 @@ pub fn fold_effective(merged: &SettingsData) -> SettingsEffective {
                 .autocomplete_max_visible
                 .unwrap_or(DEFAULT_AUTOCOMPLETE_MAX_VISIBLE),
         ),
-        http_idle_timeout_ms: merged.http_idle_timeout_ms,
+        http_idle_timeout_ms: resolve_http_idle_timeout_ms(merged.http_idle_timeout_ms),
         compaction: effective_compaction(merged.compaction.as_ref()),
         branch_summary: effective_branch_summary(merged.branch_summary.as_ref()),
         retry: effective_retry(merged.retry.as_ref()),
@@ -337,6 +363,43 @@ mod tests {
             s.timeout_ms, None,
             "timeout_ms has no pi default, passed through"
         );
+    }
+
+    #[test]
+    fn http_idle_timeout_resolves_like_pi() {
+        // pi `getHttpIdleTimeoutMs()` = `setting ?? 300000`, and `0` means "disabled".
+        assert_eq!(
+            resolve_http_idle_timeout_ms(None),
+            Some(DEFAULT_HTTP_IDLE_TIMEOUT_MS)
+        );
+        assert_eq!(resolve_http_idle_timeout_ms(Some(0)), None);
+        assert_eq!(resolve_http_idle_timeout_ms(Some(60_000)), Some(60_000));
+        assert_eq!(DEFAULT_HTTP_IDLE_TIMEOUT_MS, 300_000);
+    }
+
+    #[test]
+    fn fold_effective_applies_the_idle_timeout_default() {
+        let unset = fold_effective(&SettingsData::default());
+        assert_eq!(
+            unset.http_idle_timeout_ms,
+            Some(DEFAULT_HTTP_IDLE_TIMEOUT_MS),
+            "unset must resolve to pi's 5-minute default, not to `None` (=disabled)"
+        );
+
+        let disabled = fold_effective(&SettingsData {
+            http_idle_timeout_ms: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(
+            disabled.http_idle_timeout_ms, None,
+            "0 disables the watchdog"
+        );
+
+        let custom = fold_effective(&SettingsData {
+            http_idle_timeout_ms: Some(30_000),
+            ..Default::default()
+        });
+        assert_eq!(custom.http_idle_timeout_ms, Some(30_000));
     }
 
     #[test]

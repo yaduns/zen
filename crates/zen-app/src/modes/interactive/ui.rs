@@ -3089,6 +3089,48 @@ mod tests {
         ));
     }
 
+    /// stream-truncation-partial-content-fix: a stream cut off without `finish_reason` now reaches the UI with its
+    /// partial content (zen-ai `StreamAccumulator::finish_pending_visible_blocks`), instead of an empty message that
+    /// made the already-streamed thinking/text vanish when the `MessageEnd` replaced the streaming row.
+    #[test]
+    fn test_apply_message_end_keeps_truncated_partial_content() {
+        let mut u = ui();
+        u.apply(UiEvent::MessageStart(Message::Assistant(assistant(
+            vec![text_block("partial ans")],
+            StopReason::Stop,
+        ))));
+        let truncated = AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(zen_ai::types::ThinkingContent {
+                    thinking: "pondering".into(),
+                    thinking_signature: None,
+                    redacted: None,
+                }),
+                text_block("partial ans"),
+            ],
+            stop_reason: StopReason::Error,
+            error_message: Some("Stream ended without finish_reason".into()),
+            ..assistant(vec![], StopReason::Error)
+        };
+        u.apply(UiEvent::MessageEnd {
+            message: Message::Assistant(truncated),
+            error_text: Some("Stream ended without finish_reason".into()),
+        });
+        assert_eq!(u.chat_rows.len(), 2, "assistant row + error info row");
+        match &u.chat_rows[0] {
+            ChatRow::Assistant(m) => {
+                assert_eq!(m.content.len(), 2, "partial thinking + text survived");
+                assert!(matches!(&m.content[1], ContentBlock::Text(t) if t.text == "partial ans"));
+            }
+            _ => panic!("expected the assistant row to keep its content"),
+        }
+        assert!(matches!(
+            &u.chat_rows[1],
+            ChatRow::Info { text, kind: InfoKind::Error }
+                if text == "Stream ended without finish_reason"
+        ));
+    }
+
     #[test]
     fn test_apply_tool_flow_registers_and_updates_rows() {
         let mut u = ui();

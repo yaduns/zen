@@ -26,6 +26,17 @@ pub struct StreamConfig {
     pub max_tokens: Option<u64>, // Added: request-edge override bit; None = fall back to model.max_tokens
     pub temperature: Option<f64>, // Added: None = do not send (aligned with the pi default path)
     pub timeout_ms: Option<u64>,
+    /// Byte-level idle watchdog for the **response body**, in milliseconds (pi `settings.httpIdleTimeoutMs`,
+    /// `coding-agent/src/core/http-dispatcher.ts:4` default 300000, applied there as undici
+    /// `bodyTimeout`/`headersTimeout`).
+    ///
+    /// Semantics: the timer is re-armed on **every received chunk**, so a healthy-but-slow stream is never cut
+    /// (unlike [`Self::timeout_ms`], which is reqwest's whole-request timeout); a connection that stops delivering
+    /// bytes is aborted after this long with a retryable error (`HTTP idle timeout: no data received for {ms}ms`).
+    /// `None` and `Some(0)` both mean "no watchdog" (pi `0` = disabled).
+    ///
+    /// Consumer: [`stream`]; injected per request by the app layer (`session::http_idle_timeout`).
+    pub idle_timeout_ms: Option<u64>,
     pub session_id: Option<String>,
 }
 
@@ -445,9 +456,12 @@ pub async fn stream(
     // 6. Create channel and start background task
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // pi `httpIdleTimeoutMs` (undici `bodyTimeout`/`headersTimeout`): byte-level idle watchdog for the response body.
+    let idle = idle_timeout_from(&cfg);
+
     let model_clone = model.clone();
     tokio::spawn(async move {
-        sse_event_loop(tx, &model_clone, response, Some(cancel)).await;
+        sse_event_loop(tx, &model_clone, response, Some(cancel), idle).await;
     });
 
     Ok(rx)
@@ -1032,7 +1046,9 @@ enum StreamEvent {
 /// Modeled after cersei's `StreamAccumulator` design (`crates/cersei-provider/src/stream.rs`).
 ///
 /// Core principles:
-/// - `content_blocks` stores only finalized complete blocks (written in ascending internal index order on `ContentBlockStop`)
+/// - `content_blocks` stores complete blocks (written in ascending internal index order on `ContentBlockStop`, plus the
+///   still-active text/thinking blocks materialized at terminal assembly by `finish_pending_visible_blocks` when the
+///   stream ended without a `finish_reason`, see `stream-truncation-partial-content-fix`)
 /// - `partial_*` maps store only incomplete data, indexed by **internal block index** (unified allocator, eliminating the text/tool index 0 conflict)
 /// - `process_event()` is a pure accumulating operation and returns no events; boundary event pushes are handled by `handle_events`
 #[derive(Default)]
@@ -1259,6 +1275,61 @@ impl StreamAccumulator {
         out
     }
 
+    /// Materializes the still-active **text/thinking** blocks at terminal assembly so a stream that ends without a
+    /// `finish_reason` does not lose what the user already watched arrive.
+    ///
+    /// # Why this exists (pi parity)
+    /// pi keeps its streaming blocks inside `output.content` from the first delta on (`openai-completions.ts:243`
+    /// `const blocks = output.content`, `ensureTextBlock` `:270` / `ensureThinkingBlock` `:280` push immediately), so
+    /// its `catch` (`:489-510`) only rewrites `stopReason`/`errorMessage` and pushes an `error` event **with the
+    /// partial content still attached** — and it deliberately does *not* emit `text_end`/`thinking_end` there (they
+    /// belong to `finishBlock`, `:245`/`:470`, success path only). zen materializes on `ContentBlockStop` instead
+    /// (`finalize_all`, which only runs on `finish_reason`), so without this call an EOF / SSE error / user abort
+    /// leaves `content_blocks` empty and the partial output is silently dropped.
+    ///
+    /// # Deviation from pi (registered in `tasks/stream-truncation-partial-content-fix-implemented.md`)
+    /// An unfinished `tool_use` block is **dropped** instead of kept: pi's `blocks.push` keeps it only as an artifact
+    /// of its shared-array design, yet (a) pi never executes such a call (its loop returns before tool execution on
+    /// `error`/`aborted`, `agent-loop.ts:196`), (b) neither pi's nor zen's assistant-message component renders the
+    /// block (it is not "visible" content), and (c) an assistant `toolCall` without a matching `toolResult` makes the
+    /// next OpenAI-compatible request invalid
+    /// (`messages with role 'tool' must be a response to a preceding message with 'tool_calls'`), and zen rebuilds the
+    /// context from the persisted session on resume, so the hole would survive a restart. Its scratch buffers
+    /// (`partial_json`/`tool_use_ids`/`tool_use_names`) are removed together with the block.
+    ///
+    /// # Idempotence
+    /// Consumes the active blocks (`block_types` + `partial_*` entries), so a second call is a no-op — the following
+    /// `finalize_all()` call in the same terminal path therefore cannot double-push a block.
+    ///
+    /// # Consumers
+    /// `stream()` Phase 4 (terminal assembly).
+    fn finish_pending_visible_blocks(&mut self) {
+        let mut seqs: Vec<usize> = self.block_types.keys().copied().collect();
+        seqs.sort_unstable();
+        for seq in seqs {
+            let block_type = self.block_types.remove(&seq).unwrap_or_default();
+            let block = match block_type.as_str() {
+                "text" => ContentBlock::Text(TextContent {
+                    text: self.partial_text.remove(&seq).unwrap_or_default(),
+                    text_signature: None,
+                }),
+                "thinking" => ContentBlock::Thinking(ThinkingContent {
+                    thinking: self.partial_thinking.remove(&seq).unwrap_or_default(),
+                    thinking_signature: self.thinking_signature.clone(),
+                    redacted: None,
+                }),
+                // Unfinished tool call → dropped, see the deviation section of the doc comment.
+                _ => {
+                    self.partial_json.remove(&seq);
+                    self.tool_use_ids.remove(&seq);
+                    self.tool_use_names.remove(&seq);
+                    continue;
+                }
+            };
+            self.content_blocks.push(block);
+        }
+    }
+
     /// Build the current partial `AssistantMessage` snapshot (borrowed clone; does not consume the accumulator).
     /// content = finalized blocks (in order) + active blocks in ascending internal index order.
     /// Partial field used for incremental events (Text/Thinking/Toolcall Start/Delta/End).
@@ -1467,14 +1538,122 @@ fn handle_events(
 ///
 /// # Consumers
 /// The SSE event loop's transport-error branch (3g) in `stream()`; unit tests in this file.
-fn describe_sse_error(err: &eventsource_stream::EventStreamError<reqwest::Error>) -> String {
+fn describe_sse_error(err: &eventsource_stream::EventStreamError<IdleBodyError>) -> String {
     use eventsource_stream::EventStreamError;
     match err {
-        EventStreamError::Transport(e) => format!(
+        // The idle watchdog is not a transport failure: report it as-is (its wording carries `timeout`, which is
+        // what classifies it as retryable — pi's undici `Body Timeout Error` matches its table the same way).
+        EventStreamError::Transport(IdleBodyError::IdleTimeout(ms)) => {
+            IdleBodyError::IdleTimeout(*ms).to_string()
+        }
+        EventStreamError::Transport(IdleBodyError::Transport(e)) => format!(
             "SSE stream error: Transport error: {}",
             crate::utils::error_chain::describe_error_chain(e)
         ),
         other => format!("SSE stream error: {other}"),
+    }
+}
+
+/// Error of the response-body stream handed to `eventsource`: either the transport failure or the idle watchdog
+/// firing. `Display` matters beyond logging: the watchdog wording is what the retry wording table classifies, so it
+/// must contain `timeout` (pi's undici `Body Timeout Error` matches its table the same way).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum IdleBodyError {
+    #[error("{0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("HTTP idle timeout: no data received for {0}ms")]
+    IdleTimeout(u64),
+}
+
+/// pi `httpIdleTimeoutMs` equivalent (undici `bodyTimeout` / `headersTimeout`): a response-body stream whose timer is
+/// re-armed on every received chunk and which yields [`IdleBodyError::IdleTimeout`] when no chunk arrives within the
+/// idle limit.
+///
+/// # Why at the byte level (not per SSE event)
+/// The `eventsource` parser swallows comment lines (`: ping` keep-alives) and buffers partial events, so a per-event
+/// watchdog would treat a live-but-quiet connection as dead. pi's undici knobs are byte-level (`bodyTimeout` = max gap
+/// between body chunks); this adapter has the same granularity.
+///
+/// # Behavior
+/// - `idle == None` → pure pass-through, no timer is ever armed (pi `httpIdleTimeoutMs: 0` = disabled).
+/// - A chunk resets the deadline to `now + idle` (so a long stream that keeps emitting never times out, even if the
+///   whole response takes longer than `idle`).
+/// - Upstream `Err` is forwarded unchanged (wrapped) and upstream `None` (EOF) ends the stream as usual.
+///
+/// # Consumers
+/// `sse_event_loop` (the only construction site); unit tests below.
+struct IdleBodyStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+    idle: Option<std::time::Duration>,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<S> IdleBodyStream<S> {
+    /// Wrap `inner` with the watchdog. `idle == None` (or `Some(0)` handled by [`idle_timeout_from`]) disables it.
+    fn new(inner: S, idle: Option<std::time::Duration>) -> Self {
+        // A sleep that is never awaited when the watchdog is disabled: keep it far in the future instead of
+        // branching the type (single concrete stream type keeps `eventsource()` monomorphic).
+        let far = std::time::Duration::from_secs(u32::MAX as u64);
+        Self {
+            inner: Box::pin(inner),
+            idle,
+            deadline: Box::pin(tokio::time::sleep(far)),
+        }
+    }
+}
+
+impl<S, B> futures_util::Stream for IdleBodyStream<S>
+where
+    S: futures_util::Stream<Item = Result<B, reqwest::Error>>,
+    B: AsRef<[u8]>,
+{
+    type Item = Result<B, IdleBodyError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(idle) = this.idle {
+                    this.deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(IdleBodyError::Transport(err)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                let Some(idle) = this.idle else {
+                    return Poll::Pending;
+                };
+                match this.deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(IdleBodyError::IdleTimeout(
+                        idle.as_millis() as u64,
+                    )))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// Resolve `StreamConfig::idle_timeout_ms` into the watchdog duration.
+///
+/// # Behavior
+/// `None` and `Some(0)` → `None` (no watchdog; pi treats `httpIdleTimeoutMs: 0` as disabled); `Some(ms)` →
+/// `Some(Duration)`. Extracted as a pure function so the mapping is unit-testable without HTTP.
+///
+/// # Consumers
+/// `stream()`; unit tests.
+fn idle_timeout_from(cfg: &StreamConfig) -> Option<std::time::Duration> {
+    match cfg.idle_timeout_ms {
+        None | Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
     }
 }
 
@@ -1504,6 +1683,43 @@ fn missing_finish_reason_error(
     } else {
         Some("Stream ended without finish_reason".to_string())
     }
+}
+
+/// Terminal content assembly (Phase 4.0a): materialize the still-active **visible** blocks and take the finalized
+/// blocks out of the accumulator.
+///
+/// # Behavior
+/// 1. [`StreamAccumulator::finish_pending_visible_blocks`] — the pi-`catch` parity step that stops a stream cut off
+///    without `finish_reason` (EOF / SSE error / user cancel) from discarding the partial text/thinking.
+/// 2. `mem::take` on `content_blocks` — the accumulator is finished at this point, so taking (instead of cloning)
+///    keeps the assembly allocation-free.
+///
+/// Kept as a named function (rather than two inline statements in `stream()`) so the call-site contract is
+/// unit-testable without HTTP: `terminal_content` must return content for a stream that never saw a `finish_reason`.
+///
+/// # Consumers
+/// `stream()` Phase 4; unit tests.
+fn terminal_content(accumulator: &mut StreamAccumulator) -> Vec<ContentBlock> {
+    accumulator.finish_pending_visible_blocks();
+    std::mem::take(&mut accumulator.content_blocks)
+}
+
+/// Whether Phase 4c should synthesize `usage.output` from the final content (zen-only accommodation, pi has no such
+/// step: pi reports whatever usage the provider sent, i.e. usually 0 on a failed stream).
+///
+/// # Behavior
+/// Only a **successful** terminal reason (`Stop`/`Length`/`ToolUse`) with `input == 0 && output == 0` and non-empty
+/// content is estimated. `Error` and `Aborted` are excluded on purpose: since the terminal path now preserves partial
+/// content (`StreamAccumulator::finish_pending_visible_blocks`), estimating there would report made-up output tokens —
+/// and thus inflate the footer's token/cost totals — for a turn that produced nothing usable.
+///
+/// # Consumers
+/// `stream()` Phase 4c; unit tests.
+fn needs_usage_estimate(message: &AssistantMessage) -> bool {
+    if message.usage.input != 0 || message.usage.output != 0 || message.content.is_empty() {
+        return false;
+    }
+    !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
 }
 
 /// Reconciles the final `stop_reason` with `error_message` (pure-function extraction from `sse_event_loop` Phase 4a, for unit tests).
@@ -1549,13 +1765,16 @@ async fn sse_event_loop(
     model: &Model,
     response: reqwest::Response,
     cancel: Option<CancellationToken>,
+    idle: Option<std::time::Duration>,
 ) {
     use futures_util::StreamExt;
 
     // ── Phase 1: Initialization ──────────────────────────────────
     // Create the accumulator, SSE stream, cancellation token, response ID, and error message placeholder.
     let mut accumulator = StreamAccumulator::default();
-    let mut stream = response.bytes_stream().eventsource();
+    // pi `httpIdleTimeoutMs` parity: the byte stream (not the parsed events) is watched, so an SSE keep-alive comment
+    // or a chunk split mid-event still counts as liveness.
+    let mut stream = IdleBodyStream::new(response.bytes_stream(), idle).eventsource();
     let cancel = cancel.unwrap_or_default();
     let mut response_id: Option<String> = None;
     let mut error_message: Option<String> = None;
@@ -1633,9 +1852,11 @@ async fn sse_event_loop(
     }
 
     // ── Phase 4: Build the final AssistantMessage ───────────────────────
-    // Take all finalized content blocks from the accumulator.
-    let mut content = Vec::new();
-    std::mem::swap(&mut content, &mut accumulator.content_blocks);
+    // 4.0a. pi parity (openai-completions.ts:243/470/489): blocks that are still active because no `finish_reason`
+    //       ever arrived (EOF / SSE error / user cancel) are materialized here, so the partial text/thinking the user
+    //       already saw stays in the final message instead of collapsing to `content: []`. No End events are emitted —
+    //       pi's `catch` does not emit them either (only `finishBlock` on the success path does).
+    let content = terminal_content(&mut accumulator);
 
     // 4.0. A stream that ends quietly without ever seeing a `finish_reason` is not a success: both `[DONE]` and a
     //      plain EOF can end the loop, and pi throws `Stream ended without finish_reason` at the same point. The
@@ -1666,7 +1887,7 @@ async fn sse_event_loop(
     };
 
     // 4c. If the API did not return usage (e.g. Volcano Engine DeepSeek streaming mode), estimate output from content
-    if msg.usage.input == 0 && msg.usage.output == 0 && !msg.content.is_empty() {
+    if needs_usage_estimate(&msg) {
         let estimated = crate::utils::estimate::estimate_content_blocks_tokens(&msg.content) as u64;
         msg.usage.output = estimated;
         msg.usage.total_tokens = estimated;
@@ -3341,7 +3562,8 @@ mod tests {
             .send()
             .await
             .expect_err("port 1 must refuse the connection");
-        let wrapped = eventsource_stream::EventStreamError::Transport(err);
+        let wrapped =
+            eventsource_stream::EventStreamError::Transport(IdleBodyError::Transport(err));
         let described = describe_sse_error(&wrapped);
         assert!(
             described.starts_with("SSE stream error: Transport error: "),
@@ -3353,12 +3575,115 @@ mod tests {
     #[test]
     fn describe_sse_error_keeps_utf8_variant_wording() {
         let utf8 = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
-        let wrapped: eventsource_stream::EventStreamError<reqwest::Error> =
+        let wrapped: eventsource_stream::EventStreamError<IdleBodyError> =
             eventsource_stream::EventStreamError::Utf8(utf8);
         let described = describe_sse_error(&wrapped);
         assert!(
             described.starts_with("SSE stream error: UTF8 error: "),
             "actual: {described}"
+        );
+    }
+
+    // ── httpIdleTimeoutMs: byte-level body watchdog (pi http-dispatcher bodyTimeout/headersTimeout) ──
+
+    #[test]
+    fn idle_timeout_from_maps_the_request_boundary_form() {
+        // pi: unset → 300000 (applied by the app layer), 0 → disabled, n → n.
+        assert_eq!(
+            idle_timeout_from(&StreamConfig::default()),
+            None,
+            "None = no watchdog"
+        );
+        assert_eq!(
+            idle_timeout_from(&StreamConfig {
+                idle_timeout_ms: Some(0),
+                ..Default::default()
+            }),
+            None,
+            "pi 0 = disabled"
+        );
+        assert_eq!(
+            idle_timeout_from(&StreamConfig {
+                idle_timeout_ms: Some(1_500),
+                ..Default::default()
+            }),
+            Some(std::time::Duration::from_millis(1_500))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_watchdog_aborts_a_stalled_body() {
+        // A connection that never delivers another byte: pi's undici bodyTimeout fires, the retry table then
+        // classifies it as retryable (`timeout`).
+        let mut stream = IdleBodyStream::new(
+            futures_util::stream::pending::<Result<Vec<u8>, reqwest::Error>>(),
+            Some(std::time::Duration::from_millis(1_000)),
+        );
+        let mut first = Box::pin(futures_util::StreamExt::next(&mut stream));
+        // Nothing yet: the watchdog has not expired.
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        match first.await {
+            Some(Err(IdleBodyError::IdleTimeout(ms))) => assert_eq!(ms, 1_000),
+            other => panic!("expected the idle timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_watchdog_rearms_on_every_chunk() {
+        // A healthy-but-slow stream is never cut: each chunk resets the deadline, so 3 chunks spaced just under the
+        // limit all pass even though the total exceeds it.
+        let chunk = || Ok::<Vec<u8>, reqwest::Error>(b"data: {}\n\n".to_vec());
+        let body = futures_util::stream::iter(vec![chunk(), chunk(), chunk()]);
+        let mut stream = IdleBodyStream::new(body, Some(std::time::Duration::from_millis(1_000)));
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_millis(900)).await;
+            let item = futures_util::StreamExt::next(&mut stream)
+                .await
+                .expect("chunk available");
+            assert!(item.is_ok(), "chunk must pass through: {item:?}");
+        }
+        // The iterator is exhausted → plain EOF, not a timeout.
+        assert!(futures_util::StreamExt::next(&mut stream).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_watchdog_disabled_never_fires() {
+        let mut stream = IdleBodyStream::new(
+            futures_util::stream::pending::<Result<Vec<u8>, reqwest::Error>>(),
+            None,
+        );
+        tokio::time::advance(std::time::Duration::from_secs(86_400)).await;
+        let mut next = Box::pin(futures_util::StreamExt::next(&mut stream));
+        assert!(
+            futures_util::poll!(next.as_mut()).is_pending(),
+            "pi `httpIdleTimeoutMs: 0` = disabled ⇒ a stalled body stays pending"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_wording_is_retryable() {
+        // Parity with pi: undici throws `Body Timeout Error`, which its retry table matches via `timed? out|timeout`.
+        use crate::utils::retry::is_retryable_assistant_error;
+        let described = describe_sse_error(&eventsource_stream::EventStreamError::Transport(
+            IdleBodyError::IdleTimeout(300_000),
+        ));
+        assert!(described.contains("timeout"), "actual: {described}");
+        let msg = AssistantMessage {
+            content: vec![],
+            api: "openai-completions".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some(described),
+            timestamp: 0,
+        };
+        assert!(
+            is_retryable_assistant_error(&msg),
+            "an idle-timeout cut must be retried like pi"
         );
     }
 
@@ -3689,6 +4014,189 @@ mod tests {
             ContentBlock::Text(t) => assert_eq!(t.text, "Hello world"),
             _ => panic!("expected Text block in partial"),
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  finish_pending_visible_blocks (stream-truncation-partial-content-fix)
+    // ═════════════════════════════════════════════════════════════
+
+    #[test]
+    fn truncated_stream_keeps_partial_text_and_thinking() {
+        // A cut-off upstream (no finish_reason at all) must not lose what the user already watched arrive:
+        // the terminal assembly materializes the still-active blocks (pi `openai-completions.ts:489` catch parity).
+        let (evs, mut acc) =
+            run_chunks(&[chunk_thinking("pondering"), chunk_content("partial answer")]);
+        // Hazard this call exists for: without a `ContentBlockStop` the accumulator holds nothing finalized yet.
+        assert!(
+            acc.content_blocks.is_empty(),
+            "no finish_reason ⇒ nothing finalized ⇒ the old Phase 4 dropped every block"
+        );
+
+        acc.finish_pending_visible_blocks();
+
+        assert_eq!(acc.content_blocks.len(), 2);
+        match &acc.content_blocks[0] {
+            ContentBlock::Thinking(t) => {
+                assert_eq!(t.thinking, "pondering");
+                assert_eq!(t.thinking_signature.as_deref(), Some("reasoning_content"));
+            }
+            other => panic!("expected Thinking first (creation order), got {other:?}"),
+        }
+        match &acc.content_blocks[1] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "partial answer"),
+            other => panic!("expected Text second (creation order), got {other:?}"),
+        }
+        // pi's catch emits no `text_end`/`thinking_end`; only `finishBlock` (success path) does.
+        assert!(!evs.iter().any(|e| matches!(
+            e,
+            AssistantMessageEvent::TextEnd { .. } | AssistantMessageEvent::ThinkingEnd { .. }
+        )));
+        // Active state is consumed, so a later `finalize_all()` (success path) cannot double-push.
+        assert!(acc.partial_text.is_empty() && acc.partial_thinking.is_empty());
+        assert!(acc.block_types.is_empty());
+    }
+
+    #[test]
+    fn terminal_content_keeps_partial_content_of_a_truncated_stream() {
+        // Locks the Phase 4 **call site** (not just the accumulator method): the assembly path itself must materialize
+        // the active blocks, otherwise a cut-off stream still collapses to `content: []`.
+        let (_, mut acc) =
+            run_chunks(&[chunk_thinking("pondering"), chunk_content("partial answer")]);
+        assert!(acc.content_blocks.is_empty());
+        let content = terminal_content(&mut acc);
+        assert_eq!(
+            content.len(),
+            2,
+            "partial thinking + text, in creation order"
+        );
+        assert!(matches!(&content[1], ContentBlock::Text(t) if t.text == "partial answer"));
+        assert!(
+            acc.content_blocks.is_empty(),
+            "content is taken, not left behind for a second assembly"
+        );
+    }
+
+    #[test]
+    fn terminal_content_is_unchanged_on_the_success_path() {
+        // A stream that does see `finish_reason` is finalized by `finalize_all` and the terminal step adds nothing.
+        let (_, mut acc) = run_chunks(&[chunk_content("done"), chunk_finish()]);
+        let content = terminal_content(&mut acc);
+        assert_eq!(content.len(), 1);
+        assert!(matches!(&content[0], ContentBlock::Text(t) if t.text == "done"));
+    }
+
+    #[test]
+    fn truncated_stream_drops_unfinished_tool_call() {
+        // Deviation from pi (documented on `finish_pending_visible_blocks`): an unfinished tool call is dropped —
+        // pi never executes it either (`agent-loop.ts:196`), no component renders it, and a `toolCall` without a
+        // matching `toolResult` would make the next request invalid.
+        let (_, mut acc) = run_chunks(&[
+            chunk_content("Let me check"),
+            chunk_tool_start(0, "call_1", "bash"),
+            chunk_tool_args(0, "{\"command\":\"ls"), // truncated JSON on purpose
+        ]);
+
+        acc.finish_pending_visible_blocks();
+
+        assert_eq!(acc.content_blocks.len(), 1, "only the text block survives");
+        match &acc.content_blocks[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Let me check"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert!(acc.partial_json.is_empty(), "tool scratch buffers cleaned");
+        assert!(acc.tool_use_ids.is_empty() && acc.tool_use_names.is_empty());
+        assert!(acc.block_types.is_empty());
+    }
+
+    #[test]
+    fn finish_pending_visible_blocks_is_idempotent() {
+        let (_, mut acc) = run_chunks(&[chunk_content("abc")]);
+        acc.finish_pending_visible_blocks();
+        acc.finish_pending_visible_blocks();
+        acc.finalize_all();
+        assert_eq!(acc.content_blocks.len(), 1, "exactly one block, no clones");
+    }
+
+    #[test]
+    fn finish_pending_visible_blocks_preserves_success_path_finalization() {
+        // The normal path (`ContentBlockStop` at finish_reason) is untouched: blocks are finalized by
+        // `finalize_all`, and the terminal call then has nothing left to materialize.
+        let (evs, mut acc) = run_chunks(&[chunk_content("done"), chunk_finish()]);
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::TextEnd { .. })));
+        acc.finish_pending_visible_blocks();
+        assert_eq!(acc.content_blocks.len(), 1);
+    }
+
+    // ── needs_usage_estimate (Phase 4c gate) ──
+
+    /// Minimal assistant message for the `needs_usage_estimate` gate tests (no `Default` on the type).
+    fn assistant_with_usage(content: Vec<ContentBlock>, stop: StopReason) -> AssistantMessage {
+        AssistantMessage {
+            content,
+            api: "openai-completions".into(),
+            provider: "deepseek".into(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: stop,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn needs_usage_estimate_accepts_successful_termination_only() {
+        for stop in [StopReason::Stop, StopReason::Length, StopReason::ToolUse] {
+            let msg = assistant_with_usage(
+                vec![ContentBlock::Text(TextContent {
+                    text: "hello".into(),
+                    text_signature: None,
+                })],
+                stop.clone(),
+            );
+            assert!(needs_usage_estimate(&msg), "{stop:?} should be estimated");
+        }
+    }
+
+    #[test]
+    fn needs_usage_estimate_skips_error_and_aborted() {
+        // Preserved partial content must not be turned into fabricated token/cost totals on a failed turn
+        // (pi reports the provider usage, i.e. 0, on these paths).
+        for stop in [StopReason::Error, StopReason::Aborted] {
+            let msg = assistant_with_usage(
+                vec![ContentBlock::Text(TextContent {
+                    text: "partial".into(),
+                    text_signature: None,
+                })],
+                stop.clone(),
+            );
+            assert!(
+                !needs_usage_estimate(&msg),
+                "{stop:?} must not be estimated"
+            );
+        }
+    }
+
+    #[test]
+    fn needs_usage_estimate_skips_reported_usage_and_empty_content() {
+        let text = || {
+            vec![ContentBlock::Text(TextContent {
+                text: "hello".into(),
+                text_signature: None,
+            })]
+        };
+        let mut reported = assistant_with_usage(text(), StopReason::Stop);
+        reported.usage.output = 7;
+        assert!(
+            !needs_usage_estimate(&reported),
+            "provider already reported usage"
+        );
+
+        let empty = assistant_with_usage(vec![], StopReason::Stop);
+        assert!(!needs_usage_estimate(&empty), "nothing to estimate from");
     }
 
     /// Extract the text block content from the partial message (test helper).

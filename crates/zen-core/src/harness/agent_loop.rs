@@ -386,6 +386,25 @@ async fn agent_loop_inner(
             stream_assistant_response(context, &run_config, hooks, cancel, stream_fn.clone()).await;
         new_messages.push(Message::Assistant(assistant_msg.clone()));
 
+        // pi parity (reference/pi-original/packages/agent/src/agent-loop.ts:196): a failed or aborted turn ends
+        // right here — its tool calls are **never executed**. Two reasons: (a) a stream cut off mid-tool-call leaves
+        // arguments that may parse but are incomplete (pi fails those explicitly for `length`, `:207-212`), and (b) a
+        // provider can attach a `finish_reason` error (e.g. `content_filter`) to a message that already carries a tool
+        // call, and running it would execute a call the model never finished asking for. The message (partial content
+        // included, see `stream-truncation-partial-content-fix`) still reaches the caller and the session.
+        if matches!(
+            assistant_msg.stop_reason,
+            StopReason::Error | StopReason::Aborted
+        ) {
+            hooks
+                .on_event(&AgentEvent::TurnEnd {
+                    message: Message::Assistant(assistant_msg),
+                    tool_results: vec![],
+                })
+                .await;
+            break;
+        }
+
         // Extract tool calls
         let tool_calls: Vec<ToolCall> = assistant_msg
             .content
@@ -417,10 +436,32 @@ async fn agent_loop_inner(
             execute_tool_calls(context, &assistant_msg, &run_config, hooks, cancel).await
         };
 
-        // Inject tool results into context
+        // Inject tool results into context — and announce them as messages, exactly like pi's
+        // `emitToolResultMessage` (reference/pi-original/packages/agent/src/agent-loop.ts:789-792 emits
+        // `message_start` + `message_end` for every tool result; pi's session layer then persists them on
+        // `message_end`, `coding-agent/src/core/agent-session.ts:623-643`).
+        //
+        // Why this is load-bearing (tool-result-persistence-fix): zen's `SessionStore` is fed exclusively from
+        // `AgentEvent::MessageEnd` (`zen-app/src/session/agent_session.rs` resident subscription). Without these
+        // events the tool output only ever lived in memory, so a persisted session held `assistant.toolCall` blocks
+        // with **no** matching `toolResult` — `--resume` then produced an illegal request (measured:
+        // `400 … An assistant message with 'tool_calls' must be followed by tool messages responding to each
+        // 'tool_call_id'`) and the model had to re-read every file from scratch. Emitting them keeps the
+        // assistant→tool pairing in the session tree, which is what `build_context` replays on resume.
         for result in &tool_results {
-            context.messages.push(Message::ToolResult(result.clone()));
-            new_messages.push(Message::ToolResult(result.clone()));
+            let message = Message::ToolResult(result.clone());
+            hooks
+                .on_event(&AgentEvent::MessageStart {
+                    message: message.clone(),
+                })
+                .await;
+            hooks
+                .on_event(&AgentEvent::MessageEnd {
+                    message: message.clone(),
+                })
+                .await;
+            context.messages.push(message.clone());
+            new_messages.push(message);
         }
 
         // Send turn_end event

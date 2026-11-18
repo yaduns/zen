@@ -26,6 +26,7 @@ use crate::prompt_templates::LoadedPromptTemplate;
 use crate::resources::{load_resources, LoadResourcesOptions, LoadResourcesResult};
 use crate::session::agent_session::{AgentSession, SessionStore};
 use crate::session::assembly_options::SessionAssemblyOptions;
+use crate::session::http_idle_timeout::with_http_idle_timeout;
 use crate::session::provider_attribution::with_provider_attribution;
 use crate::session::runtime::{
     create_initial_runtime, AgentSessionRuntime, AgentSessionServices, SessionStartReason,
@@ -209,6 +210,9 @@ pub fn create_agent_session(
     // T-AI-02-10: provider attribution headers (e.g. opencode `x-opencode-session`) are injected at the assembly layer
     // (the request layer no longer contains resolve_provider; see `session::provider_attribution`).
     let stream_fn = with_provider_attribution(stream_fn);
+    // pi `httpIdleTimeoutMs` (http-dispatcher.ts:4 / sdk.ts:302-308): the body idle watchdog is read from settings per
+    // request at the same seam pi reads it (`streamFn`), so agent turns, compaction and branch summaries all get it.
+    let stream_fn = with_http_idle_timeout(stream_fn, settings.effective().http_idle_timeout_ms);
     let agent = Agent::new(
         state,
         ToolExecutionMode::Parallel,
@@ -706,6 +710,7 @@ mod tests {
 
     use std::ffi::OsString;
     use std::sync::Mutex;
+    use zen_ai::api::openai_stream::StreamConfig;
 
     /// Test helper: serializes tests touching environment variables (same pattern as config/mod.rs — `resolve_model` reads
     /// `ZEN_PROVIDER`; parallel tests mutating it race with each other).
@@ -1193,6 +1198,135 @@ mod tests {
         assert_eq!(
             runtime_tools(&["--no-tools", "--tools", "read"]).await,
             vec!["read"]
+        );
+    }
+
+    // ── HTTP idle timeout wiring (pi `httpIdleTimeoutMs`) ─────
+
+    /// Settings → assembled `StreamFn` → request boundary: `create_agent_session` must decorate the stream fn so that
+    /// every request carries the resolved idle timeout (pi reads the same setting inside `streamFn`, sdk.ts:302-308).
+    #[tokio::test]
+    async fn assembled_session_injects_the_http_idle_timeout() {
+        let seen: Arc<Mutex<Vec<Option<StreamConfig>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let probe: zen_ai::types::StreamFn =
+            Arc::new(move |_model, _ctx, cfg: Option<StreamConfig>, _cancel| {
+                let recorded = Arc::clone(&recorded);
+                Box::pin(async move {
+                    recorded.lock().unwrap().push(cfg);
+                    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                        zen_ai::types::AssistantMessageEvent,
+                    >();
+                    Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
+                })
+            });
+
+        let settings = Arc::new(SettingsManager::empty());
+        settings.apply_overrides(SettingsData {
+            http_idle_timeout_ms: Some(45_000),
+            ..Default::default()
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(SessionManager::in_memory("/work"));
+        let session = create_agent_session(
+            zen_ai::catalog::Catalog::embedded()
+                .default_model()
+                .expect("embedded catalog has a default model"),
+            String::new(),
+            Vec::new(),
+            zen_ai::types::ThinkingLevel::Off,
+            Arc::new(NoopHooks),
+            probe,
+            store,
+            ShellConfig::default(),
+            settings,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // Drive the decorated stream fn exactly as the agent loop would (fresh, unset cfg).
+        let stream_fn = session.agent.stream_fn();
+        let model = session.model();
+        let _ = stream_fn(
+            &model,
+            &zen_ai::types::Context {
+                system_prompt: None,
+                messages: Vec::new(),
+                tools: None,
+            },
+            Some(StreamConfig::default()),
+            None,
+        )
+        .await;
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "the probe must see exactly one request");
+        assert_eq!(
+            recorded[0].as_ref().expect("cfg present").idle_timeout_ms,
+            Some(45_000),
+            "the assembled session must inject settings.httpIdleTimeoutMs into every request"
+        );
+    }
+
+    /// `httpIdleTimeoutMs: 0` (pi "disabled") must leave requests without a watchdog.
+    #[tokio::test]
+    async fn assembled_session_respects_a_disabled_idle_timeout() {
+        let seen: Arc<Mutex<Vec<Option<StreamConfig>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let probe: zen_ai::types::StreamFn =
+            Arc::new(move |_model, _ctx, cfg: Option<StreamConfig>, _cancel| {
+                let recorded = Arc::clone(&recorded);
+                Box::pin(async move {
+                    recorded.lock().unwrap().push(cfg);
+                    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                        zen_ai::types::AssistantMessageEvent,
+                    >();
+                    Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
+                })
+            });
+
+        let settings = Arc::new(SettingsManager::empty());
+        settings.apply_overrides(SettingsData {
+            http_idle_timeout_ms: Some(0),
+            ..Default::default()
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(SessionManager::in_memory("/work"));
+        let session = create_agent_session(
+            zen_ai::catalog::Catalog::embedded()
+                .default_model()
+                .expect("embedded catalog has a default model"),
+            String::new(),
+            Vec::new(),
+            zen_ai::types::ThinkingLevel::Off,
+            Arc::new(NoopHooks),
+            probe,
+            store,
+            ShellConfig::default(),
+            settings,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let stream_fn = session.agent.stream_fn();
+        let model = session.model();
+        let _ = stream_fn(
+            &model,
+            &zen_ai::types::Context {
+                system_prompt: None,
+                messages: Vec::new(),
+                tools: None,
+            },
+            Some(StreamConfig::default()),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            seen.lock().unwrap()[0]
+                .as_ref()
+                .expect("cfg present")
+                .idle_timeout_ms,
+            None,
+            "pi `0` disables the watchdog"
         );
     }
 

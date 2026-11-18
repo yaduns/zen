@@ -841,6 +841,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             timeout_ms: None,
+            idle_timeout_ms: None,
             session_id: None,
         }
     }

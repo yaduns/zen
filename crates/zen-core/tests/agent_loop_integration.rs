@@ -201,6 +201,75 @@ impl AgentLoopHooks for MockHooks {
     }
 }
 
+/// Build a mock StreamFn that returns an `Error` assistant message **carrying a tool call**.
+///
+/// This is the shape produced by (a) a provider that attaches `finish_reason` with an error (`content_filter`) to a
+/// message that already streamed a tool call, and (b) `stream-truncation-partial-content-fix`: a cut-off stream now
+/// keeps its partial content, so an `Error` message can carry tool calls even without `finish_reason`.
+fn mock_error_with_tool_call_stream_fn() -> StreamFn {
+    // Turn 1: the failed message (Error + tool call). From turn 2 on: a plain text answer, so a loop that *does*
+    // execute the tool terminates and the regression shows up as an assertion failure instead of a hang.
+    let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::new(
+        move |_model: &Model, _ctx: &Context, _cfg: Option<_>, _cancel: Option<_>| {
+            let turns = turns.clone();
+            Box::pin(async move {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let turn = turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let msg = if turn == 0 {
+                    AssistantMessage {
+                        content: vec![ContentBlock::ToolCall(ToolCall {
+                            id: "call-err".into(),
+                            name: "bash".into(),
+                            arguments: serde_json::json!({"command": "echo should-not-run"}),
+                            thought_signature: None,
+                        })],
+                        api: "test".into(),
+                        provider: "test".into(),
+                        model: "test-model".into(),
+                        response_model: None,
+                        response_id: None,
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Error,
+                        error_message: Some("Provider finish_reason: content_filter".into()),
+                        timestamp: 1000,
+                    }
+                } else {
+                    AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent {
+                            text: "should be unreachable".into(),
+                            text_signature: None,
+                        })],
+                        api: "test".into(),
+                        provider: "test".into(),
+                        model: "test-model".into(),
+                        response_model: None,
+                        response_id: None,
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                        timestamp: 1001,
+                    }
+                };
+                if turn == 0 {
+                    tx.send(AssistantMessageEvent::Error {
+                        reason: ErrorStopReason::Error,
+                        error: msg,
+                    })
+                    .ok();
+                } else {
+                    tx.send(AssistantMessageEvent::Done {
+                        reason: NonErrorStopReason::Stop,
+                        message: msg,
+                    })
+                    .ok();
+                }
+                Ok(rx)
+            })
+        },
+    )
+}
+
 // ─── Mock Tool ───────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -543,6 +612,115 @@ async fn mock_test_tool_call_execution() {
         .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
         .collect();
     assert!(!tool_ends.is_empty(), "expected ToolExecutionEnd events");
+}
+
+/// `tool-result-persistence-fix` (pi `agent-loop.ts:789-792`): every tool result is announced as a message
+/// (`message_start` + `message_end`) **before** `turn_end`, which is what the session layer persists on.
+#[tokio::test]
+async fn mock_test_tool_result_emits_message_start_and_end() {
+    let hooks = MockHooks::new();
+    let cancel = CancellationToken::new();
+    let stream_fn = mock_two_turn_stream_fn();
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(BashMockTool::new())];
+    let mut ctx = create_context("You are a test assistant.".into(), vec![], &tools);
+
+    let _ = run_agent_loop(
+        vec![user_message("Run a command")],
+        &mut ctx,
+        &default_config(),
+        &hooks,
+        &cancel,
+        stream_fn,
+    )
+    .await;
+
+    let events = hooks.collected_events();
+    let positions: Vec<(usize, &'static str)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            AgentEvent::MessageStart {
+                message: Message::ToolResult(_),
+            } => Some((i, "start")),
+            AgentEvent::MessageEnd {
+                message: Message::ToolResult(_),
+            } => Some((i, "end")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        positions.iter().map(|(_, k)| *k).collect::<Vec<_>>(),
+        vec!["start", "end"],
+        "exactly one tool result, announced as a pair"
+    );
+
+    // Order contract: tool_execution_end → message_start → message_end → turn_end (pi emits the message pair after
+    // the execution ends and before the turn closes).
+    let start = positions[0].0;
+    let end = positions[1].0;
+    let tool_end = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+        .expect("tool execution end");
+    let turn_end = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+        .expect("turn end");
+    assert!(tool_end < start, "execution end precedes the message pair");
+    assert!(end < turn_end, "the message pair precedes turn_end");
+
+    // The result is in the context, so replaying this conversation keeps the assistant→tool pairing.
+    assert!(
+        ctx.messages
+            .iter()
+            .any(|m| matches!(m, Message::ToolResult(r) if r.tool_call_id == "call-1")),
+        "tool result must be part of the replayed context"
+    );
+}
+
+/// `stream-truncation-partial-content-fix` + pi `agent-loop.ts:196`: a failed/aborted turn never executes the tool
+/// calls its message carries, and it emits exactly one `TurnEnd` with an empty `tool_results`.
+#[tokio::test]
+async fn mock_test_error_message_with_tool_call_is_never_executed() {
+    let hooks = MockHooks::new();
+    let cancel = CancellationToken::new();
+    let stream_fn = mock_error_with_tool_call_stream_fn();
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(BashMockTool::new())];
+    let mut ctx = create_context("You are a test assistant.".into(), vec![], &tools);
+
+    let result = run_agent_loop(
+        vec![user_message("Do something that gets cut off")],
+        &mut ctx,
+        &default_config(),
+        &hooks,
+        &cancel,
+        stream_fn,
+    )
+    .await;
+
+    // user prompt + the failed assistant message; no tool result, and no second LLM turn.
+    assert_eq!(result.len(), 2, "no tool result must be produced");
+    assert!(matches!(
+        result.last(),
+        Some(Message::Assistant(a)) if a.stop_reason == StopReason::Error && a.content.len() == 1
+    ));
+
+    let events = hooks.collected_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })),
+        "pi returns before the tool-execution branch (`agent-loop.ts:196`)"
+    );
+    let turn_ends: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(turn_ends.len(), 1, "one turn, then the loop exits");
+    match turn_ends[0] {
+        AgentEvent::TurnEnd { tool_results, .. } => assert!(tool_results.is_empty()),
+        _ => unreachable!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

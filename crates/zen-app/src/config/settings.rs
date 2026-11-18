@@ -177,8 +177,12 @@ pub struct SettingsData {
     /// consumer zen-tui editor rendering)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clear_on_shrink: Option<bool>,
-    /// HTTP idle timeout in milliseconds, 0 = disabled (consumer zen-ai request boundary `StreamConfig.timeout_ms`
-    /// same-family parameter slot, T-AP-08-3 assembly point; whether it shares the slot with the overall request timeout is pending decision, see implementation notes "Open Issues")
+    /// HTTP idle timeout in milliseconds, `0` = disabled (pi `settings.httpIdleTimeoutMs`, default 300000).
+    ///
+    /// Resolved by `config::defaults::resolve_http_idle_timeout_ms` (unset → 300000, `0` → disabled) and consumed by
+    /// `session::http_idle_timeout::with_http_idle_timeout`, which writes it into zen-ai's
+    /// `StreamConfig.idle_timeout_ms` — the byte-level watchdog on the response body (pi undici
+    /// `bodyTimeout`/`headersTimeout`), **not** the whole-request timeout (`StreamConfig.timeout_ms`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
     /// Compression toggle and token threshold (consumer T-AP-04-3; defaults

@@ -710,7 +710,9 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
     use zen_ai::tool::ToolExecutionMode;
-    use zen_ai::types::StreamFn;
+    use zen_ai::types::{
+        AssistantMessage, ContentBlock, StreamFn, TextContent, ToolCall, ToolResultMessage, Usage,
+    };
     use zen_core::harness::agent_hooks::AgentLoopHooks;
     use zen_core::harness::types::AgentState;
 
@@ -720,6 +722,9 @@ mod tests {
     struct MockStore {
         model_changes: Mutex<Vec<(String, String)>>,
         thinking_changes: Mutex<Vec<String>>,
+        /// Messages delivered by the resident `MessageEnd` subscription (the same channel the real
+        /// `SessionManager` persists from) — tool-result-persistence-fix asserts on it.
+        persisted: Mutex<Vec<Message>>,
     }
 
     impl MockStore {
@@ -729,10 +734,15 @@ mod tests {
         fn thinking_changes(&self) -> Vec<String> {
             self.thinking_changes.lock().unwrap().clone()
         }
+        fn persisted(&self) -> Vec<Message> {
+            self.persisted.lock().unwrap().clone()
+        }
     }
 
     impl SessionStore for MockStore {
-        fn append_message(&self, _message: &Message) {}
+        fn append_message(&self, message: &Message) {
+            self.persisted.lock().unwrap().push(message.clone());
+        }
         fn append_model_change(&self, provider: &str, model_id: &str) {
             self.model_changes
                 .lock()
@@ -1066,5 +1076,192 @@ mod tests {
                 "Output truncated. Full output: /tmp/bash-abc.log]"
             )
         );
+    }
+    // ── tool-result-persistence-fix ──
+
+    /// Minimal tool used to drive one real tool round (args schema kept trivial).
+    #[derive(Debug)]
+    struct EchoTool {
+        params: serde_json::Value,
+    }
+
+    impl EchoTool {
+        fn new() -> Self {
+            Self {
+                params: serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"]
+                }),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zen_ai::tool::Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echo the given text"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.params
+        }
+        fn label(&self) -> &str {
+            "Echo"
+        }
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            params: &serde_json::Value,
+            _cancel: &tokio_util::sync::CancellationToken,
+            _on_update: zen_ai::tool::ToolUpdateCallback,
+        ) -> Result<zen_ai::tool::ToolExecutionResult, zen_ai::tool::ToolError> {
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(zen_ai::tool::ToolExecutionResult {
+                message: ToolResultMessage {
+                    tool_call_id: tool_call_id.to_string(),
+                    tool_name: "echo".to_string(),
+                    content: vec![ContentBlock::Text(TextContent {
+                        text,
+                        text_signature: None,
+                    })],
+                    details: None,
+                    usage: Some(Usage::default()),
+                    is_error: false,
+                    added_tool_names: None,
+                    timestamp: 2,
+                },
+                terminate: false,
+            })
+        }
+    }
+
+    /// Turn 1: a tool call; turn 2 (after the tool result lands in context): a final text answer.
+    fn tool_then_text_stream_fn() -> StreamFn {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::sync::Arc::new(
+            move |_model: &Model,
+                  _ctx: &zen_ai::types::Context,
+                  _cfg: Option<zen_ai::api::openai_stream::StreamConfig>,
+                  _cancel: Option<tokio_util::sync::CancellationToken>| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let turn = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (content, stop) = if turn == 0 {
+                        (
+                            vec![ContentBlock::ToolCall(ToolCall {
+                                id: "call-1".into(),
+                                name: "echo".into(),
+                                arguments: serde_json::json!({"text": "hello"}),
+                                thought_signature: None,
+                            })],
+                            StopReason::ToolUse,
+                        )
+                    } else {
+                        (
+                            vec![ContentBlock::Text(TextContent {
+                                text: "done".into(),
+                                text_signature: None,
+                            })],
+                            StopReason::Stop,
+                        )
+                    };
+                    let message = AssistantMessage {
+                        content,
+                        api: "openai-completions".into(),
+                        provider: "opencode-go".into(),
+                        model: "deepseek-v4-flash".into(),
+                        response_model: None,
+                        response_id: None,
+                        usage: Usage::default(),
+                        stop_reason: stop.clone(),
+                        error_message: None,
+                        timestamp: 1,
+                    };
+                    let _ = tx.send(zen_ai::types::AssistantMessageEvent::Start {
+                        partial: message.clone(),
+                    });
+                    let _ = tx.send(zen_ai::types::AssistantMessageEvent::Done {
+                        reason: match stop {
+                            StopReason::ToolUse => zen_ai::types::NonErrorStopReason::ToolUse,
+                            _ => zen_ai::types::NonErrorStopReason::Stop,
+                        },
+                        message,
+                    });
+                    Ok::<_, zen_ai::api::openai_stream::StreamError>(rx)
+                })
+            },
+        )
+    }
+
+    /// pi `agent-loop.ts:789-792` + `agent-session.ts:623-643`: the tool result is announced as a message and the
+    /// resident `MessageEnd` subscription persists it, **between** the assistant tool call and the next assistant turn.
+    ///
+    /// This is the regression lock for the resume-time `400 … An assistant message with 'tool_calls' must be followed
+    /// by tool messages`: without the persisted tool result, a resumed session replays assistant tool calls with no
+    /// answers (measured on `--Users-jason-Projects-Rust-DeerChat--/2026-11-06T04-18-10…`, 2026-11-10T06:20).
+    #[tokio::test]
+    async fn test_tool_result_is_persisted_between_assistant_turns() {
+        let mut state = agent_state();
+        state.tools =
+            vec![std::sync::Arc::new(EchoTool::new()) as std::sync::Arc<dyn zen_ai::tool::Tool>];
+        let agent = Agent::new(
+            state,
+            ToolExecutionMode::Sequential,
+            std::sync::Arc::new(MockHooks),
+            tool_then_text_stream_fn(),
+            None,
+        );
+        let store = Arc::new(MockStore::default());
+        let session = AgentSession::new(agent, store.clone());
+
+        session
+            .prompt("run the echo tool", &[])
+            .await
+            .expect("prompt");
+
+        let persisted = store.persisted();
+        let shape: Vec<&str> = persisted
+            .iter()
+            .map(|m| match m {
+                Message::User(_) => "user",
+                Message::Assistant(_) => "assistant",
+                Message::ToolResult(_) => "toolResult",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["user", "assistant", "toolResult", "assistant"],
+            "pairing must survive persistence (pi persists `message_end` for toolResult too)"
+        );
+
+        // The persisted result answers the persisted tool call, i.e. a replay is a legal request.
+        let Message::Assistant(call_msg) = &persisted[1] else {
+            panic!("second persisted message must be the assistant tool call");
+        };
+        let call_id = call_msg
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::ToolCall(tc) => Some(tc.id.clone()),
+                _ => None,
+            })
+            .expect("tool call id");
+        let Message::ToolResult(result) = &persisted[2] else {
+            panic!("third persisted message must be the tool result");
+        };
+        assert_eq!(result.tool_call_id, call_id);
+        assert_eq!(result.tool_name, "echo");
+        match &result.content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "hello"),
+            other => panic!("unexpected tool result content: {other:?}"),
+        }
     }
 }
