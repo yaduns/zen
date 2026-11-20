@@ -174,13 +174,24 @@ enum RequestMessage {
         content: MessageContent,
     },
     /// Assistant message, containing model-generated text and/or tool call requests.
+    ///
+    /// `content` is always serialized (as `null` when there is no text), matching pi's
+    /// `ChatCompletionAssistantMessageParam` shape — some providers reject a missing `content` key.
     Assistant {
-        /// Text content. May be `None` (pure tool call response).
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Text content. `None` (serialized as `null`) for a response with only tool calls or only thinking.
         content: Option<String>,
-        /// List of tool calls.
+        /// List of tool calls. Omitted entirely when empty (pi `convertMessages` only sets it when
+        /// the message carries tool calls; an explicit `[]` is not in the OpenAI shape).
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<RequestToolCall>>,
+        /// Replayed thinking (pi `convertMessages` openai-completions.ts:999-1013): a single
+        /// provider-named field (e.g. `reasoning_content`) holding the assistant's reasoning text.
+        ///
+        /// The field **name** comes from `ThinkingContent::thinking_signature` (the SSE delta field the
+        /// provider streams), so this cannot be a struct field; the map is flattened into the assistant
+        /// object for serialization. Empty map = nothing is emitted.
+        #[serde(flatten)]
+        reasoning: std::collections::BTreeMap<String, String>,
     },
     /// Tool result message, containing the execution result of a tool call.
     Tool {
@@ -679,7 +690,7 @@ fn build_request_body(model: &Model, context: &Context, cfg: &StreamConfig) -> R
 
     // Convert all messages
     for msg in &context.messages {
-        messages.push(convert_message(msg));
+        messages.push(convert_message(model, msg));
     }
 
     // Tool definitions: only set when non-empty (schema derived from executable tools at the request boundary, aligned with Pi's convertTools)
@@ -763,8 +774,14 @@ fn merge_request_headers(model: &Model, cfg: &StreamConfig) -> HashMap<String, S
 
 /// Converts a `Message` into an OpenAI API message object.
 ///
-/// Corresponds to Pi's internal `convertMessage` function.
-fn convert_message(message: &Message) -> RequestMessage {
+/// Corresponds to Pi's internal `convertMessage` function (openai-completions.ts:887-1050).
+///
+/// # Parameters
+/// - `model`: the model this request targets. Needed by the assistant branch: pi replays thinking
+///   **only for the same model** (`transform-messages.ts:96-127` `isSameModel`), because a thinking
+///   signature is provider-private and invalid for a different endpoint.
+/// - `message`: the internal message to convert.
+fn convert_message(model: &Model, message: &Message) -> RequestMessage {
     match message {
         Message::User(user_message) => match &user_message.content {
             ContentBlockList::Text(text) => RequestMessage::User {
@@ -782,12 +799,27 @@ fn convert_message(message: &Message) -> RequestMessage {
         },
 
         Message::Assistant(assistant_message) => {
-            let mut _text_content = String::new();
-            let mut _tool_calls = Vec::new();
+            // pi `transform-messages.ts:96-104`: thinking is only replayable against the model that produced it.
+            let same_model = assistant_message.api == model.api.to_string()
+                && assistant_message.provider == model.provider
+                && assistant_message.model == model.id;
+
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+            // Reasoning texts kept for replay, in content order (pi joins them with "\n").
+            let mut thinking_texts: Vec<&str> = Vec::new();
+            // pi reads the signature from the **first** non-empty thinking block only
+            // (openai-completions.ts:1010-1012); `None` inner = "first block has no signature".
+            let mut first_thinking_signature: Option<Option<&str>> = None;
 
             for content in &assistant_message.content {
                 match content {
-                    ContentBlock::Text(text_content) => _text_content = text_content.text.clone(),
+                    ContentBlock::Text(text_content) => {
+                        // pi filters empty text parts (`openai-completions.ts:975-983`).
+                        if !text_content.text.trim().is_empty() {
+                            text.push_str(&text_content.text);
+                        }
+                    }
                     ContentBlock::ToolCall(tool_call) => {
                         let request_tool_call = RequestToolCall {
                             id: tool_call.id.clone(),
@@ -797,14 +829,66 @@ fn convert_message(message: &Message) -> RequestMessage {
                                 arguments: tool_call.arguments.to_string(),
                             },
                         };
-                        _tool_calls.push(request_tool_call);
+                        tool_calls.push(request_tool_call);
                     }
-                    _ => (),
+                    ContentBlock::Thinking(thinking) => {
+                        let redacted = thinking.redacted.unwrap_or(false);
+                        // Redacted (encrypted) thinking is opaque: only valid for the producing model, and
+                        // never turned into visible text (pi `transform-messages.ts:106-121`).
+                        if redacted {
+                            if same_model && first_thinking_signature.is_none() {
+                                first_thinking_signature =
+                                    Some(thinking.thinking_signature.as_deref());
+                            }
+                            if same_model {
+                                thinking_texts.push(&thinking.thinking);
+                            }
+                            continue;
+                        }
+                        if thinking.thinking.trim().is_empty() {
+                            continue;
+                        }
+                        if same_model {
+                            if first_thinking_signature.is_none() {
+                                first_thinking_signature =
+                                    Some(thinking.thinking_signature.as_deref());
+                            }
+                            thinking_texts.push(&thinking.thinking);
+                        } else {
+                            // pi downgrades non-redacted thinking of another model to plain text
+                            // (`transform-messages.ts:119-123`) rather than dropping it.
+                            text.push_str(&thinking.thinking);
+                        }
+                    }
+                    ContentBlock::Image(_) => {}
                 }
             }
+
+            // pi: no signature → nothing is replayed (the field name is unknown, openai-completions.ts:1013).
+            let mut reasoning = std::collections::BTreeMap::new();
+            if !thinking_texts.is_empty() {
+                if let Some(Some(signature)) = first_thinking_signature {
+                    // pi normalizes the opencode-go streaming field `reasoning` to the canonical
+                    // replay name `reasoning_content` (openai-completions.ts:1009-1012).
+                    let signature = if model.provider == "opencode-go" && signature == "reasoning" {
+                        "reasoning_content"
+                    } else {
+                        signature
+                    };
+                    if !signature.is_empty() {
+                        reasoning.insert(signature.to_string(), thinking_texts.join("\n"));
+                    }
+                }
+            }
+
             RequestMessage::Assistant {
-                content: Some(_text_content),
-                tool_calls: Some(_tool_calls),
+                content: if text.is_empty() { None } else { Some(text) },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                reasoning,
             }
         }
         Message::ToolResult(tool_result_message) => {
@@ -2128,7 +2212,7 @@ mod tests {
             content: ContentBlockList::Text("hello".into()),
             timestamp: 0,
         });
-        let result = convert_message(&msg);
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::User {
@@ -2153,7 +2237,7 @@ mod tests {
             ]),
             timestamp: 0,
         });
-        let result = convert_message(&msg);
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::User {
@@ -2180,14 +2264,14 @@ mod tests {
             error_message: None,
             timestamp: 0,
         });
-        let result = convert_message(&msg);
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::Assistant {
                 content: Some(ref t),
-                tool_calls: Some(ref tc),
+                tool_calls: None,
                 ..
-            } if t == "response" && tc.is_empty()
+            } if t == "response"
         ));
     }
 
@@ -2216,7 +2300,7 @@ mod tests {
             error_message: None,
             timestamp: 0,
         });
-        let result = convert_message(&msg);
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::Assistant {
@@ -2228,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_message_assistant_skips_thinking() {
+    fn test_convert_message_assistant_thinking_without_signature_is_not_replayed() {
         let msg = Message::Assistant(AssistantMessage {
             content: vec![
                 ContentBlock::Thinking(ThinkingContent {
@@ -2251,14 +2335,161 @@ mod tests {
             error_message: None,
             timestamp: 0,
         });
-        // Only text blocks are extracted; thinking blocks are skipped
-        let result = convert_message(&msg);
+        // pi (`openai-completions.ts:1013`): without a signature the wire field name is unknown, so
+        // nothing is replayed; text blocks are unaffected.
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::Assistant {
                 content: Some(ref t),
+                ref reasoning,
                 ..
-            } if t == "visible"
+            } if t == "visible" && reasoning.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_convert_message_assistant_replays_thinking_for_the_same_model() {
+        let msg = Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "step one".into(),
+                    thinking_signature: Some("reasoning_content".into()),
+                    redacted: None,
+                }),
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "step two".into(),
+                    thinking_signature: Some("reasoning_content".into()),
+                    redacted: None,
+                }),
+            ],
+            api: "openai-completions".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("Stream ended without finish_reason".into()),
+            timestamp: 0,
+        });
+        let result = convert_message(&sample_model(), &msg);
+        assert!(matches!(
+            &result,
+            RequestMessage::Assistant {
+                content: None,
+                tool_calls: None,
+                reasoning,
+            } if reasoning.get("reasoning_content").map(String::as_str) == Some("step one\nstep two")
+        ));
+        // The replayed field must really land on the wire under the provider's name
+        // (serde `flatten` inside an internally tagged enum).
+        let json = serde_json::to_value(&result).expect("assistant message serializes");
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["reasoning_content"], "step one\nstep two");
+        assert!(json["content"].is_null());
+        assert!(json.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_convert_message_assistant_normalizes_opencode_go_reasoning_signature() {
+        let msg = Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "thinking".into(),
+                thinking_signature: Some("reasoning".into()),
+                redacted: None,
+            })],
+            api: "openai-completions".into(),
+            provider: "opencode-go".into(),
+            model: "mimo-v2.6-flash".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+        let model = Model {
+            provider: "opencode-go".into(),
+            id: "mimo-v2.6-flash".into(),
+            ..sample_model()
+        };
+        // pi `openai-completions.ts:1009-1012`: opencode-go streams `delta.reasoning` but the replay
+        // field must be the canonical `reasoning_content`.
+        let result = convert_message(&model, &msg);
+        assert!(matches!(
+            &result,
+            RequestMessage::Assistant { reasoning, .. }
+                if reasoning.get("reasoning_content").map(String::as_str) == Some("thinking")
+                    && !reasoning.contains_key("reasoning")
+        ));
+    }
+
+    #[test]
+    fn test_convert_message_assistant_downgrades_thinking_of_another_model_to_text() {
+        let msg = Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "old reasoning".into(),
+                    thinking_signature: Some("reasoning_content".into()),
+                    redacted: None,
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "answer".into(),
+                    text_signature: None,
+                }),
+            ],
+            // Produced by a different model than the request target
+            api: "openai-completions".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4.1-flash".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+        // pi `transform-messages.ts:119-123`: another model's non-redacted thinking becomes plain text
+        // (the signature is provider-private and must not be sent back).
+        let result = convert_message(&sample_model(), &msg);
+        assert!(matches!(
+            &result,
+            RequestMessage::Assistant {
+                content: Some(t),
+                reasoning,
+                ..
+            } if t == "old reasoninganswer" && reasoning.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_convert_message_assistant_drops_redacted_thinking_of_another_model() {
+        let msg = Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "opaque".into(),
+                thinking_signature: Some("reasoning_content".into()),
+                redacted: Some(true),
+            })],
+            api: "openai-completions".into(),
+            provider: "openai".into(),
+            model: "gpt-x".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+        // pi `transform-messages.ts:106-109`: encrypted thinking is only valid for the producing model.
+        let result = convert_message(&sample_model(), &msg);
+        assert!(matches!(
+            &result,
+            RequestMessage::Assistant {
+                content: None,
+                reasoning,
+                ..
+            } if reasoning.is_empty()
         ));
     }
 
@@ -2277,7 +2508,7 @@ mod tests {
             added_tool_names: None,
             timestamp: 0,
         });
-        let result = convert_message(&msg);
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::Tool {
@@ -2309,7 +2540,7 @@ mod tests {
             added_tool_names: None,
             timestamp: 0,
         });
-        let result = convert_message(&msg);
+        let result = convert_message(&sample_model(), &msg);
         assert!(matches!(
             result,
             RequestMessage::Tool {
