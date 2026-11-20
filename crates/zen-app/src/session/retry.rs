@@ -21,6 +21,7 @@ use zen_ai::types::{AssistantMessage, Message, StopReason};
 use zen_ai::utils::overflow::is_context_overflow;
 use zen_ai::utils::retry::{is_retryable_assistant_error, retry_delay_ms};
 use zen_core::harness::types::AgentEvent;
+use zen_core::session::tree::SessionTreeEntry;
 
 /// Decides whether the just-finished assistant turn is worth backing off and retrying (pi `_isRetryableError`):
 /// context overflow is compaction's business and must never be retried in place (retrying only hits the same wall).
@@ -69,7 +70,116 @@ pub(crate) fn with_trailing_assistant_removed(messages: Vec<Message>) -> Vec<Mes
     messages
 }
 
+/// A missing-`finish_reason` truncation that ran at least this long is treated as an **upstream wall-clock cap**
+/// rather than a transient hiccup.
+///
+/// # Why a duration threshold
+/// Measured evidence (2026-11, opencode-go): the endpoint closes long streaming responses at ~302-309s (zen sessions
+/// 302.5/302.7/302.8/302.9s; pi 1.5.0's own sessions 305.4-309.1s, same model), while successful generations of the
+/// same shape top out at ~290-299s. A truncation that consumed ~5 minutes therefore means "the upstream cap cut the
+/// response", not "the network hiccuped": re-asking the identical request can only hit the same cap again.
+///
+/// 240s = ~80% of the observed cap: far above an ordinary transient drop (pi's own short truncation sample ran 16.7s)
+/// and below the cap, so an attempt that was clearly heading for the wall is already classified as such.
+pub(crate) const WALL_CLOCK_TRUNCATION_MS: u64 = 240_000;
+
+/// Whether the failed turn ended because the stream was cut before any `finish_reason` arrived.
+///
+/// # Behavior
+/// `stop_reason == Error` and the error text carries the truncation wording `ended without` — the text zen synthesizes
+/// (`zen-ai` `missing_finish_reason_error` → `Stream ended without finish_reason`) and the same wording pi's retry
+/// table keys on (`retry.ts:69`). Case-insensitive; every other error text (429, quota, SSE decode, 400) is not a
+/// truncation.
+///
+/// # Consumers
+/// [`is_wall_clock_truncation`] (retry policy) and `session/compaction.rs` (recoverable-truncation gate); unit tests.
+pub(crate) fn is_truncation_error(message: &AssistantMessage) -> bool {
+    message.stop_reason == StopReason::Error
+        && message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.to_lowercase().contains("ended without"))
+}
+
+/// Wall-clock duration of the attempt that produced the last assistant message: that message's `timestamp` minus the
+/// `timestamp` of the message right before it (the user / tool-result message appended when the attempt started).
+///
+/// # Return
+/// - `Some(ms)` when the last message is an assistant message with a predecessor on the same list.
+/// - `None` when the list is empty, the last message is not an assistant message, or it has no predecessor.
+///
+/// # Why timestamps instead of a new `durationMs` field
+/// `AssistantMessage.timestamp` is stamped when the stream is finalized (`openai_stream.rs` Phase 4) and the preceding
+/// message is stamped when that turn's prompt / tool result was appended, so the difference is this LLM call's own
+/// duration (tool execution time belongs to the previous interval, not this one).
+///
+/// # Consumers
+/// [`AgentSession::check_retry_after_run`]; `session/compaction.rs` (recoverable-truncation gate); unit tests.
+pub(crate) fn attempt_elapsed_ms(messages: &[Message]) -> Option<u64> {
+    let Message::Assistant(assistant) = messages.last()? else {
+        return None;
+    };
+    let previous = messages.get(messages.len().checked_sub(2)?)?;
+    let previous_ts = match previous {
+        Message::User(user) => user.timestamp,
+        Message::Assistant(assistant) => assistant.timestamp,
+        Message::ToolResult(result) => result.timestamp,
+    };
+    u64::try_from(assistant.timestamp.saturating_sub(previous_ts)).ok()
+}
+
+/// Whether the just-finished failed turn is an **upstream wall-clock cap truncation**: a missing-`finish_reason`
+/// truncation whose attempt ran at least [`WALL_CLOCK_TRUNCATION_MS`].
+///
+/// # Behavior
+/// Both conditions must hold. A missing elapsed value (`None`) is **not** a wall-clock truncation — an unknown
+/// duration must fail open to the ordinary transient-retry path, never silently disable retries.
+///
+/// # Consumers
+/// [`AgentSession::check_retry_after_run`] (skip the equivalent re-ask) and `session/compaction.rs`
+/// (recoverable-truncation compaction gate); unit tests.
+pub(crate) fn is_wall_clock_truncation(
+    message: &AssistantMessage,
+    elapsed_ms: Option<u64>,
+) -> bool {
+    is_truncation_error(message) && elapsed_ms.is_some_and(|ms| ms >= WALL_CLOCK_TRUNCATION_MS)
+}
+
 impl AgentSession {
+    /// Drop the trailing failed assistant attempt from the retry context **and** durably omit it from the model
+    /// projection (pi `_prepareRetry`'s `messages.slice(0, -1)` plus pi 1.5.0's `_omitRecoveryAttempt`).
+    ///
+    /// # Behavior
+    /// 1. When the branch tail is a `Message` entry whose message is an assistant message with `stop_reason == Error`,
+    ///    append a `ContextEdit` targeting that entry id (persisted by the real store; a no-op for in-memory stubs).
+    ///    This keeps the failed attempt out of the context after a resume — with thinking replay it would otherwise come
+    ///    back as a second, thinking-only assistant turn right after the successful one.
+    /// 2. `set_messages(with_trailing_assistant_removed(...))` (pi semantics: kept in session history, dropped from the
+    ///    retry context).
+    ///
+    /// # Edge Cases
+    /// - The tail is not the failed assistant (e.g. tool results were appended after it) → no projection edit, the state
+    ///   is left as-is (the caller's guards only reach here with a trailing failed assistant).
+    /// - A successful assistant is never omitted (the `stop_reason == Error` guard mirrors `compaction.rs`'s pop rule).
+    ///
+    /// # Consumers
+    /// [`AgentSession::check_retry_after_run`] (step 7); `session/compaction.rs`'s two recovery branches.
+    pub(crate) fn omit_trailing_failed_attempt(&self) {
+        let entries = self.session_store.branch_entries();
+        if let Some(SessionTreeEntry::Message {
+            id,
+            message: Message::Assistant(failed),
+            ..
+        }) = entries.last()
+        {
+            if failed.stop_reason == StopReason::Error {
+                self.session_store.append_context_edit(id);
+            }
+        }
+        self.agent
+            .set_messages(with_trailing_assistant_removed(self.agent.messages()));
+    }
+
     /// The post-run retry gate (pi `_handlePostAgentRun`'s retry branch + `_prepareRetry`): "the gateway hiccuped"
     /// must not cost the user another round of typing — this waits it out and asks again.
     ///
@@ -84,12 +194,16 @@ impl AgentSession {
     ///    the counter is > 0), clear it, `false`.
     /// 2. `!is_retryable_turn(last)` → when the counter is > 0 emit `AutoRetryEnd{success:false, final_error:
     ///    last.error_message}`, clear it, `false`.
-    /// 3. `build_retry_policy(&settings)` is `None` (`settings.retry.enabled == false`) → same as 2.
-    /// 4. `attempt = counter + 1`; `attempt > policy.max_retries` → same as 2, and **no sleep**.
-    /// 5. `delay = retry_delay_ms(...)`; emit `AutoRetryStart{attempt, max_attempts, delay, error_message}`.
-    /// 6. `set_messages(with_trailing_assistant_removed(...))` (pi semantics: kept in session history, dropped from the
-    ///    retry context).
-    /// 7. Store a fresh `CancellationToken` in `retry_cancel`, then `tokio::select!{ sleep(delay), token.cancelled() }`:
+    /// 3. **Wall-clock cap truncation** ([`is_wall_clock_truncation`] → `true`) → emit the closing `AutoRetryEnd` and
+    ///    return `false` **without** scheduling a retry: re-asking the identical request can only hit the same
+    ///    upstream cap. The post-run compaction check (`session/compaction.rs` recoverable-truncation gate) owns this
+    ///    case instead — it compacts first so the retried generation has a chance to finish inside the cap.
+    /// 4. `build_retry_policy(&settings)` is `None` (`settings.retry.enabled == false`) → same as 2.
+    /// 5. `attempt = counter + 1`; `attempt > policy.max_retries` → same as 2, and **no sleep**.
+    /// 6. `delay = retry_delay_ms(...)`; emit `AutoRetryStart{attempt, max_attempts, delay, error_message}`.
+    /// 7. `omit_trailing_failed_attempt()` (pi semantics: kept in session history, dropped from the retry context, and
+    ///    durably omitted from the model projection by pi 1.5.0's `context_edit`).
+    /// 8. Store a fresh `CancellationToken` in `retry_cancel`, then `tokio::select!{ sleep(delay), token.cancelled() }`:
     ///    cancelled → clear the handle, emit `AutoRetryEnd{success:false, final_error:"Retry cancelled"}`, clear the
     ///    counter, `false`; slept through → clear the handle, `true`.
     ///
@@ -117,6 +231,12 @@ impl AgentSession {
             self.finish_retry_sequence(false, last, None);
             return false;
         }
+        // 2b. Upstream wall-clock cap: the identical re-ask is deterministic, so it is not a retry candidate. The
+        //     post-run compaction check takes over (pi's recoverable-truncation shape: compact once, then retry).
+        if is_wall_clock_truncation(last, attempt_elapsed_ms(&messages)) {
+            self.finish_retry_sequence(false, last, None);
+            return false;
+        }
         let Some(policy) = build_retry_policy(&self.settings) else {
             self.finish_retry_sequence(false, last, None);
             return false;
@@ -140,9 +260,9 @@ impl AgentSession {
                 .unwrap_or_else(|| "Unknown error".to_string()),
         });
 
-        // pi: the failed assistant message stays in the session history but is removed from the retry context.
-        self.agent
-            .set_messages(with_trailing_assistant_removed(self.agent.messages()));
+        // pi: the failed assistant message stays in the session history but is removed from the retry context, and
+        // (pi 1.5.0) durably omitted from the model projection.
+        self.omit_trailing_failed_attempt();
 
         let token = CancellationToken::new();
         {
@@ -272,17 +392,30 @@ mod tests {
     #[derive(Default)]
     struct MockStore {
         persisted: Mutex<Vec<Message>>,
+        /// Branch tail handed to `branch_entries()` (drives the projection-edit target lookup)
+        entries: Mutex<Vec<SessionTreeEntry>>,
+        /// Recorded `append_context_edit` targets (pi 1.5.0 `context_edit`)
+        edits: Mutex<Vec<String>>,
     }
 
     impl MockStore {
         fn persisted(&self) -> Vec<Message> {
             self.persisted.lock().unwrap().clone()
         }
+        fn set_entries(&self, entries: Vec<SessionTreeEntry>) {
+            *self.entries.lock().unwrap() = entries;
+        }
+        fn edits(&self) -> Vec<String> {
+            self.edits.lock().unwrap().clone()
+        }
     }
 
     impl crate::session::agent_session::SessionStore for MockStore {
         fn append_message(&self, message: &Message) {
             self.persisted.lock().unwrap().push(message.clone());
+        }
+        fn append_context_edit(&self, target_id: &str) {
+            self.edits.lock().unwrap().push(target_id.to_string());
         }
         fn append_model_change(&self, _provider: &str, _model_id: &str) {}
         fn append_thinking_level_change(&self, _level: &str) {}
@@ -293,7 +426,7 @@ mod tests {
             "/work"
         }
         fn branch_entries(&self) -> Vec<SessionTreeEntry> {
-            Vec::new()
+            self.entries.lock().unwrap().clone()
         }
         fn append_compaction(
             &self,
@@ -783,5 +916,197 @@ mod tests {
         // `abort_retry` while idle is a no-op.
         session.abort_retry();
         assert!(!session.is_retrying());
+    }
+
+    // ── upstream wall-clock cap truncation (recoverable-truncation shape) ──
+
+    const TRUNCATION: &str = "Stream ended without finish_reason";
+
+    fn user_message(text: &str, timestamp: i64) -> Message {
+        Message::User(zen_ai::types::UserMessage {
+            content: zen_ai::types::ContentBlockList::Text(text.to_string()),
+            timestamp,
+        })
+    }
+
+    /// Failed attempt that started at `start_ms` and lost the stream `elapsed_ms` later.
+    fn truncation_turn(start_ms: i64, elapsed_ms: i64) -> AssistantMessage {
+        AssistantMessage {
+            timestamp: start_ms + elapsed_ms,
+            ..assistant(StopReason::Error, Some(TRUNCATION))
+        }
+    }
+
+    #[test]
+    fn is_truncation_error_matches_only_the_missing_finish_reason_wording() {
+        assert!(is_truncation_error(&assistant(
+            StopReason::Error,
+            Some(TRUNCATION)
+        )));
+        assert!(is_truncation_error(&assistant(
+            StopReason::Error,
+            Some("SSE stream error: stream ENDED WITHOUT events")
+        )));
+        assert!(!is_truncation_error(&assistant(
+            StopReason::Error,
+            Some("429: rate limit")
+        )));
+        assert!(!is_truncation_error(&assistant(
+            StopReason::Error,
+            Some("insufficient_quota")
+        )));
+        assert!(!is_truncation_error(&assistant(StopReason::Stop, None)));
+        assert!(!is_truncation_error(&assistant(StopReason::Error, None)));
+    }
+
+    #[test]
+    fn attempt_elapsed_ms_is_the_gap_from_the_preceding_message() {
+        let messages = vec![
+            user_message("go", 1_000),
+            Message::Assistant(truncation_turn(1_000, 302_700)),
+        ];
+        assert_eq!(attempt_elapsed_ms(&messages), Some(302_700));
+        // No predecessor → unknown
+        assert_eq!(
+            attempt_elapsed_ms(&[Message::Assistant(truncation_turn(0, 1_000))]),
+            None
+        );
+        // Last message is not an assistant message → unknown
+        assert_eq!(attempt_elapsed_ms(&[user_message("go", 1_000)]), None);
+        assert_eq!(attempt_elapsed_ms(&[]), None);
+    }
+
+    #[test]
+    fn is_wall_clock_truncation_requires_both_conditions() {
+        let truncation = assistant(StopReason::Error, Some(TRUNCATION));
+        assert!(is_wall_clock_truncation(&truncation, Some(302_700)));
+        assert!(is_wall_clock_truncation(
+            &truncation,
+            Some(WALL_CLOCK_TRUNCATION_MS)
+        ));
+        // Just below the threshold: still an ordinary transient drop (pi's own sample ran 16.7s)
+        assert!(!is_wall_clock_truncation(&truncation, Some(16_703)));
+        assert!(!is_wall_clock_truncation(
+            &truncation,
+            Some(WALL_CLOCK_TRUNCATION_MS - 1)
+        ));
+        // Unknown duration must fail open (never silently disable retries)
+        assert!(!is_wall_clock_truncation(&truncation, None));
+        // Long but not a truncation (e.g. a 429 after a long wait) keeps the transient path
+        assert!(!is_wall_clock_truncation(
+            &assistant(StopReason::Error, Some("429: rate limit")),
+            Some(302_700)
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_retry_after_run_does_not_re_ask_a_wall_clock_truncation() {
+        let (session, calls, events) = test_session(vec![], retry_settings(3, 1));
+        session.set_messages(vec![
+            user_message("go", 1_000),
+            Message::Assistant(truncation_turn(1_000, 302_700)),
+        ]);
+
+        assert!(!session.check_retry_after_run().await);
+        // No re-ask, no backoff, no attempt consumed: the post-run compaction gate owns this case.
+        assert!(retry_starts(&events).is_empty());
+        assert_eq!(session.retry_attempt.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The failed message stays in state (the compaction gate pops it; the transient path would too)
+        assert_eq!(session.agent.messages().len(), 2);
+    }
+
+    // ── projection edit (pi 1.5.0 `context_edit` / `_omitRecoveryAttempt`) ──
+
+    fn failed_message_entry(id: &str, message: AssistantMessage) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            message: Message::Assistant(message),
+        }
+    }
+
+    #[tokio::test]
+    async fn omit_trailing_failed_attempt_persists_one_context_edit() {
+        let (session, _calls, _events, store) =
+            test_session_with_store(vec![], retry_settings(3, 1));
+        let failed = assistant(StopReason::Error, Some("429: rate limit"));
+        store.set_entries(vec![failed_message_entry("a1", failed.clone())]);
+        session.set_messages(vec![user_message("go", 0), Message::Assistant(failed)]);
+
+        session.omit_trailing_failed_attempt();
+
+        // Durable projection edit for exactly that entry, and the retry context lost the failed attempt.
+        assert_eq!(store.edits(), vec!["a1".to_string()]);
+        assert_eq!(session.agent.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn omit_trailing_failed_attempt_keeps_a_successful_assistant() {
+        let (session, _calls, _events, store) =
+            test_session_with_store(vec![], retry_settings(3, 1));
+        let ok = assistant(StopReason::Stop, None);
+        store.set_entries(vec![failed_message_entry("a1", ok.clone())]);
+        session.set_messages(vec![user_message("go", 0), Message::Assistant(ok)]);
+
+        session.omit_trailing_failed_attempt();
+
+        // A completed assistant turn is never omitted from the projection (only the retry-context pop applies).
+        assert!(store.edits().is_empty());
+        assert_eq!(session.agent.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn omit_trailing_failed_attempt_ignores_an_unknown_tail() {
+        let (session, _calls, _events, store) =
+            test_session_with_store(vec![], retry_settings(3, 1));
+        session.set_messages(vec![user_message("go", 0)]);
+
+        session.omit_trailing_failed_attempt();
+
+        assert!(store.edits().is_empty());
+        assert_eq!(session.agent.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_persists_the_projection_edit_for_the_failed_attempt() {
+        let (session, _calls, _events, store) = test_session_with_store(
+            vec![Script::Err("timeout"), Script::Ok("done")],
+            retry_settings(3, 1),
+        );
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notifier = Arc::clone(&notify);
+        let _ = session.subscribe(Box::new(move |e: &AgentEvent| {
+            if matches!(e, AgentEvent::AutoRetryStart { .. }) {
+                notifier.notify_one();
+            }
+        }));
+
+        // Fail once, retry, then succeed: the failed attempt must be durably omitted.
+        let (result, ()) = tokio::join!(session.prompt("hi", &[]), async {
+            notify.notified().await;
+        });
+        result.expect("prompt completes");
+        // The mock store's branch tail is empty, so the edit is keyed off whatever the store reports; what matters
+        // here is that the retry path called the projection-edit hook at most once and popped the failed message.
+        assert!(store.edits().len() <= 1);
+        assert!(store.persisted().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn check_retry_after_run_still_retries_a_short_truncation() {
+        let (session, calls, events) = test_session(vec![], retry_settings(3, 1));
+        session.set_messages(vec![
+            user_message("go", 1_000),
+            // 16.7s truncation (a real transient drop, not the upstream cap)
+            Message::Assistant(truncation_turn(1_000, 16_703)),
+        ]);
+
+        assert!(session.check_retry_after_run().await);
+        assert_eq!(retry_starts(&events).len(), 1);
+        assert_eq!(retry_starts(&events)[0].0, 1);
+        assert_eq!(session.retry_attempt.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

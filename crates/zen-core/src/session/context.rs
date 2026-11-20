@@ -70,13 +70,14 @@ pub fn build_context_entries(path_entries: &[SessionTreeEntry]) -> Vec<SessionTr
 
 /// Convert a single `SessionTreeEntry` into a set of context messages.
 ///
-/// Corresponds to Pi's `sessionEntryToContextMessages` function.
+/// Corresponds to Pi's `sessionEntryToContextMessages` function (`entries` is the whole path, so projection edits can
+/// be resolved: a `Message` targeted by a `ContextEdit` on the same path yields no message).
 /// Mapping rules:
-/// - `Message` → return `entry.message` directly
+/// - `Message` → return `entry.message` directly, unless a `ContextEdit` on this path targets it (→ empty)
 /// - `CustomMessage` → create the message via `createCustomMessage`
 /// - `Compaction` → create a summary message via `createCompactionSummaryMessage`; if `retained_tail` exists, append it
 /// - `BranchSummary` → create a branch summary message via `createBranchSummaryMessage`
-/// - `Custom` → return an empty Vec (v1 extension system not implemented; CustomEntry is never produced)
+/// - `Custom` / `ContextEdit` → return an empty Vec (v1 extension system not implemented; projection edits are metadata)
 /// - Other types (ThinkingLevelChange/ModelChange/ActiveToolsChange/Label/SessionInfo/Leaf) → return empty
 /// entries and index are unused in v1 and retained as reserved parameters; adjacent entries may need to be inspected to determine how to convert a CustomEntry into a message
 pub fn session_entry_to_context_messages(
@@ -85,8 +86,18 @@ pub fn session_entry_to_context_messages(
     entries: &[SessionTreeEntry],
 ) -> Vec<Message> {
     match entry {
-           SessionTreeEntry::Message { message, .. } => {
-               vec![message.clone()]
+           SessionTreeEntry::Message { id, message, .. } => {
+               // Durable projection edit (pi 1.5.0 `context_edit`): the entry stays in the raw history but is not
+               // part of the model context. zen only produces the omission form (there is no replacement content
+               // in the zen schema yet), so "targeted by any ContextEdit on this path" ⇒ omit.
+               let omitted = entries.iter().any(|other| {
+                   matches!(other, SessionTreeEntry::ContextEdit { target_id, .. } if target_id == id)
+               });
+               if omitted {
+                   vec![]
+               } else {
+                   vec![message.clone()]
+               }
            }
            SessionTreeEntry::Compaction {
                summary,
@@ -131,6 +142,8 @@ pub fn session_entry_to_context_messages(
            }
            // The Custom → v1 extension is not implemented and produces no message
            SessionTreeEntry::Custom { .. }
+           // Context edits are projection metadata and never produce a message themselves
+           | SessionTreeEntry::ContextEdit { .. }
            // Other types do not produce context messages
            | SessionTreeEntry::ThinkingLevelChange { .. }
            | SessionTreeEntry::ModelChange { .. }
@@ -747,6 +760,45 @@ mod tests {
         ];
         let ctx = build_session_context(&entries);
         assert_eq!(ctx.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_context_edit_omits_the_targeted_message() {
+        // pi 1.5.0 `context_edit` (projection edit): the entry stays in the raw history but leaves the context.
+        let mut entries = vec![
+            msg_entry("u1", None, "user"),
+            msg_entry("a1", Some("u1"), "assistant"),
+            msg_entry("u2", Some("a1"), "user"),
+        ];
+        entries.push(SessionTreeEntry::ContextEdit {
+            id: "ce1".into(),
+            parent_id: Some("u2".into()),
+            timestamp: "".into(),
+            target_id: "a1".into(),
+        });
+        let ctx = build_session_context(&entries);
+        // 3 message entries + 1 edit → only the two non-targeted messages remain
+        assert_eq!(ctx.messages.len(), 2);
+        assert!(matches!(ctx.messages[0], Message::User(_)));
+        assert!(matches!(ctx.messages[1], Message::User(_)));
+    }
+
+    #[test]
+    fn test_context_edit_does_not_omit_another_entry() {
+        let entries = vec![
+            msg_entry("u1", None, "user"),
+            msg_entry("a1", Some("u1"), "assistant"),
+            SessionTreeEntry::ContextEdit {
+                id: "ce1".into(),
+                parent_id: Some("a1".into()),
+                timestamp: "".into(),
+                target_id: "u1".into(),
+            },
+        ];
+        let ctx = build_session_context(&entries);
+        // Only the targeted user message is dropped; the assistant message stays.
+        assert_eq!(ctx.messages.len(), 1);
+        assert!(matches!(ctx.messages[0], Message::Assistant(_)));
     }
 
     #[test]

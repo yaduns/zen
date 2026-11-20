@@ -289,6 +289,50 @@ impl SessionManager {
     }
     // Consumers: T-AP-01-1 (AgentSession subscription closure via SessionStore), T-AP-11-1 (interactive append)
 
+    /// Persist a model-projection edit for `target_id` (pi 1.5.0 `appendContextEdit`): appends a
+    /// [`SessionTreeEntry::ContextEdit`] entry so `build_context` omits that entry on every future rebuild, while the
+    /// entry itself stays in the raw history (visible in the tree/export).
+    ///
+    /// # Parameters
+    /// - `target_id`: entry id to omit. Callers resolve it from the branch tail (`branch_entries()`); an unknown id is
+    ///   accepted as-is — it simply never matches a message.
+    ///
+    /// # Return
+    /// The new [`SessionTreeEntry::ContextEdit`] entry id (same convention as [`Self::append_message`]).
+    ///
+    /// # Consumers
+    /// `SessionStore::append_context_edit` (trait impl above) → `session/retry.rs::omit_trailing_failed_attempt`.
+    pub fn append_context_edit(&self, target_id: &str) -> String {
+        // 1. Inside the lock: pure in-memory operations (ID generation + tree append)
+        let (entry_id, entry_to_persist, session_file) = {
+            let mut inner = self.inner.lock().unwrap();
+            let entry_id = inner.tree.generate_entry_id();
+            let parent_id = inner.tree.leaf_id().map(|s| s.to_string());
+            let entry = SessionTreeEntry::ContextEdit {
+                id: entry_id.clone(),
+                parent_id,
+                timestamp: create_timestamp(),
+                target_id: target_id.to_string(),
+            };
+            inner.tree.append(entry.clone());
+            let file = if self.persist {
+                inner.session_file.clone()
+            } else {
+                None
+            };
+            (entry_id, entry, file)
+        }; // ← lock released
+
+        // 2. Outside the lock: file I/O (doesn't block other threads)
+        if let Some(path) = session_file {
+            if let Err(e) = append_entry(&path, &entry_to_persist) {
+                tracing::warn!("JSONL append failed (entry in memory only): {e}");
+            }
+        }
+
+        entry_id
+    }
+
     /// Append a thinking-level change, returning the entry id.
     pub fn append_thinking_level_change(&self, thinking_level: &str) -> String {
         // 1. Inside the lock: pure in-memory operations (ID generation + tree append)
@@ -732,6 +776,11 @@ impl SessionStore for SessionManager {
     fn append_message(&self, _message: &Message) {
         self.append_message(_message);
     }
+    /// Persist a model-projection edit (pi 1.5.0 `appendContextEdit`): the targeted entry stays in the raw history but
+    /// is omitted when the context is rebuilt.
+    fn append_context_edit(&self, target_id: &str) {
+        self.append_context_edit(target_id);
+    }
     /// Record a model switch.
     fn append_model_change(&self, _provider: &str, _model_id: &str) {
         self.append_model_change(_provider, _model_id);
@@ -1111,6 +1160,64 @@ mod tests {
         assert_eq!(ids, vec![m1.clone(), m2.clone()]);
         assert_eq!(mgr.get_entry(&m2).unwrap().parent_id(), Some(m1.as_str()));
         assert_eq!(mgr.get_entry(&m1).unwrap().parent_id(), None);
+    }
+
+    #[test]
+    fn test_append_context_edit_persists_a_projection_edit() {
+        let root = test_dir("append_context_edit");
+        let mgr = create_in(&root, "/proj", Some("s1"));
+        let id = mgr.append_message(&user_message("hello"));
+
+        let edit_id = mgr.append_context_edit(&id);
+        assert_eq!(mgr.get_leaf_id().as_deref(), Some(edit_id.as_str()));
+        match mgr.get_entry(&edit_id).unwrap() {
+            SessionTreeEntry::ContextEdit {
+                target_id,
+                parent_id,
+                ..
+            } => {
+                assert_eq!(target_id, id.as_str());
+                assert_eq!(parent_id.as_deref(), Some(id.as_str()));
+            }
+            other => panic!("expected ContextEdit, got {other:?}"),
+        }
+
+        // Persisted to disk: survives a reload and keeps the projection edit on the branch.
+        let path = mgr.get_session_file().unwrap();
+        let (_h, entries, _leaf) = read_session_file(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[1],
+            SessionTreeEntry::ContextEdit { target_id, .. } if target_id == &id
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_append_context_edit_is_omitted_from_the_rebuilt_context() {
+        let mgr = SessionManager::in_memory("/proj");
+        let user = mgr.append_message(&user_message("hello"));
+        let failed = mgr.append_message(&Message::Assistant(zen_ai::types::AssistantMessage {
+            content: vec![],
+            api: "openai-completions".into(),
+            provider: "opencode-go".into(),
+            model: "deepseek-v4-flash".into(),
+            response_model: None,
+            response_id: None,
+            usage: Default::default(),
+            stop_reason: zen_ai::types::StopReason::Error,
+            error_message: Some("Stream ended without finish_reason".into()),
+            timestamp: 0,
+        }));
+        let edit = mgr.append_context_edit(&failed);
+
+        let ctx = zen_core::session::context::build_session_context(&mgr.get_branch(None));
+        // The raw branch keeps both messages; the model context keeps only the user message.
+        let branch_entries = mgr.get_branch(None);
+        let branch: Vec<&str> = branch_entries.iter().map(|e| e.id()).collect();
+        assert_eq!(branch, vec![user.as_str(), failed.as_str(), edit.as_str()]);
+        assert_eq!(ctx.messages.len(), 1);
+        assert!(matches!(ctx.messages[0], Message::User(_)));
     }
 
     #[test]

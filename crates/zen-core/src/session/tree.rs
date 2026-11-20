@@ -129,6 +129,28 @@ pub enum SessionTreeEntry {
         timestamp: String,
         target_id: Option<String>,
     },
+    /// Durable edit of the **model projection**: the entry named by `target_id` stays in the raw history (it is still
+    /// visible in the tree/export) but is omitted from the messages sent to the model.
+    ///
+    /// Origin: pi 1.5.0 `_omitRecoveryAttempt` → `SessionManager.appendContextEdit(targetId, null)`
+    /// (`dist/core/session-manager.js:997-1006`); the comment there is the contract: *"Keep the failed attempt in raw
+    /// history while durably omitting it from model projection."* zen emits it from the turn-level retry and from the
+    /// compaction recovery branches, so a failed attempt never re-enters the context on resume as an empty/invalid
+    /// assistant turn (two assistant messages in a row).
+    ///
+    /// # Field parity (pi `context_edit` entry)
+    /// - `id` / `parent_id` / `timestamp`: aligned (every session entry carries them).
+    /// - `target_id`: aligned (pi `targetId`).
+    /// - `replacement`: **dissolved to `None`-only in v1** — pi can also substitute edited content
+    ///   (`replacement: ContentBlock[] | null`); zen only produces the omission form, and the field is not part of the
+    ///   zen schema yet (reserved for a future user-facing context-edit command).
+    #[serde(rename_all = "camelCase")]
+    ContextEdit {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: String,
+        target_id: String,
+    },
 }
 
 /// Holds a set of SessionTreeEntry and tracks the current leaf node ID; provides pure tree navigation functions (no storage IO)
@@ -188,7 +210,8 @@ impl SessionTreeEntry {
             | SessionTreeEntry::CustomMessage { id, .. }
             | SessionTreeEntry::Label { id, .. }
             | SessionTreeEntry::SessionInfo { id, .. }
-            | SessionTreeEntry::Leaf { id, .. } => id.as_str(),
+            | SessionTreeEntry::Leaf { id, .. }
+            | SessionTreeEntry::ContextEdit { id, .. } => id.as_str(),
         }
     }
     pub fn parent_id(&self) -> Option<&str> {
@@ -203,7 +226,8 @@ impl SessionTreeEntry {
             | SessionTreeEntry::CustomMessage { parent_id, .. }
             | SessionTreeEntry::Label { parent_id, .. }
             | SessionTreeEntry::SessionInfo { parent_id, .. }
-            | SessionTreeEntry::Leaf { parent_id, .. } => parent_id.as_deref(),
+            | SessionTreeEntry::Leaf { parent_id, .. }
+            | SessionTreeEntry::ContextEdit { parent_id, .. } => parent_id.as_deref(),
         }
     }
 }

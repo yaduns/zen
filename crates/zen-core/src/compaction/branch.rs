@@ -369,7 +369,8 @@ fn message_from_entry(entry: &SessionTreeEntry) -> Option<Message> {
             timestamp,
         )),
         // Metadata entries produce no message
-        SessionTreeEntry::Custom { .. }
+        SessionTreeEntry::ContextEdit { .. }
+        | SessionTreeEntry::Custom { .. }
         | SessionTreeEntry::ThinkingLevelChange { .. }
         | SessionTreeEntry::ModelChange { .. }
         | SessionTreeEntry::ActiveToolsChange { .. }

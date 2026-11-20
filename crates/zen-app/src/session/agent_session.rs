@@ -30,6 +30,19 @@ pub trait SessionStore: Send + Sync {
     /// Corresponds to Pi's `SessionManager.appendMessage`.
     fn append_message(&self, message: &Message);
 
+    /// Durably omit an existing entry from the **model projection** while keeping it in the raw history
+    /// (pi 1.5.0 `_omitRecoveryAttempt` → `SessionManager.appendContextEdit(targetId, null)`;
+    /// `dist/core/agent-session.js:3110-3128` + `dist/core/session-manager.js:997-1006`).
+    ///
+    /// # Consumers
+    /// `session/retry.rs::omit_trailing_failed_attempt` (turn-level retry) and `session/compaction.rs`'s two recovery
+    /// branches: a failed attempt must not re-enter the context on resume as an empty / consecutive assistant turn.
+    ///
+    /// # Default
+    /// No-op. Only [`crate::session::session_manager::SessionManager`] persists a projection edit; the in-memory and
+    /// test stubs of this trait never rebuild a projection from entries, so they need no implementation.
+    fn append_context_edit(&self, _target_id: &str) {}
+
     /// Record a model-switch event.
     /// Corresponds to Pi `SessionManager.appendModelChange`.
     fn append_model_change(&self, provider: &str, model_id: &str);

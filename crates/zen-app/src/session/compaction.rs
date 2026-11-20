@@ -28,6 +28,11 @@ use super::agent_session::{AgentSession, AgentSessionError};
 /// (agent-session.ts:1990, user-visible message when the overflow recovery budget is exhausted).
 const OVERFLOW_RECOVERY_FAILED: &str = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
 
+/// pi's "Truncated response recovery failed after one compact-and-retry attempt." (agent-session.js:2465-2466 of
+/// pi 1.5.0 — the same budget-exhausted message, specialised for the truncation branch).
+const TRUNCATION_RECOVERY_FAILED: &str =
+    "Truncated response recovery failed after one compact-and-retry attempt.";
+
 /// Take the last assistant message (shared input source for pre-submit pre-check and post-run check; aligning pi
 /// `_findLastAssistantMessage`）。
 /// consumers: this module (check_compaction/execute flow) + agent_session.rs (prompt wiring).
@@ -128,7 +133,8 @@ impl AgentSession {
     /// (prevents switching from a small-window model to a large-window model from re-triggering compaction due to the old model's overflow errors);
     /// ④ assistant messages older than the most recent compaction boundary are skipped (prevents old usage from re-triggering right after compaction completes);
     /// ⑤ overflow branch (errors or usage exceeds the window; `stop` means "compact only, no retry", otherwise delete trailing error messages,
-    /// compact and retry — `overflow_recovery_attempted` guarantees only one recovery attempt) → threshold branch
+    /// compact and retry — `overflow_recovery_attempted` guarantees only one recovery attempt) → recoverable-truncation branch
+    /// (upstream wall-clock cap cut; same single-recovery budget) → threshold branch
     /// (usage computed directly; on errors/all-zeros falls back to message estimation + staleness check on the estimation source).
     ///
     /// # Returns
@@ -187,14 +193,46 @@ impl AgentSession {
                 .store(true, Ordering::Relaxed);
             // Drop the trailing erroneous assistant message (pi :2002-2006: already persisted to session history, but not kept in the retry context;
             // after compaction the context is rebuilt wholesale, so popping it here clears the way for estimation/retry)
-            // Shared with the turn-level retry orchestration (turn-auto-retry-fix) — same rule, same helper.
-            let messages = self.agent.messages();
-            if matches!(messages.last(), Some(Message::Assistant(_))) {
-                self.agent
-                    .set_messages(super::retry::with_trailing_assistant_removed(messages));
-            }
+            // Shared with the turn-level retry orchestration (turn-auto-retry-fix) — same rule, same helper. Since pi
+            // 1.5.0 the helper also durably omits the attempt from the model projection (`context_edit`), so the
+            // rebuilt context cannot re-inject it (`_omitRecoveryAttempt`, agent-session.js:2486).
+            self.omit_trailing_failed_attempt();
             return self
                 .run_auto_compaction(CompactionReason::Overflow, will_retry)
+                .await;
+        }
+
+        // Gate ⑤c: recoverable truncation — pi's recoverable-length shape (`agent-session.js:2455-2491` plus
+        // `isRecoverableLength` in `pi-ai/utils/overflow.js:177`) applied to the upstream wall-clock cap: a stream cut
+        // after minutes of generation is deterministic (the turn-level retry deliberately does not re-ask it, see
+        // `retry.rs::is_wall_clock_truncation`), but a smaller context generates faster and can fit inside the cap.
+        // So compact once and retry once, sharing the single-recovery budget with overflow (pi reuses
+        // `_overflowRecoveryAttempted` for both branches).
+        let messages = self.agent.messages();
+        if same_model
+            && super::retry::is_wall_clock_truncation(
+                last_assistant,
+                super::retry::attempt_elapsed_ms(&messages),
+            )
+        {
+            if self.overflow_recovery_attempted.load(Ordering::Relaxed) {
+                self.agent.emit(AgentEvent::CompactionEnd {
+                    reason: CompactionReason::Overflow,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(TRUNCATION_RECOVERY_FAILED.to_string()),
+                });
+                return Ok(false);
+            }
+            self.overflow_recovery_attempted
+                .store(true, Ordering::Relaxed);
+            // Same rule as the overflow branch: the failed attempt stays in session history but leaves the retry
+            // context (`continue_turn` rejects a trailing assistant message) and is durably omitted from the model
+            // projection (pi 1.5.0 `_omitRecoveryAttempt`).
+            self.omit_trailing_failed_attempt();
+            return self
+                .run_auto_compaction(CompactionReason::Overflow, true)
                 .await;
         }
 
@@ -690,6 +728,23 @@ mod tests {
         }
     }
 
+    /// Assistant turn cut by the upstream wall-clock cap: thinking-only content, no `finish_reason`, and an
+    /// `elapsed_ms` gap from the prompt that puts it past `WALL_CLOCK_TRUNCATION_MS`.
+    fn wall_clock_truncation_assistant(start_ms: i64, elapsed_ms: i64) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![],
+            api: "openai-completions".into(),
+            provider: "opencode-go".into(),
+            model: "deepseek-v4-flash".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("Stream ended without finish_reason".into()),
+            timestamp: start_ms + elapsed_ms,
+        }
+    }
+
     fn assistant_with_usage(total_tokens: u64, timestamp: i64) -> AssistantMessage {
         AssistantMessage {
             content: vec![],
@@ -953,6 +1008,91 @@ mod tests {
                     .as_deref()
                     .unwrap()
                     .contains("recovery failed"));
+            }
+            _ => panic!("expected CompactionEnd"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_compaction_truncation_recovery_budget_is_one() {
+        let store = Arc::new(FixedStore::new(vec![user_entry("u1", "hi")]));
+        let (session, events) = test_session(Arc::clone(&store), None);
+        // Recovery budget already spent (shared with the overflow branch, pi `_overflowRecoveryAttempted`)
+        session
+            .overflow_recovery_attempted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let a = wall_clock_truncation_assistant(T1_MS, 305_000);
+        session.set_messages(vec![
+            Message::User(zen_ai::types::UserMessage {
+                content: ContentBlockList::Text("hi".into()),
+                timestamp: T1_MS,
+            }),
+            Message::Assistant(a.clone()),
+        ]);
+
+        let cont = session.check_compaction(&a, true).await.unwrap();
+        assert!(!cont);
+        assert_eq!(store.compaction_count(), 0);
+        let guard = events.lock().unwrap();
+        match compaction_events(&guard).last().unwrap() {
+            AgentEvent::CompactionEnd {
+                result,
+                will_retry,
+                error_message,
+                ..
+            } => {
+                assert!(result.is_none());
+                assert!(!*will_retry);
+                assert_eq!(
+                    error_message.as_deref(),
+                    Some("Truncated response recovery failed after one compact-and-retry attempt.")
+                );
+            }
+            _ => panic!("expected CompactionEnd"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_compaction_recovers_a_wall_clock_truncation_once() {
+        let store = Arc::new(FixedStore::new(vec![user_entry("u1", "hi")]));
+        let (session, events) = test_session(Arc::clone(&store), None);
+        let a = wall_clock_truncation_assistant(T1_MS, 305_000);
+        session.set_messages(vec![
+            Message::User(zen_ai::types::UserMessage {
+                content: ContentBlockList::Text("hi".into()),
+                timestamp: T1_MS,
+            }),
+            Message::Assistant(a.clone()),
+        ]);
+
+        let cont = session.check_compaction(&a, true).await.unwrap();
+        // Recoverable truncation: compact first (smaller context → faster generation), then retry once
+        assert!(cont);
+        assert_eq!(store.compaction_count(), 1);
+        // The failed attempt left the retry context (`continue_turn` rejects a trailing assistant)
+        assert!(!session
+            .agent
+            .messages()
+            .iter()
+            .any(|m| matches!(m, Message::Assistant(_))));
+        let guard = events.lock().unwrap();
+        let evts = compaction_events(&guard);
+        assert!(matches!(
+            evts[0],
+            AgentEvent::CompactionStart {
+                reason: CompactionReason::Overflow
+            }
+        ));
+        match evts[1] {
+            AgentEvent::CompactionEnd {
+                result,
+                will_retry,
+                error_message,
+                ..
+            } => {
+                assert!(result.is_some());
+                assert!(*will_retry);
+                assert!(error_message.is_none());
             }
             _ => panic!("expected CompactionEnd"),
         }

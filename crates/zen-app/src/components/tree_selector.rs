@@ -147,6 +147,8 @@ fn kind_name(e: &SessionTreeEntry) -> &'static str {
         SessionTreeEntry::Label { .. } => "label",
         SessionTreeEntry::SessionInfo { .. } => "session-info",
         SessionTreeEntry::Leaf { .. } => "leaf",
+        // Projection edit (pi 1.5.0 `context_edit`): bookkeeping between real entries
+        SessionTreeEntry::ContextEdit { .. } => "context-edit",
     }
 }
 
@@ -621,7 +623,8 @@ fn entry_timestamp_str(e: &SessionTreeEntry) -> String {
         | SessionTreeEntry::CustomMessage { timestamp, .. }
         | SessionTreeEntry::Label { timestamp, .. }
         | SessionTreeEntry::SessionInfo { timestamp, .. }
-        | SessionTreeEntry::Leaf { timestamp, .. } => timestamp,
+        | SessionTreeEntry::Leaf { timestamp, .. }
+        | SessionTreeEntry::ContextEdit { timestamp, .. } => timestamp,
     };
     ts.chars().skip(11).take(8).collect()
 }
